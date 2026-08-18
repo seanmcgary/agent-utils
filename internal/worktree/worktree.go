@@ -130,9 +130,24 @@ func (m *Manager) git(dir string, args ...string) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git %s in %s: %w: %s",
-			strings.Join(args, " "), dir, err, strings.TrimSpace(string(out)))
+			strings.Join(args, " "), dir, err, redact(strings.TrimSpace(string(out))))
 	}
 	return nil
+}
+
+// credentialInURL matches the userinfo part of a remote URL, and the two GitHub
+// token shapes.
+var (
+	credentialInURL = regexp.MustCompile(`://[^/@\s]*@`)
+	tokenShape      = regexp.MustCompile(`\b(ghp_|github_pat_|gho_|ghs_)[A-Za-z0-9_]+`)
+)
+
+// redact removes credentials from git output. That output is stored in the
+// dispatch row and written to the cron log, and an https remote can carry a
+// token in its userinfo.
+func redact(s string) string {
+	s = credentialInURL.ReplaceAllString(s, "://REDACTED@")
+	return tokenShape.ReplaceAllString(s, "REDACTED")
 }
 
 func exists(path string) bool {

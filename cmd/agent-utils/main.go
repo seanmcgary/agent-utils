@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -55,14 +56,14 @@ func loopCommand() *cli.Command {
 				Usage: "run one reconcile and dispatch pass, then exit",
 				Flags: []cli.Flag{configFlag()},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					cfg, deps, cleanup, err := setup(c.String("config"))
+					cfg, deps, cleanup, err := setup(c.String("config"), true)
 					if err != nil {
 						return err
 					}
 					defer cleanup()
 
 					l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
-					if err == lock.ErrHeld {
+					if errors.Is(err, lock.ErrHeld) {
 						slog.Info("another tick is running; exiting", "loop", cfg.Name)
 						return nil
 					}
@@ -80,7 +81,7 @@ func loopCommand() *cli.Command {
 				Usage: "print the reconciled view without changing anything",
 				Flags: []cli.Flag{configFlag()},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					cfg, deps, cleanup, err := setup(c.String("config"))
+					cfg, deps, cleanup, err := setup(c.String("config"), true)
 					if err != nil {
 						return err
 					}
@@ -102,12 +103,24 @@ func loopCommand() *cli.Command {
 					&cli.IntFlag{Name: "issue", Usage: "issue number", Required: true},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					cfg, deps, cleanup, err := setup(c.String("config"))
+					cfg, deps, cleanup, err := setup(c.String("config"), false)
 					if err != nil {
 						return err
 					}
 					defer cleanup()
-					return loopcmd.Reset(cfg, deps.Store, deps.WT, c.Int("issue"))
+
+					// Take the same lock a tick takes. Without it a reset can
+					// delete a worktree while a tick is dispatching into it.
+					l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
+					if errors.Is(err, lock.ErrHeld) {
+						return fmt.Errorf("a tick is running for loop %q; try again", cfg.Name)
+					}
+					if err != nil {
+						return err
+					}
+					defer l.Release()
+
+					return loopcmd.Reset(cfg, deps.Store, deps.WT, c.Int("issue"), deps.IsAlive)
 				},
 			},
 		},
@@ -128,7 +141,7 @@ func internalCommand() *cli.Command {
 					&cli.IntFlag{Name: "dispatch", Usage: "dispatch id", Required: true},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					cfg, deps, cleanup, err := setup(c.String("config"))
+					cfg, deps, cleanup, err := setup(c.String("config"), false)
 					if err != nil {
 						return err
 					}
@@ -140,7 +153,7 @@ func internalCommand() *cli.Command {
 	}
 }
 
-func setup(configPath string) (*config.Config, loopcmd.Deps, func(), error) {
+func setup(configPath string, needsGitHub bool) (*config.Config, loopcmd.Deps, func(), error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, loopcmd.Deps{}, nil, err
@@ -153,8 +166,11 @@ func setup(configPath string) (*config.Config, loopcmd.Deps, func(), error) {
 
 	// The token must come from the environment, never a flag. A flag value
 	// shows up in `ps` output and in the shell history of anyone who typed it.
+	// The detached runner never calls the GitHub API, so it must neither require
+	// nor carry the token. Requiring it there would put a repository-write
+	// credential in the environment of a process whose child is the agent.
 	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" {
+	if token == "" && needsGitHub {
 		return nil, loopcmd.Deps{}, nil, fmt.Errorf("GITHUB_TOKEN is not set")
 	}
 

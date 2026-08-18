@@ -1,3 +1,4 @@
+// Package store holds the durable loop state in SQLite.
 package store
 
 import (
@@ -47,7 +48,8 @@ CREATE TABLE IF NOT EXISTS dispatches (
   duration_ms  INTEGER NOT NULL DEFAULT 0,
   api_error    TEXT NOT NULL DEFAULT '',
   log_path     TEXT NOT NULL DEFAULT '',
-  pr_number    INTEGER NOT NULL DEFAULT 0
+  pr_number    INTEGER NOT NULL DEFAULT 0,
+  title        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS dispatches_running
@@ -101,11 +103,68 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// The database holds session identifiers. Keep it private to this user.
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		_ = os.Chmod(path+suffix, 0o600)
 	}
 	return &Store{db: db}, nil
+}
+
+// addedColumns lists every column added after the first release. CREATE TABLE
+// IF NOT EXISTS does nothing to a database that already exists, so a new column
+// must be added explicitly or every query naming it fails on an older file.
+var addedColumns = []struct{ table, column, def string }{
+	{"issues", "needs_retry", "INTEGER NOT NULL DEFAULT 0"},
+	{"issues", "session_started", "INTEGER NOT NULL DEFAULT 0"},
+	{"issues", "parked", "INTEGER NOT NULL DEFAULT 0"},
+	{"dispatches", "pr_number", "INTEGER NOT NULL DEFAULT 0"},
+	{"dispatches", "title", "TEXT NOT NULL DEFAULT ''"},
+	{"pr_links", "behind_by", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+// migrate adds any column missing from an existing database. Each column has a
+// default, so an added column needs no backfill.
+func migrate(db *sql.DB) error {
+	for _, c := range addedColumns {
+		has, err := hasColumn(db, c.table, c.column)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.column, c.def)
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("add column %s.%s: %w", c.table, c.column, err)
+		}
+	}
+	return nil
+}
+
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, ctype      string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("scan %s columns: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Close closes the database.
@@ -179,6 +238,38 @@ func (s *Store) MarkNeedsRetry(loop, repo string, number int) error {
 	return nil
 }
 
+// ClearNeedsRetry clears a failure flag that no retry can act on. Without it an
+// issue whose failure was recorded while it was not in flight is stranded
+// permanently.
+func (s *Store) ClearNeedsRetry(loop, repo string, number int) error {
+	_, err := s.db.Exec(`
+		UPDATE issues SET needs_retry = 0, updated_at = ?
+		WHERE loop = ? AND repo = ? AND number = ?`,
+		time.Now().UTC(), loop, repo, number)
+	if err != nil {
+		return fmt.Errorf("clear needs retry: %w", err)
+	}
+	return nil
+}
+
+// MarkSessionStarted records that claude created the session for this issue.
+//
+// It is written on ANY dispatch whose stream reported a session identifier,
+// success or failure alike. If it were written only on success, a run that
+// created a session and then crashed would leave the flag false, and every
+// retry would start a NEW run against the already-used identifier, which claude
+// refuses outright.
+func (s *Store) MarkSessionStarted(loop, repo string, number int) error {
+	_, err := s.db.Exec(`
+		UPDATE issues SET session_started = 1, updated_at = ?
+		WHERE loop = ? AND repo = ? AND number = ?`,
+		time.Now().UTC(), loop, repo, number)
+	if err != nil {
+		return fmt.Errorf("mark session started: %w", err)
+	}
+	return nil
+}
+
 // MarkSucceeded clears the failure state after a clean dispatch. It resets the
 // retry budget, so an issue that fails three times over its lifetime with
 // successful runs in between is not parked on its next single failure.
@@ -195,16 +286,21 @@ func (s *Store) MarkSucceeded(loop, repo string, number int) error {
 	return nil
 }
 
-// IssueStateOrZero returns the stored state for one issue, or a zero value with
-// the keys filled in when no row exists.
-func (s *Store) IssueStateOrZero(loop, repo string, number int) IssueState {
+// IssueState returns the stored state for one issue. When no row exists it
+// returns a zero value with the keys filled in.
+//
+// It reports a read error rather than hiding one. A caller that persisted a
+// zero value returned from a failed read would wipe the session identifier and
+// the retry counter of a live issue.
+func (s *Store) IssueState(loop, repo string, number int) (IssueState, error) {
 	states, err := s.IssueStates(loop, repo)
-	if err == nil {
-		if st, ok := states[number]; ok {
-			return st
-		}
+	if err != nil {
+		return IssueState{}, err
 	}
-	return IssueState{Loop: loop, Repo: repo, Number: number}
+	if st, ok := states[number]; ok {
+		return st, nil
+	}
+	return IssueState{Loop: loop, Repo: repo, Number: number}, nil
 }
 
 // LastTick returns the time of the most recent recorded tick.
@@ -258,10 +354,10 @@ func (s *Store) DeleteIssueState(loop, repo string, number int) error {
 func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO dispatches (loop, repo, number, kind, session_id,
-		                        status, started_at, log_path, pr_number)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                        status, started_at, log_path, pr_number, title)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		d.Loop, d.Repo, d.Number, d.Kind, d.SessionID,
-		StatusRunning, time.Now().UTC(), d.LogPath, d.PRNumber)
+		StatusRunning, time.Now().UTC(), d.LogPath, d.PRNumber, d.Title)
 	if err != nil {
 		return 0, fmt.Errorf("create dispatch: %w", err)
 	}
@@ -280,28 +376,43 @@ func (s *Store) SetDispatchProcess(id int64, pid int, startedAt time.Time) error
 
 // FinishDispatch records the outcome of a dispatch.
 func (s *Store) FinishDispatch(id int64, r DispatchResult) error {
-	_, err := s.db.Exec(`
+	// Only a row that is still running may be finished. If a tick already reaped
+	// this row as dead and dispatched a replacement, the original runner must not
+	// come back and overwrite the replacement's state.
+	res, err := s.db.Exec(`
 		UPDATE dispatches
 		SET status = ?, exit_code = ?, cost_usd = ?, duration_ms = ?,
 		    api_error = ?, finished_at = ?
-		WHERE id = ?`,
-		r.Status, r.ExitCode, r.CostUSD, r.DurationMS, r.APIError, time.Now().UTC(), id)
+		WHERE id = ? AND status = ?`,
+		r.Status, r.ExitCode, r.CostUSD, r.DurationMS, r.APIError, time.Now().UTC(),
+		id, StatusRunning)
 	if err != nil {
 		return fmt.Errorf("finish dispatch: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("finish dispatch rows: %w", err)
+	}
+	if n == 0 {
+		return ErrDispatchNotRunning
 	}
 	return nil
 }
 
+// ErrDispatchNotRunning reports that a dispatch was already finished, so this
+// caller lost the race and must not write any further state for it.
+var ErrDispatchNotRunning = errors.New("dispatch is no longer running")
+
 const dispatchColumns = `id, loop, repo, number, kind, session_id, pid, pid_start_at,
 	status, started_at, finished_at, exit_code, cost_usd, duration_ms, api_error,
-	log_path, pr_number`
+	log_path, pr_number, title`
 
 func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 	var d Dispatch
 	var pidStart, finished sql.NullTime
 	err := sc.Scan(&d.ID, &d.Loop, &d.Repo, &d.Number, &d.Kind, &d.SessionID,
 		&d.PID, &pidStart, &d.Status, &d.StartedAt, &finished, &d.ExitCode,
-		&d.CostUSD, &d.DurationMS, &d.APIError, &d.LogPath, &d.PRNumber)
+		&d.CostUSD, &d.DurationMS, &d.APIError, &d.LogPath, &d.PRNumber, &d.Title)
 	if err != nil {
 		return Dispatch{}, err
 	}
@@ -348,13 +459,14 @@ func (s *Store) GetDispatch(id int64) (Dispatch, error) {
 // PutPRLink inserts or replaces one issue-to-pull-request mapping.
 func (s *Store) PutPRLink(l PRLink) error {
 	_, err := s.db.Exec(`
-		INSERT INTO pr_links (loop, repo, number, pr_number, head_ref, base_ref)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO pr_links (loop, repo, number, pr_number, head_ref, base_ref, behind_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(loop, repo, number) DO UPDATE SET
 		  pr_number = excluded.pr_number,
 		  head_ref  = excluded.head_ref,
-		  base_ref  = excluded.base_ref`,
-		l.Loop, l.Repo, l.Number, l.PRNumber, l.HeadRef, l.BaseRef)
+		  base_ref  = excluded.base_ref,
+		  behind_by = excluded.behind_by`,
+		l.Loop, l.Repo, l.Number, l.PRNumber, l.HeadRef, l.BaseRef, l.BehindBy)
 	if err != nil {
 		return fmt.Errorf("put pr link: %w", err)
 	}
@@ -364,7 +476,7 @@ func (s *Store) PutPRLink(l PRLink) error {
 // PRLinks returns every issue-to-pull-request mapping for one loop.
 func (s *Store) PRLinks(loop, repo string) (map[int]PRLink, error) {
 	rows, err := s.db.Query(
-		`SELECT number, pr_number, head_ref, base_ref FROM pr_links
+		`SELECT number, pr_number, head_ref, base_ref, behind_by FROM pr_links
 		 WHERE loop = ? AND repo = ?`, loop, repo)
 	if err != nil {
 		return nil, fmt.Errorf("query pr links: %w", err)
@@ -374,7 +486,7 @@ func (s *Store) PRLinks(loop, repo string) (map[int]PRLink, error) {
 	out := make(map[int]PRLink)
 	for rows.Next() {
 		l := PRLink{Loop: loop, Repo: repo}
-		if err := rows.Scan(&l.Number, &l.PRNumber, &l.HeadRef, &l.BaseRef); err != nil {
+		if err := rows.Scan(&l.Number, &l.PRNumber, &l.HeadRef, &l.BaseRef, &l.BehindBy); err != nil {
 			return nil, fmt.Errorf("scan pr link: %w", err)
 		}
 		out[l.Number] = l

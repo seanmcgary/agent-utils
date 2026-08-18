@@ -4,6 +4,7 @@ package loopcmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -34,6 +35,15 @@ type Deps struct {
 	Fetch func() error
 }
 
+// count increments n only when the action succeeded, so the recorded summary
+// never claims a dispatch that did not happen.
+func count(n *int, err error) error {
+	if err == nil {
+		*n++
+	}
+	return err
+}
+
 // pidGracePeriod is how long a dispatch row may carry pid 0 before the tick
 // treats it as dead. It covers the window between the row insert and the pid
 // write, so a crash in that window cannot cause a duplicate dispatch.
@@ -56,10 +66,16 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	var sum Summary
 	now := deps.Now()
 
+	// A failed fetch makes branch comparisons stale, so it suppresses TENDING.
+	// It must not abandon the tick: reaping dead runners, retrying, and parking
+	// have nothing to do with git, and skipping RecordTick would freeze the tick
+	// counter that every backoff window is measured in.
+	fetchOK := true
 	if deps.Fetch != nil {
 		if err := deps.Fetch(); err != nil {
-			// A failed fetch makes every branch comparison stale. Stop here.
-			return sum, fmt.Errorf("fetch primary checkout: %w", err)
+			fetchOK = false
+			slog.Error("fetch primary checkout; skipping tend this tick",
+				"loop", cfg.Name, "err", err)
 		}
 	}
 
@@ -71,7 +87,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	}
 
 	snap := engine.Snapshot{Issues: issues, BehindBy: map[int]int{}}
-	if cfg.TendPR {
+	if cfg.TendPR && fetchOK {
 		prs, err := deps.GH.ListOpenPullRequests(ctx, owner, repo)
 		if err != nil {
 			return sum, err
@@ -198,26 +214,27 @@ func act(
 	sum *Summary,
 ) error {
 	switch d.Kind {
+	case engine.KindClearRetry:
+		// Not a dispatch. Clear a failure flag that no retry can act on, so the
+		// issue is not stranded outside the loop forever.
+		slog.Info("clearing stale retry flag", "loop", cfg.Name, "issue", d.Issue,
+			"reason", d.Reason)
+		return deps.Store.ClearNeedsRetry(cfg.Name, cfg.Repo, d.Issue)
 	case engine.KindParkRetryExhausted:
-		sum.Parked++
-		return parkRetryExhausted(ctx, cfg, deps, d)
+		return count(&sum.Parked, parkRetryExhausted(ctx, cfg, deps, d))
 	case engine.KindTend:
-		sum.Tended++
-		return dispatch(ctx, cfg, deps, d, st, now, store.KindTend)
+		return count(&sum.Tended, dispatch(ctx, cfg, deps, d, st, now, store.KindTend))
 	case engine.KindResume:
-		sum.Resumed++
-		return dispatch(ctx, cfg, deps, d, st, now, store.KindResume)
+		return count(&sum.Resumed, dispatch(ctx, cfg, deps, d, st, now, store.KindResume))
 	case engine.KindRetryResume:
-		sum.Retried++
-		return dispatch(ctx, cfg, deps, d, st, now, store.KindResume)
+		return count(&sum.Retried, dispatch(ctx, cfg, deps, d, st, now, store.KindResume))
 	case engine.KindRetryStart:
-		// The previous attempt never created a session, so resuming would fail
-		// the same way every time. Start instead, keeping the same identifier.
-		sum.Retried++
-		return dispatch(ctx, cfg, deps, d, st, now, store.KindStart)
+		// The previous attempt never created a usable session, so resuming would
+		// fail every time. Start instead, with a NEW identifier: the decision
+		// carries no session id precisely so dispatch mints a fresh one.
+		return count(&sum.Retried, dispatch(ctx, cfg, deps, d, st, now, store.KindStart))
 	case engine.KindStart:
-		sum.Started++
-		return dispatch(ctx, cfg, deps, d, st, now, store.KindStart)
+		return count(&sum.Started, dispatch(ctx, cfg, deps, d, st, now, store.KindStart))
 	default:
 		return fmt.Errorf("unknown decision kind %q", d.Kind)
 	}
@@ -232,7 +249,12 @@ func dispatch(
 	now time.Time,
 	kind string,
 ) error {
-	state := deps.Store.IssueStateOrZero(cfg.Name, cfg.Repo, d.Issue)
+	state, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Issue)
+	if err != nil {
+		// Persisting a zero value read from a failed query would wipe the
+		// session identifier and the retry counter of a live issue.
+		return fmt.Errorf("read issue state for #%d: %w", d.Issue, err)
+	}
 
 	sessionID := d.SessionID
 	if sessionID == "" {
@@ -270,7 +292,7 @@ func dispatch(
 	// recorded as a failed dispatch rather than vanishing into a log line.
 	dispatchID, err := deps.Store.CreateDispatch(store.Dispatch{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: d.Issue, Kind: kind,
-		SessionID: sessionID, LogPath: logPath, PRNumber: d.PR,
+		SessionID: sessionID, LogPath: logPath, PRNumber: d.PR, Title: d.Title,
 	})
 	if err != nil {
 		return err
@@ -285,12 +307,13 @@ func dispatch(
 			workDir, wtErr = deps.WT.EnsureIssue(d.Issue)
 		}
 		if wtErr != nil {
+			// Record the failed dispatch, but do NOT set the retry flag. No agent
+			// ran, so the issue carries no in-flight label, and a retry flag on an
+			// issue that is not in flight can never be acted on. The trigger label
+			// is still present, so the ordinary path tries again next tick.
 			_ = deps.Store.FinishDispatch(dispatchID, store.DispatchResult{
 				Status: store.StatusFailed, ExitCode: -1, APIError: wtErr.Error(),
 			})
-			if kind != store.KindTend {
-				_ = deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, d.Issue)
-			}
 			return wtErr
 		}
 		if kind != store.KindTend {
@@ -302,12 +325,11 @@ func dispatch(
 	runnerLog := runner.RunnerLogPath(cfg.StateDir, cfg.Name, dispatchID)
 	pid, err := deps.Spawn(deps.SelfPath, dispatchID, deps.ConfigPath, runnerLog)
 	if err != nil {
+		// As above: no agent ran, so no retry flag. Setting one here would strand
+		// the issue, because nothing can act on a retry flag without in-flight.
 		_ = deps.Store.FinishDispatch(dispatchID, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
 		})
-		if kind != store.KindTend {
-			_ = deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, d.Issue)
-		}
 		return err
 	}
 	if err := deps.Store.SetDispatchProcess(dispatchID, pid, now); err != nil {
@@ -330,9 +352,29 @@ To proceed: re-add the ` + "`%s`" + ` label once the underlying issue has cleare
 // report the failure would fail the same way.
 func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision) error {
 	owner, repo := cfg.RepoOwner(), cfg.RepoName()
+
+	state, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Issue)
+	if err != nil {
+		return err
+	}
+	if state.Parked {
+		// Already parked. Re-posting would put one identical comment on the issue
+		// per tick, forever, if a previous label edit failed after the comment.
+		return nil
+	}
+
+	// Write the durable park state FIRST. It is idempotent, and recording it
+	// before the GitHub calls means a failure there cannot produce a comment
+	// storm on the next tick.
+	state.Parked = true
+	state.NeedsRetry = false
+	state.UpdatedAt = deps.Now()
+	if err := deps.Store.PutIssueState(state); err != nil {
+		return err
+	}
+
 	body := fmt.Sprintf(retryCapComment,
 		cfg.Retry.Max, cfg.Retry.Max, cfg.Retry.Max, cfg.Labels.Trigger)
-
 	if err := deps.GH.PostComment(ctx, owner, repo, d.Issue, body); err != nil {
 		return err
 	}
@@ -342,16 +384,6 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 	if err := deps.GH.EditLabels(ctx, owner, repo, d.Issue,
 		[]string{cfg.Labels.Blocked},
 		[]string{cfg.Labels.InFlight, cfg.Labels.Trigger}); err != nil {
-		return err
-	}
-
-	// Record the park durably, and clear the retry flag: this failure episode is
-	// over. A human re-applying the trigger label starts a new one.
-	state := deps.Store.IssueStateOrZero(cfg.Name, cfg.Repo, d.Issue)
-	state.Parked = true
-	state.NeedsRetry = false
-	state.UpdatedAt = deps.Now()
-	if err := deps.Store.PutIssueState(state); err != nil {
 		return err
 	}
 
@@ -385,8 +417,11 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		tmpl = cfg.TendPrompt
 	}
 
-	link, _ := deps.Store.PRLinks(cfg.Name, cfg.Repo)
-	pr := link[d.Number]
+	links, err := deps.Store.PRLinks(cfg.Name, cfg.Repo)
+	if err != nil {
+		return fmt.Errorf("read pr links: %w", err)
+	}
+	pr := links[d.Number]
 
 	workDir := cfg.CheckoutBaseDir
 	if cfg.Agent.Worktree == config.WorktreePerIssue {
@@ -402,9 +437,15 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		Loop:      cfg.Name,
 		SessionID: d.SessionID,
 		Worktree:  workDir,
-		Issue:     runner.PromptIssue{Number: d.Number},
+		Issue:     runner.PromptIssue{Number: d.Number, Title: d.Title},
 		PR: runner.PromptPR{
-			Number: d.PRNumber, HeadRef: pr.HeadRef, BaseRef: pr.BaseRef,
+			Number:  d.PRNumber,
+			HeadRef: pr.HeadRef,
+			BaseRef: pr.BaseRef,
+			// The tend prompt renders BehindBy and acts on it: it tells the agent
+			// to make no push when the branch is current. Leaving it zero told
+			// every tend agent the opposite of why it was dispatched.
+			BehindBy: pr.BehindBy,
 		},
 		Labels: runner.PromptLabels{
 			Trigger:  cfg.Labels.Trigger,
@@ -415,7 +456,11 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		},
 	})
 	if err != nil {
-		_ = deps.Store.FinishDispatch(dispatchID, store.DispatchResult{
+		// Route this through the same accounting as any other failed dispatch.
+		// Calling FinishDispatch alone would skip MarkNeedsRetry, and the issue
+		// would keep its trigger label and redispatch every tick with no cap:
+		// one detached process per tick, forever, on a single template typo.
+		_ = runner.Finish(deps.Store, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
 		})
 		return err
@@ -428,7 +473,29 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 
 // Reset drops the stored session and worktree for one issue, so the next tick
 // starts it clean.
-func Reset(cfg *config.Config, s *store.Store, wt *worktree.Manager, number int) error {
+func Reset(cfg *config.Config, s *store.Store, wt *worktree.Manager, number int,
+	isAlive func(pid int, dispatchID int64) bool) error {
+	running, err := s.RunningDispatches(cfg.Name, cfg.Repo)
+	if err != nil {
+		return err
+	}
+	for _, d := range running {
+		if d.Number != number {
+			continue
+		}
+		if isAlive(d.PID, d.ID) {
+			// Removing the worktree now would delete files an agent is editing.
+			return fmt.Errorf(
+				"issue #%d has a live dispatch (pid %d); stop it before resetting",
+				number, d.PID)
+		}
+		// The runner is gone. Retire the row so the next tick is coherent.
+		if err := s.FinishDispatch(d.ID, store.DispatchResult{
+			Status: store.StatusFailed, ExitCode: -1, APIError: "reset by operator",
+		}); err != nil && !errors.Is(err, store.ErrDispatchNotRunning) {
+			return err
+		}
+	}
 	if err := wt.Remove(wt.PathForIssue(number)); err != nil {
 		return err
 	}

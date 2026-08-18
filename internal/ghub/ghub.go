@@ -1,9 +1,11 @@
+// Package ghub reads issues and pull requests from GitHub.
 package ghub
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/go-github/v77/github"
 )
@@ -102,7 +104,10 @@ func (g *GitHubClient) ListOpenPullRequests(ctx context.Context, owner, repo str
 			// trusted only when its head branch lives in this repository and its
 			// author is a repository insider. Tending checks the head branch out
 			// and runs an agent in it, so an untrusted head is code execution.
-			trusted := headRepo == owner+"/"+repo &&
+			// EqualFold: full_name comes back in GitHub's canonical casing while
+			// owner/repo come from config unchecked. A casing mismatch would fail
+			// closed and silently disable tending with no diagnostic.
+			trusted := strings.EqualFold(headRepo, owner+"/"+repo) &&
 				(assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR") &&
 				SafeRef(head) && SafeRef(base)
 

@@ -165,8 +165,13 @@ func TestRetryStartsWhenSessionWasNeverCreated(t *testing.T) {
 }
 
 // The reference loops define an orphan as carrying the in-flight label. An agent
-// that finished its work and moved the label on must not be woken by a retry.
-func TestFailedIssueWithoutInFlightLabelIsLeftAlone(t *testing.T) {
+// that finished its work and moved the label on must not be woken by a RETRY --
+// but the stale failure flag must be CLEARED, not left set.
+//
+// Regression test. Leaving the flag set stranded the issue permanently: every
+// later tick took the failure branch, never reached the trigger check, and
+// re-applying the trigger label did nothing at all.
+func TestFailedIssueWithoutInFlightLabelIsCleared(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Blocked)}}
 	st := State{
@@ -174,8 +179,58 @@ func TestFailedIssueWithoutInFlightLabelIsLeftAlone(t *testing.T) {
 		TickCount: 5,
 	}
 	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindClearRetry {
+		t.Fatalf("decisions = %v, want one clear_retry", kinds(p))
+	}
+	// It must NOT be a dispatch of any kind.
+	for _, d := range p.Decisions {
+		if d.Kind == KindRetryStart || d.Kind == KindRetryResume {
+			t.Errorf("issue not in flight must never be retried, got %v", d.Kind)
+		}
+	}
+}
+
+// A retry whose previous attempt never created a session must carry NO session
+// identifier, so dispatch mints a fresh one. claude refuses a reused
+// --session-id outright ("Session ID <uuid> is already in use"), so passing the
+// old one made every retry fail in under a second and then park the issue.
+func TestRetryStartCarriesNoSessionID(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
+	st := State{
+		Issues: map[int]store.IssueState{
+			1: {Number: 1, SessionID: "burned-uuid", SessionStarted: false, NeedsRetry: true},
+		},
+		TickCount: 5,
+	}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryStart {
+		t.Fatalf("decisions = %v, want one retry_start", kinds(p))
+	}
+	if p.Decisions[0].SessionID != "" {
+		t.Errorf("SessionID = %q, want empty so a fresh one is minted",
+			p.Decisions[0].SessionID)
+	}
+}
+
+// A live issue agent must suppress tending of its own branch. The agent flips
+// its own labels asynchronously, so an issue can still carry the review label
+// while its dispatch is live -- and a tend agent force-pushes the branch the
+// issue agent is committing to.
+func TestLiveIssueDispatchSuppressesTend(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{
+		Issues:  map[int]store.IssueState{},
+		Running: []store.Dispatch{{Number: 1, Kind: store.KindStart, Status: store.StatusRunning}},
+	}
+	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none", kinds(p))
+		t.Fatalf("decisions = %v, want none while the issue agent is live", kinds(p))
 	}
 }
 
@@ -317,7 +372,7 @@ func TestDoesNotTendCurrentPullRequest(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{
 		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1"}},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
 		BehindBy: map[int]int{20: 0},
 	}
 	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
@@ -331,7 +386,7 @@ func TestDoesNotTendWhenTendIsDisabled(t *testing.T) {
 	cfg.TendPR = false
 	snap := Snapshot{
 		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1"}},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
 		BehindBy: map[int]int{20: 9},
 	}
 	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
@@ -344,7 +399,7 @@ func TestDoesNotTendWhileTendDispatchIsLive(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{
 		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1"}},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
 		BehindBy: map[int]int{20: 4},
 	}
 	st := State{

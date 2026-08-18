@@ -1,3 +1,4 @@
+// Package config loads and validates a loop configuration file.
 package config
 
 import (
@@ -5,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"text/template"
 
 	"gopkg.in/yaml.v3"
 )
@@ -179,6 +181,12 @@ func (c *Config) validate() error {
 	if c.Agent.Model == "" {
 		errs = append(errs, errors.New("agent.model is required"))
 	}
+	switch c.Agent.Effort {
+	case "", "low", "medium", "high", "xhigh", "max":
+	default:
+		errs = append(errs, fmt.Errorf(
+			"agent.effort %q is not a valid effort level", c.Agent.Effort))
+	}
 	if c.Agent.Timeout.Std() <= 0 {
 		errs = append(errs, errors.New("agent.timeout must be greater than zero"))
 	}
@@ -200,6 +208,20 @@ func (c *Config) validate() error {
 
 	if c.TendPR && strings.TrimSpace(c.TendPrompt) == "" {
 		errs = append(errs, errors.New("tend_prompt is required when tend_pr is true"))
+	}
+
+	// Parse every template at load time. A typo such as {{.Issue.Titel}} would
+	// otherwise surface only inside a detached runner, where it recorded a failed
+	// dispatch and redispatched on the next tick.
+	for name, tmpl := range map[string]string{
+		"prompt": c.Prompt, "resume_prompt": c.ResumePrompt, "tend_prompt": c.TendPrompt,
+	} {
+		if strings.TrimSpace(tmpl) == "" {
+			continue
+		}
+		if _, err := template.New(name).Parse(tmpl); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		}
 	}
 
 	return errors.Join(errs...)

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
@@ -111,5 +112,35 @@ func TestSuperviseRecordsFailureWhenStreamHasNoResult(t *testing.T) {
 	got, _ := s.GetDispatch(id)
 	if got.Status != store.StatusFailed {
 		t.Errorf("Status = %q, want failed when no result line is present", got.Status)
+	}
+}
+
+// The agent runs with permission prompts disabled on third-party issue text, so
+// it must not inherit the repository-write credential. This is asserted rather
+// than assumed because both hops (the detached runner and the agent) had to be
+// filtered separately: a same-user process can read its parent's environment.
+func TestAgentEnvExcludesCredentials(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_secret_value")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-appear")
+	t.Setenv("HOME", "/home/tester")
+
+	env := agentEnv()
+
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GITHUB_TOKEN=") {
+			t.Error("GITHUB_TOKEN must not reach the agent")
+		}
+		if strings.HasPrefix(kv, "AWS_SECRET_ACCESS_KEY=") {
+			t.Error("the environment must be an allowlist, not a denylist")
+		}
+	}
+	var sawHome bool
+	for _, kv := range env {
+		if kv == "HOME=/home/tester" {
+			sawHome = true
+		}
+	}
+	if !sawHome {
+		t.Error("HOME must be preserved; the agent needs it to run git and gh")
 	}
 }

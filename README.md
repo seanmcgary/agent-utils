@@ -2,7 +2,10 @@
 
 A Go CLI that reads GitHub issues by label and dispatches `claude -p` agents
 deterministically. It replaces an LLM orchestrator in a planning loop and an
-execution loop: Go owns every deterministic decision (counting slots, flipping
+execution loop: Go owns the deterministic decisions: selecting issues by label, session and
+worktree bookkeeping, retries, backoff, and the circuit breaker. The agent owns
+every judgement and every GitHub write except one (see Security). Cron does the
+scheduling; the engine has no timer of its own.
 labels before dispatch, retries, the circuit breaker, scheduling); the agent
 owns every judgment and every GitHub write, with one stated exception (see
 Security).
@@ -44,7 +47,16 @@ Point a loop only at a repository whose issue and pull request population you
 trust. The engine reduces the blast radius in three ways, none of which is a
 substitute for that rule:
 
-- The agent process gets a minimal environment. `GITHUB_TOKEN` is removed.
+- The agent process gets a filtered environment and `GITHUB_TOKEN` is removed
+  from it, at both hops (the detached runner and the agent itself).
+
+  **This does not make the agent unprivileged.** It keeps `HOME` and
+  `SSH_AUTH_SOCK`, because it has to push branches and use `gh`. Anything
+  readable by your user is readable by the agent: `~/.config/gh/hosts.yml`,
+  `~/.ssh`, git credential helpers, and the very `~/.agent-utils/env` file this
+  README tells you to create. Treat the environment filter as defence in depth,
+  not as a boundary. If you need a real boundary, run the loop as a separate
+  user with its own `HOME` and a narrowly scoped token.
 - Only a pull request opened by an OWNER, MEMBER, or COLLABORATOR, whose head
   branch lives in the target repository, is ever linked to an issue or tended.
 - `bypassPermissions` requires `i_understand_bypass_permissions: true`.

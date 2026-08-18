@@ -39,6 +39,15 @@ func Spawn(selfPath string, dispatchID int64, configPath, runnerLog string) (int
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin = nil
 
+	// Filter the environment HERE too, not only in Supervise.
+	//
+	// The detached runner is the FIRST hop and claude is the second. A same-uid
+	// process can read its parent's exec-time environment ("ps eww" on macOS,
+	// /proc/<pid>/environ on Linux), so leaving GITHUB_TOKEN in the runner's
+	// environment hands it to the agent just as surely as putting it in the
+	// agent's own. RunAgent never uses a GitHub client.
+	cmd.Env = agentEnv()
+
 	// The runner does the long work, so its structured logs must go somewhere.
 	// Discarding them would make every failure inside the detached process
 	// invisible. Open the file 0600: it can quote repository content.
@@ -142,13 +151,29 @@ func Supervise(
 	tee := io.TeeReader(stdout, logFile)
 	result, parseErr := ParseStream(tee)
 
+	// ParseStream can return early on a scanner error, for example a stream line
+	// above its buffer cap. Drain whatever is left before Wait: an undrained pipe
+	// blocks the child on write, and Wait would then hang until the agent
+	// timeout with the dispatch row pinned running.
+	_, _ = io.Copy(io.Discard, stdout)
+
 	waitErr := cmd.Wait()
+
+	// WaitDelay kills only the direct child. Sweep the process group so a
+	// surviving grandchild cannot keep working in a worktree that the next tick
+	// is about to hand to a replacement agent.
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
 	res := store.DispatchResult{
 		Status:     store.StatusSucceeded,
 		CostUSD:    result.CostUSD,
 		DurationMS: result.DurationMS,
 		APIError:   result.APIError,
+		// A session identifier in the stream proves claude created the session,
+		// whatever happened afterwards.
+		SessionStarted: result.SessionID != "",
 	}
 
 	switch {
@@ -177,6 +202,13 @@ func Supervise(
 // finish records the outcome of a dispatch AND the durable issue state that the
 // next tick's decision depends on. Both writes happen here so no code path can
 // record one without the other.
+// Finish records a dispatch outcome and the durable issue state that the next
+// tick's decision depends on. Every failure path must go through it, or the
+// issue keeps its trigger label and redispatches with no cap.
+func Finish(st *store.Store, d store.Dispatch, res store.DispatchResult) error {
+	return finish(st, d, res)
+}
+
 func finish(st *store.Store, d store.Dispatch, res store.DispatchResult) error {
 	if err := st.FinishDispatch(d.ID, res); err != nil {
 		return fmt.Errorf("record dispatch %d: %w", d.ID, err)
@@ -184,6 +216,14 @@ func finish(st *store.Store, d store.Dispatch, res store.DispatchResult) error {
 
 	// A tend run holds no issue state: it is idempotent and keeps no session.
 	if d.Kind != store.KindTend {
+		if res.SessionStarted {
+			// Record this on failure as well as success. A run that created the
+			// session and then crashed must be resumed, never restarted against
+			// the same identifier: claude refuses a reused --session-id outright.
+			if err := st.MarkSessionStarted(d.Loop, d.Repo, d.Number); err != nil {
+				return fmt.Errorf("mark session started: %w", err)
+			}
+		}
 		if res.Status == store.StatusFailed {
 			if err := st.MarkNeedsRetry(d.Loop, d.Repo, d.Number); err != nil {
 				return fmt.Errorf("mark needs retry: %w", err)

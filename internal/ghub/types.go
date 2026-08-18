@@ -30,9 +30,11 @@ func (i Issue) HasLabel(name string) bool {
 func (i Issue) HasAnyLabel(names []string) bool {
 	for _, n := range names {
 		if strings.HasSuffix(n, "*") {
-			prefix := strings.TrimSuffix(n, "*")
+			// Compare whole lowered strings rather than slicing by byte index,
+			// which could split a multi-byte rune on a non-ASCII label.
+			prefix := strings.ToLower(strings.TrimSuffix(n, "*"))
 			for _, l := range i.Labels {
-				if len(l) >= len(prefix) && strings.EqualFold(l[:len(prefix)], prefix) {
+				if strings.HasPrefix(strings.ToLower(l), prefix) {
 					return true
 				}
 			}

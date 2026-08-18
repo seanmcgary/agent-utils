@@ -25,6 +25,10 @@ const (
 	KindTend Kind = "tend"
 	// KindParkRetryExhausted is the one decision that writes to GitHub.
 	KindParkRetryExhausted Kind = "park_retry_exhausted"
+	// KindClearRetry clears a failure flag that no retry can ever act on,
+	// because the issue is not in flight. Without it such an issue is stranded
+	// permanently and no human action recovers it.
+	KindClearRetry Kind = "clear_retry"
 )
 
 // Snapshot is the GitHub view for one tick.
@@ -42,7 +46,9 @@ type State struct {
 	// confirmed alive. The caller performs the liveness check, so Decide stays
 	// pure.
 	Running []store.Dispatch
-	// TickCount is how many ticks this loop has recorded, including this one.
+	// TickCount is how many ticks this loop has recorded, NOT including this
+	// one: the tick reads it before it records itself. The backoff arithmetic
+	// relies on that, because LastRetryTick is stamped from the same value.
 	TickCount int64
 	// CooldownUntil is the time before which the loop must not dispatch.
 	CooldownUntil time.Time
@@ -52,6 +58,7 @@ type State struct {
 type Decision struct {
 	Kind      Kind
 	Issue     int
+	Title     string
 	PR        int
 	SessionID string
 	HeadRef   string

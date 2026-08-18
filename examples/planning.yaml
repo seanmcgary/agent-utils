@@ -101,6 +101,10 @@ prompt: |
   not be built, post that finding with your reasoning and PARK-BLOCKED. Do not
   close the issue and do not reshape it into a different feature.
 
+  YOU NEVER MERGE. You never merge or close a pull request, and you never mark
+  the design draft pull request ready for review. The only branch and pull
+  request you may create is the design-assets draft described above.
+
   BEFORE EVERY PARK: make the "## Pipeline State" block current, and push any
   design branch. An unpushed worktree commit is lost work.
 

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -178,5 +179,63 @@ func TestReopenPersists(t *testing.T) {
 	got, _ := s2.IssueStates("planning", "o/r")
 	if got[1].SessionID != "keep" {
 		t.Errorf("session did not persist across reopen: %+v", got)
+	}
+}
+
+// A database created by an older build must keep working. CREATE TABLE IF NOT
+// EXISTS does nothing to an existing file, so every column added after the
+// first release has to be added explicitly.
+func TestOpenMigratesAnOlderDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+
+	// Build a database with the pre-migration shape.
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = old.Exec(`
+		CREATE TABLE issues (
+		  loop TEXT NOT NULL, repo TEXT NOT NULL, number INTEGER NOT NULL,
+		  session_id TEXT NOT NULL DEFAULT '', worktree_path TEXT NOT NULL DEFAULT '',
+		  retry_count INTEGER NOT NULL DEFAULT 0, last_retry_tick INTEGER NOT NULL DEFAULT 0,
+		  updated_at TIMESTAMP NOT NULL, PRIMARY KEY (loop, repo, number));
+		CREATE TABLE dispatches (
+		  id INTEGER PRIMARY KEY AUTOINCREMENT, loop TEXT NOT NULL, repo TEXT NOT NULL,
+		  number INTEGER NOT NULL, kind TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '',
+		  pid INTEGER NOT NULL DEFAULT 0, pid_start_at TIMESTAMP, status TEXT NOT NULL,
+		  started_at TIMESTAMP NOT NULL, finished_at TIMESTAMP,
+		  exit_code INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
+		  duration_ms INTEGER NOT NULL DEFAULT 0, api_error TEXT NOT NULL DEFAULT '',
+		  log_path TEXT NOT NULL DEFAULT '');
+		CREATE TABLE pr_links (
+		  loop TEXT NOT NULL, repo TEXT NOT NULL, number INTEGER NOT NULL,
+		  pr_number INTEGER NOT NULL, head_ref TEXT NOT NULL, base_ref TEXT NOT NULL,
+		  PRIMARY KEY (loop, repo, number));
+		INSERT INTO issues (loop, repo, number, session_id, updated_at)
+		  VALUES ('planning', 'o/r', 1, 'keep-me', CURRENT_TIMESTAMP);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open must migrate an older database: %v", err)
+	}
+	defer s.Close()
+
+	// Every query naming a new column must work, and old rows must survive.
+	states, err := s.IssueStates("planning", "o/r")
+	if err != nil {
+		t.Fatalf("IssueStates after migration: %v", err)
+	}
+	if states[1].SessionID != "keep-me" {
+		t.Errorf("existing row lost: %+v", states[1])
+	}
+	if _, err := s.RunningDispatches("planning", "o/r"); err != nil {
+		t.Errorf("RunningDispatches after migration: %v", err)
+	}
+	if _, err := s.PRLinks("planning", "o/r"); err != nil {
+		t.Errorf("PRLinks after migration: %v", err)
 	}
 }

@@ -1,3 +1,4 @@
+// Package engine decides what a tick must do. Decide is pure.
 package engine
 
 import (
@@ -43,6 +44,12 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		if liveIssues[iss.Number] {
 			// A live dispatch is the guard against double dispatch. Labels are
 			// not, because the agent owns them and may not have flipped yet.
+			//
+			// Mark the issue decided so tendDecisions skips it too. An agent
+			// working the branch and a tend agent force-pushing it are the same
+			// hazard as two dispatches, and the agent flips its own labels
+			// asynchronously, so the review label can still be present here.
+			decided[iss.Number] = true
 			continue
 		}
 
@@ -56,6 +63,20 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			// label AND has no live agent". Honour that: an agent that finished
 			// its work and moved the label on must not be woken by a retry.
 			if !iss.HasLabel(cfg.Labels.InFlight) {
+				// No in-flight run to retry: either the agent moved the label on
+				// before the failure was recorded, or the failure happened before
+				// any agent took ownership.
+				//
+				// The flag MUST be cleared here. Nothing else clears it, so
+				// leaving it set strands the issue permanently: every later tick
+				// takes this branch, the trigger check below is never reached,
+				// and re-applying the trigger label does nothing.
+				decided[iss.Number] = true
+				decisions = append(decisions, Decision{
+					Kind:   KindClearRetry,
+					Issue:  iss.Number,
+					Reason: "failure recorded while the issue was not in flight",
+				})
 				continue
 			}
 			d, eligible := retryDecision(cfg, iss.Number, state, st)
@@ -85,6 +106,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			decisions = append(decisions, Decision{
 				Kind:      KindResume,
 				Issue:     iss.Number,
+				Title:     iss.Title,
 				SessionID: state.SessionID,
 				Reason:    "trigger label present and a started session exists",
 			})
@@ -93,6 +115,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		decisions = append(decisions, Decision{
 			Kind:      KindStart,
 			Issue:     iss.Number,
+			Title:     iss.Title,
 			SessionID: state.SessionID,
 			Reason:    "trigger label present and no started session exists",
 		})
@@ -143,15 +166,24 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, st St
 
 	// Resume only when claude actually created the session. Otherwise "-r" would
 	// target a session that never existed and fail identically every retry.
-	kind := KindRetryStart
+	//
+	// A retry that must START carries NO session identifier. claude refuses to
+	// reuse one ("Session ID <uuid> is already in use"), so passing the old id
+	// would make every retry fail in under a second and then park the issue with
+	// a comment blaming the platform.
 	if state.SessionStarted && state.SessionID != "" {
-		kind = KindRetryResume
+		return &Decision{
+			Kind:      KindRetryResume,
+			Issue:     number,
+			SessionID: state.SessionID,
+			Reason:    fmt.Sprintf("retry %d/%d, resuming the existing session", state.RetryCount+1, cfg.Retry.Max),
+		}, true
 	}
 	return &Decision{
-		Kind:      kind,
+		Kind:      KindRetryStart,
 		Issue:     number,
-		SessionID: state.SessionID,
-		Reason:    fmt.Sprintf("retry %d/%d after a failed dispatch", state.RetryCount+1, cfg.Retry.Max),
+		SessionID: "",
+		Reason:    fmt.Sprintf("retry %d/%d with a new session; the previous attempt never started one", state.RetryCount+1, cfg.Retry.Max),
 	}, true
 }
 

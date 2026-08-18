@@ -58,9 +58,16 @@ instruction hidden in a comment executes with the privileges of the agent proces
 Three consequences follow, and all three are requirements:
 
 1. Point a loop only at a repository whose issue and pull request population you trust.
-2. The agent process gets a minimal environment. `GITHUB_TOKEN` is removed from it. The
-   agent never needs that credential, and the whole "Go performs one GitHub write" property
-   is void if the agent holds a repository-write token.
+2. The agent process gets a filtered environment at both hops — the detached runner and the
+   agent itself — and `GITHUB_TOKEN` is removed from both. A same-user process can read its
+   parent's environment, so filtering only the second hop would achieve nothing.
+
+   **This is defence in depth, not a boundary.** The agent keeps `HOME` and `SSH_AUTH_SOCK`
+   because it must push branches and use `gh`. Everything the operator's user can read, the
+   agent can read: the `gh` token, the SSH agent, git credential helpers, and the token file
+   this design tells the operator to create. A real boundary needs a separate user or a
+   container with its own `HOME` and a narrowly scoped token. The specification states this
+   plainly rather than claiming a property the implementation does not have.
 3. Only a pull request whose head branch lives in the target repository, and whose author is
    an `OWNER`, `MEMBER`, or `COLLABORATOR`, may be linked to an issue. Tending checks the
    head branch out and runs an agent inside it, so an untrusted head is code execution.
@@ -150,7 +157,8 @@ cron ──► agent-utils loop tick --config planning.yaml
            └─ 5. exit      fast; no daemon
 
 agent-utils internal run-agent --dispatch <id>   (detached; one process per dispatch)
-           ├─ ensure the git worktree
+           ├─ (the TICK created the worktree, so a failure there is a recorded
+           │   failed dispatch rather than a silent log line)
            ├─ exec `claude -p …`; tee stream-json to a log file
            └─ record exit code, cost, and duration in SQLite
 ```
@@ -381,7 +389,9 @@ The policy follows the reference documents, but it reads facts instead of commen
 ### 8.3 The one GitHub write
 
 Go performs one GitHub write, and only one. When an issue reaches the retry cap, Go posts a
-comment and moves the issue from `in_flight` to `blocked`.
+comment and moves the issue from `in_flight` to `blocked`. It also removes the `trigger`
+label: leaving it in place would make the next tick resume the issue immediately, so the park
+would stop nothing.
 
 This is a deliberate exception to the rule in section 2. The reference documents make the same
 exception, and for the same reason: the failing action is the dispatch itself. To dispatch an

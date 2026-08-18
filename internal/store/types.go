@@ -59,6 +59,10 @@ type Dispatch struct {
 	APIError   string
 	LogPath    string
 	PRNumber   int
+	// Title is the issue title at dispatch time. The detached runner never sees
+	// the tick's GitHub snapshot, so a prompt using {{.Issue.Title}} would
+	// otherwise render an empty string.
+	Title string
 }
 
 // DispatchResult is the outcome recorded when a dispatch ends.
@@ -68,6 +72,9 @@ type DispatchResult struct {
 	CostUSD    float64
 	DurationMS int64
 	APIError   string
+	// SessionStarted reports that the run produced a session identifier, so the
+	// session exists on disk and a later retry must resume rather than restart.
+	SessionStarted bool
 }
 
 // PRLink maps an issue to the pull request that closes it.
@@ -78,4 +85,8 @@ type PRLink struct {
 	PRNumber int
 	HeadRef  string
 	BaseRef  string
+	// BehindBy is how many commits the head lacks from the base. The tend prompt
+	// renders it, so it must survive into the detached runner, which never sees
+	// the tick's snapshot.
+	BehindBy int
 }
