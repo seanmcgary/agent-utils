@@ -2226,7 +2226,7 @@ func TestTendsStalePullRequest(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{
 		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master"}},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
 		BehindBy: map[int]int{20: 4},
 	}
 	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
