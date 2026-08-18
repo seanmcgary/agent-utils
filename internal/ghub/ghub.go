@@ -1,0 +1,164 @@
+package ghub
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/google/go-github/v77/github"
+)
+
+// Client is the read surface the engine needs, plus the two writes reserved
+// for the retry-cap park. Every method is safe to fake in a test.
+type Client interface {
+	ListOpenIssues(ctx context.Context, owner, repo string) ([]Issue, error)
+	ListOpenPullRequests(ctx context.Context, owner, repo string) ([]PullRequest, error)
+	BehindBy(ctx context.Context, owner, repo, base, head string) (int, error)
+	PostComment(ctx context.Context, owner, repo string, number int, body string) error
+	EditLabels(ctx context.Context, owner, repo string, number int, add, remove []string) error
+}
+
+// GitHubClient is the go-github backed implementation of Client.
+type GitHubClient struct {
+	c *github.Client
+}
+
+// New returns a client authenticated with token.
+func New(token string) *GitHubClient {
+	return &GitHubClient{c: github.NewClient(nil).WithAuthToken(token)}
+}
+
+// ConvertIssues maps go-github issues onto the engine type. It drops pull
+// requests. The issues endpoint returns pull requests together with issues, so
+// this filter is required, not optional.
+func ConvertIssues(in []*github.Issue) []Issue {
+	out := make([]Issue, 0, len(in))
+	for _, gi := range in {
+		if gi == nil || gi.IsPullRequest() {
+			continue
+		}
+		labels := make([]string, 0, len(gi.Labels))
+		for _, l := range gi.Labels {
+			if l.GetName() != "" {
+				labels = append(labels, l.GetName())
+			}
+		}
+		out = append(out, Issue{
+			Number:    gi.GetNumber(),
+			Title:     gi.GetTitle(),
+			Labels:    labels,
+			UpdatedAt: gi.GetUpdatedAt().Time,
+		})
+	}
+	return out
+}
+
+// ListOpenIssues returns every open issue in the repository.
+//
+// The call sends no label filter on purpose. IssueListByRepoOptions.Labels is
+// an AND filter, so it cannot express "carries any of these labels". The engine
+// also needs the complete label set of each issue to evaluate the veto list.
+func (g *GitHubClient) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issue, error) {
+	opts := &github.IssueListByRepoOptions{
+		State:       "open",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	var all []Issue
+	for {
+		page, resp, err := g.c.Issues.ListByRepo(ctx, owner, repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list issues %s/%s: %w", owner, repo, err)
+		}
+		all = append(all, ConvertIssues(page)...)
+		if resp.NextPage == 0 {
+			return all, nil
+		}
+		// IssueListByRepoOptions embeds BOTH ListCursorOptions (Page string) and
+		// ListOptions (Page int) at the same depth, so a bare opts.Page is an
+		// ambiguous selector and does not compile. Qualify it.
+		opts.ListOptions.Page = resp.NextPage
+	}
+}
+
+// ListOpenPullRequests returns every open pull request in the repository.
+func (g *GitHubClient) ListOpenPullRequests(ctx context.Context, owner, repo string) ([]PullRequest, error) {
+	opts := &github.PullRequestListOptions{
+		State:       "open",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	var all []PullRequest
+	for {
+		page, resp, err := g.c.PullRequests.List(ctx, owner, repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list pull requests %s/%s: %w", owner, repo, err)
+		}
+		for _, pr := range page {
+			head := pr.GetHead().GetRef()
+			base := pr.GetBase().GetRef()
+			assoc := pr.GetAuthorAssociation()
+			headRepo := pr.GetHead().GetRepo().GetFullName()
+
+			// Trust is decided here, once, at the boundary. A pull request is
+			// trusted only when its head branch lives in this repository and its
+			// author is a repository insider. Tending checks the head branch out
+			// and runs an agent in it, so an untrusted head is code execution.
+			trusted := headRepo == owner+"/"+repo &&
+				(assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR") &&
+				SafeRef(head) && SafeRef(base)
+
+			all = append(all, PullRequest{
+				Number:            pr.GetNumber(),
+				HeadRef:           head,
+				BaseRef:           base,
+				Body:              pr.GetBody(),
+				Draft:             pr.GetDraft(),
+				HeadRepo:          headRepo,
+				AuthorAssociation: assoc,
+				Trusted:           trusted,
+			})
+		}
+		if resp.NextPage == 0 {
+			return all, nil
+		}
+		// PullRequestListOptions embeds only ListOptions, so this one is fine.
+		opts.Page = resp.NextPage
+	}
+}
+
+// BehindBy returns how many commits head lacks from base.
+func (g *GitHubClient) BehindBy(ctx context.Context, owner, repo, base, head string) (int, error) {
+	cmp, _, err := g.c.Repositories.CompareCommits(ctx, owner, repo, base, head, nil)
+	if err != nil {
+		return 0, fmt.Errorf("compare %s...%s: %w", base, head, err)
+	}
+	return cmp.GetBehindBy(), nil
+}
+
+// PostComment adds a comment to an issue. Task 10 is its only caller.
+func (g *GitHubClient) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
+	_, _, err := g.c.Issues.CreateComment(ctx, owner, repo, number,
+		&github.IssueComment{Body: github.Ptr(body)})
+	if err != nil {
+		return fmt.Errorf("comment on #%d: %w", number, err)
+	}
+	return nil
+}
+
+// EditLabels adds and removes labels on an issue. Task 10 is its only caller.
+func (g *GitHubClient) EditLabels(ctx context.Context, owner, repo string, number int, add, remove []string) error {
+	for _, name := range remove {
+		if _, err := g.c.Issues.RemoveLabelForIssue(ctx, owner, repo, number, name); err != nil {
+			// A label that is already absent is not an error for this caller.
+			var ge *github.ErrorResponse
+			if !errors.As(err, &ge) || ge.Response == nil || ge.Response.StatusCode != 404 {
+				return fmt.Errorf("remove label %q from #%d: %w", name, number, err)
+			}
+		}
+	}
+	if len(add) > 0 {
+		if _, _, err := g.c.Issues.AddLabelsToIssue(ctx, owner, repo, number, add); err != nil {
+			return fmt.Errorf("add labels %v to #%d: %w", add, number, err)
+		}
+	}
+	return nil
+}
