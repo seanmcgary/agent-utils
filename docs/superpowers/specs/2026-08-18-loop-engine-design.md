@@ -390,9 +390,14 @@ CREATE TABLE ticks (
 );
 ```
 
-`dispatches.pid_start_at` holds the process start time. A process identifier alone is not
-sufficient, because the operating system reuses identifiers. The engine compares the recorded
-start time with the live process start time before it decides the process is the same one.
+A process identifier alone is not proof of identity, because the operating system reuses
+identifiers. The engine therefore confirms identity in two steps. It first asks the kernel
+whether the process exists. It then reads the command line of the process and matches the
+dispatch identifier that the runner carries in its own arguments (`--dispatch <id>`). This check
+needs no extra dependency and works on macOS and Linux.
+
+`dispatches.pid_start_at` holds the spawn time. It is a diagnostic record for logs and for the
+status command. It is not part of the liveness check.
 
 ## 10. Observability
 
