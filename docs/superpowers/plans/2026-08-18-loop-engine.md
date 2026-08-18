@@ -5457,7 +5457,7 @@ git commit -m "feat(examples): planning and execution loop configurations with p
 
 | Field   | Value                                                        |
 |---------|--------------------------------------------------------------|
-| stage   | 4 (commit review)                                            |
+| stage   | 5 (pr feedback loop)                                         |
 | class   | large (new subsystem, new schema, process supervision)        |
 | profile | backend                                                      |
 | branch  | feat/loop-engine                                             |
