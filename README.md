@@ -36,6 +36,12 @@ Two example loop configurations, ported from the reference planning and
 execution orchestrators, live in `examples/planning.yaml` and
 `examples/execution.yaml`.
 
+## Configuration
+
+One YAML file defines one loop. `docs/configuration.md` documents every field: what it means,
+what reads it, and what happens if you get it wrong. `examples/planning.yaml` and
+`examples/execution.yaml` are complete working files.
+
 ## Security
 
 A loop dispatches an agent that runs with permission prompts disabled, inside a
