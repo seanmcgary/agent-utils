@@ -2,12 +2,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
@@ -20,6 +23,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/version"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -31,6 +35,7 @@ func main() {
 		Version: version.GetVersion(),
 		Commands: []*cli.Command{
 			loopCommand(),
+			listCommand(),
 			versionCommand(),
 			internalCommand(),
 		},
@@ -54,9 +59,163 @@ func versionCommand() *cli.Command {
 
 func configFlag() *cli.StringFlag {
 	return &cli.StringFlag{
-		Name:     "config",
-		Usage:    "path to the loop configuration file",
-		Required: true,
+		Name: "config",
+		Usage: "path to a loop configuration file. Omit it to select one by name " +
+			"from " + config.DirName + "/" + config.ConfigsSubdir,
+	}
+}
+
+// nameArgument lets a command be written as `agent-utils loop tick planning`,
+// naming a configuration in the local .agent-utils directory.
+func nameArgument() cli.Argument {
+	return &cli.StringArg{
+		Name:      "name",
+		UsageText: "name of a loop configuration in " + config.DirName + "/" + config.ConfigsSubdir,
+	}
+}
+
+// resolveConfigPath decides which configuration file a command should use.
+//
+// Precedence:
+//  1. --config, an explicit path. cron should use this: it depends on no
+//     directory layout and never prompts.
+//  2. A name argument, resolved against the local .agent-utils directory.
+//  3. The only configuration present, when there is exactly one.
+//  4. An interactive choice, but ONLY when stdin is a terminal. A prompt in a
+//     cron job would hang forever, so a non-interactive run gets an error
+//     listing the names instead.
+func resolveConfigPath(c *cli.Command) (string, error) {
+	if path := c.String("config"); path != "" {
+		return path, nil
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	dir, err := config.FindDir(cwd)
+	if err != nil {
+		return "", fmt.Errorf("%w\n\nCreate one with:\n  mkdir -p %s/%s\n\nOr pass a file directly with --config",
+			err, config.DirName, config.ConfigsSubdir)
+	}
+
+	if name := c.StringArg("name"); name != "" {
+		return config.Resolve(dir, name)
+	}
+
+	entries, err := config.List(dir)
+	if err != nil {
+		return "", err
+	}
+	if len(entries) == 1 {
+		return entries[0].Path, nil
+	}
+	if !isInteractive() {
+		// Suggest a config that actually loads. Pointing the operator at a
+		// broken one just moves the confusion one command along.
+		example := entries[0].Name
+		for _, e := range entries {
+			if e.Err == nil {
+				example = e.Name
+				break
+			}
+		}
+		// FullName already includes the root command name.
+		return "", fmt.Errorf("%w: %s\n\nName one, for example:\n  %s %s",
+			config.ErrAmbiguous, strings.Join(config.Names(entries), ", "),
+			c.FullName(), example)
+	}
+	return promptForConfig(entries)
+}
+
+// isInteractive reports whether stdin is a terminal. This is what keeps a
+// prompt out of a cron job.
+//
+// It asks the terminal driver rather than checking os.ModeCharDevice. That mode
+// bit is set for /dev/null, which is exactly what cron attaches to stdin, so the
+// simpler check calls a cron run interactive and prompts into a void.
+func isInteractive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// promptForConfig asks which configuration to use. Prompts go to stderr so a
+// piped stdout stays machine readable.
+func promptForConfig(entries []config.Entry) (string, error) {
+	fmt.Fprintln(os.Stderr, "Select a loop configuration:")
+	for i, e := range entries {
+		suffix := e.Repo
+		if e.Err != nil {
+			suffix = "INVALID: " + e.Err.Error()
+		}
+		fmt.Fprintf(os.Stderr, "  %d) %-20s %s\n", i+1, e.Name, suffix)
+	}
+	fmt.Fprintf(os.Stderr, "Enter a number or a name: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read selection: %w", err)
+	}
+	choice := strings.TrimSpace(line)
+	if choice == "" {
+		return "", errors.New("no configuration selected")
+	}
+
+	if n, err := strconv.Atoi(choice); err == nil {
+		if n < 1 || n > len(entries) {
+			return "", fmt.Errorf("selection %d is out of range 1-%d", n, len(entries))
+		}
+		return entries[n-1].Path, nil
+	}
+	for _, e := range entries {
+		if e.Name == choice {
+			return e.Path, nil
+		}
+	}
+	return "", fmt.Errorf("%w %q", config.ErrNotFound, choice)
+}
+
+// listCommand prints the configurations in the local .agent-utils directory.
+func listCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "list",
+		Usage: "list the loop configurations in the local " + config.DirName + " directory",
+		Action: func(_ context.Context, _ *cli.Command) error {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			dir, err := config.FindDir(cwd)
+			if err != nil {
+				return fmt.Errorf("%w\n\nCreate one with:\n  mkdir -p %s/%s",
+					err, config.DirName, config.ConfigsSubdir)
+			}
+
+			entries, err := config.List(dir)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("%s\n\n", config.ConfigsDir(dir))
+			fmt.Printf("%-20s %-40s %s\n", "NAME", "REPO", "STATUS")
+			for _, e := range entries {
+				status := "ok"
+				repo := e.Repo
+				if e.Err != nil {
+					status = "INVALID"
+					repo = "-"
+				}
+				fmt.Printf("%-20s %-40s %s\n", e.Name, repo, status)
+			}
+			// Print the reason for each broken file after the table, so the
+			// table stays readable and the error is still visible.
+			for _, e := range entries {
+				if e.Err != nil {
+					fmt.Printf("\n%s: %v\n", e.Name, e.Err)
+				}
+			}
+			return nil
+		},
 	}
 }
 
@@ -66,11 +225,16 @@ func loopCommand() *cli.Command {
 		Usage: "run and inspect an issue-driven agent loop",
 		Commands: []*cli.Command{
 			{
-				Name:  "tick",
-				Usage: "run one reconcile and dispatch pass, then exit",
-				Flags: []cli.Flag{configFlag()},
+				Name:      "tick",
+				Usage:     "run one reconcile and dispatch pass, then exit",
+				Flags:     []cli.Flag{configFlag()},
+				Arguments: []cli.Argument{nameArgument()},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					cfg, deps, cleanup, err := setup(c.String("config"), true)
+					path, err := resolveConfigPath(c)
+					if err != nil {
+						return err
+					}
+					cfg, deps, cleanup, err := setup(path, true)
 					if err != nil {
 						return err
 					}
@@ -91,11 +255,16 @@ func loopCommand() *cli.Command {
 				},
 			},
 			{
-				Name:  "status",
-				Usage: "print the reconciled view without changing anything",
-				Flags: []cli.Flag{configFlag()},
+				Name:      "status",
+				Usage:     "print the reconciled view without changing anything",
+				Flags:     []cli.Flag{configFlag()},
+				Arguments: []cli.Argument{nameArgument()},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					cfg, deps, cleanup, err := setup(c.String("config"), true)
+					path, err := resolveConfigPath(c)
+					if err != nil {
+						return err
+					}
+					cfg, deps, cleanup, err := setup(path, true)
 					if err != nil {
 						return err
 					}
@@ -116,8 +285,13 @@ func loopCommand() *cli.Command {
 					configFlag(),
 					&cli.IntFlag{Name: "issue", Usage: "issue number", Required: true},
 				},
+				Arguments: []cli.Argument{nameArgument()},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					cfg, deps, cleanup, err := setup(c.String("config"), false)
+					path, err := resolveConfigPath(c)
+					if err != nil {
+						return err
+					}
+					cfg, deps, cleanup, err := setup(path, false)
 					if err != nil {
 						return err
 					}
@@ -151,7 +325,9 @@ func internalCommand() *cli.Command {
 				Name:  "run-agent",
 				Usage: "run one dispatch and record its outcome",
 				Flags: []cli.Flag{
-					configFlag(),
+					// The runner is spawned with an explicit path and must never
+					// prompt or scan, so this one stays required.
+					&cli.StringFlag{Name: "config", Required: true},
 					&cli.IntFlag{Name: "dispatch", Usage: "dispatch id", Required: true},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {

@@ -1,0 +1,169 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+// DirName is the directory that holds this tool's local files.
+const DirName = ".agent-utils"
+
+// ConfigsSubdir is the directory inside DirName that holds loop configurations.
+const ConfigsSubdir = "configs"
+
+// Discovery errors. Each is a distinct condition with a distinct fix, so the
+// caller can say something useful rather than "not found".
+var (
+	// ErrNoDir reports that no .agent-utils directory was found.
+	ErrNoDir = errors.New("no " + DirName + " directory found")
+	// ErrNoConfigs reports that the directory exists but holds no configuration.
+	ErrNoConfigs = errors.New("no loop configurations found")
+	// ErrNotFound reports that a named configuration does not exist.
+	ErrNotFound = errors.New("no such loop configuration")
+	// ErrAmbiguous reports that several configurations exist and none was named.
+	ErrAmbiguous = errors.New("several loop configurations found and none was named")
+)
+
+// Entry is one discovered configuration file.
+type Entry struct {
+	// Name is the file name without its extension. It is how a configuration is
+	// selected on the command line.
+	Name string
+	// Path is the absolute path to the file.
+	Path string
+	// Repo is the repository the loop watches. It is empty when Err is set.
+	Repo string
+	// Err records why the file could not be loaded. Listing reports a broken
+	// configuration rather than hiding it, because a file that silently does
+	// not appear is harder to debug than one that appears with its error.
+	Err error
+}
+
+// FindDir locates the .agent-utils directory.
+//
+// It looks in three places, in order:
+//
+//  1. $AGENT_UTILS_DIR, when set. This is the escape hatch for an unusual
+//     layout, and for a cron entry that does not want to depend on a directory.
+//  2. A .agent-utils directory in startDir or any parent of it, the way git
+//     finds .git. This is what makes the tool work from a subdirectory.
+//  3. $HOME/.agent-utils. cron runs with an unpredictable working directory,
+//     so the walk above frequently finds nothing.
+func FindDir(startDir string) (string, error) {
+	if env := strings.TrimSpace(os.Getenv("AGENT_UTILS_DIR")); env != "" {
+		if isDir(env) {
+			return env, nil
+		}
+		return "", fmt.Errorf("%w: AGENT_UTILS_DIR is set to %q, which is not a directory",
+			ErrNoDir, env)
+	}
+
+	dir, err := filepath.Abs(startDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w", startDir, err)
+	}
+	for {
+		candidate := filepath.Join(dir, DirName)
+		if isDir(candidate) {
+			return candidate, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break // reached the filesystem root
+		}
+		dir = parent
+	}
+
+	if home, err := os.UserHomeDir(); err == nil {
+		candidate := filepath.Join(home, DirName)
+		if isDir(candidate) {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf(
+		"%w: looked in %s and every parent directory, and in $HOME/%s",
+		ErrNoDir, startDir, DirName)
+}
+
+// ConfigsDir returns the configurations directory inside a .agent-utils dir.
+func ConfigsDir(agentUtilsDir string) string {
+	return filepath.Join(agentUtilsDir, ConfigsSubdir)
+}
+
+// List returns every configuration in a .agent-utils directory, sorted by name.
+//
+// A file that fails to load is still listed, with its error in Entry.Err.
+func List(agentUtilsDir string) ([]Entry, error) {
+	configs := ConfigsDir(agentUtilsDir)
+	if !isDir(configs) {
+		return nil, fmt.Errorf("%w: %s does not exist", ErrNoConfigs, configs)
+	}
+
+	items, err := os.ReadDir(configs)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", configs, err)
+	}
+
+	var out []Entry
+	for _, item := range items {
+		if item.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(item.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		path := filepath.Join(configs, item.Name())
+		entry := Entry{
+			Name: strings.TrimSuffix(item.Name(), ext),
+			Path: path,
+		}
+		if cfg, err := Load(path); err != nil {
+			entry.Err = err
+		} else {
+			entry.Repo = cfg.Repo
+		}
+		out = append(out, entry)
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: %s holds no .yaml or .yml file", ErrNoConfigs, configs)
+	}
+	return out, nil
+}
+
+// Resolve returns the path of the configuration called name.
+func Resolve(agentUtilsDir, name string) (string, error) {
+	entries, err := List(agentUtilsDir)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if e.Name == name {
+			return e.Path, nil
+		}
+	}
+	return "", fmt.Errorf("%w %q in %s; available: %s",
+		ErrNotFound, name, ConfigsDir(agentUtilsDir), strings.Join(Names(entries), ", "))
+}
+
+// Names returns the name of each entry.
+func Names(entries []Entry) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Name)
+	}
+	return out
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}

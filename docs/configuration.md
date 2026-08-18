@@ -10,6 +10,60 @@ together, in a stable order.
 `examples/planning.yaml` and `examples/execution.yaml` are complete working files. Read this
 reference for what each field means; read those for a shape to copy.
 
+## Where configuration files live
+
+Configuration files live in `.agent-utils/configs/`, one YAML file per loop. The file name
+without its extension is the loop's **name** on the command line.
+
+```
+.agent-utils/
+└── configs/
+    ├── planning.yaml     -> agent-utils loop tick planning
+    └── execution.yaml    -> agent-utils loop tick execution
+```
+
+`agent-utils list` prints what it finds:
+
+```
+$ agent-utils list
+/Users/you/.agent-utils/configs
+
+NAME                 REPO                                     STATUS
+execution            mcgarylabs/lawndominator-monorepo        ok
+planning             mcgarylabs/lawndominator-monorepo        ok
+```
+
+A file that fails to load is still listed, marked `INVALID`, with its error printed below the
+table. A configuration that silently does not appear is harder to debug than one that appears
+broken.
+
+### How the directory is found
+
+In order:
+
+1. `$AGENT_UTILS_DIR`, when set. If it is set but is not a directory, that is an error rather
+   than a silent fallback.
+2. A `.agent-utils` directory in the working directory or any parent, the way git finds
+   `.git`. This is what makes the tool work from a subdirectory of a project.
+3. `$HOME/.agent-utils`.
+
+If none exists, every command that needs a configuration fails with an error naming where it
+looked.
+
+### How a configuration is chosen
+
+| You run | What happens |
+|---|---|
+| `agent-utils loop tick --config path/to/file.yaml` | That exact file. Nothing is scanned. |
+| `agent-utils loop tick planning` | `planning.yaml` from the configs directory |
+| `agent-utils loop tick`, one config present | That one |
+| `agent-utils loop tick`, several present, terminal | Prompts you to pick one |
+| `agent-utils loop tick`, several present, **not** a terminal | Fails, listing the names |
+
+That last row matters. A prompt in a cron job would wait for input that never arrives, so the
+prompt appears only when stdin is a real terminal. **cron should use `--config` with an
+absolute path** — it depends on no working directory and can never prompt.
+
 ## Contents
 
 - [Quick reference](#quick-reference)

@@ -130,9 +130,25 @@ Build them locally with `make release`.
 
 ## Configuration
 
-One YAML file defines one loop. `docs/configuration.md` documents every field: what it means,
-what reads it, and what happens if you get it wrong. `examples/planning.yaml` and
-`examples/execution.yaml` are complete working files.
+Configuration files live in `.agent-utils/configs/`, one YAML file per loop. The file name is
+the loop's name on the command line.
+
+```bash
+mkdir -p .agent-utils/configs
+cp examples/planning.yaml .agent-utils/configs/
+
+agent-utils list                    # what is available
+agent-utils loop tick planning      # select by name
+agent-utils loop status             # the only one, or a prompt, or an error listing names
+```
+
+The directory is found in `$AGENT_UTILS_DIR`, then by walking up from the working directory,
+then in `$HOME/.agent-utils`. A cron entry should pass `--config` with an absolute path
+instead: it depends on no working directory and never prompts.
+
+`docs/configuration.md` documents every field: what it means, what reads it, and what happens
+if you get it wrong. `examples/planning.yaml` and `examples/execution.yaml` are complete
+working files.
 
 ## Security
 
@@ -173,5 +189,5 @@ echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
 ```
 
 ```cron
-*/15 * * * * . $HOME/.agent-utils/env && /usr/local/bin/agent-utils loop tick --config $HOME/.agent-utils/planning.yaml >> $HOME/.agent-utils/planning.log 2>&1
+*/15 * * * * . $HOME/.agent-utils/env && /usr/local/bin/agent-utils loop tick --config $HOME/.agent-utils/configs/planning.yaml >> $HOME/.agent-utils/planning.log 2>&1
 ```

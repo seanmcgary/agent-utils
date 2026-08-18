@@ -6,6 +6,7 @@ require (
 	github.com/google/go-github/v77 v77.0.0
 	github.com/google/uuid v1.6.0
 	github.com/urfave/cli/v3 v3.11.0
+	golang.org/x/term v0.45.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.56.0
 )
