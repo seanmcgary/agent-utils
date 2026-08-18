@@ -38,6 +38,7 @@ func main() {
 			loopCommand(),
 			projectStatusCommand(),
 			listCommand(),
+			logsCommand(),
 			forgetCommand(),
 			versionCommand(),
 			internalCommand(),
@@ -224,6 +225,84 @@ func forgetCommand() *cli.Command {
 			}
 			fmt.Printf("forgot %s\n", dir)
 			return nil
+		},
+	}
+}
+
+// logsCommand shows what a dispatched agent is doing. The tick only starts the
+// agent and exits, so this is how a run is observed while it happens.
+func logsCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "logs",
+		Usage: "show the log of a dispatched agent, live or after the fact",
+		Flags: []cli.Flag{
+			configFlag(),
+			nameFlag(),
+			&cli.IntFlag{Name: "issue", Usage: "show the newest dispatch for this issue"},
+			&cli.IntFlag{Name: "dispatch", Usage: "show this dispatch id exactly"},
+			&cli.BoolFlag{Name: "follow", Aliases: []string{"f"},
+				Usage: "keep streaming while the agent is alive"},
+			&cli.BoolFlag{Name: "list", Aliases: []string{"l"},
+				Usage: "list recent dispatches and their ids instead of showing a log"},
+			&cli.BoolFlag{Name: "raw", Usage: "print the stream-json verbatim"},
+			&cli.BoolFlag{Name: "thinking", Usage: "include the agent's thinking blocks"},
+			&cli.BoolFlag{Name: "stderr", Usage: "show the agent's standard error instead"},
+			&cli.BoolFlag{Name: "runner", Usage: "show the runner's own log instead"},
+			&cli.BoolFlag{Name: "path", Usage: "print the log file path and exit"},
+			&cli.IntFlag{Name: "limit", Value: 20, Usage: "how many dispatches --list shows"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			path, err := resolveConfigPath(c)
+			if err != nil {
+				return err
+			}
+			// Reading logs needs no GitHub access.
+			cfg, deps, cleanup, err := setup(path, false)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+
+			if c.Bool("list") {
+				ds, err := deps.Store.RecentDispatches(
+					cfg.Name, cfg.Repo, c.Int("issue"), c.Int("limit"))
+				if err != nil {
+					return err
+				}
+				fmt.Print(loopcmd.RenderDispatchList(ds))
+				return nil
+			}
+
+			stream := loopcmd.StreamAgent
+			switch {
+			case c.Bool("stderr"):
+				stream = loopcmd.StreamStderr
+			case c.Bool("runner"):
+				stream = loopcmd.StreamRunner
+			}
+
+			opts := loopcmd.LogOptions{
+				Issue:    c.Int("issue"),
+				Dispatch: int64(c.Int("dispatch")),
+				Stream:   stream,
+				Follow:   c.Bool("follow"),
+				Raw:      c.Bool("raw"),
+				Thinking: c.Bool("thinking"),
+			}
+
+			d, err := loopcmd.SelectDispatch(deps.Store, cfg, opts)
+			if err != nil {
+				return err
+			}
+			logPath := loopcmd.LogPathFor(cfg, d, stream)
+			if c.Bool("path") {
+				fmt.Println(logPath)
+				return nil
+			}
+
+			fmt.Fprintf(os.Stderr, "dispatch %d  issue #%d  %s  %s\n%s\n\n",
+				d.ID, d.Number, d.Kind, d.Status, logPath)
+			return loopcmd.Tail(ctx, os.Stdout, logPath, d, opts)
 		},
 	}
 }

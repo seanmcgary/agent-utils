@@ -446,6 +446,39 @@ func (s *Store) RunningDispatches(loop, repo string) ([]Dispatch, error) {
 	return out, rows.Err()
 }
 
+// RecentDispatches returns the most recent dispatches for a loop, newest first.
+// A non-zero issue restricts the result to that issue.
+func (s *Store) RecentDispatches(loop, repo string, issue, limit int) ([]Dispatch, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	query := `SELECT ` + dispatchColumns + ` FROM dispatches
+		WHERE loop = ? AND repo = ?`
+	args := []any{loop, repo}
+	if issue > 0 {
+		query += ` AND number = ?`
+		args = append(args, issue)
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query recent dispatches: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Dispatch
+	for rows.Next() {
+		d, err := scanDispatch(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan dispatch: %w", err)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // GetDispatch returns one dispatch by identifier.
 func (s *Store) GetDispatch(id int64) (Dispatch, error) {
 	row := s.db.QueryRow(`SELECT `+dispatchColumns+` FROM dispatches WHERE id = ?`, id)

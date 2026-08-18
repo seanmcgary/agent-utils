@@ -64,6 +64,41 @@ Tests run with `-p 1` and no cache on purpose: the `worktree` package shells out
 real git and `runner` spawns real processes, so package-level parallelism is not
 safe, and a cached PASS is not evidence about the working tree.
 
+## Watching a run
+
+`loop tick` starts agents and exits, by design: it runs from cron and must not
+block. The agents keep writing, and `agent-utils logs` is how you watch them.
+
+```bash
+agent-utils logs --name planning --list        # recent dispatches and their ids
+agent-utils logs --name planning -f            # follow the newest one live
+agent-utils logs --name planning --issue 42    # the newest dispatch for one issue
+agent-utils logs --name planning --dispatch 17 # one dispatch exactly
+```
+
+The transcript is rendered rather than dumped: session start, the agent's text,
+each tool call and its result, and a final line with turns, cost and duration.
+Thinking blocks and token counters are hidden.
+
+| Flag | Effect |
+|---|---|
+| `-f`, `--follow` | Stream while the agent is alive, then stop. Following a finished run exits rather than hanging. |
+| `--thinking` | Include the agent's thinking blocks |
+| `--raw` | Print the stream-json verbatim |
+| `--stderr` | The agent's standard error instead |
+| `--runner` | The runner's own structured log, for when a dispatch fails before the agent starts |
+| `--path` | Print the log file path and exit, for piping into your own tools |
+
+Each dispatch writes three files under `{state_dir}/logs/{loop}/`:
+
+| File | Contents |
+|---|---|
+| `{kind}-{issue}-{timestamp}.jsonl` | The agent's stream-json transcript |
+| `{kind}-{issue}-{timestamp}.jsonl.stderr` | The agent's standard error |
+| `runner-{dispatch}.log` | The detached runner's own log |
+
+All three are mode `0600`: a transcript records everything the agent read and ran.
+
 ## Versioning and releases
 
 The semantic version lives in the `VERSION` file at the repository root. It is the
