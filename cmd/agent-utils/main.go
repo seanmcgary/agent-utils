@@ -28,15 +28,27 @@ func main() {
 	cmd := &cli.Command{
 		Name:    "agent-utils",
 		Usage:   "utilities for agent workflows",
-		Version: version.Commit,
+		Version: version.GetVersion(),
 		Commands: []*cli.Command{
 			loopCommand(),
+			versionCommand(),
 			internalCommand(),
 		},
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
+	}
+}
+
+func versionCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "version",
+		Usage: "print the version and the commit this binary was built from",
+		Action: func(_ context.Context, _ *cli.Command) error {
+			fmt.Printf("agent-utils %s (%s)\n", version.GetVersion(), version.GetCommit())
+			return nil
+		},
 	}
 }
 

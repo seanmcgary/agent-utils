@@ -64,6 +64,70 @@ Tests run with `-p 1` and no cache on purpose: the `worktree` package shells out
 real git and `runner` spawns real processes, so package-level parallelism is not
 safe, and a cached PASS is not evidence about the working tree.
 
+## Versioning and releases
+
+The semantic version lives in the `VERSION` file at the repository root. It is the
+single source of truth; nothing infers a version from a tag.
+
+`scripts/version.sh <ref>` reconciles the file with the git ref:
+
+| Ref | Behaviour |
+|---|---|
+| Not a tag | Rewrites `VERSION` to `<version>+<short-sha>` so the build identifies its commit |
+| `refs/tags/vX.Y.Z` matching `VERSION` | Leaves the file alone; the release ships a bare semantic version |
+| `refs/tags/vX.Y.Z` **not** matching | Exits non-zero and fails the build |
+
+That last row is the whole point: a tag cannot produce a release whose binary reports a
+different version than the tag says.
+
+The Makefile stamps both values in with `-ldflags -X`:
+
+```bash
+make build && ./bin/agent-utils version
+# agent-utils v0.1.0 (d6e9df9)
+```
+
+A binary built without the Makefile reports `unknown` for both, which is accurate rather
+than misleading.
+
+### Cutting a release
+
+1. Bump `VERSION` (e.g. `v0.2.0`) and merge it to the default branch.
+2. Tag that commit with exactly the same string and push the tag:
+
+   ```bash
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+The release workflow then verifies the tag is an ancestor of the default branch, verifies
+`VERSION` equals the tag, builds four static binaries, and publishes a GitHub release with
+generated notes.
+
+| Artifact | Platform |
+|---|---|
+| `agent-utils-linux-amd64-<version>.tar.gz` | Linux x86-64 |
+| `agent-utils-linux-arm64-<version>.tar.gz` | Linux ARM64 |
+| `agent-utils-darwin-amd64-<version>.tar.gz` | macOS Intel |
+| `agent-utils-darwin-arm64-<version>.tar.gz` | macOS Apple Silicon |
+
+Every binary is built `CGO_ENABLED=0` and is fully static, which is possible because every
+dependency is pure Go — `modernc.org/sqlite` was chosen partly for this. One Linux binary
+runs on any distribution with no libc to match.
+
+Build them locally with `make release`.
+
+## Continuous integration
+
+`.github/workflows/main.yml` runs on every push and pull request:
+
+| Job | Does |
+|---|---|
+| `fmt` | Fails on unformatted code |
+| `lint` | `golangci-lint` |
+| `test` | Full suite, then again under `-race` |
+| `build` | Cross-compiles all four platforms and asserts each carries the expected version stamp |
+| `release` | Tags only. Gated on all of the above passing |
+
 ## Configuration
 
 One YAML file defines one loop. `docs/configuration.md` documents every field: what it means,

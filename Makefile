@@ -1,12 +1,29 @@
-.PHONY: all build clean test lint fmt fmtcheck vet check deps install
+.PHONY: all build clean test lint fmt fmtcheck vet check deps install version release
 
 GO = $(shell which go)
 BIN = ./bin
 
-# Stamp the commit into the binary so `agent-utils --version` identifies the
-# build. A build that skips the Makefile reports "unknown", which is accurate
-# rather than misleading.
-GO_FLAGS = -ldflags "-X 'github.com/seanmcgary/agent-utils/internal/version.Commit=$(shell git rev-parse --short HEAD 2>/dev/null || echo 'unknown')'"
+PKG = github.com/seanmcgary/agent-utils
+RELEASE = ./release
+
+# Stamp the version and commit into the binary. A build that skips the Makefile
+# reports "unknown" for both, which is accurate rather than misleading.
+#
+# VERSION is read from the file, which scripts/version.sh rewrites to
+# "<version>+<sha>" on any build that is not a tagged release. So a local or
+# CI build identifies its exact commit, and only a release carries a bare
+# semantic version.
+VERSION = $(shell cat VERSION | tr -d '[:space:]')
+COMMIT = $(shell git rev-parse --short HEAD 2>/dev/null || echo 'unknown')
+
+LDFLAGS = -X '$(PKG)/internal/version.Version=$(VERSION)' -X '$(PKG)/internal/version.Commit=$(COMMIT)'
+GO_FLAGS = -ldflags "$(LDFLAGS)"
+
+# NOTE: the static flags are ONE -ldflags, not two. Passing -ldflags twice makes
+# the last one win, which silently drops the -X stamps and produces a binary
+# reporting version "unknown". Verified: `go build -ldflags "-X main.V=x"
+# -ldflags="-s -w"` yields an unstamped binary.
+GO_FLAGS_STATIC = -ldflags "$(LDFLAGS) -s -w"
 
 all: deps/go build/cmd
 
@@ -14,6 +31,16 @@ all: deps/go build/cmd
 # Dependencies
 # -----------------------------------------------------------------------------
 deps: deps/go
+
+.PHONY: version
+version:
+	@echo $(VERSION)
+
+# Rewrites VERSION to "<version>+<sha>" for a non-release build, or verifies it
+# matches the tag for a release. CI runs this before any build.
+.PHONY: version/set
+version/set:
+	./scripts/version.sh $(REF)
 
 .PHONY: deps/go
 deps/go:
@@ -38,6 +65,48 @@ build: build/cmd
 # point at; `go install` on its own leaves the version "unknown".
 install:
 	$(GO) install $(GO_FLAGS) ./cmd/agent-utils
+
+# -----------------------------------------------------------------------------
+# Release binaries
+# -----------------------------------------------------------------------------
+
+# CGO_ENABLED=0 is safe because every dependency is pure Go -- notably
+# modernc.org/sqlite, which is why that driver was chosen. It makes each binary
+# a single static file with no libc dependency, so one linux/amd64 build runs on
+# any distribution.
+define build_release
+	CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) $(GO) build \
+		$(GO_FLAGS_STATIC) \
+		-trimpath -buildvcs=false \
+		-o $(RELEASE)/$(1)-$(2)/agent-utils ./cmd/agent-utils
+endef
+
+.PHONY: release/linux-amd64
+release/linux-amd64:
+	$(call build_release,linux,amd64)
+
+.PHONY: release/linux-arm64
+release/linux-arm64:
+	$(call build_release,linux,arm64)
+
+.PHONY: release/darwin-amd64
+release/darwin-amd64:
+	$(call build_release,darwin,amd64)
+
+.PHONY: release/darwin-arm64
+release/darwin-arm64:
+	$(call build_release,darwin,arm64)
+
+.PHONY: release/binaries
+release/binaries: release/linux-amd64 release/linux-arm64 release/darwin-amd64 release/darwin-arm64
+
+# Tars each platform directory into release/agent-utils-<os>-<arch>-<version>.tar.gz
+.PHONY: release/bundle
+release/bundle:
+	./scripts/bundleReleases.sh $(VERSION)
+
+.PHONY: release
+release: release/binaries release/bundle
 
 # -----------------------------------------------------------------------------
 # Tests and linting
@@ -103,7 +172,7 @@ check: fmtcheck vet lint test
 # -----------------------------------------------------------------------------
 
 clean:
-	rm -rf $(BIN) coverage.out
+	rm -rf $(BIN) $(RELEASE) coverage.out
 
 # Removes worktrees and state for a loop. DESTRUCTIVE, and deliberately not
 # wired into `clean`: it deletes agent working trees that may hold unpushed
