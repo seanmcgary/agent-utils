@@ -11,6 +11,19 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
+// truncate shortens a string to width, marking that it was cut. Issue titles
+// are arbitrary length and would otherwise break the column layout.
+func truncate(s string, width int) string {
+	r := []rune(s)
+	if len(r) <= width {
+		return s
+	}
+	if width <= 1 {
+		return string(r[:width])
+	}
+	return string(r[:width-1]) + "\u2026"
+}
+
 // Status renders the reconciled view. It changes nothing.
 func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) {
 	issues, err := deps.GH.ListOpenIssues(ctx, cfg.RepoOwner(), cfg.RepoName())
@@ -65,8 +78,8 @@ func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) 
 	fmt.Fprintln(&b)
 
 	sort.Slice(issues, func(i, j int) bool { return issues[i].Number < issues[j].Number })
-	fmt.Fprintf(&b, "%-6s %-14s %-9s %-9s %-38s %s\n",
-		"ISSUE", "STATE", "RETRIES", "COST", "SESSION", "WORKTREE")
+	fmt.Fprintf(&b, "%-6s %-44s %-14s %-9s %-9s %-38s %s\n",
+		"ISSUE", "TITLE", "STATE", "RETRIES", "COST", "SESSION", "WORKTREE")
 
 	for _, iss := range issues {
 		var state string
@@ -102,8 +115,8 @@ func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) 
 		if s.Parked {
 			state = "parked"
 		}
-		fmt.Fprintf(&b, "%-6d %-14s %-9d %-9s %-38s %s\n",
-			iss.Number, state, s.RetryCount,
+		fmt.Fprintf(&b, "%-6d %-44s %-14s %-9d %-9s %-38s %s\n",
+			iss.Number, truncate(iss.Title, 44), state, s.RetryCount,
 			fmt.Sprintf("$%.2f", cost[iss.Number]), session, wt)
 	}
 

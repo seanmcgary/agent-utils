@@ -3,6 +3,7 @@ package loopcmd
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,5 +319,63 @@ func TestTickIsQuietWhenNothingMatches(t *testing.T) {
 	}
 	if sum.Started != 0 || sum.Resumed != 0 || sum.Tended != 0 {
 		t.Errorf("summary = %+v, want all zero", sum)
+	}
+}
+
+func TestTruncateKeepsColumnsAligned(t *testing.T) {
+	cases := []struct {
+		in    string
+		width int
+		want  string
+	}{
+		{"short", 10, "short"},
+		{"exactlyten", 10, "exactlyten"},
+		{"this title is far too long to fit", 10, "this titl\u2026"},
+		{"", 10, ""},
+	}
+	for _, c := range cases {
+		if got := truncate(c.in, c.width); got != c.want {
+			t.Errorf("truncate(%q, %d) = %q, want %q", c.in, c.width, got, c.want)
+		}
+		if got := truncate(c.in, c.width); len([]rune(got)) > c.width {
+			t.Errorf("truncate(%q, %d) = %q, longer than the column", c.in, c.width, got)
+		}
+	}
+}
+
+// A multi-byte title must not be cut mid-rune.
+func TestTruncateIsRuneSafe(t *testing.T) {
+	got := truncate("日本語のタイトルはとても長い", 5)
+	if len([]rune(got)) != 5 {
+		t.Errorf("got %q (%d runes), want 5 runes", got, len([]rune(got)))
+	}
+}
+
+func TestRenderProjectsExplainsAnEmptyRegistry(t *testing.T) {
+	out := RenderProjects(nil)
+	for _, want := range []string{"No projects", ".agent-utils/configs", "agent-utils list"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output should mention %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderProjectsSurfacesAMissingProject(t *testing.T) {
+	out := RenderProjects([]ProjectSummary{
+		{Root: "/gone", Dir: "/gone/.agent-utils", Missing: true},
+	})
+	if !strings.Contains(out, "MISSING") || !strings.Contains(out, "forget /gone") {
+		t.Errorf("a moved project must be reported with its fix:\n%s", out)
+	}
+}
+
+// An orphaned dispatch has to be visible at a glance, not buried.
+func TestRenderProjectsFlagsOrphans(t *testing.T) {
+	out := RenderProjects([]ProjectSummary{{
+		Root: "/p", Dir: "/p/.agent-utils",
+		Loops: []LoopSummary{{Name: "planning", Repo: "o/r", Live: 2, Orphans: 1}},
+	}})
+	if !strings.Contains(out, "2+1!") {
+		t.Errorf("orphans should be marked in the LIVE column:\n%s", out)
 	}
 }

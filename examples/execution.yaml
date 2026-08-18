@@ -3,7 +3,9 @@ repo: mcgarylabs/lawndominator-monorepo
 
 checkout_base_dir: /Users/seanmcgary/Code/lawndominator
 worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
-state_dir: /Users/seanmcgary/.agent-utils/execution
+# state_dir is optional. When omitted it defaults to
+# <project>/.agent-utils/state/<name>, which keeps every project's
+# database, lock and logs separate. Set it only to override that.
 default_branch: master
 
 labels:

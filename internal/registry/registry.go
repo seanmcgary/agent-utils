@@ -1,0 +1,207 @@
+// Package registry records which projects this tool has been used against.
+//
+// It exists so `agent-utils status` can report every onboarded project without
+// being told where they are. It is a convenience index, never a source of
+// truth: a project's real configuration and state live in its own .agent-utils
+// directory, so deleting the registry loses nothing but the list.
+package registry
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"syscall"
+	"time"
+)
+
+// FileName is the registry file inside the user's home .agent-utils directory.
+const FileName = "registry.json"
+
+// Project is one recorded project.
+type Project struct {
+	// Root is the directory that contains the .agent-utils directory.
+	Root string `json:"root"`
+	// AgentUtilsDir is the .agent-utils directory itself.
+	AgentUtilsDir string `json:"agent_utils_dir"`
+	// FirstSeen is when this project was first used.
+	FirstSeen time.Time `json:"first_seen"`
+	// LastSeen is when a command last ran against it.
+	LastSeen time.Time `json:"last_seen"`
+}
+
+// Exists reports whether the project's directory is still present. A project
+// that has been moved or deleted stays in the registry until it is pruned, so
+// status can say so rather than silently omitting it.
+func (p Project) Exists() bool {
+	info, err := os.Stat(p.AgentUtilsDir)
+	return err == nil && info.IsDir()
+}
+
+type file struct {
+	Projects []Project `json:"projects"`
+}
+
+// Path returns the registry location, $HOME/.agent-utils/registry.json.
+//
+// The registry is always in the home directory even when the project's own
+// .agent-utils lives elsewhere. A per-project registry could not list the other
+// projects, which is the whole point of it.
+func Path() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("locate home directory: %w", err)
+	}
+	return filepath.Join(home, ".agent-utils", FileName), nil
+}
+
+// Register records that a command ran against this .agent-utils directory.
+//
+// It is best effort by contract: the caller should log a failure and carry on.
+// Failing a tick because an index could not be updated would trade a real
+// operation for a cosmetic one.
+func Register(agentUtilsDir string) error {
+	abs, err := filepath.Abs(agentUtilsDir)
+	if err != nil {
+		return err
+	}
+	path, err := Path()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create registry directory: %w", err)
+	}
+
+	// Several loops can tick at once, each in its own process, so the
+	// read-modify-write below has to be exclusive.
+	unlock, err := lockRegistry(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	f, err := read(path)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	for i := range f.Projects {
+		if f.Projects[i].AgentUtilsDir == abs {
+			f.Projects[i].LastSeen = now
+			return write(path, f)
+		}
+	}
+	f.Projects = append(f.Projects, Project{
+		Root:          filepath.Dir(abs),
+		AgentUtilsDir: abs,
+		FirstSeen:     now,
+		LastSeen:      now,
+	})
+	return write(path, f)
+}
+
+// List returns every recorded project, most recently used first.
+func List() ([]Project, error) {
+	path, err := Path()
+	if err != nil {
+		return nil, err
+	}
+	f, err := read(path)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(f.Projects, func(i, j int) bool {
+		return f.Projects[i].LastSeen.After(f.Projects[j].LastSeen)
+	})
+	return f.Projects, nil
+}
+
+// Forget removes a project from the registry. It does not touch the project's
+// own files.
+func Forget(agentUtilsDir string) error {
+	abs, err := filepath.Abs(agentUtilsDir)
+	if err != nil {
+		return err
+	}
+	path, err := Path()
+	if err != nil {
+		return err
+	}
+	unlock, err := lockRegistry(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	f, err := read(path)
+	if err != nil {
+		return err
+	}
+	kept := f.Projects[:0]
+	for _, p := range f.Projects {
+		if p.AgentUtilsDir != abs {
+			kept = append(kept, p)
+		}
+	}
+	f.Projects = kept
+	return write(path, f)
+}
+
+func read(path string) (*file, error) {
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &file{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read registry: %w", err)
+	}
+	if len(raw) == 0 {
+		return &file{}, nil
+	}
+	var f file
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, fmt.Errorf("parse registry %s: %w", path, err)
+	}
+	return &f, nil
+}
+
+func write(path string, f *file) error {
+	raw, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode registry: %w", err)
+	}
+	raw = append(raw, '\n')
+
+	// Write to a temporary file and rename, so a crash mid-write cannot leave a
+	// truncated registry behind.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("write registry: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace registry: %w", err)
+	}
+	return nil
+}
+
+// lockRegistry takes an exclusive lock on a sidecar file. It blocks rather than
+// failing: an update is quick, and a caller that gave up would silently skip
+// recording the project.
+func lockRegistry(path string) (func(), error) {
+	lf, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open registry lock: %w", err)
+	}
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
+		lf.Close()
+		return nil, fmt.Errorf("lock registry: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+		_ = lf.Close()
+	}, nil
+}

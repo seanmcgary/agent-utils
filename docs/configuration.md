@@ -84,7 +84,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `repo` | string `owner/name` | yes | — |
 | `checkout_base_dir` | path | yes | — |
 | `worktree_dir` | path | yes | — |
-| `state_dir` | path | yes | — |
+| `state_dir` | path | no | `<project>/.agent-utils/state/<name>` |
 | `default_branch` | string | yes | — |
 | `labels.trigger` | string | yes | — |
 | `labels.in_flight` | string | yes | — |
@@ -171,13 +171,28 @@ worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
 
 ### `state_dir`
 
-Holds everything durable except the worktrees:
+**Optional.** When omitted it defaults to `<project>/.agent-utils/state/<name>`, derived from
+the configuration file's own location.
+
+Leave it unset. The default is what keeps state distinct per project: a shared absolute path
+copied between two projects would point both at one database, so each would see the other's
+dispatches, sessions, and issue state. Set it only to deliberately place state elsewhere. A
+leading `~` is expanded.
+
+A configuration outside any `.agent-utils` directory has no project to derive from, so
+`state_dir` is required there and its absence is an error naming the file.
+
+It holds everything durable except the worktrees:
 
 | Path | Contents |
 |---|---|
 | `{state_dir}/state.db` | SQLite: issue state, dispatches, pull request links, ticks |
 | `{state_dir}/{name}.lock` | The per-loop tick lock |
 | `{state_dir}/logs/{name}/` | Agent transcripts and runner logs |
+
+Separately, `$HOME/.agent-utils/registry.json` records which projects have been used, so
+`agent-utils status` can list them. It is an index only: deleting it loses the list and
+nothing else, and every project's real configuration and state stay in its own directory.
 
 The loop creates this directory `0700`, the database `0600`, and every log file `0600`. The
 transcripts record everything the agent read and ran, so they are not world-readable by

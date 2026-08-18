@@ -18,6 +18,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
 	"github.com/seanmcgary/agent-utils/internal/proc"
+	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/version"
@@ -35,7 +36,9 @@ func main() {
 		Version: version.GetVersion(),
 		Commands: []*cli.Command{
 			loopCommand(),
+			projectStatusCommand(),
 			listCommand(),
+			forgetCommand(),
 			versionCommand(),
 			internalCommand(),
 		},
@@ -173,6 +176,48 @@ func promptForConfig(entries []config.Entry) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("%w %q", config.ErrNotFound, choice)
+}
+
+// projectStatusCommand reports every project this tool has been used against.
+// It reads only local state, so it needs no token and works offline.
+func projectStatusCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "status",
+		Usage: "list every onboarded project and the state of its loops",
+		Action: func(_ context.Context, _ *cli.Command) error {
+			projects, err := loopcmd.Projects()
+			if err != nil {
+				return err
+			}
+			fmt.Print(loopcmd.RenderProjects(projects))
+			return nil
+		},
+	}
+}
+
+// forgetCommand removes a project from the registry. It touches nothing the
+// project owns, so it is safe to run against a directory that has moved.
+func forgetCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "forget",
+		Usage:     "remove a project from the registry without touching its files",
+		Arguments: []cli.Argument{&cli.StringArg{Name: "path"}},
+		Action: func(_ context.Context, c *cli.Command) error {
+			root := c.StringArg("path")
+			if root == "" {
+				return errors.New("usage: agent-utils forget <project path>")
+			}
+			dir := root
+			if filepath.Base(dir) != config.DirName {
+				dir = filepath.Join(root, config.DirName)
+			}
+			if err := registry.Forget(dir); err != nil {
+				return err
+			}
+			fmt.Printf("forgot %s\n", dir)
+			return nil
+		},
+	}
 }
 
 // listCommand prints the configurations in the local .agent-utils directory.
@@ -347,6 +392,24 @@ func setup(configPath string, needsGitHub bool) (*config.Config, loopcmd.Deps, f
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, loopcmd.Deps{}, nil, err
+	}
+
+	// Resolve the state directory before anything uses it. When state_dir is
+	// not set this derives <project>/.agent-utils/state/<name>, which is what
+	// keeps two projects from sharing one database.
+	stateDir, err := cfg.ResolveStateDir(configPath)
+	if err != nil {
+		return nil, loopcmd.Deps{}, nil, err
+	}
+	cfg.StateDir = stateDir
+
+	// Record the project so `agent-utils status` can find it later. This is an
+	// index, not state anything depends on, so a failure is logged and the
+	// command carries on.
+	if dir := config.DirFromPath(configPath); dir != "" {
+		if err := registry.Register(dir); err != nil {
+			slog.Warn("could not record project in the registry", "dir", dir, "err", err)
+		}
 	}
 	// 0700: the state directory holds the sqlite database, which carries
 	// session identifiers and transcript logs.

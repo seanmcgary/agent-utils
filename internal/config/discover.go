@@ -163,6 +163,61 @@ func Names(entries []Entry) []string {
 	return out
 }
 
+// StateSubdir is the directory inside DirName that holds per-loop state.
+const StateSubdir = "state"
+
+// DirFromPath returns the .agent-utils directory a file lives under, or "" when
+// the file is not inside one. It walks up from the file, so it works for a
+// config in .agent-utils/configs and for one nested deeper.
+func DirFromPath(path string) string {
+	dir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return ""
+	}
+	for {
+		if filepath.Base(dir) == DirName && isDir(dir) {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// ResolveStateDir returns where this loop keeps its database, lock and logs.
+//
+// An explicit state_dir wins. Otherwise the directory is derived from the
+// configuration file's own location: <project>/.agent-utils/state/<name>.
+//
+// Deriving it is what keeps state distinct per project. A shared absolute
+// state_dir copied between two projects would point both of them at one
+// database, so each would see the other's dispatches and issue state.
+func (c *Config) ResolveStateDir(configPath string) (string, error) {
+	if strings.TrimSpace(c.StateDir) != "" {
+		return expandHome(c.StateDir)
+	}
+	if dir := DirFromPath(configPath); dir != "" {
+		return filepath.Join(dir, StateSubdir, c.Name), nil
+	}
+	return "", fmt.Errorf(
+		"state_dir is required for %s: it is not inside a %s directory, so a "+
+			"per-project state directory cannot be derived", configPath, DirName)
+}
+
+// expandHome expands a leading ~ so a configuration can be written portably.
+func expandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("expand %q: %w", path, err)
+	}
+	return filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(path, "~"), "/")), nil
+}
+
 func isDir(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()

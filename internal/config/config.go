@@ -119,7 +119,6 @@ func (c *Config) validate() error {
 		{"repo", c.Repo},
 		{"checkout_base_dir", c.CheckoutBaseDir},
 		{"worktree_dir", c.WorktreeDir},
-		{"state_dir", c.StateDir},
 		{"default_branch", c.DefaultBranch},
 		{"prompt", c.Prompt},
 		{"resume_prompt", c.ResumePrompt},

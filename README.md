@@ -137,10 +137,27 @@ the loop's name on the command line.
 mkdir -p .agent-utils/configs
 cp examples/planning.yaml .agent-utils/configs/
 
-agent-utils list                    # what is available
+agent-utils list                    # configs in THIS project
 agent-utils loop tick planning      # select by name
 agent-utils loop status             # the only one, or a prompt, or an error listing names
+agent-utils status                  # every project onboarded, across the machine
 ```
+
+Each project keeps its own state under its own `.agent-utils/state/`, so two projects never
+share a database. `agent-utils status` reads only local state, so it needs no token and works
+offline:
+
+```
+$ agent-utils status
+/Users/you/Code/lawndominator
+  LOOP           REPO                             TICKS  LIVE   COST     LAST TICK
+  execution      mcgarylabs/lawndominator-monorepo  128   1      $84.20   2026-08-18 14:55
+  planning       mcgarylabs/lawndominator-monorepo   96   0+1!   $31.05   2026-08-18 14:50
+```
+
+`LIVE` shows running agents; a `+n!` suffix marks dispatches whose process is gone. A project
+is recorded the first time any command runs against it; `agent-utils forget <path>` removes it
+from the list without touching its files.
 
 The directory is found in `$AGENT_UTILS_DIR`, then by walking up from the working directory,
 then in `$HOME/.agent-utils`. A cron entry should pass `--config` with an absolute path
