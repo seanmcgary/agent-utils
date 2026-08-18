@@ -163,6 +163,40 @@ Build them locally with `make release`.
 | `build` | Cross-compiles all four platforms and asserts each carries the expected version stamp |
 | `release` | Tags only. Gated on all of the above passing |
 
+## Install
+
+```bash
+go install github.com/seanmcgary/agent-utils/cmd/agent-utils@latest
+```
+
+This works once the code is on the default branch. Pin a release instead when you
+want a known version:
+
+```bash
+go install github.com/seanmcgary/agent-utils/cmd/agent-utils@v0.1.0
+```
+
+A `go install` binary reports the module version and the VCS revision, because the
+Go toolchain embeds both:
+
+```
+$ agent-utils version
+agent-utils v0.1.0 (071ca17)
+```
+
+Note that `@<branch>` only works for a branch whose name has no `/` in it; Go rejects
+`@feat/my-branch` as an invalid version string. Use a commit SHA for an unmerged
+branch, or build from a checkout:
+
+```bash
+git clone https://github.com/seanmcgary/agent-utils && cd agent-utils
+make install     # into GOBIN, with the VERSION file's value stamped in
+make build       # into ./bin
+```
+
+Prebuilt static binaries for linux and darwin on amd64 and arm64 are attached to each
+[release](https://github.com/seanmcgary/agent-utils/releases).
+
 ## Configuration
 
 Configuration files live in `.agent-utils/configs/`, one YAML file per loop. A loop's name is
