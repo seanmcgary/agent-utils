@@ -130,8 +130,9 @@ Build them locally with `make release`.
 
 ## Configuration
 
-Configuration files live in `.agent-utils/configs/`, one YAML file per loop. The file name is
-the loop's name on the command line.
+Configuration files live in `.agent-utils/configs/`, one YAML file per loop. A loop's name is
+the `name:` field inside the file, not the file name, and it must be unique within a
+directory.
 
 ```bash
 mkdir -p .agent-utils/configs

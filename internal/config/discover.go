@@ -26,13 +26,22 @@ var (
 	ErrNotFound = errors.New("no such loop configuration")
 	// ErrAmbiguous reports that several configurations exist and none was named.
 	ErrAmbiguous = errors.New("several loop configurations found and none was named")
+	// ErrDuplicateName reports that more than one file declares the same name.
+	ErrDuplicateName = errors.New("duplicate loop name")
 )
 
 // Entry is one discovered configuration file.
 type Entry struct {
-	// Name is the file name without its extension. It is how a configuration is
-	// selected on the command line.
+	// Name is the loop's name: the `name` field INSIDE the file, not the file
+	// name. It is how a configuration is selected on the command line, and it
+	// is what the loop keys its database rows and its state directory on.
+	//
+	// When the file cannot be loaded there is no name to read, so this falls
+	// back to the file's base name purely so the entry can be reported.
 	Name string
+	// File is the base file name. It is shown when it differs from Name, so a
+	// configuration can be traced back to the file that declares it.
+	File string
 	// Path is the absolute path to the file.
 	Path string
 	// Repo is the repository the loop watches. It is empty when Err is set.
@@ -120,12 +129,16 @@ func List(agentUtilsDir string) ([]Entry, error) {
 		}
 		path := filepath.Join(configs, item.Name())
 		entry := Entry{
+			// Placeholder until the file is read. A file that fails to load has
+			// no name field to report, so the file name stands in for it.
 			Name: strings.TrimSuffix(item.Name(), ext),
+			File: item.Name(),
 			Path: path,
 		}
 		if cfg, err := Load(path); err != nil {
 			entry.Err = err
 		} else {
+			entry.Name = cfg.Name
 			entry.Repo = cfg.Repo
 		}
 		out = append(out, entry)
@@ -139,19 +152,53 @@ func List(agentUtilsDir string) ([]Entry, error) {
 	return out, nil
 }
 
-// Resolve returns the path of the configuration called name.
+// Resolve returns the path of the configuration whose name field is name.
 func Resolve(agentUtilsDir, name string) (string, error) {
 	entries, err := List(agentUtilsDir)
 	if err != nil {
 		return "", err
 	}
+
+	var matches []Entry
 	for _, e := range entries {
 		if e.Name == name {
-			return e.Path, nil
+			matches = append(matches, e)
 		}
 	}
-	return "", fmt.Errorf("%w %q in %s; available: %s",
-		ErrNotFound, name, ConfigsDir(agentUtilsDir), strings.Join(Names(entries), ", "))
+	switch len(matches) {
+	case 1:
+		return matches[0].Path, nil
+	case 0:
+		return "", fmt.Errorf("%w %q in %s; available: %s",
+			ErrNotFound, name, ConfigsDir(agentUtilsDir), strings.Join(Names(entries), ", "))
+	default:
+		files := make([]string, 0, len(matches))
+		for _, m := range matches {
+			files = append(files, m.File)
+		}
+		return "", fmt.Errorf("%w: %d files declare the name %q (%s)",
+			ErrDuplicateName, len(matches), name, strings.Join(files, ", "))
+	}
+}
+
+// Duplicates returns every name declared by more than one file, sorted.
+//
+// Two loops sharing a name is never benign: the name keys the state directory,
+// the lock file and every database row, so both would write one database and
+// contend for one lock while appearing to be separate loops.
+func Duplicates(entries []Entry) []string {
+	seen := map[string]int{}
+	for _, e := range entries {
+		seen[e.Name]++
+	}
+	var out []string
+	for name, n := range seen {
+		if n > 1 {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Names returns the name of each entry.

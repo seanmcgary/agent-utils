@@ -12,15 +12,25 @@ reference for what each field means; read those for a shape to copy.
 
 ## Where configuration files live
 
-Configuration files live in `.agent-utils/configs/`, one YAML file per loop. The file name
-without its extension is the loop's **name** on the command line.
+Configuration files live in `.agent-utils/configs/`, one YAML file per loop.
+
+A loop's **name** is the `name:` field **inside** the file, not the file name. The same value
+keys the loop's state directory, its lock file, and every row it writes, so selecting by it on
+the command line selects the same thing the loop calls itself.
 
 ```
 .agent-utils/
 └── configs/
-    ├── planning.yaml     -> agent-utils loop tick --name planning
-    └── execution.yaml    -> agent-utils loop tick --name execution
+    ├── planning.yaml     name: planning   -> agent-utils loop tick --name planning
+    └── execution.yaml    name: execution  -> agent-utils loop tick --name execution
 ```
+
+File names are yours to choose; only `.yaml` and `.yml` are read. `backlog-planning.yaml`
+declaring `name: planning` is still selected as `planning`.
+
+**Every loop needs a unique name.** Two files declaring the same one would share a state
+directory and a lock while looking like separate loops, so `--name` refuses to guess between
+them and `list` prints a warning.
 
 `agent-utils list` prints what it finds:
 
@@ -28,10 +38,13 @@ without its extension is the loop's **name** on the command line.
 $ agent-utils list
 /Users/you/.agent-utils/configs
 
-NAME                 REPO                                     STATUS
-execution            mcgarylabs/lawndominator-monorepo        ok
-planning             mcgarylabs/lawndominator-monorepo        ok
+NAME                 FILE                     REPO                                 STATUS
+execution            execution.yaml           mcgarylabs/lawndominator-monorepo    ok
+planning             backlog-planning.yaml    mcgarylabs/lawndominator-monorepo    ok
 ```
+
+`NAME` is the `name:` field; `FILE` is where it came from. They are listed separately because
+they need not agree.
 
 A file that fails to load is still listed, marked `INVALID`, with its error printed below the
 table. A configuration that silently does not appear is harder to debug than one that appears
@@ -59,11 +72,12 @@ running against the wrong loop.
 | You run | What happens |
 |---|---|
 | `agent-utils loop tick --config path/to/file.yaml` | That exact file. Nothing is scanned. |
-| `agent-utils loop tick --name planning` | `planning.yaml` from the configs directory |
+| `agent-utils loop tick --name planning` | The file declaring `name: planning` |
 | `agent-utils loop tick`, one config present | That one |
 | `agent-utils loop tick`, several present, terminal | Prompts you to pick one |
 | `agent-utils loop tick`, several present, **not** a terminal | Fails, listing the names |
 | `agent-utils loop tick --config … --name …` | Fails: pass only one |
+| `--name x` when two files declare `name: x` | Fails, naming both files |
 
 That last row matters. A prompt in a cron job would wait for input that never arrives, so the
 prompt appears only when stdin is a real terminal. **cron should use `--config` with an
@@ -117,8 +131,11 @@ absolute path** — it depends on no working directory and can never prompt.
 
 ### `name`
 
-The loop's identity. Every row the loop writes to SQLite is keyed by it, and it names the
-lock file and the log directory.
+The loop's identity, and how it is selected on the command line with `--name`. Every row the
+loop writes to SQLite is keyed by it, and it names the state directory, the lock file, and the
+log directory. It is independent of the file name.
+
+It must be unique across the configurations in one directory.
 
 Two loops that share a `state_dir` **must** have different names. They would otherwise share
 one lock, so only one of them could tick at a time, and they would read each other's issue

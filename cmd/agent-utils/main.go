@@ -250,7 +250,9 @@ func listCommand() *cli.Command {
 			}
 
 			fmt.Printf("%s\n\n", config.ConfigsDir(dir))
-			fmt.Printf("%-20s %-40s %s\n", "NAME", "REPO", "STATUS")
+			// NAME is the `name` field inside each file; FILE is where it came
+			// from. They are shown separately because they need not agree.
+			fmt.Printf("%-20s %-24s %-40s %s\n", "NAME", "FILE", "REPO", "STATUS")
 			for _, e := range entries {
 				status := "ok"
 				repo := e.Repo
@@ -258,7 +260,16 @@ func listCommand() *cli.Command {
 					status = "INVALID"
 					repo = "-"
 				}
-				fmt.Printf("%-20s %-40s %s\n", e.Name, repo, status)
+				fmt.Printf("%-20s %-24s %-40s %s\n", e.Name, e.File, repo, status)
+			}
+
+			// A duplicated name is not cosmetic: the name keys the state
+			// directory, the lock and every database row, so two loops sharing
+			// one would write the same database while looking separate.
+			if dupes := config.Duplicates(entries); len(dupes) > 0 {
+				fmt.Printf("\nWARNING: %d name(s) declared by more than one file: %s\n",
+					len(dupes), strings.Join(dupes, ", "))
+				fmt.Printf("Each loop needs a unique name; they share a state directory and lock otherwise.\n")
 			}
 			// Print the reason for each broken file after the table, so the
 			// table stays readable and the error is still visible.
