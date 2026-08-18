@@ -60,6 +60,8 @@ The remaining constraints come from the spec. Every task must respect them:
 | `internal/runner/runner.go` | Detached spawn and child supervision. |
 | `internal/loopcmd/tick.go` | Tick orchestration: lock, reconcile, decide, act. |
 | `internal/loopcmd/status.go` | Status rendering. |
+| `internal/lock/lock.go` | Per-loop advisory tick lock. |
+| `examples/*.yaml` | The two loop configurations. The prompts port both reference loops. |
 
 ---
 
@@ -118,6 +120,8 @@ labels:
   terminal: status:ready-for-execution
   veto:
     - blocked:design
+default_branch: master
+i_understand_bypass_permissions: true
 agent:
   model: opus
   effort: high
@@ -185,11 +189,11 @@ repo: a/b
 checkout_base_dir: /tmp/c
 worktree_dir: /tmp/w
 state_dir: /tmp/s
+default_branch: master
 labels:
   trigger: t
   in_flight: f
   blocked: b
-  review: r
 agent: {model: opus, worktree: per_issue, timeout: 1h}
 retry: {max: 1, backoff_ticks: [0], breaker: {orphan_threshold: 2, cooldown: 1m}}
 prompt: p
@@ -197,7 +201,30 @@ resume_prompt: rp
 `
 	_, err := Load(writeTemp(t, body))
 	if err == nil {
-		t.Fatal("want error for missing labels.terminal, got nil")
+		t.Fatal("want error for missing labels.review, got nil")
+	}
+}
+
+// labels.terminal is optional: the execution loop has no terminal label.
+func TestLoadAcceptsMissingTerminalLabel(t *testing.T) {
+	body := replaceOnce(validYAML, "  terminal: status:ready-for-execution\n", "")
+	if _, err := Load(writeTemp(t, body)); err != nil {
+		t.Fatalf("labels.terminal must be optional: %v", err)
+	}
+}
+
+// bypassPermissions disables every permission gate on third-party issue text.
+func TestBypassPermissionsNeedsExplicitAcknowledgement(t *testing.T) {
+	body := replaceOnce(validYAML, "i_understand_bypass_permissions: true\n", "")
+	if _, err := Load(writeTemp(t, body)); err == nil {
+		t.Fatal("want error when bypassPermissions is set without the acknowledgement")
+	}
+}
+
+func TestRejectsUnknownPermissionMode(t *testing.T) {
+	body := replaceOnce(validYAML, "permission_mode: bypassPermissions", "permission_mode: nonsense")
+	if _, err := Load(writeTemp(t, body)); err == nil {
+		t.Fatal("want error for an invalid permission mode")
 	}
 }
 
@@ -316,10 +343,18 @@ type Config struct {
 	WorktreeDir     string `yaml:"worktree_dir"`
 	StateDir        string `yaml:"state_dir"`
 
+	// DefaultBranch is the branch new worktrees start from. It is not always
+	// "master", so it is configuration rather than an assumption.
+	DefaultBranch string `yaml:"default_branch"`
+
 	Labels Labels `yaml:"labels"`
 	Agent  Agent  `yaml:"agent"`
 	TendPR bool   `yaml:"tend_pr"`
 	Retry  Retry  `yaml:"retry"`
+
+	// AcknowledgeBypassPermissions must be true to select the
+	// bypassPermissions agent permission mode. See validate.
+	AcknowledgeBypassPermissions bool `yaml:"i_understand_bypass_permissions"`
 
 	Prompt       string `yaml:"prompt"`
 	ResumePrompt string `yaml:"resume_prompt"`
@@ -401,18 +436,21 @@ func Load(path string) (*Config, error) {
 func (c *Config) validate() error {
 	var errs []error
 
-	required := map[string]string{
-		"name":              c.Name,
-		"repo":              c.Repo,
-		"checkout_base_dir": c.CheckoutBaseDir,
-		"worktree_dir":      c.WorktreeDir,
-		"state_dir":         c.StateDir,
-		"prompt":            c.Prompt,
-		"resume_prompt":     c.ResumePrompt,
+	// A slice, not a map: Go randomises map iteration, so a map would print the
+	// same bad config's errors in a different order on every run.
+	required := []struct{ field, value string }{
+		{"name", c.Name},
+		{"repo", c.Repo},
+		{"checkout_base_dir", c.CheckoutBaseDir},
+		{"worktree_dir", c.WorktreeDir},
+		{"state_dir", c.StateDir},
+		{"default_branch", c.DefaultBranch},
+		{"prompt", c.Prompt},
+		{"resume_prompt", c.ResumePrompt},
 	}
-	for field, value := range required {
-		if strings.TrimSpace(value) == "" {
-			errs = append(errs, fmt.Errorf("%s is required", field))
+	for _, r := range required {
+		if strings.TrimSpace(r.value) == "" {
+			errs = append(errs, fmt.Errorf("%s is required", r.field))
 		}
 	}
 
@@ -421,17 +459,38 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf("repo must be in owner/name form, got %q", c.Repo))
 	}
 
-	roles := map[string]string{
-		"labels.trigger":   c.Labels.Trigger,
-		"labels.in_flight": c.Labels.InFlight,
-		"labels.blocked":   c.Labels.Blocked,
-		"labels.review":    c.Labels.Review,
-		"labels.terminal":  c.Labels.Terminal,
+	// labels.terminal is deliberately NOT required. The planning loop has a
+	// terminal label (the human's approval); the execution loop has none,
+	// because an issue leaves it when its pull request merges. Requiring it
+	// would force an operator to invent a value that changes no behavior.
+	roles := []struct{ field, value string }{
+		{"labels.trigger", c.Labels.Trigger},
+		{"labels.in_flight", c.Labels.InFlight},
+		{"labels.blocked", c.Labels.Blocked},
+		{"labels.review", c.Labels.Review},
 	}
-	for field, value := range roles {
-		if strings.TrimSpace(value) == "" {
-			errs = append(errs, fmt.Errorf("%s is required", field))
+	for _, r := range roles {
+		if strings.TrimSpace(r.value) == "" {
+			errs = append(errs, fmt.Errorf("%s is required", r.field))
 		}
+	}
+
+	switch c.Agent.PermissionMode {
+	case "", "acceptEdits", "auto", "manual", "dontAsk", "plan":
+	case "bypassPermissions":
+		// bypassPermissions disables every permission prompt. The agent reads
+		// issue and comment text written by third parties, so an injected
+		// instruction executes with no gate. Require the operator to say so.
+		if !c.AcknowledgeBypassPermissions {
+			errs = append(errs, errors.New(
+				"agent.permission_mode is \"bypassPermissions\", which disables every "+
+					"permission prompt on third-party issue text; set "+
+					"i_understand_bypass_permissions: true to confirm"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf(
+			"agent.permission_mode %q is not a valid claude permission mode",
+			c.Agent.PermissionMode))
 	}
 
 	switch c.Agent.Worktree {
@@ -737,14 +796,26 @@ const (
 
 // IssueState is the durable per-issue record.
 type IssueState struct {
-	Loop          string
-	Repo          string
-	Number        int
-	SessionID     string
-	WorktreePath  string
-	RetryCount    int
+	Loop         string
+	Repo         string
+	Number       int
+	SessionID    string
+	WorktreePath string
+	RetryCount   int
+	// LastRetryTick is the tick counter value when the last retry was dispatched.
 	LastRetryTick int64
-	UpdatedAt     time.Time
+	// NeedsRetry is durable failure state. A dispatch that dies or exits non-zero
+	// sets it. Only a retry, a park, or a success clears it. It must NOT be
+	// derived from the dispatches table: a tick that declines to act (backoff or
+	// circuit breaker) would then lose the fact and strand the issue forever.
+	NeedsRetry bool
+	// SessionStarted records that claude actually created the session. Until it
+	// is true, a retry must start rather than resume, because "-r" against a
+	// session that was never created fails every time.
+	SessionStarted bool
+	// Parked records that the loop gave up after the retry cap.
+	Parked    bool
+	UpdatedAt time.Time
 }
 
 // Dispatch is one agent run.
@@ -795,17 +866,19 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
+// The pragmas live in the DSN, not in this schema string. journal_mode is
+// persisted in the file, but busy_timeout and foreign_keys are PER CONNECTION.
+// The tick process and every detached runner open this file at the same time,
+// so a pragma applied to one pooled connection does not protect the others.
 const schema = `
-PRAGMA journal_mode=WAL;
-PRAGMA busy_timeout=5000;
-PRAGMA foreign_keys=ON;
-
 CREATE TABLE IF NOT EXISTS issues (
   loop            TEXT NOT NULL,
   repo            TEXT NOT NULL,
@@ -814,6 +887,9 @@ CREATE TABLE IF NOT EXISTS issues (
   worktree_path   TEXT NOT NULL DEFAULT '',
   retry_count     INTEGER NOT NULL DEFAULT 0,
   last_retry_tick INTEGER NOT NULL DEFAULT 0,
+  needs_retry     INTEGER NOT NULL DEFAULT 0,
+  session_started INTEGER NOT NULL DEFAULT 0,
+  parked          INTEGER NOT NULL DEFAULT 0,
   updated_at      TIMESTAMP NOT NULL,
   PRIMARY KEY (loop, repo, number)
 );
@@ -842,12 +918,13 @@ CREATE INDEX IF NOT EXISTS dispatches_running
   ON dispatches (loop, repo, status);
 
 CREATE TABLE IF NOT EXISTS pr_links (
-  loop      TEXT NOT NULL,
-  repo      TEXT NOT NULL,
-  number    INTEGER NOT NULL,
-  pr_number INTEGER NOT NULL,
-  head_ref  TEXT NOT NULL,
-  base_ref  TEXT NOT NULL,
+  loop       TEXT NOT NULL,
+  repo       TEXT NOT NULL,
+  number     INTEGER NOT NULL,
+  pr_number  INTEGER NOT NULL,
+  head_ref   TEXT NOT NULL,
+  base_ref   TEXT NOT NULL,
+  behind_by  INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (loop, repo, number)
 );
 
@@ -872,15 +949,25 @@ type Store struct {
 
 // Open opens the database at path and applies the schema.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// Every connection must carry busy_timeout, because several processes write
+	// this file. Passing the pragmas in the DSN is the only way to guarantee it.
+	dsn := "file:" + path +
+		"?_pragma=busy_timeout(10000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=foreign_keys(1)"
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	// The driver is not safe for unlimited parallel writers on one file.
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	// The database holds session identifiers. Keep it private to this user.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Chmod(path+suffix, 0o600)
 	}
 	return &Store{db: db}, nil
 }
@@ -891,7 +978,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // IssueStates returns every issue record for one loop and repository.
 func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	rows, err := s.db.Query(`
-		SELECT number, session_id, worktree_path, retry_count, last_retry_tick, updated_at
+		SELECT number, session_id, worktree_path, retry_count, last_retry_tick,
+		       needs_retry, session_started, parked, updated_at
 		FROM issues WHERE loop = ? AND repo = ?`, loop, repo)
 	if err != nil {
 		return nil, fmt.Errorf("query issues: %w", err)
@@ -902,7 +990,8 @@ func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	for rows.Next() {
 		st := IssueState{Loop: loop, Repo: repo}
 		if err := rows.Scan(&st.Number, &st.SessionID, &st.WorktreePath,
-			&st.RetryCount, &st.LastRetryTick, &st.UpdatedAt); err != nil {
+			&st.RetryCount, &st.LastRetryTick, &st.NeedsRetry, &st.SessionStarted,
+			&st.Parked, &st.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan issue: %w", err)
 		}
 		out[st.Number] = st
@@ -917,20 +1006,106 @@ func (s *Store) PutIssueState(st IssueState) error {
 	}
 	_, err := s.db.Exec(`
 		INSERT INTO issues (loop, repo, number, session_id, worktree_path,
-		                    retry_count, last_retry_tick, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		                    retry_count, last_retry_tick, needs_retry,
+		                    session_started, parked, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(loop, repo, number) DO UPDATE SET
 		  session_id      = excluded.session_id,
 		  worktree_path   = excluded.worktree_path,
 		  retry_count     = excluded.retry_count,
 		  last_retry_tick = excluded.last_retry_tick,
+		  needs_retry     = excluded.needs_retry,
+		  session_started = excluded.session_started,
+		  parked          = excluded.parked,
 		  updated_at      = excluded.updated_at`,
 		st.Loop, st.Repo, st.Number, st.SessionID, st.WorktreePath,
-		st.RetryCount, st.LastRetryTick, st.UpdatedAt.UTC())
+		st.RetryCount, st.LastRetryTick, st.NeedsRetry, st.SessionStarted,
+		st.Parked, st.UpdatedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("put issue state: %w", err)
 	}
 	return nil
+}
+
+// MarkNeedsRetry records that a dispatch for this issue failed. It is durable,
+// so a tick that declines to act on the failure (backoff or circuit breaker)
+// does not lose it.
+func (s *Store) MarkNeedsRetry(loop, repo string, number int) error {
+	_, err := s.db.Exec(`
+		INSERT INTO issues (loop, repo, number, needs_retry, updated_at)
+		VALUES (?, ?, ?, 1, ?)
+		ON CONFLICT(loop, repo, number) DO UPDATE SET
+		  needs_retry = 1, updated_at = excluded.updated_at`,
+		loop, repo, number, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("mark needs retry: %w", err)
+	}
+	return nil
+}
+
+// MarkSucceeded clears the failure state after a clean dispatch. It resets the
+// retry budget, so an issue that fails three times over its lifetime with
+// successful runs in between is not parked on its next single failure.
+func (s *Store) MarkSucceeded(loop, repo string, number int) error {
+	_, err := s.db.Exec(`
+		UPDATE issues
+		SET needs_retry = 0, parked = 0, retry_count = 0, session_started = 1,
+		    updated_at = ?
+		WHERE loop = ? AND repo = ? AND number = ?`,
+		time.Now().UTC(), loop, repo, number)
+	if err != nil {
+		return fmt.Errorf("mark succeeded: %w", err)
+	}
+	return nil
+}
+
+// IssueStateOrZero returns the stored state for one issue, or a zero value with
+// the keys filled in when no row exists.
+func (s *Store) IssueStateOrZero(loop, repo string, number int) IssueState {
+	states, err := s.IssueStates(loop, repo)
+	if err == nil {
+		if st, ok := states[number]; ok {
+			return st
+		}
+	}
+	return IssueState{Loop: loop, Repo: repo, Number: number}
+}
+
+// LastTick returns the time of the most recent recorded tick.
+func (s *Store) LastTick(loop string) (time.Time, error) {
+	var t time.Time
+	err := s.db.QueryRow(
+		`SELECT started_at FROM ticks WHERE loop = ? ORDER BY id DESC LIMIT 1`,
+		loop).Scan(&t)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("last tick: %w", err)
+	}
+	return t.UTC(), nil
+}
+
+// CostByIssue returns the total recorded cost for each issue.
+func (s *Store) CostByIssue(loop, repo string) (map[int]float64, error) {
+	rows, err := s.db.Query(
+		`SELECT number, SUM(cost_usd) FROM dispatches
+		 WHERE loop = ? AND repo = ? GROUP BY number`, loop, repo)
+	if err != nil {
+		return nil, fmt.Errorf("cost by issue: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[int]float64)
+	for rows.Next() {
+		var number int
+		var cost float64
+		if err := rows.Scan(&number, &cost); err != nil {
+			return nil, fmt.Errorf("scan cost: %w", err)
+		}
+		out[number] = cost
+	}
+	return out, rows.Err()
 }
 
 // DeleteIssueState removes one issue record.
@@ -1111,7 +1286,7 @@ func (s *Store) SetCooldown(loop string, until time.Time) error {
 func (s *Store) CooldownUntil(loop string) (time.Time, error) {
 	var t time.Time
 	err := s.db.QueryRow(`SELECT until FROM cooldowns WHERE loop = ?`, loop).Scan(&t)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return time.Time{}, nil
 	}
 	if err != nil {
@@ -1232,6 +1407,7 @@ Expected: FAIL. The package does not compile.
 package ghub
 
 import (
+	"regexp"
 	"strings"
 	"time"
 )
@@ -1254,9 +1430,20 @@ func (i Issue) HasLabel(name string) bool {
 	return false
 }
 
-// HasAnyLabel reports whether the issue carries any of names.
+// HasAnyLabel reports whether the issue carries any of names. An entry that
+// ends with "*" is a prefix rule, so "blocked:*" matches "blocked:design" and
+// "blocked:legal". The reference loops state the rule that way.
 func (i Issue) HasAnyLabel(names []string) bool {
 	for _, n := range names {
+		if strings.HasSuffix(n, "*") {
+			prefix := strings.TrimSuffix(n, "*")
+			for _, l := range i.Labels {
+				if len(l) >= len(prefix) && strings.EqualFold(l[:len(prefix)], prefix) {
+					return true
+				}
+			}
+			continue
+		}
 		if i.HasLabel(n) {
 			return true
 		}
@@ -1271,7 +1458,23 @@ type PullRequest struct {
 	BaseRef string
 	Body    string
 	Draft   bool
+	// HeadRepo is the full name of the repository the head branch lives in. A
+	// pull request from a fork has a different value here.
+	HeadRepo string
+	// AuthorAssociation is the author's relationship to the repository.
+	AuthorAssociation string
+	// Trusted is set at the API boundary. Only a trusted pull request may be
+	// linked to an issue and tended, because tending checks the head branch out
+	// and runs an agent inside it.
+	Trusted bool
 }
+
+// safeRef matches a git branch name this program is willing to pass to git.
+// It rejects a leading dash, which git would read as an option.
+var safeRef = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._/-]*$`)
+
+// SafeRef reports whether a ref name is safe to pass to git.
+func SafeRef(ref string) bool { return safeRef.MatchString(ref) }
 ```
 
 - [ ] **Step 4: Write `internal/ghub/ghub.go`**
@@ -1281,7 +1484,9 @@ package ghub
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 
 	"github.com/google/go-github/v77/github"
 )
@@ -1351,7 +1556,10 @@ func (g *GitHubClient) ListOpenIssues(ctx context.Context, owner, repo string) (
 		if resp.NextPage == 0 {
 			return all, nil
 		}
-		opts.Page = resp.NextPage
+		// IssueListByRepoOptions embeds BOTH ListCursorOptions (Page string) and
+		// ListOptions (Page int) at the same depth, so a bare opts.Page is an
+		// ambiguous selector and does not compile. Qualify it.
+		opts.ListOptions.Page = resp.NextPage
 	}
 }
 
@@ -1368,17 +1576,34 @@ func (g *GitHubClient) ListOpenPullRequests(ctx context.Context, owner, repo str
 			return nil, fmt.Errorf("list pull requests %s/%s: %w", owner, repo, err)
 		}
 		for _, pr := range page {
+			head := pr.GetHead().GetRef()
+			base := pr.GetBase().GetRef()
+			assoc := pr.GetAuthorAssociation()
+			headRepo := pr.GetHead().GetRepo().GetFullName()
+
+			// Trust is decided here, once, at the boundary. A pull request is
+			// trusted only when its head branch lives in this repository and its
+			// author is a repository insider. Tending checks the head branch out
+			// and runs an agent in it, so an untrusted head is code execution.
+			trusted := headRepo == owner+"/"+repo &&
+				(assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR") &&
+				SafeRef(head) && SafeRef(base)
+
 			all = append(all, PullRequest{
-				Number:  pr.GetNumber(),
-				HeadRef: pr.GetHead().GetRef(),
-				BaseRef: pr.GetBase().GetRef(),
-				Body:    pr.GetBody(),
-				Draft:   pr.GetDraft(),
+				Number:            pr.GetNumber(),
+				HeadRef:           head,
+				BaseRef:           base,
+				Body:              pr.GetBody(),
+				Draft:             pr.GetDraft(),
+				HeadRepo:          headRepo,
+				AuthorAssociation: assoc,
+				Trusted:           trusted,
 			})
 		}
 		if resp.NextPage == 0 {
 			return all, nil
 		}
+		// PullRequestListOptions embeds only ListOptions, so this one is fine.
 		opts.Page = resp.NextPage
 	}
 }
@@ -1422,17 +1647,7 @@ func (g *GitHubClient) EditLabels(ctx context.Context, owner, repo string, numbe
 }
 ```
 
-The import block for this file is:
-
-```go
-import (
-	"context"
-	"errors"
-	"fmt"
-
-	"github.com/google/go-github/v77/github"
-)
-```
+The import block is already correct inside the code block above. Do not add another.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -1478,10 +1693,10 @@ import (
 
 func TestLinkPR(t *testing.T) {
 	prs := []ghub.PullRequest{
-		{Number: 10, Body: "Closes #5", HeadRef: "feat/five", BaseRef: "master"},
-		{Number: 11, Body: "unrelated work"},
-		{Number: 12, Body: "fixes #123"},
-		{Number: 13, Body: "Resolves #7\n\nmore text"},
+		{Number: 10, Body: "Closes #5", HeadRef: "feat/five", BaseRef: "master", Trusted: true},
+		{Number: 11, Body: "unrelated work", Trusted: true},
+		{Number: 12, Body: "fixes #123", Trusted: true},
+		{Number: 13, Body: "Resolves #7\n\nmore text", Trusted: true},
 	}
 
 	cases := []struct {
@@ -1492,7 +1707,7 @@ func TestLinkPR(t *testing.T) {
 		{5, 10, true},
 		{7, 13, true},
 		{123, 12, true},
-		{12, 0, false},  // "#123" must not match issue 12
+		{12, 0, false}, // "#123" must not match issue 12
 		{999, 0, false},
 	}
 
@@ -1509,8 +1724,28 @@ func TestLinkPR(t *testing.T) {
 }
 
 func TestLinkPRIgnoresEmptyBody(t *testing.T) {
-	if _, ok := LinkPR(1, []ghub.PullRequest{{Number: 2}}); ok {
+	if _, ok := LinkPR(1, []ghub.PullRequest{{Number: 2, Trusted: true}}); ok {
 		t.Error("an empty body must not link")
+	}
+}
+
+// A fork pull request can claim "Closes #N" for any issue. Linking it would make
+// the tend path check an untrusted branch out and run an agent inside it.
+func TestLinkPRIgnoresUntrustedPullRequest(t *testing.T) {
+	prs := []ghub.PullRequest{{Number: 9, Body: "Closes #1", Trusted: false}}
+	if _, ok := LinkPR(1, prs); ok {
+		t.Error("an untrusted pull request must never link")
+	}
+}
+
+func TestLinkPRPrefersLowestNumber(t *testing.T) {
+	prs := []ghub.PullRequest{
+		{Number: 30, Body: "Closes #4", Trusted: true},
+		{Number: 12, Body: "Closes #4", Trusted: true},
+	}
+	got, ok := LinkPR(4, prs)
+	if !ok || got.Number != 12 {
+		t.Errorf("got PR %d (ok=%v), want the lowest trusted match, PR 12", got.Number, ok)
 	}
 }
 ```
@@ -1541,8 +1776,11 @@ const (
 	KindStart Kind = "start"
 	// KindResume continues the stored session for an issue.
 	KindResume Kind = "resume"
-	// KindRetry redispatches an orphaned issue.
-	KindRetry Kind = "retry"
+	// KindRetryStart redispatches a failed issue with a NEW session, because the
+	// previous attempt never created one.
+	KindRetryStart Kind = "retry_start"
+	// KindRetryResume redispatches a failed issue into its existing session.
+	KindRetryResume Kind = "retry_resume"
 	// KindTend rebases a stale pull request.
 	KindTend Kind = "tend"
 	// KindParkRetryExhausted is the one decision that writes to GitHub.
@@ -1568,9 +1806,6 @@ type State struct {
 	TickCount int64
 	// CooldownUntil is the time before which the loop must not dispatch.
 	CooldownUntil time.Time
-	// Orphans holds every dispatch row still marked running whose process is
-	// confirmed dead.
-	Orphans []store.Dispatch
 }
 
 // Decision is one action the tick must perform.
@@ -1611,19 +1846,28 @@ var closingRef = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[s
 
 // LinkPR returns the open pull request whose body closes issueNumber.
 // It returns false when no pull request closes the issue.
+// It ignores an untrusted pull request. Selection is deterministic: when more
+// than one trusted pull request closes the issue, the lowest number wins, so the
+// result does not depend on the order the API returned.
 func LinkPR(issueNumber int, prs []ghub.PullRequest) (ghub.PullRequest, bool) {
 	want := strconv.Itoa(issueNumber)
+	var best ghub.PullRequest
+	found := false
 	for _, pr := range prs {
-		if pr.Body == "" {
+		if !pr.Trusted || pr.Body == "" {
 			continue
 		}
 		for _, m := range closingRef.FindAllStringSubmatch(pr.Body, -1) {
-			if m[1] == want {
-				return pr, true
+			if m[1] != want {
+				continue
 			}
+			if !found || pr.Number < best.Number {
+				best, found = pr, true
+			}
+			break
 		}
 	}
-	return ghub.PullRequest{}, false
+	return best, found
 }
 
 // describeLink renders a link for a log line.
@@ -1664,12 +1908,16 @@ Decision rules, in order:
 
 1. When `now` is before `st.CooldownUntil`, return an empty plan.
 2. Build the set of issue numbers that have a live dispatch. **A live dispatch is the only guard against double dispatch.** A label is not a guard, because an agent flips its own labels and may not have done so yet.
-3. For each issue, skip it when it carries any veto label.
+3. For each issue, skip it when it carries any veto label. A veto entry that ends with `*` is a prefix rule.
 4. Skip an issue that has a live dispatch.
-5. When the issue has an orphan dispatch, apply the retry rules.
-6. Otherwise, when the issue carries the trigger label, start it or resume it. Resume when a stored session identifier exists.
-7. When `tend_pr` is true, select stale pull requests for issues carrying the review label.
-8. When the number of eligible orphans reaches the breaker threshold, drop every decision and set the cooldown.
+5. When the issue's stored state has `NeedsRetry`, apply the retry rules — but only when the issue also carries the in-flight label. `NeedsRetry` is **durable state on the issue row**, not a property of a dispatch row.
+6. Otherwise, when the issue carries the trigger label, start it or resume it. Resume only when a stored session identifier exists **and** `SessionStarted` is true.
+7. When the number of eligible retries reaches the breaker threshold, drop every dispatch decision and set the cooldown. Park decisions survive.
+8. When `tend_pr` is true, select stale pull requests for issues carrying the review label that received no other decision this tick.
+
+**Why `NeedsRetry` is durable state and not a derived value.** The first draft of this plan derived "orphan" from a dispatch row still marked `running` whose process was dead, and the tick retired that row as it discovered it. An orphan was therefore visible for exactly one tick — but two paths deliberately decline to act in that tick (the backoff window and the circuit breaker). The row was already retired by the next tick, so the failure was lost and the issue sat in-flight forever, never retried and never parked. With the default `backoff_ticks: [0, 1, 2]`, retries 2 and 3 and the retry cap were all unreachable. A durable flag on the issue row removes the whole class of bug: a tick that declines to act changes nothing, and the next tick sees the same fact.
+
+**Why the failure path covers more than a dead process.** A dispatch that exits non-zero — a platform error, an exhausted budget, a crashed `claude` — must also count against the retry cap. If only dead processes counted, a cleanly failing dispatch would leave the trigger label in place and redispatch on every tick, without a cap, at Opus prices. `Supervise` therefore sets `NeedsRetry` for any failed dispatch, not only for a dead one.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1742,7 +1990,7 @@ func TestResumesIssueWithStoredSession(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, cfg.Labels.Blocked)}}
 	st := State{Issues: map[int]store.IssueState{
-		1: {Number: 1, SessionID: "sess-1"},
+		1: {Number: 1, SessionID: "sess-1", SessionStarted: true},
 	}}
 
 	p := Decide(cfg, snap, st, time.Now())
@@ -1774,11 +2022,21 @@ func TestNoTriggerLabelIsSkipped(t *testing.T) {
 
 // A live dispatch is the guard against double dispatch, not the label. An agent
 // that has not yet flipped trigger -> in_flight must not be dispatched twice.
+func TestVetoSupportsPrefixWildcard(t *testing.T) {
+	cfg := testConfig()
+	cfg.Labels.Veto = []string{"blocked:*"}
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "blocked:legal")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none; blocked:* must match blocked:legal", kinds(p))
+	}
+}
+
 func TestLiveDispatchBlocksSecondDispatch(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
 	st := State{
-		Issues:  map[int]store.IssueState{1: {Number: 1, SessionID: "sess-1"}},
+		Issues:  map[int]store.IssueState{1: {Number: 1, SessionID: "sess-1", SessionStarted: true}},
 		Running: []store.Dispatch{{Number: 1, Kind: store.KindStart, Status: store.StatusRunning}},
 	}
 	p := Decide(cfg, snap, st, time.Now())
@@ -1800,47 +2058,87 @@ func TestHealthyInFlightIssueProducesNothing(t *testing.T) {
 	}
 }
 
-func TestOrphanRetriesImmediatelyOnFirstAttempt(t *testing.T) {
+func TestFailedIssueRetriesImmediatelyOnFirstAttempt(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
 	st := State{
-		Issues:    map[int]store.IssueState{1: {Number: 1, SessionID: "s", RetryCount: 0}},
-		Orphans:   []store.Dispatch{{Number: 1, Status: store.StatusRunning}},
+		Issues: map[int]store.IssueState{
+			1: {Number: 1, SessionID: "s", SessionStarted: true, NeedsRetry: true},
+		},
 		TickCount: 5,
 	}
 	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetry {
-		t.Fatalf("decisions = %v, want one retry", kinds(p))
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryResume {
+		t.Fatalf("decisions = %v, want one retry_resume", kinds(p))
 	}
 }
 
-func TestOrphanWaitsInsideBackoffWindow(t *testing.T) {
+// A dispatch that died before claude created the session must retry as a START.
+// Resuming a session that was never created fails identically every time.
+func TestRetryStartsWhenSessionWasNeverCreated(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
-	// Retry 2 needs one extra tick after the retry-1 marker at tick 5.
 	st := State{
-		Issues:    map[int]store.IssueState{1: {Number: 1, RetryCount: 1, LastRetryTick: 5}},
-		Orphans:   []store.Dispatch{{Number: 1}},
+		Issues: map[int]store.IssueState{
+			1: {Number: 1, SessionID: "s", SessionStarted: false, NeedsRetry: true},
+		},
+		TickCount: 5,
+	}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryStart {
+		t.Fatalf("decisions = %v, want one retry_start", kinds(p))
+	}
+}
+
+// The reference loops define an orphan as carrying the in-flight label. An agent
+// that finished its work and moved the label on must not be woken by a retry.
+func TestFailedIssueWithoutInFlightLabelIsLeftAlone(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Blocked)}}
+	st := State{
+		Issues:    map[int]store.IssueState{1: {Number: 1, NeedsRetry: true}},
 		TickCount: 5,
 	}
 	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none inside the backoff window", kinds(p))
-	}
-
-	st.TickCount = 6
-	p = Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetry {
-		t.Fatalf("decisions = %v, want one retry once backoff clears", kinds(p))
+		t.Fatalf("decisions = %v, want none", kinds(p))
 	}
 }
 
-func TestOrphanParksAtRetryCap(t *testing.T) {
+// This is the regression test for the strand bug: a deferred retry must still be
+// pending on the NEXT tick, because NeedsRetry is durable state rather than a
+// dispatch row the reconcile pass consumes.
+func TestBackoffDefersButDoesNotLoseTheRetry(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
 	st := State{
-		Issues:    map[int]store.IssueState{1: {Number: 1, RetryCount: 3, LastRetryTick: 1}},
-		Orphans:   []store.Dispatch{{Number: 1}},
+		Issues: map[int]store.IssueState{
+			1: {Number: 1, RetryCount: 2, LastRetryTick: 5, NeedsRetry: true,
+				SessionID: "s", SessionStarted: true},
+		},
+		TickCount: 5,
+	}
+	// backoff_ticks[2] == 2, so tick 5 and tick 6 defer.
+	for _, tick := range []int64{5, 6} {
+		st.TickCount = tick
+		if p := Decide(cfg, snap, st, time.Now()); len(p.Decisions) != 0 {
+			t.Fatalf("tick %d: decisions = %v, want none inside backoff", tick, kinds(p))
+		}
+	}
+	st.TickCount = 7
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryResume {
+		t.Fatalf("tick 7: decisions = %v, want the retry to fire", kinds(p))
+	}
+}
+
+func TestParksAtRetryCap(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
+	st := State{
+		Issues: map[int]store.IssueState{
+			1: {Number: 1, RetryCount: 3, LastRetryTick: 1, NeedsRetry: true},
+		},
 		TickCount: 99,
 	}
 	p := Decide(cfg, snap, st, time.Now())
@@ -1849,27 +2147,61 @@ func TestOrphanParksAtRetryCap(t *testing.T) {
 	}
 }
 
-func TestCircuitBreakerDropsEveryDecision(t *testing.T) {
+// A parked issue must stay quiet. parkRetryExhausted removes the trigger label,
+// so the issue carries only the blocked label and nothing picks it up.
+func TestParkedIssueIsNotResumed(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Blocked)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s", SessionStarted: true, Parked: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none for a parked issue", kinds(p))
+	}
+}
+
+// A human re-applying the trigger label un-parks the issue and resumes its
+// original session. This is the operator's only way out of a park.
+func TestHumanRetriggerUnparks(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, cfg.Labels.Blocked)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s", SessionStarted: true, Parked: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindResume {
+		t.Fatalf("decisions = %v, want one resume", kinds(p))
+	}
+	if p.Decisions[0].SessionID != "s" {
+		t.Errorf("SessionID = %q, want the original session s", p.Decisions[0].SessionID)
+	}
+}
+
+func TestCircuitBreakerDropsDispatchesButKeepsParks(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{
 		issue(1, cfg.Labels.InFlight),
 		issue(2, cfg.Labels.InFlight),
 		issue(3, cfg.Labels.Trigger),
+		issue(4, cfg.Labels.InFlight),
 	}}
 	st := State{
 		Issues: map[int]store.IssueState{
-			1: {Number: 1, RetryCount: 0},
-			2: {Number: 2, RetryCount: 0},
+			1: {Number: 1, NeedsRetry: true},
+			2: {Number: 2, NeedsRetry: true},
+			4: {Number: 4, NeedsRetry: true, RetryCount: 3},
 		},
-		Orphans:   []store.Dispatch{{Number: 1}, {Number: 2}},
 		TickCount: 10,
 	}
 	p := Decide(cfg, snap, st, time.Now())
 	if !p.BreakerTripped {
-		t.Fatal("BreakerTripped = false, want true with two eligible orphans")
+		t.Fatal("BreakerTripped = false, want true with two eligible retries")
 	}
-	if len(p.Decisions) != 0 {
-		t.Errorf("decisions = %v, want none when the breaker trips", kinds(p))
+	// Issue 3's start and issues 1 and 2's retries are dropped. Issue 4's park
+	// survives: the reference loop still posts a cap-reached comment that is due.
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindParkRetryExhausted {
+		t.Errorf("decisions = %v, want only the park", kinds(p))
 	}
 	if p.CooldownUntil.IsZero() {
 		t.Error("CooldownUntil must be set when the breaker trips")
@@ -2009,21 +2341,13 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		liveIssues[d.Number] = true
 	}
 
-	orphanIssues := make(map[int]bool, len(st.Orphans))
-	for _, d := range st.Orphans {
-		if d.Kind == store.KindTend {
-			// A dead tend run holds no label and needs no retry bookkeeping.
-			// The next tick re-evaluates the pull request from scratch.
-			continue
-		}
-		orphanIssues[d.Number] = true
-	}
-
 	issues := append([]ghub.Issue(nil), snap.Issues...)
 	sort.Slice(issues, func(i, j int) bool { return issues[i].Number < issues[j].Number })
 
 	var decisions []Decision
-	eligibleOrphans := 0
+	var parks []Decision
+	decided := make(map[int]bool)
+	eligibleRetries := 0
 
 	for _, iss := range issues {
 		if iss.HasAnyLabel(cfg.Labels.Veto) {
@@ -2035,61 +2359,83 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			continue
 		}
 
-		if orphanIssues[iss.Number] {
-			d, eligible := orphanDecision(cfg, iss.Number, st)
+		state := st.Issues[iss.Number]
+
+		// FAILURE PATH. NeedsRetry is durable state written when a dispatch died
+		// or exited non-zero. It covers both a dead runner and a clean non-zero
+		// exit, so a failing dispatch can never redispatch without a cap.
+		if state.NeedsRetry {
+			// The reference loops define an orphan as "carries the in-flight
+			// label AND has no live agent". Honour that: an agent that finished
+			// its work and moved the label on must not be woken by a retry.
+			if !iss.HasLabel(cfg.Labels.InFlight) {
+				continue
+			}
+			d, eligible := retryDecision(cfg, iss.Number, state, st)
 			if eligible {
-				eligibleOrphans++
+				eligibleRetries++
 			}
 			if d != nil {
-				decisions = append(decisions, *d)
+				decided[iss.Number] = true
+				if d.Kind == KindParkRetryExhausted {
+					parks = append(parks, *d)
+				} else {
+					decisions = append(decisions, *d)
+				}
 			}
 			continue
 		}
 
+		// A parked issue needs no separate guard here. parkRetryExhausted removes
+		// the trigger label, so the check below already skips it, and a human who
+		// re-applies that label deliberately un-parks the issue.
 		if !iss.HasLabel(cfg.Labels.Trigger) {
 			continue
 		}
 
-		state := st.Issues[iss.Number]
-		if state.SessionID != "" {
+		decided[iss.Number] = true
+		if state.SessionID != "" && state.SessionStarted {
 			decisions = append(decisions, Decision{
 				Kind:      KindResume,
 				Issue:     iss.Number,
 				SessionID: state.SessionID,
-				Reason:    "trigger label present and a session exists",
+				Reason:    "trigger label present and a started session exists",
 			})
 			continue
 		}
 		decisions = append(decisions, Decision{
-			Kind:   KindStart,
-			Issue:  iss.Number,
-			Reason: "trigger label present and no session exists",
+			Kind:      KindStart,
+			Issue:     iss.Number,
+			SessionID: state.SessionID,
+			Reason:    "trigger label present and no started session exists",
 		})
 	}
 
-	// The breaker treats several orphans in one tick as a platform failure
-	// rather than several unrelated crashes. It drops every decision, including
-	// starts and tends, exactly as the reference documents require.
-	if eligibleOrphans >= cfg.Retry.Breaker.OrphanThreshold {
+	// The breaker treats several failures in one tick as a platform problem
+	// rather than several unrelated crashes. It drops every DISPATCH decision.
+	// Parks survive: the reference loop states that a cap-reached comment already
+	// due is still posted during a breaker tick.
+	if eligibleRetries >= cfg.Retry.Breaker.OrphanThreshold {
 		return Plan{
+			Decisions:      parks,
 			BreakerTripped: true,
 			CooldownUntil:  now.Add(cfg.Retry.Breaker.Cooldown.Std()),
 		}
 	}
 
+	decisions = append(decisions, parks...)
+
 	if cfg.TendPR {
-		decisions = append(decisions, tendDecisions(cfg, issues, snap, liveTendPRs)...)
+		decisions = append(decisions, tendDecisions(cfg, issues, snap, liveTendPRs, decided)...)
 	}
 
 	return Plan{Decisions: decisions}
 }
 
-// orphanDecision returns the action for one orphaned issue. The second result
-// reports whether the orphan cleared its backoff window, which is what the
+// retryDecision returns the action for one failed issue. The second result
+// reports whether the failure cleared its backoff window, which is what the
 // circuit breaker counts.
-func orphanDecision(cfg *config.Config, number int, st State) (*Decision, bool) {
-	state := st.Issues[number]
-
+func retryDecision(cfg *config.Config, number int, state store.IssueState, st State) (*Decision, bool) {
 	if state.RetryCount >= cfg.Retry.Max {
 		return &Decision{
 			Kind:   KindParkRetryExhausted,
@@ -2104,22 +2450,40 @@ func orphanDecision(cfg *config.Config, number int, st State) (*Decision, bool) 
 	}
 	if wait > 0 && st.TickCount-state.LastRetryTick < int64(wait) {
 		// Still inside the backoff window. Take no action and post no comment.
+		// NeedsRetry stays set in the store, so the next tick sees it again.
 		return nil, false
 	}
 
+	// Resume only when claude actually created the session. Otherwise "-r" would
+	// target a session that never existed and fail identically every retry.
+	kind := KindRetryStart
+	if state.SessionStarted && state.SessionID != "" {
+		kind = KindRetryResume
+	}
 	return &Decision{
-		Kind:      KindRetry,
+		Kind:      kind,
 		Issue:     number,
 		SessionID: state.SessionID,
-		Reason:    fmt.Sprintf("orphan retry %d/%d", state.RetryCount+1, cfg.Retry.Max),
+		Reason:    fmt.Sprintf("retry %d/%d after a failed dispatch", state.RetryCount+1, cfg.Retry.Max),
 	}, true
 }
 
 // tendDecisions selects stale pull requests for issues awaiting review.
-func tendDecisions(cfg *config.Config, issues []ghub.Issue, snap Snapshot, liveTendPRs map[int]bool) []Decision {
+func tendDecisions(
+	cfg *config.Config,
+	issues []ghub.Issue,
+	snap Snapshot,
+	liveTendPRs map[int]bool,
+	decided map[int]bool,
+) []Decision {
 	var out []Decision
 	for _, iss := range issues {
 		if iss.HasAnyLabel(cfg.Labels.Veto) {
+			continue
+		}
+		if decided[iss.Number] {
+			// The issue already has a decision this tick. Two agents in one
+			// branch is worse than a late rebase.
 			continue
 		}
 		if !iss.HasLabel(cfg.Labels.Review) {
@@ -2205,6 +2569,17 @@ func TestIsAliveFalseForDeadProcess(t *testing.T) {
 	}
 	if IsAlive(cmd.Process.Pid, 1) {
 		t.Error("IsAlive = true for an exited process")
+	}
+}
+
+func TestIsAliveRejectsPrefixCollision(t *testing.T) {
+	// A runner for dispatch 70 must not make dispatch 7 look alive.
+	line := "/usr/local/bin/agent-utils internal run-agent --dispatch 70 --config /x.yaml"
+	if matchesDispatch(line, 7) {
+		t.Error("substring collision: dispatch 7 matched a dispatch 70 runner")
+	}
+	if !matchesDispatch(line, 70) {
+		t.Error("dispatch 70 must match its own runner")
 	}
 }
 
@@ -2306,7 +2681,10 @@ const DispatchFlag = "--dispatch"
 
 // CommandLine returns the full command line of pid.
 func CommandLine(pid int) (string, error) {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	// -ww stops procps on Linux from truncating the argument list at 80 columns
+	// when stdout is not a terminal. Without it the --dispatch token can fall off
+	// the end and every live runner is reported dead.
+	out, err := exec.Command("ps", "-ww", "-p", strconv.Itoa(pid), "-o", "command=").Output()
 	if err != nil {
 		return "", fmt.Errorf("read command line of %d: %w", pid, err)
 	}
@@ -2328,10 +2706,27 @@ func IsAlive(pid int, dispatchID int64) bool {
 	}
 	cmdline, err := CommandLine(pid)
 	if err != nil {
-		return false
+		// The kernel already confirmed the process exists. A failed ps (EAGAIN
+		// under load, for example) is not evidence of death. Fail SAFE: report
+		// alive, so a transient error cannot cause a duplicate dispatch.
+		return true
 	}
-	marker := DispatchFlag + " " + strconv.FormatInt(dispatchID, 10)
-	return strings.Contains(cmdline, marker)
+	// Match on whole tokens. A substring match would make "--dispatch 7" match a
+	// live runner for dispatch 70, which would strand dispatch 7 forever.
+	return matchesDispatch(cmdline, dispatchID)
+}
+
+// matchesDispatch reports whether a command line is the runner for dispatchID.
+// It compares whole tokens, never a substring.
+func matchesDispatch(cmdline string, dispatchID int64) bool {
+	want := strconv.FormatInt(dispatchID, 10)
+	fields := strings.Fields(cmdline)
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == DispatchFlag && fields[i+1] == want {
+			return true
+		}
+	}
+	return false
 }
 ```
 
@@ -2459,13 +2854,23 @@ func initRepo(t *testing.T) string {
 	}
 	run("add", ".")
 	run("commit", "-m", "initial")
+
+	// EnsureIssue starts worktrees from origin/<default_branch>, so the fixture
+	// needs a real origin to resolve that ref.
+	bare := t.TempDir()
+	cmd := exec.Command("git", "init", "--bare", bare)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+	run("remote", "add", "origin", bare)
+	run("push", "-u", "origin", "master")
 	return dir
 }
 
 func TestEnsureIssueCreatesWorktreeAndIsIdempotent(t *testing.T) {
 	repo := initRepo(t)
 	wtDir := filepath.Join(t.TempDir(), "worktrees")
-	m := New(repo, wtDir, "planning")
+	m := New(repo, wtDir, "planning", "master")
 
 	path, err := m.EnsureIssue(42)
 	if err != nil {
@@ -2491,7 +2896,7 @@ func TestEnsureIssueCreatesWorktreeAndIsIdempotent(t *testing.T) {
 func TestRemoveDeletesWorktree(t *testing.T) {
 	repo := initRepo(t)
 	wtDir := filepath.Join(t.TempDir(), "worktrees")
-	m := New(repo, wtDir, "planning")
+	m := New(repo, wtDir, "planning", "master")
 
 	path, err := m.EnsureIssue(7)
 	if err != nil {
@@ -2506,7 +2911,7 @@ func TestRemoveDeletesWorktree(t *testing.T) {
 }
 
 func TestPathHelpers(t *testing.T) {
-	m := New("/repo", "/wt", "exec")
+	m := New("/repo", "/wt", "exec", "main")
 	if got := m.PathForIssue(3); got != "/wt/exec/issue-3" {
 		t.Errorf("PathForIssue = %q", got)
 	}
@@ -2532,6 +2937,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -2540,14 +2946,16 @@ type Manager struct {
 	checkoutBaseDir string
 	worktreeDir     string
 	loop            string
+	defaultBranch   string
 }
 
 // New returns a Manager.
-func New(checkoutBaseDir, worktreeDir, loop string) *Manager {
+func New(checkoutBaseDir, worktreeDir, loop, defaultBranch string) *Manager {
 	return &Manager{
 		checkoutBaseDir: checkoutBaseDir,
 		worktreeDir:     worktreeDir,
 		loop:            loop,
+		defaultBranch:   defaultBranch,
 	}
 }
 
@@ -2574,11 +2982,20 @@ func (m *Manager) EnsureIssue(number int) (string, error) {
 	if exists(path) {
 		return path, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("create worktree parent: %w", err)
 	}
-	branch := fmt.Sprintf("agent-utils/%s/issue-%d", m.loop, number)
-	if err := m.git(m.checkoutBaseDir, "worktree", "add", "-B", branch, path); err != nil {
+	// Create the worktree DETACHED at an explicit start point.
+	//
+	// Two reasons. First, "worktree add -B <branch> <path>" with no start point
+	// branches from whatever the primary checkout has checked out, which this
+	// program does not control. Second, both reference loops make branch
+	// resolution the AGENT's job: plan-feature may already have created the
+	// feature branch and committed design assets on it, and build-feature must
+	// check that branch out rather than re-create it. Inventing a branch here
+	// would fight that rule.
+	start := "origin/" + m.defaultBranch
+	if err := m.git(m.checkoutBaseDir, "worktree", "add", "--detach", path, start); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -2587,23 +3004,40 @@ func (m *Manager) EnsureIssue(number int) (string, error) {
 // EnsurePR creates the worktree for a pull request and checks out its head
 // branch.
 func (m *Manager) EnsurePR(number int, headRef string) (string, error) {
+	if !SafeRef(headRef) {
+		return "", fmt.Errorf("unsafe branch name %q", headRef)
+	}
 	path := m.PathForPR(number)
+
 	if exists(path) {
-		if err := m.git(path, "checkout", headRef); err != nil {
+		// Refresh an existing tend worktree. Without the fetch the rebase agent
+		// would operate on a stale head and could force-push a regression.
+		if err := m.git(path, "fetch", "origin", headRef); err != nil {
+			return "", err
+		}
+		if err := m.git(path, "checkout", "--detach", "FETCH_HEAD"); err != nil {
 			return "", err
 		}
 		return path, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("create worktree parent: %w", err)
 	}
-	err := m.git(m.checkoutBaseDir, "worktree", "add", path,
-		"--track", "-B", headRef, "origin/"+headRef)
+	// Detached, so this never collides with the same branch checked out in the
+	// issue worktree. Git refuses to check one branch out in two worktrees, and
+	// that collision would hit exactly the pull requests most in need of a rebase.
+	err := m.git(m.checkoutBaseDir, "worktree", "add", "--detach", path, "origin/"+headRef)
 	if err != nil {
 		return "", err
 	}
 	return path, nil
 }
+
+// SafeRef reports whether a ref name is safe to pass to git as an argument.
+// It rejects a leading dash, which git would read as an option.
+func SafeRef(ref string) bool { return safeRef.MatchString(ref) }
+
+var safeRef = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._/-]*$`)
 
 // Remove deletes a worktree and its directory.
 func (m *Manager) Remove(path string) error {
@@ -3251,6 +3685,12 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
+// RunnerLogPath returns the log file path for a detached runner process.
+func RunnerLogPath(stateDir, loop string, dispatchID int64) string {
+	return filepath.Join(stateDir, "logs", loop,
+		fmt.Sprintf("runner-%d.log", dispatchID))
+}
+
 // Spawn starts a detached runner process for one dispatch and returns its
 // process identifier.
 //
@@ -3258,16 +3698,28 @@ import (
 // runs for a long time. Some process must therefore outlive the tick to record
 // how the agent ended. The runner is this program invoked again, so it survives
 // the tick and writes the outcome itself.
-func Spawn(selfPath string, dispatchID int64, configPath string) (int, error) {
+func Spawn(selfPath string, dispatchID int64, configPath, runnerLog string) (int, error) {
 	cmd := exec.Command(selfPath, "internal", "run-agent",
 		proc.DispatchFlag, strconv.FormatInt(dispatchID, 10),
 		"--config", configPath)
 
-	// Detach from the tick: a new session, and no inherited standard streams.
+	// Detach from the tick with a new session.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+
+	// The runner does the long work, so its structured logs must go somewhere.
+	// Discarding them would make every failure inside the detached process
+	// invisible. Open the file 0600: it can quote repository content.
+	if err := os.MkdirAll(filepath.Dir(runnerLog), 0o700); err != nil {
+		return 0, fmt.Errorf("create runner log directory: %w", err)
+	}
+	lf, err := os.OpenFile(runnerLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return 0, fmt.Errorf("open runner log: %w", err)
+	}
+	defer lf.Close()
+	cmd.Stdout = lf
+	cmd.Stderr = lf
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("spawn runner for dispatch %d: %w", dispatchID, err)
@@ -3297,15 +3749,16 @@ func Supervise(
 		defer cancel()
 	}
 
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return finish(st, d.ID, store.DispatchResult{
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return finish(st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("create log directory: %v", err),
 		})
 	}
-	logFile, err := os.Create(logPath)
+	// 0600: the transcript records everything the agent read and ran.
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return finish(st, d.ID, store.DispatchResult{
+		return finish(st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("create log file: %v", err),
 		})
@@ -3314,18 +3767,39 @@ func Supervise(
 
 	cmd := exec.CommandContext(ctx, "claude", BuildArgs(cfg, inv)...)
 	cmd.Dir = workDir
+	cmd.Env = agentEnv()
+	// Put the agent in its own process group so a timeout can kill the whole
+	// tree. A coding agent routinely leaves dev servers and watchers behind, and
+	// CommandContext kills only the direct child.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	}
+	// Do not block forever in Wait when a grandchild still holds the pipe.
+	cmd.WaitDelay = 10 * time.Second
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return finish(st, d.ID, store.DispatchResult{
+		return finish(st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("stdout pipe: %v", err),
 		})
 	}
-	cmd.Stderr = logFile
+	// Give stderr its own file. Sharing one file description between the child
+	// and the parent's tee splices plain text into the middle of a JSON line and
+	// makes the transcript unparseable.
+	errFile, err := os.OpenFile(logPath+".stderr", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return finish(st, d, store.DispatchResult{
+			Status: store.StatusFailed, ExitCode: -1,
+			APIError: fmt.Sprintf("create stderr log: %v", err),
+		})
+	}
+	defer errFile.Close()
+	cmd.Stderr = errFile
 
 	if err := cmd.Start(); err != nil {
-		return finish(st, d.ID, store.DispatchResult{
+		return finish(st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("start claude: %v", err),
 		})
@@ -3365,17 +3839,51 @@ func Supervise(
 		res.Status = store.StatusFailed
 	}
 
-	return finish(st, d.ID, res)
+	return finish(st, d, res)
 }
 
-func finish(st *store.Store, id int64, res store.DispatchResult) error {
-	if err := st.FinishDispatch(id, res); err != nil {
-		return fmt.Errorf("record dispatch %d: %w", id, err)
+// finish records the outcome of a dispatch AND the durable issue state that the
+// next tick's decision depends on. Both writes happen here so no code path can
+// record one without the other.
+func finish(st *store.Store, d store.Dispatch, res store.DispatchResult) error {
+	if err := st.FinishDispatch(d.ID, res); err != nil {
+		return fmt.Errorf("record dispatch %d: %w", d.ID, err)
 	}
+
+	// A tend run holds no issue state: it is idempotent and keeps no session.
+	if d.Kind != store.KindTend {
+		if res.Status == store.StatusFailed {
+			if err := st.MarkNeedsRetry(d.Loop, d.Repo, d.Number); err != nil {
+				return fmt.Errorf("mark needs retry: %w", err)
+			}
+		} else if err := st.MarkSucceeded(d.Loop, d.Repo, d.Number); err != nil {
+			return fmt.Errorf("mark succeeded: %w", err)
+		}
+	}
+
 	if res.Status == store.StatusFailed {
-		return fmt.Errorf("dispatch %d failed: exit %d: %s", id, res.ExitCode, res.APIError)
+		return fmt.Errorf("dispatch %d failed: exit %d: %s", d.ID, res.ExitCode, res.APIError)
 	}
 	return nil
+}
+
+// agentEnv returns the environment for the claude child.
+//
+// The parent environment is NOT inherited. It holds GITHUB_TOKEN, which the
+// agent never needs and which an injected instruction in an issue comment could
+// exfiltrate, because the agent runs with permission prompts disabled.
+func agentEnv() []string {
+	keep := []string{
+		"HOME", "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM",
+		"TMPDIR", "SSH_AUTH_SOCK", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+	}
+	out := make([]string, 0, len(keep))
+	for _, k := range keep {
+		if v, ok := os.LookupEnv(k); ok {
+			out = append(out, k+"="+v)
+		}
+	}
+	return out
 }
 
 func exitCodeOf(err error) int {
@@ -3429,7 +3937,7 @@ git commit -m "feat(runner): detached spawn and child supervision that always re
 
 **review: yes** — this task holds the only GitHub write and the ordering that makes a tick safe to repeat.
 
-**Acceptance criteria:** `go test ./internal/loopcmd/...` passes with a fake `ghub.Client` and a fake spawn function. A tick with one triggered issue creates one dispatch row and calls spawn once. A second tick, while that dispatch is live, calls spawn zero times. `go build ./...` succeeds.
+**Acceptance criteria:** `go test ./internal/loopcmd/...` passes with a fake `ghub.Client`, a fake spawn function, and a fake liveness function. A tick with one triggered issue creates one dispatch row and calls spawn once. Three further ticks, while that dispatch is live, call spawn zero more times — asserted unconditionally, with liveness controlled through `Deps.IsAlive` rather than through a real process. A resumed issue carries the same session identifier as its first dispatch. A park removes both the in-flight label and the trigger label. `go build ./...` succeeds.
 
 The one GitHub write. When `Decide` returns `KindParkRetryExhausted`, the tick posts a comment and moves the issue from `in_flight` to `blocked`. This is the single exception to the rule that Go never writes to GitHub. The reference documents make the same exception, and for the same reason: the failing action is the dispatch itself, so an agent dispatched to report the failure would fail the same way.
 
@@ -3524,15 +4032,18 @@ func newDeps(t *testing.T, cfg *config.Config, gh ghub.Client, spawned *int) Dep
 	return Deps{
 		Store:      s,
 		GH:         gh,
-		WT:         worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name),
+		WT:         worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch),
 		SelfPath:   "/bin/true",
 		ConfigPath: "/tmp/loop.yaml",
 		Now:        time.Now,
-		Spawn: func(string, int64, string) (int, error) {
+		Spawn: func(string, int64, string, string) (int, error) {
 			*spawned++
 			return 4242, nil
 		},
-		SkipFetch: true,
+		// Default to "the runner is alive", which is the common case. A test
+		// that wants the failure path overrides this.
+		IsAlive: func(int, int64) bool { return true },
+		Fetch:   nil,
 	}
 }
 
@@ -3563,6 +4074,9 @@ func TestTickStartsTriggeredIssue(t *testing.T) {
 	}
 }
 
+// The single most important safety property: while an agent is alive, no second
+// agent is dispatched for the same issue. IsAlive is a seam so this is
+// deterministic rather than dependent on a real process.
 func TestTickDoesNotDoubleDispatchWhileRunning(t *testing.T) {
 	cfg := tickConfig(t)
 	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"trigger"}}}}
@@ -3572,16 +4086,128 @@ func TestTickDoesNotDoubleDispatchWhileRunning(t *testing.T) {
 	if _, err := Tick(context.Background(), cfg, deps); err != nil {
 		t.Fatal(err)
 	}
-	// The stub spawn returns pid 4242, which is not a live runner, so the
-	// second tick must treat it as an orphan rather than as a fresh start.
-	// Either way it must not start the issue a second time.
-	before := spawned
+	if spawned != 1 {
+		t.Fatalf("first tick spawned = %d, want 1", spawned)
+	}
+
+	// The issue still carries the trigger label, because the agent has not
+	// flipped it yet. The live dispatch must be what stops a second spawn.
+	for i := 0; i < 3; i++ {
+		if _, err := Tick(context.Background(), cfg, deps); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if spawned != 1 {
+		t.Errorf("spawned = %d after four ticks, want 1 while the agent is alive", spawned)
+	}
+}
+
+// A dead runner must be retried exactly once per tick, under the cap.
+func TestTickRetriesDeadRunnerOnce(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"in-flight"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+	deps.IsAlive = func(int, int64) bool { return false }
+
+	id, _ := deps.Store.CreateDispatch(store.Dispatch{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindStart, SessionID: "s",
+	})
+	_ = deps.Store.SetDispatchProcess(id, 999999, time.Now().Add(-time.Hour))
+	_ = deps.Store.PutIssueState(store.IssueState{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
+		SessionStarted: true, UpdatedAt: time.Now(),
+	})
+
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+	if spawned != 1 {
+		t.Fatalf("spawned = %d, want exactly 1 retry", spawned)
+	}
+	states, _ := deps.Store.IssueStates(cfg.Name, cfg.Repo)
+	if states[1].RetryCount != 1 {
+		t.Errorf("RetryCount = %d, want 1", states[1].RetryCount)
+	}
+}
+
+// This is the reason the project exists: a resumed issue must continue its
+// ORIGINAL session, not start a new one.
+func TestTickResumePreservesSession(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"trigger"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
 	if _, err := Tick(context.Background(), cfg, deps); err != nil {
 		t.Fatal(err)
 	}
 	states, _ := deps.Store.IssueStates(cfg.Name, cfg.Repo)
-	if states[1].RetryCount == 0 && spawned != before {
-		t.Errorf("issue was started twice: spawned went %d -> %d", before, spawned)
+	original := states[1].SessionID
+	if original == "" {
+		t.Fatal("first tick stored no session identifier")
+	}
+
+	// The agent finishes cleanly and parks. The human answers and re-applies
+	// the trigger label.
+	running, _ := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
+	for _, d := range running {
+		_ = deps.Store.FinishDispatch(d.ID, store.DispatchResult{Status: store.StatusSucceeded})
+	}
+	_ = deps.Store.MarkSucceeded(cfg.Name, cfg.Repo, 1)
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Resumed != 1 {
+		t.Fatalf("Resumed = %d, want 1", sum.Resumed)
+	}
+	states, _ = deps.Store.IssueStates(cfg.Name, cfg.Repo)
+	if states[1].SessionID != original {
+		t.Errorf("session changed on resume: %q -> %q", original, states[1].SessionID)
+	}
+
+	// The resume must be dispatched as a resume, so claude gets "-r".
+	all, _ := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
+	if len(all) != 1 || all[0].Kind != store.KindResume {
+		t.Errorf("dispatch kind = %+v, want one resume", all)
+	}
+	if all[0].SessionID != original {
+		t.Errorf("dispatch session = %q, want %q", all[0].SessionID, original)
+	}
+}
+
+// A tick must never wake an issue whose retry budget is spent, and the park must
+// remove the trigger label so nothing picks it up again.
+func TestParkRemovesTriggerLabel(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"in-flight"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+	deps.IsAlive = func(int, int64) bool { return false }
+
+	id, _ := deps.Store.CreateDispatch(store.Dispatch{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindStart, SessionID: "s",
+	})
+	_ = deps.Store.SetDispatchProcess(id, 999999, time.Now().Add(-time.Hour))
+	_ = deps.Store.PutIssueState(store.IssueState{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
+		RetryCount: 3, UpdatedAt: time.Now(),
+	})
+
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+	if spawned != 0 {
+		t.Errorf("spawned = %d, want 0 at the retry cap", spawned)
+	}
+	wantRemoved := map[string]bool{cfg.Labels.InFlight: true, cfg.Labels.Trigger: true}
+	for _, l := range gh.removed {
+		delete(wantRemoved, l)
+	}
+	if len(wantRemoved) != 0 {
+		t.Errorf("park did not remove %v; removed = %v", wantRemoved, gh.removed)
 	}
 }
 
@@ -3591,11 +4217,13 @@ func TestTickPostsCommentAndLabelsAtRetryCap(t *testing.T) {
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
 
-	// An orphan at the cap: a running dispatch row whose process is dead.
+	deps.IsAlive = func(int, int64) bool { return false }
+
+	// A failure at the cap: a running dispatch row whose process is dead.
 	id, _ := deps.Store.CreateDispatch(store.Dispatch{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindStart, SessionID: "s",
 	})
-	_ = deps.Store.SetDispatchProcess(id, 999999, time.Now())
+	_ = deps.Store.SetDispatchProcess(id, 999999, time.Now().Add(-time.Hour))
 	_ = deps.Store.PutIssueState(store.IssueState{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
 		RetryCount: 3, UpdatedAt: time.Now(),
@@ -3674,10 +4302,18 @@ type Deps struct {
 	SelfPath   string
 	ConfigPath string
 	Now        func() time.Time
-	Spawn      func(selfPath string, dispatchID int64, configPath string) (int, error)
-	// SkipFetch turns off the git fetch. Tests set it.
-	SkipFetch bool
+	Spawn      func(selfPath string, dispatchID int64, configPath, runnerLog string) (int, error)
+	// IsAlive reports whether a dispatch's runner process is still running.
+	// It is a seam so a test can control liveness; production passes proc.IsAlive.
+	IsAlive func(pid int, dispatchID int64) bool
+	// Fetch updates the primary checkout. It is a seam so a test can skip git.
+	Fetch func() error
 }
+
+// pidGracePeriod is how long a dispatch row may carry pid 0 before the tick
+// treats it as dead. It covers the window between the row insert and the pid
+// write, so a crash in that window cannot cause a duplicate dispatch.
+const pidGracePeriod = 90 * time.Second
 
 // Summary reports what one tick did.
 type Summary struct {
@@ -3696,8 +4332,8 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	var sum Summary
 	now := deps.Now()
 
-	if !deps.SkipFetch {
-		if err := deps.WT.Fetch(); err != nil {
+	if deps.Fetch != nil {
+		if err := deps.Fetch(); err != nil {
 			// A failed fetch makes every branch comparison stale. Stop here.
 			return sum, fmt.Errorf("fetch primary checkout: %w", err)
 		}
@@ -3727,13 +4363,22 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 			}
 			behind, err := deps.GH.BehindBy(ctx, owner, repo, pr.BaseRef, pr.HeadRef)
 			if err != nil {
-				return sum, err
+				// One unusable pull request must not abandon the whole tick. If
+				// this returned early, anyone able to open a pull request could
+				// stop the loop, and the tick counter would freeze with it,
+				// which also freezes every backoff window.
+				slog.Warn("compare failed; skipping this pull request",
+					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
+				continue
 			}
 			snap.BehindBy[pr.Number] = behind
-			_ = deps.Store.PutPRLink(store.PRLink{
+			if err := deps.Store.PutPRLink(store.PRLink{
 				Loop: cfg.Name, Repo: cfg.Repo, Number: iss.Number,
 				PRNumber: pr.Number, HeadRef: pr.HeadRef, BaseRef: pr.BaseRef,
-			})
+				BehindBy: behind,
+			}); err != nil {
+				slog.Error("store pr link", "loop", cfg.Name, "issue", iss.Number, "err", err)
+			}
 		}
 	}
 
@@ -3751,18 +4396,40 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	// retry policy here needs no marker comments.
 	st := engine.State{Issues: states, CooldownUntil: time.Time{}}
 	for _, d := range running {
-		if proc.IsAlive(d.PID, d.ID) {
+		// A row whose process has not registered its pid yet is NOT an orphan.
+		// The tick writes the pid just after the spawn, so a young row with
+		// pid 0 is a live agent in that window, not a dead one.
+		if d.PID == 0 && now.Sub(d.StartedAt) < pidGracePeriod {
 			st.Running = append(st.Running, d)
 			continue
 		}
-		st.Orphans = append(st.Orphans, d)
-		// A dead runner must not stay running forever.
-		_ = deps.Store.FinishDispatch(d.ID, store.DispatchResult{
+		if deps.IsAlive(d.PID, d.ID) {
+			st.Running = append(st.Running, d)
+			continue
+		}
+
+		// The runner died without recording an outcome. Retire the row AND write
+		// the durable failure flag. The flag is what the next decision reads: a
+		// tick that declines to act (backoff or breaker) must not lose the fact.
+		if err := deps.Store.FinishDispatch(d.ID, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1, APIError: "runner process died",
-		})
+		}); err != nil {
+			return sum, fmt.Errorf("retire dead dispatch %d: %w", d.ID, err)
+		}
+		if d.Kind != store.KindTend {
+			if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, d.Number); err != nil {
+				return sum, fmt.Errorf("mark issue %d for retry: %w", d.Number, err)
+			}
+			// Reflect the write in the snapshot this tick decides from.
+			sIssue := states[d.Number]
+			sIssue.Number = d.Number
+			sIssue.NeedsRetry = true
+			states[d.Number] = sIssue
+		}
+		sum.Orphans++
 	}
 	sum.Live = len(st.Running)
-	sum.Orphans = len(st.Orphans)
+	st.Issues = states
 
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
 		return sum, err
@@ -3783,7 +4450,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	}
 
 	for _, d := range plan.Decisions {
-		if err := act(ctx, cfg, deps, d, issues, now, &sum); err != nil {
+		if err := act(ctx, cfg, deps, d, st, now, &sum); err != nil {
 			// One failed decision must not abandon the rest of the tick.
 			slog.Error("decision failed", "loop", cfg.Name, "kind", d.Kind,
 				"issue", d.Issue, "err", err)
@@ -3803,7 +4470,7 @@ func act(
 	cfg *config.Config,
 	deps Deps,
 	d engine.Decision,
-	issues []ghub.Issue,
+	st engine.State,
 	now time.Time,
 	sum *Summary,
 ) error {
@@ -3813,16 +4480,21 @@ func act(
 		return parkRetryExhausted(ctx, cfg, deps, d)
 	case engine.KindTend:
 		sum.Tended++
-		return dispatch(ctx, cfg, deps, d, issues, now, store.KindTend)
+		return dispatch(ctx, cfg, deps, d, st, now, store.KindTend)
 	case engine.KindResume:
 		sum.Resumed++
-		return dispatch(ctx, cfg, deps, d, issues, now, store.KindResume)
-	case engine.KindRetry:
+		return dispatch(ctx, cfg, deps, d, st, now, store.KindResume)
+	case engine.KindRetryResume:
 		sum.Retried++
-		return dispatch(ctx, cfg, deps, d, issues, now, store.KindResume)
+		return dispatch(ctx, cfg, deps, d, st, now, store.KindResume)
+	case engine.KindRetryStart:
+		// The previous attempt never created a session, so resuming would fail
+		// the same way every time. Start instead, keeping the same identifier.
+		sum.Retried++
+		return dispatch(ctx, cfg, deps, d, st, now, store.KindStart)
 	case engine.KindStart:
 		sum.Started++
-		return dispatch(ctx, cfg, deps, d, issues, now, store.KindStart)
+		return dispatch(ctx, cfg, deps, d, st, now, store.KindStart)
 	default:
 		return fmt.Errorf("unknown decision kind %q", d.Kind)
 	}
@@ -3833,16 +4505,11 @@ func dispatch(
 	cfg *config.Config,
 	deps Deps,
 	d engine.Decision,
-	issues []ghub.Issue,
+	st engine.State,
 	now time.Time,
 	kind string,
 ) error {
-	state := store.IssueState{Loop: cfg.Name, Repo: cfg.Repo, Number: d.Issue}
-	if existing, err := deps.Store.IssueStates(cfg.Name, cfg.Repo); err == nil {
-		if s, ok := existing[d.Issue]; ok {
-			state = s
-		}
-	}
+	state := deps.Store.IssueStateOrZero(cfg.Name, cfg.Repo, d.Issue)
 
 	sessionID := d.SessionID
 	if sessionID == "" {
@@ -3853,21 +4520,31 @@ func dispatch(
 		sessionID = uuid.NewString()
 	}
 
-	workDir := cfg.CheckoutBaseDir
-	if cfg.Agent.Worktree == config.WorktreePerIssue {
-		var err error
-		if kind == store.KindTend {
-			workDir, err = deps.WT.EnsurePR(d.PR, d.HeadRef)
-		} else {
-			workDir, err = deps.WT.EnsureIssue(d.Issue)
+	logPath := runner.LogPath(cfg.StateDir, cfg.Name, d.Issue, kind, now)
+
+	// Persist the issue state BEFORE spawning. If the process dies between the
+	// spawn and this write, the next tick would otherwise see "no session" and
+	// start a second agent with a fresh session against a live worktree.
+	if kind != store.KindTend {
+		state.SessionID = sessionID
+		state.UpdatedAt = now
+		state.NeedsRetry = false
+		state.Parked = false
+		switch d.Kind {
+		case engine.KindRetryStart, engine.KindRetryResume:
+			state.RetryCount++
+			state.LastRetryTick = st.TickCount
+		default:
+			// A human trigger begins a new episode, so the budget starts over.
+			state.RetryCount = 0
 		}
-		if err != nil {
+		if err := deps.Store.PutIssueState(state); err != nil {
 			return err
 		}
 	}
 
-	logPath := runner.LogPath(cfg.StateDir, cfg.Name, d.Issue, kind, now)
-
+	// Create the dispatch row BEFORE the worktree, so a worktree failure is
+	// recorded as a failed dispatch rather than vanishing into a log line.
 	dispatchID, err := deps.Store.CreateDispatch(store.Dispatch{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: d.Issue, Kind: kind,
 		SessionID: sessionID, LogPath: logPath, PRNumber: d.PR,
@@ -3876,28 +4553,42 @@ func dispatch(
 		return err
 	}
 
-	pid, err := deps.Spawn(deps.SelfPath, dispatchID, deps.ConfigPath)
+	workDir := cfg.CheckoutBaseDir
+	if cfg.Agent.Worktree == config.WorktreePerIssue {
+		var wtErr error
+		if kind == store.KindTend {
+			workDir, wtErr = deps.WT.EnsurePR(d.PR, d.HeadRef)
+		} else {
+			workDir, wtErr = deps.WT.EnsureIssue(d.Issue)
+		}
+		if wtErr != nil {
+			_ = deps.Store.FinishDispatch(dispatchID, store.DispatchResult{
+				Status: store.StatusFailed, ExitCode: -1, APIError: wtErr.Error(),
+			})
+			if kind != store.KindTend {
+				_ = deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, d.Issue)
+			}
+			return wtErr
+		}
+		if kind != store.KindTend {
+			state.WorktreePath = workDir
+			_ = deps.Store.PutIssueState(state)
+		}
+	}
+
+	runnerLog := runner.RunnerLogPath(cfg.StateDir, cfg.Name, dispatchID)
+	pid, err := deps.Spawn(deps.SelfPath, dispatchID, deps.ConfigPath, runnerLog)
 	if err != nil {
 		_ = deps.Store.FinishDispatch(dispatchID, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
 		})
+		if kind != store.KindTend {
+			_ = deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, d.Issue)
+		}
 		return err
 	}
 	if err := deps.Store.SetDispatchProcess(dispatchID, pid, now); err != nil {
 		return err
-	}
-
-	if kind != store.KindTend {
-		state.SessionID = sessionID
-		state.WorktreePath = workDir
-		state.UpdatedAt = now
-		if d.Kind == engine.KindRetry {
-			state.RetryCount++
-			state.LastRetryTick, _ = deps.Store.TickCount(cfg.Name)
-		}
-		if err := deps.Store.PutIssueState(state); err != nil {
-			return err
-		}
 	}
 
 	slog.Info("dispatched", "loop", cfg.Name, "kind", kind, "issue", d.Issue,
@@ -3922,10 +4613,25 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 	if err := deps.GH.PostComment(ctx, owner, repo, d.Issue, body); err != nil {
 		return err
 	}
+	// Remove the trigger label as well as the in-flight label. Without this the
+	// issue still looks queued, so the next tick resumes it and the park stops
+	// nothing at all.
 	if err := deps.GH.EditLabels(ctx, owner, repo, d.Issue,
-		[]string{cfg.Labels.Blocked}, []string{cfg.Labels.InFlight}); err != nil {
+		[]string{cfg.Labels.Blocked},
+		[]string{cfg.Labels.InFlight, cfg.Labels.Trigger}); err != nil {
 		return err
 	}
+
+	// Record the park durably, and clear the retry flag: this failure episode is
+	// over. A human re-applying the trigger label starts a new one.
+	state := deps.Store.IssueStateOrZero(cfg.Name, cfg.Repo, d.Issue)
+	state.Parked = true
+	state.NeedsRetry = false
+	state.UpdatedAt = deps.Now()
+	if err := deps.Store.PutIssueState(state); err != nil {
+		return err
+	}
+
 	slog.Warn("parked at retry cap", "loop", cfg.Name, "issue", d.Issue)
 	return nil
 }
@@ -3934,6 +4640,16 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int64) error {
 	d, err := deps.Store.GetDispatch(dispatchID)
 	if err != nil {
+		return err
+	}
+	if d.Status != store.StatusRunning {
+		// The tick already reaped this dispatch. Two supervisors for one row
+		// would both record an outcome and both mutate the worktree.
+		return fmt.Errorf("dispatch %d is %s, not running", dispatchID, d.Status)
+	}
+	// Self-register. The pid this process reports is by definition the live one,
+	// which closes the window where the row carries pid 0.
+	if err := deps.Store.SetDispatchProcess(dispatchID, os.Getpid(), time.Now()); err != nil {
 		return err
 	}
 
@@ -4277,7 +4993,7 @@ func setup(configPath string) (*config.Config, loopcmd.Deps, func(), error) {
 	deps := loopcmd.Deps{
 		Store:      s,
 		GH:         ghub.New(token),
-		WT:         worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name),
+		WT:         worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch),
 		SelfPath:   self,
 		ConfigPath: abs,
 		Now:        time.Now,
@@ -4288,15 +5004,7 @@ func setup(configPath string) (*config.Config, loopcmd.Deps, func(), error) {
 }
 ```
 
-- [ ] **Step 7: Write the example configurations and the README**
-
-Create `examples/planning.yaml` and `examples/execution.yaml` using the label roles from the two reference documents. Create `README.md` with the install command, a cron line, and the three operator commands. Include this cron example verbatim:
-
-```cron
-*/15 * * * * GITHUB_TOKEN=... /usr/local/bin/agent-utils loop tick --config ~/.agent-utils/planning.yaml >> ~/.agent-utils/planning.log 2>&1
-```
-
-- [ ] **Step 8: Verify the whole build and every test**
+- [ ] **Step 7: Verify the whole build and every test**
 
 Run:
 
@@ -4306,20 +5014,445 @@ go build ./... && go vet ./... && gofmt -l . && go test ./...
 
 Expected: the build succeeds, vet is silent, `gofmt -l` prints nothing, and every test passes.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add cmd internal/loopcmd examples README.md go.mod go.sum
+go mod tidy
+git add cmd internal/loopcmd go.mod go.sum
 git commit -m "feat(cli): tick orchestration, status, reset and the detached run-agent command"
 ```
 
 ---
 
+---
+
+### Task 11: The prompt templates, the example configurations, and the README
+
+**Files:**
+- Create: `examples/planning.yaml`
+- Create: `examples/execution.yaml`
+- Create: `README.md`
+- Test: `internal/config/examples_test.go`
+
+**Interfaces:**
+- Consumes: `config.Load` (Task 1), `runner.RenderPrompt` and `runner.PromptData` (Task 8).
+- Produces: two working loop configurations.
+
+**review: yes** — these templates are where the two reference documents actually get ported. Every agent-side rule of both loops lives in these strings, and none of it is expressed anywhere else in this repository.
+
+**Acceptance criteria:** `go test ./internal/config/...` passes, including a test that loads both example files and renders all three templates against a fixture. A missing template variable fails the test rather than a production dispatch.
+
+Two rules govern the content:
+
+1. **Copy the agent-side rules; drop the orchestrator-side rules.** The reference DISPATCH PROMPT blocks mix both. Everything about counting slots, flipping labels before dispatch, posting retry markers, and scheduling the next check-in is now Go's job and must not appear. Everything about how the agent works and how it stops must be carried over word for word.
+2. **The engine never applies the terminal label.** The prompt must repeat that, because it is the one rule the whole pipeline depends on.
+
+- [ ] **Step 1: Write `examples/planning.yaml`**
+
+```yaml
+name: planning
+repo: mcgarylabs/lawndominator-monorepo
+
+checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
+state_dir: /Users/seanmcgary/.agent-utils/planning
+default_branch: master
+
+labels:
+  trigger:   status:ready-for-spec
+  in_flight: status:speccing
+  blocked:   status:needs-spec-input
+  review:    status:plan-ready-for-review
+  terminal:  status:ready-for-execution
+  veto:
+    - "blocked:*"
+    - status:ready-for-execution
+    - status:executing
+    - status:ready-for-review
+
+agent:
+  model: opus
+  effort: high
+  permission_mode: bypassPermissions
+  worktree: per_issue
+  max_budget_usd: 25
+  timeout: 3h
+
+i_understand_bypass_permissions: true
+
+# Tending is an EXECUTION-loop duty. The planning loop must never tend.
+# plan-feature opens a design draft pull request whose body says "Closes #N",
+# which is exactly what the pull request linker matches. With tending on, an
+# issue parked in plan-ready-for-review would get an agent that force-pushes a
+# draft pull request the human is reading.
+tend_pr: false
+
+retry:
+  max: 3
+  backoff_ticks: [0, 1, 2]
+  breaker:
+    orphan_threshold: 2
+    cooldown: 30m
+
+prompt: |
+  Run the /plan-feature skill for GitHub issue #{{.Issue.Number}}, repo {{.Repo}}.
+  The issue carries {{.Labels.Trigger}}. Treat plan-feature's precondition as
+  satisfied. Follow plan-feature EXACTLY, with these overrides.
+
+  YOU OWN THE LABELS. Nothing else moves them. As your first action, remove
+  {{.Labels.Trigger}} and add {{.Labels.InFlight}}.
+
+  READ-ONLY REPO, except design artifacts. You run in an isolated git worktree,
+  checked out detached at the default branch. Resolve or create the feature
+  branch yourself. Read code freely to ground the premise and blast-radius check
+  and the plan. Do not edit or commit, with the single exception of the design
+  artifacts step in plan-feature's phase 3. The spec and the plan are ISSUE
+  COMMENTS, not files.
+
+  DESIGN SYNC: run plan-feature's phase 3 as written. Push the design branch
+  before you park; your worktree may be removed before your next dispatch. If you
+  cannot fetch the source, that is a PARK-BLOCKED, not a reason to describe the
+  design in prose.
+
+  HEADLESS. Never ask the human through the CLI and never block on a reply. All
+  human interaction is issue comments plus label transitions. Read the issue body
+  and every comment as your input and as the record of what has already been
+  asked. Never re-ask a question the thread answers. Collect every outstanding
+  question into ONE numbered comment, @-mention @seanmcgary, then park.
+
+  QUESTION DISCIPLINE. A question earns a place in your batch ONLY if it is
+  genuinely unresolvable without the human: you cannot write the plan without an
+  answer, or the decision carries real weight an agent should not own alone (new
+  recurring cost, a legal or compliance surface, an irreversible data-model
+  choice, a genuine scope-boundary call). EVERYTHING ELSE IS A DEFAULT, NOT A
+  QUESTION. Decide it, write one line in the plan ("Assumed X because Y — flag in
+  review if wrong"), and move on. If you can write "recommended: X" with real
+  confidence, X is the plan, not a question.
+  Two sharper rules. First, pre-launch reversibility kills the question: if
+  nothing has shipped, "wrong" costs one review comment, so pick the best option
+  and let review correct it. Second, you own the whole codebase, so always do the
+  breaking change and update every call site; additive-and-deprecated machinery
+  is for external consumers that do not exist here.
+
+  TWO WAYS TO STOP. They are not interchangeable.
+  PARK-BLOCKED means you cannot proceed without an answer. Post a comment stating
+  exactly what you need, remove {{.Labels.InFlight}}, add {{.Labels.Blocked}},
+  and stop. End the comment with: "To proceed: comment your answers and re-add
+  the {{.Labels.Trigger}} label."
+  PARK-FOR-REVIEW means you are finished. Post or refresh the plan comment,
+  remove {{.Labels.InFlight}} and {{.Labels.Blocked}}, add {{.Labels.Review}},
+  strip a stale status:needs-spec label if present, and stop.
+
+  THE HUMAN GATE. You NEVER apply {{.Labels.Terminal}}, under any circumstance,
+  including a human comment that says "approved". Only the human applies it. Your
+  last act is to park for review. End the plan comment with: "To approve: apply
+  the {{.Labels.Terminal}} label. To request changes: comment what you want
+  changed and re-add {{.Labels.Trigger}}."
+
+  PREMISE CHECK FAILURE is a first-class outcome. If the issue as filed should
+  not be built, post that finding with your reasoning and PARK-BLOCKED. Do not
+  close the issue and do not reshape it into a different feature.
+
+  BEFORE EVERY PARK: make the "## Pipeline State" block current, and push any
+  design branch. An unpushed worktree commit is lost work.
+
+resume_prompt: |
+  Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
+  in the SAME session you used before, so you already know what you planned and
+  why. Re-add {{.Labels.InFlight}} and remove {{.Labels.Trigger}} as your first
+  action.
+
+  Read the comments added since your last message. They are either answers to
+  your questions or a change request on the plan.
+
+  A re-applied {{.Labels.Trigger}} NEVER means approval. It means "keep working".
+  If your Pipeline State is at the plan-review stage, this is a CHANGE REQUEST:
+  revise the plan, edit the plan comment IN PLACE, and park for review again.
+  Repeat for as many rounds as the human wants.
+
+  All other rules from your original instructions still apply, including the two
+  ways to stop and the rule that you never apply {{.Labels.Terminal}}.
+
+tend_prompt: |
+  Tending is disabled for the planning loop. This template is never rendered.
+```
+
+- [ ] **Step 2: Write `examples/execution.yaml`**
+
+```yaml
+name: execution
+repo: mcgarylabs/lawndominator-monorepo
+
+checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
+state_dir: /Users/seanmcgary/.agent-utils/execution
+default_branch: master
+
+labels:
+  trigger:   status:ready-for-execution
+  in_flight: status:executing
+  blocked:   status:needs-execution-input
+  review:    status:ready-for-review
+  # The execution loop has no terminal label. An issue leaves it when its pull
+  # request merges, so the field is omitted rather than invented.
+  veto:
+    - "blocked:*"
+
+agent:
+  model: opus
+  effort: high
+  permission_mode: bypassPermissions
+  worktree: per_issue
+  max_budget_usd: 50
+  timeout: 4h
+
+i_understand_bypass_permissions: true
+tend_pr: true
+
+retry:
+  max: 3
+  backoff_ticks: [0, 1, 2]
+  breaker:
+    orphan_threshold: 2
+    cooldown: 30m
+
+prompt: |
+  Run the build-feature skill for GitHub issue #{{.Issue.Number}}, repo {{.Repo}},
+  in ISSUE MODE. The issue carries {{.Labels.Trigger}}, which is the human's
+  approval of a plan already posted in the issue comments. Follow build-feature
+  EXACTLY, with these overrides.
+
+  YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
+  {{.Labels.InFlight}}.
+
+  WORKTREE AND PUSH DISCIPLINE. You run in an isolated git worktree, checked out
+  detached at the default branch. Resolve the branch yourself as build-feature's
+  phase 0 describes: check out the EXISTING remote feature branch if one exists
+  and never re-create it over the design assets, then rebase onto the default
+  branch. If the rebase conflicts, PARK with a comment listing the conflicted
+  files. Never force and never guess.
+  At the END of every phase AND before every park: commit and
+  `git push -u origin <branch>`. Your worktree may be removed before your next
+  dispatch, so unpushed work is lost.
+
+  A FRESH WORKTREE HAS NO node_modules. Run `pnpm install` before any Node gate.
+
+  HEADLESS. Never ask the human through the CLI and never block on a reply. All
+  human interaction is issue comments plus label transitions. Read the issue body
+  and comments, including the posted plan, as your specification.
+
+  PARKING ON BLOCKERS. On any of build-feature's five blockers, PARK: commit and
+  push, post a comment stating exactly what you need, remove
+  {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment with:
+  "To proceed: comment your decision and re-add the {{.Labels.Trigger}} label."
+  Never guess on a genuine blocker.
+
+  ON COMPLETION. Open the pull request, or promote plan-feature's draft, with
+  "Closes #{{.Issue.Number}}" in the body. Assign @seanmcgary. Remove
+  {{.Labels.InFlight}} and add {{.Labels.Review}}. Keep the "## Pipeline State"
+  block current at every phase transition.
+
+  NEVER MERGE. Merging is the human's decision, at every stage, without exception.
+
+resume_prompt: |
+  Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
+  in the SAME session you used before, so you already know what you built and why.
+  Remove {{.Labels.Trigger}} and add {{.Labels.InFlight}} as your first action.
+
+  Read the comments added since your last message. They answer the blocker you
+  parked on, or they ask for more work on a pull request you already opened.
+
+  Resume from your "## Pipeline State" block. Re-check out your branch and rebase
+  it onto the default branch before you continue. All other rules from your
+  original instructions still apply, including push discipline and never merging.
+
+tend_prompt: |
+  You are TENDING pull request #{{.PR.Number}} for issue #{{.Issue.Number}} in
+  {{.Repo}}. It is {{.PR.BehindBy}} commits behind {{.PR.BaseRef}}.
+
+  This is maintenance on a finished feature, NOT new feature work. Do not add
+  scope. Do not refactor beyond the rebase. NEVER merge or close the pull request.
+  Do not change any label unless you park.
+
+  You run in an isolated git worktree checked out detached at
+  origin/{{.PR.HeadRef}}.
+
+  1. `git fetch origin`, then rebase onto origin/{{.PR.BaseRef}}.
+  2. If the rebase is clean, push with
+     `git push --force-with-lease origin HEAD:refs/heads/{{.PR.HeadRef}}`.
+     Use --force-with-lease, never plain --force. If the lease check REJECTS the
+     push, another run touched the branch: change nothing and stop.
+  3. If the rebase CONFLICTS, run `git rebase --abort`, then PARK with a comment
+     listing the conflicted files. Never resolve a conflict by guessing.
+
+  PARK means: post the comment, remove {{.Labels.Review}}, add
+  {{.Labels.Blocked}}, and stop. End with: "To proceed: comment your decision and
+  re-add the {{.Labels.Trigger}} label."
+
+  If the branch turns out to be current, post NO comment and make NO push.
+  Silence is the correct output for a quiet pull request.
+```
+
+- [ ] **Step 3: Write the failing test**
+
+Create `internal/config/examples_test.go`:
+
+```go
+package config_test
+
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/runner"
+)
+
+// The example configurations are the port of the two reference loops. A typo in
+// a template must fail here, not at three in the morning inside a detached
+// process whose output nobody is reading.
+func TestExampleConfigsLoadAndRender(t *testing.T) {
+	for _, name := range []string{"planning.yaml", "execution.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := config.Load(filepath.Join("..", "..", "examples", name))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+
+			data := runner.PromptData{
+				Repo:      cfg.Repo,
+				Loop:      cfg.Name,
+				SessionID: "sess",
+				Worktree:  "/tmp/wt",
+				Issue:     runner.PromptIssue{Number: 12, Title: "a title"},
+				PR: runner.PromptPR{
+					Number: 34, HeadRef: "feat/x", BaseRef: "master", BehindBy: 3,
+				},
+				Labels: runner.PromptLabels{
+					Trigger:  cfg.Labels.Trigger,
+					InFlight: cfg.Labels.InFlight,
+					Blocked:  cfg.Labels.Blocked,
+					Review:   cfg.Labels.Review,
+					Terminal: cfg.Labels.Terminal,
+				},
+			}
+
+			for label, tmpl := range map[string]string{
+				"prompt":        cfg.Prompt,
+				"resume_prompt": cfg.ResumePrompt,
+				"tend_prompt":   cfg.TendPrompt,
+			} {
+				if tmpl == "" {
+					continue
+				}
+				if _, err := runner.RenderPrompt(tmpl, data); err != nil {
+					t.Errorf("%s: %v", label, err)
+				}
+			}
+		})
+	}
+}
+
+// The planning loop must never tend. plan-feature's design draft pull request
+// says "Closes #N", so tending would force-push a draft the human is reading.
+func TestPlanningExampleDoesNotTend(t *testing.T) {
+	cfg, err := config.Load(filepath.Join("..", "..", "examples", "planning.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TendPR {
+		t.Error("tend_pr must be false for the planning loop")
+	}
+}
+
+// No template may tell an agent to apply the terminal label. That gate is the
+// human's, and it is the one rule the whole pipeline depends on.
+func TestNoTemplateApprovesItself(t *testing.T) {
+	cfg, err := config.Load(filepath.Join("..", "..", "examples", "planning.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsAll(cfg.Prompt, "NEVER apply", cfg.Labels.Terminal) {
+		t.Error("the planning prompt must forbid applying the terminal label")
+	}
+}
+
+func containsAll(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if !contains(s, sub) {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+```
+
+- [ ] **Step 4: Run the test to verify it fails, then passes**
+
+Run: `go test ./internal/config/... -run Example -v`
+Expected: FAIL before the YAML files exist, PASS after.
+
+- [ ] **Step 5: Write `README.md`**
+
+The README must contain the install command, the three operator commands, and this security note and cron setup verbatim:
+
+````markdown
+## Security
+
+A loop dispatches an agent that runs with permission prompts disabled, inside a
+git worktree, on text written by other people. Issue bodies, issue comments, and
+pull request bodies are UNTRUSTED input. An instruction hidden in a comment
+executes.
+
+Point a loop only at a repository whose issue and pull request population you
+trust. The engine reduces the blast radius in three ways, none of which is a
+substitute for that rule:
+
+- The agent process gets a minimal environment. `GITHUB_TOKEN` is removed.
+- Only a pull request opened by an OWNER, MEMBER, or COLLABORATOR, whose head
+  branch lives in the target repository, is ever linked to an issue or tended.
+- `bypassPermissions` requires `i_understand_bypass_permissions: true`.
+
+## Cron
+
+Do NOT put the token inline in the crontab. cron runs the whole line through
+`/bin/sh -c`, so a `VAR=value command` prefix puts the token in the shell's
+argument list, where `ps` shows it to every user on the machine.
+
+Put it in a file instead:
+
+```bash
+install -m 600 /dev/null ~/.agent-utils/env
+echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
+```
+
+```cron
+*/15 * * * * . $HOME/.agent-utils/env && /usr/local/bin/agent-utils loop tick --config $HOME/.agent-utils/planning.yaml >> $HOME/.agent-utils/planning.log 2>&1
+```
+````
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add examples README.md internal/config/examples_test.go
+git commit -m "feat(examples): planning and execution loop configurations with ported prompts"
+```
+
+
 ## Pipeline State
 
 | Field   | Value                                                        |
 |---------|--------------------------------------------------------------|
-| stage   | 2 (plan review)                                              |
+| stage   | 2 (plan review, revised after three-reviewer fan-out)         |
 | class   | large (new subsystem, new schema, process supervision)        |
 | profile | backend                                                      |
 | branch  | feat/loop-engine                                             |

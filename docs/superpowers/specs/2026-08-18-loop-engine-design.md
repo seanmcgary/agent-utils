@@ -43,6 +43,31 @@ The loop engine must model both loops from one code path and two configuration f
 - Automatic resume from new comments. A human must apply the trigger label.
 - Concurrency caps and priority ordering. The operator controls load through labels.
 - Merging a pull request. The engine never merges.
+- Reading the body text of issue comments. The engine reads labels and metadata only.
+  Comment-marker protocols therefore do not transfer. The planning loop's
+  `DESIGN-SYNC-UNAVAILABLE-BACKGROUND` self-service is one of them: an issue that parks on
+  that marker is a genuine human wait under this engine, not an automatic recovery.
+- Answering pull request review feedback. Version 1 of `tend_pr` rebases a stale branch only.
+
+## 2.1 Trust boundary
+
+**Issue bodies, issue comments, and pull request bodies are untrusted third-party input.**
+The engine feeds that text to an agent that runs with permission prompts disabled. An
+instruction hidden in a comment executes with the privileges of the agent process.
+
+Three consequences follow, and all three are requirements:
+
+1. Point a loop only at a repository whose issue and pull request population you trust.
+2. The agent process gets a minimal environment. `GITHUB_TOKEN` is removed from it. The
+   agent never needs that credential, and the whole "Go performs one GitHub write" property
+   is void if the agent holds a repository-write token.
+3. Only a pull request whose head branch lives in the target repository, and whose author is
+   an `OWNER`, `MEMBER`, or `COLLABORATOR`, may be linked to an issue. Tending checks the
+   head branch out and runs an agent inside it, so an untrusted head is code execution.
+
+A human applying the trigger label approves the issue **at one instant**. The reporter may
+edit the body afterwards, and the resume path deliberately feeds later comments to the agent.
+The label is not a guarantee about content over time.
 
 ## 3. Premise check findings
 
@@ -72,8 +97,10 @@ is not necessary for **session** state.
 
 ### 3.3 The result JSON schema
 
-`claude -p --output-format json` prints one JSON object. The object holds these fields, among
-others:
+The engine always runs `claude -p --output-format stream-json --verbose`. Running the binary
+confirmed that `--print` with `--output-format stream-json` is **rejected** without
+`--verbose`. The stream ends with one line whose `type` is `result`. That line holds these
+fields, among others:
 
 | Field | Type | Use |
 |---|---|---|
@@ -151,7 +178,11 @@ which is why its reference document contains a large amount of retry guesswork.
 | `internal/engine` | Pure decision function. Holds no I/O. |
 | `internal/runner` | Builds the `claude` command line. Spawns the detached process. Parses the result. |
 | `internal/worktree` | Creates, lists, and removes git worktrees. |
-| `cmd/agent-utils` | Command wiring with `urfave/cli` v3. |
+| `internal/proc` | Reports whether a runner process is alive, by process identity. |
+| `internal/lock` | Per-loop advisory tick lock. |
+| `internal/loopcmd` | Tick orchestration, status, reset, and the detached runner entry point. |
+| `cmd/agent-utils` | Command wiring only. No logic. |
+| `examples/` | The two loop configurations. Their prompts port both reference loops. |
 
 ### 5.1 Commands
 
@@ -172,6 +203,9 @@ repo: mcgarylabs/lawndominator-monorepo
 
 checkout_base_dir: /Users/seanmcgary/Code/lawndominator
 worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
+state_dir: /Users/seanmcgary/.agent-utils/planning
+default_branch: master
+i_understand_bypass_permissions: true
 
 labels:
   trigger:   status:ready-for-spec
@@ -180,8 +214,10 @@ labels:
   review:    status:plan-ready-for-review
   terminal:  status:ready-for-execution
   veto:
-    - blocked:design
+    - "blocked:*"          # a trailing * is a prefix rule
     - status:ready-for-execution
+    - status:executing
+    - status:ready-for-review
 
 agent:
   model: opus
@@ -191,7 +227,10 @@ agent:
   max_budget_usd: 25
   timeout: 3h
 
-tend_pr: true
+# Tending is an EXECUTION-loop duty. Set it false for planning: plan-feature's
+# design draft pull request also says "Closes #N", so a planning loop with
+# tending on would force-push a draft the human is reading.
+tend_pr: false
 
 retry:
   max: 3
@@ -233,6 +272,14 @@ rule for `blocked:design`, and for an issue that a human approved while a run wa
 - `checkout_base_dir` is the primary checkout of the target repository. The engine runs
   `git fetch` in it. The engine never changes its branch and never edits its files.
 - `worktree_dir` is the parent directory for every worktree the engine creates.
+- `state_dir` holds `state.db`, the tick lock file, and the log tree. The engine creates it
+  with mode `0700`, because the logs and the database hold private repository content.
+- `default_branch` is the branch a new worktree starts from.
+
+Every worktree is created **detached** at `origin/<default_branch>`. The agent resolves or
+creates the real branch itself. Both reference loops require this: `plan-feature` may already
+have created the feature branch and committed design assets onto it, and `build-feature` must
+check that branch out rather than re-create it.
 
 Worktree paths are deterministic:
 
@@ -271,7 +318,13 @@ The engine runs these steps in order.
 | Start | `trigger` present, no session row | Create a session identifier. Create the worktree. Dispatch with `prompt`. |
 | Resume | `trigger` present, session row exists | Dispatch with `resume_prompt` and `-r <session-id>`. |
 | Healthy | `in_flight` present, process alive | Do nothing. Spend no tokens and make no API write. |
-| Orphan | `in_flight` present, dispatch is `running`, process dead | Apply the retry policy. |
+| Failure | `in_flight` present and the issue's durable `needs_retry` flag is set | Apply the retry policy. |
+
+A dispatch fails in two ways, and both set the same durable flag on the issue row: the runner
+process died without recording an outcome, or `claude` exited with an error. The flag lives on
+the issue, not on the dispatch row, because a tick may deliberately decline to act on a failure
+(a backoff window, or the circuit breaker). A fact stored on a row that the same tick retires
+would be lost, and the issue would never retry and never park.
 
 The **Resume** case is the reason this project exists. The reference documents make a human
 re-apply a label and then make an LLM work out whether the issue was seen before. Go answers
@@ -338,16 +391,23 @@ agent whose task is to report that dispatch is broken would fail for the same ca
 
 SQLite, through `modernc.org/sqlite`. The driver name is `sqlite`. The driver needs no CGO.
 
+The pragmas go in the DSN, never in the schema string. `journal_mode` is persisted in the
+file, but `busy_timeout` and `foreign_keys` are **per connection**, and the tick process and
+every detached runner open this file at the same time.
+
 ```sql
 CREATE TABLE issues (
-  loop           TEXT NOT NULL,
-  repo           TEXT NOT NULL,
-  number         INTEGER NOT NULL,
-  session_id     TEXT,
-  worktree_path  TEXT,
-  retry_count    INTEGER NOT NULL DEFAULT 0,
-  last_retry_tick INTEGER,
-  updated_at     TIMESTAMP NOT NULL,
+  loop            TEXT NOT NULL,
+  repo            TEXT NOT NULL,
+  number          INTEGER NOT NULL,
+  session_id      TEXT NOT NULL DEFAULT '',
+  worktree_path   TEXT NOT NULL DEFAULT '',
+  retry_count     INTEGER NOT NULL DEFAULT 0,
+  last_retry_tick INTEGER NOT NULL DEFAULT 0,
+  needs_retry     INTEGER NOT NULL DEFAULT 0,  -- durable failure state
+  session_started INTEGER NOT NULL DEFAULT 0,  -- claude created the session
+  parked          INTEGER NOT NULL DEFAULT 0,
+  updated_at      TIMESTAMP NOT NULL,
   PRIMARY KEY (loop, repo, number)
 );
 
@@ -371,24 +431,32 @@ CREATE TABLE dispatches (
 );
 
 CREATE TABLE pr_links (
-  loop      TEXT NOT NULL,
-  repo      TEXT NOT NULL,
-  number    INTEGER NOT NULL,          -- the issue number
-  pr_number INTEGER NOT NULL,
-  head_ref  TEXT NOT NULL,
-  base_ref  TEXT NOT NULL,
+  loop       TEXT NOT NULL,
+  repo       TEXT NOT NULL,
+  number     INTEGER NOT NULL,         -- the issue number
+  pr_number  INTEGER NOT NULL,
+  head_ref   TEXT NOT NULL,
+  base_ref   TEXT NOT NULL,
+  behind_by  INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (loop, repo, number)
+);
+
+CREATE TABLE cooldowns (
+  loop  TEXT PRIMARY KEY,
+  until TIMESTAMP NOT NULL
 );
 
 CREATE TABLE ticks (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   loop            TEXT NOT NULL,
   started_at      TIMESTAMP NOT NULL,
-  finished_at     TIMESTAMP,
   breaker_tripped INTEGER NOT NULL DEFAULT 0,
-  summary_json    TEXT
+  summary_json    TEXT NOT NULL DEFAULT ''
 );
 ```
+
+The `dispatches` table adds `pr_number`, which the tend path keys on, and an index on
+`(loop, repo, status)` for the running-dispatch query.
 
 A process identifier alone is not proof of identity, because the operating system reuses
 identifiers. The engine therefore confirms identity in two steps. It first asks the kernel
@@ -402,7 +470,9 @@ status command. It is not part of the liveness check.
 ## 10. Observability
 
 - **Log files.** Each dispatch writes its `stream-json` output to
-  `{log_dir}/{loop}/{issue}-{timestamp}.jsonl`.
+  `{state_dir}/logs/{loop}/{kind}-{issue}-{timestamp}.jsonl`, mode `0600`. Standard error goes
+  to a sibling `.stderr` file, so plain text cannot splice into a JSON line. Each detached
+  runner writes its own structured log to `{state_dir}/logs/{loop}/runner-{dispatch}.log`.
 - **Structured logs.** The tick writes `log/slog` JSON lines to standard output. Cron captures
   them.
 - **Status command.** `loop status` prints the in-flight set, the parked set, the review set,
@@ -480,14 +550,34 @@ type IssueListByRepoOptions struct {
 Claude Code command line facts, confirmed by running the binary:
 
 ```
-claude -p --session-id <uuid> --model <m> --output-format json "<prompt>"
-claude -p -r <uuid> --model <m> --output-format json "<prompt>"
-claude -p --output-format stream-json …    # for the log file
+# --verbose is MANDATORY with stream-json under --print. Verified by running it:
+#   "Error: When using --print, --output-format=stream-json requires --verbose"
+claude -p --output-format stream-json --verbose --session-id <uuid> --model <m> "<prompt>"
+claude -p --output-format stream-json --verbose -r <uuid>          --model <m> "<prompt>"
 --permission-mode bypassPermissions
 --max-budget-usd <amount>
 --effort <low|medium|high|xhigh|max>
 ```
 
-## 13. Open items
+## 13. Revision history
+
+**2026-08-18, after a three-reviewer fan-out over the plan.** The review found two design
+faults in the first draft of this specification. Both are corrected above:
+
+1. **The failure record was derived, not stored.** An orphan was defined as a dispatch row
+   still marked `running` whose process was dead, and the tick retired that row as it found
+   it. A tick that declined to act — a backoff window or the circuit breaker — therefore lost
+   the failure, and the issue was never retried and never parked. Section 7.1 now stores the
+   failure on the issue row.
+2. **The retry cap covered only dead processes.** A dispatch that exited with an error left
+   the trigger label in place and redispatched every tick, with no cap. Section 8.1 now routes
+   every failed dispatch through the same cap and backoff.
+
+Three smaller corrections came from the same review: the planning example set `tend_pr: true`,
+which would have force-pushed `plan-feature`'s design draft pull requests; `labels.terminal`
+was required although the execution loop has no terminal label; and the documented cron line
+put the token in a world-readable argument list.
+
+## 14. Open items
 
 None. The design is agreed.
