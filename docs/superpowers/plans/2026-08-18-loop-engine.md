@@ -5452,10 +5452,10 @@ git commit -m "feat(examples): planning and execution loop configurations with p
 
 | Field   | Value                                                        |
 |---------|--------------------------------------------------------------|
-| stage   | 2 (plan review, revised after three-reviewer fan-out)         |
+| stage   | 3 (implementation)                                           |
 | class   | large (new subsystem, new schema, process supervision)        |
 | profile | backend                                                      |
 | branch  | feat/loop-engine                                             |
 | pr      | #1                                                           |
-| gate    | pending                                                      |
+| gate    | approved 2026-08-18                                          |
 | round   | 0                                                            |
