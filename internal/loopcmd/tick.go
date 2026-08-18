@@ -316,9 +316,15 @@ func dispatch(
 			})
 			return wtErr
 		}
-		if kind != store.KindTend {
-			state.WorktreePath = workDir
-			_ = deps.Store.PutIssueState(state)
+	}
+
+	// Record the working directory in both worktree modes, not only per_issue.
+	// Recording it only in one left the path empty in "none" mode, so status
+	// reported no working directory for a live agent.
+	if kind != store.KindTend {
+		state.WorktreePath = workDir
+		if err := deps.Store.PutIssueState(state); err != nil {
+			return err
 		}
 	}
 

@@ -69,7 +69,7 @@ func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) 
 		"ISSUE", "STATE", "RETRIES", "COST", "SESSION", "WORKTREE")
 
 	for _, iss := range issues {
-		state := "-"
+		var state string
 		switch {
 		case iss.HasAnyLabel(cfg.Labels.Veto):
 			state = "veto"

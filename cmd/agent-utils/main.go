@@ -17,6 +17,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
+	"github.com/seanmcgary/agent-utils/internal/version"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 	"github.com/urfave/cli/v3"
 )
@@ -25,8 +26,9 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	cmd := &cli.Command{
-		Name:  "agent-utils",
-		Usage: "utilities for agent workflows",
+		Name:    "agent-utils",
+		Usage:   "utilities for agent workflows",
+		Version: version.Commit,
 		Commands: []*cli.Command{
 			loopCommand(),
 			internalCommand(),

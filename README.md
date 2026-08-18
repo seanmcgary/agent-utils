@@ -36,6 +36,34 @@ Two example loop configurations, ported from the reference planning and
 execution orchestrators, live in `examples/planning.yaml` and
 `examples/execution.yaml`.
 
+## Development
+
+```bash
+make deps        # install golangci-lint and staticcheck
+make build       # build ./bin/agent-utils, commit stamped in
+make check       # fmtcheck + vet + lint + test, in that order
+```
+
+| Target | Does |
+|---|---|
+| `make all` | `deps` then `build` |
+| `make build` | Build `./bin/agent-utils` with the commit stamped into `--version` |
+| `make install` | Same, into `GOBIN`. Point cron at this, not at a bare `go install` |
+| `make test` | Full suite, cache disabled, one package at a time |
+| `make test/race` | Same under `-race`. Roughly 3x slower; worth it before a release |
+| `make test/verbose` | Full suite with per-test output |
+| `make cover` | Coverage profile plus a total |
+| `make lint` | `golangci-lint` |
+| `make vet` | `go vet` |
+| `make fmt` | `gofmt -w .` |
+| `make fmtcheck` | Fail if anything is unformatted |
+| `make check` | Everything that must pass before pushing |
+| `make clean` | Remove build output and coverage |
+
+Tests run with `-p 1` and no cache on purpose: the `worktree` package shells out to
+real git and `runner` spawns real processes, so package-level parallelism is not
+safe, and a cached PASS is not evidence about the working tree.
+
 ## Configuration
 
 One YAML file defines one loop. `docs/configuration.md` documents every field: what it means,
