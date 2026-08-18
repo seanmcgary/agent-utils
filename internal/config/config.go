@@ -1,0 +1,206 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config is one loop definition.
+type Config struct {
+	Name            string `yaml:"name"`
+	Repo            string `yaml:"repo"`
+	CheckoutBaseDir string `yaml:"checkout_base_dir"`
+	WorktreeDir     string `yaml:"worktree_dir"`
+	StateDir        string `yaml:"state_dir"`
+
+	// DefaultBranch is the branch new worktrees start from. It is not always
+	// "master", so it is configuration rather than an assumption.
+	DefaultBranch string `yaml:"default_branch"`
+
+	Labels Labels `yaml:"labels"`
+	Agent  Agent  `yaml:"agent"`
+	TendPR bool   `yaml:"tend_pr"`
+	Retry  Retry  `yaml:"retry"`
+
+	// AcknowledgeBypassPermissions must be true to select the
+	// bypassPermissions agent permission mode. See validate.
+	AcknowledgeBypassPermissions bool `yaml:"i_understand_bypass_permissions"`
+
+	Prompt       string `yaml:"prompt"`
+	ResumePrompt string `yaml:"resume_prompt"`
+	TendPrompt   string `yaml:"tend_prompt"`
+}
+
+// Labels holds the five label roles and the veto list.
+type Labels struct {
+	Trigger  string   `yaml:"trigger"`
+	InFlight string   `yaml:"in_flight"`
+	Blocked  string   `yaml:"blocked"`
+	Review   string   `yaml:"review"`
+	Terminal string   `yaml:"terminal"`
+	Veto     []string `yaml:"veto"`
+}
+
+// Agent holds the claude invocation settings.
+type Agent struct {
+	Model          string   `yaml:"model"`
+	Effort         string   `yaml:"effort"`
+	PermissionMode string   `yaml:"permission_mode"`
+	Worktree       string   `yaml:"worktree"`
+	MaxBudgetUSD   float64  `yaml:"max_budget_usd"`
+	Timeout        Duration `yaml:"timeout"`
+}
+
+// Retry holds the failure policy.
+type Retry struct {
+	Max          int     `yaml:"max"`
+	BackoffTicks []int   `yaml:"backoff_ticks"`
+	Breaker      Breaker `yaml:"breaker"`
+}
+
+// Breaker holds the cross-issue circuit breaker policy.
+type Breaker struct {
+	OrphanThreshold int      `yaml:"orphan_threshold"`
+	Cooldown        Duration `yaml:"cooldown"`
+}
+
+// Worktree modes.
+const (
+	WorktreePerIssue = "per_issue"
+	WorktreeNone     = "none"
+)
+
+// RepoOwner returns the owner part of repo.
+func (c *Config) RepoOwner() string {
+	owner, _, _ := strings.Cut(c.Repo, "/")
+	return owner
+}
+
+// RepoName returns the name part of repo.
+func (c *Config) RepoName() string {
+	_, name, _ := strings.Cut(c.Repo, "/")
+	return name
+}
+
+// Load reads and validates a loop configuration file.
+func Load(path string) (*Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open config: %w", err)
+	}
+	defer f.Close()
+
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true)
+
+	var cfg Config
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("invalid config %s: %w", path, err)
+	}
+	return &cfg, nil
+}
+
+func (c *Config) validate() error {
+	var errs []error
+
+	// A slice, not a map: Go randomises map iteration, so a map would print the
+	// same bad config's errors in a different order on every run.
+	required := []struct{ field, value string }{
+		{"name", c.Name},
+		{"repo", c.Repo},
+		{"checkout_base_dir", c.CheckoutBaseDir},
+		{"worktree_dir", c.WorktreeDir},
+		{"state_dir", c.StateDir},
+		{"default_branch", c.DefaultBranch},
+		{"prompt", c.Prompt},
+		{"resume_prompt", c.ResumePrompt},
+	}
+	for _, r := range required {
+		if strings.TrimSpace(r.value) == "" {
+			errs = append(errs, fmt.Errorf("%s is required", r.field))
+		}
+	}
+
+	owner, name, ok := strings.Cut(c.Repo, "/")
+	if !ok || owner == "" || name == "" {
+		errs = append(errs, fmt.Errorf("repo must be in owner/name form, got %q", c.Repo))
+	}
+
+	// labels.terminal is deliberately NOT required. The planning loop has a
+	// terminal label (the human's approval); the execution loop has none,
+	// because an issue leaves it when its pull request merges. Requiring it
+	// would force an operator to invent a value that changes no behavior.
+	roles := []struct{ field, value string }{
+		{"labels.trigger", c.Labels.Trigger},
+		{"labels.in_flight", c.Labels.InFlight},
+		{"labels.blocked", c.Labels.Blocked},
+		{"labels.review", c.Labels.Review},
+	}
+	for _, r := range roles {
+		if strings.TrimSpace(r.value) == "" {
+			errs = append(errs, fmt.Errorf("%s is required", r.field))
+		}
+	}
+
+	switch c.Agent.PermissionMode {
+	case "", "acceptEdits", "auto", "manual", "dontAsk", "plan":
+	case "bypassPermissions":
+		// bypassPermissions disables every permission prompt. The agent reads
+		// issue and comment text written by third parties, so an injected
+		// instruction executes with no gate. Require the operator to say so.
+		if !c.AcknowledgeBypassPermissions {
+			errs = append(errs, errors.New(
+				"agent.permission_mode is \"bypassPermissions\", which disables every "+
+					"permission prompt on third-party issue text; set "+
+					"i_understand_bypass_permissions: true to confirm"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf(
+			"agent.permission_mode %q is not a valid claude permission mode",
+			c.Agent.PermissionMode))
+	}
+
+	switch c.Agent.Worktree {
+	case WorktreePerIssue, WorktreeNone:
+	case "":
+		errs = append(errs, errors.New("agent.worktree is required"))
+	default:
+		errs = append(errs, fmt.Errorf("agent.worktree must be %q or %q, got %q",
+			WorktreePerIssue, WorktreeNone, c.Agent.Worktree))
+	}
+
+	if c.Agent.Model == "" {
+		errs = append(errs, errors.New("agent.model is required"))
+	}
+	if c.Agent.Timeout.Std() <= 0 {
+		errs = append(errs, errors.New("agent.timeout must be greater than zero"))
+	}
+
+	if c.Retry.Max < 0 {
+		errs = append(errs, errors.New("retry.max must not be negative"))
+	}
+	if len(c.Retry.BackoffTicks) < c.Retry.Max {
+		errs = append(errs, fmt.Errorf(
+			"retry.backoff_ticks has %d entries but retry.max is %d; it needs one entry per retry",
+			len(c.Retry.BackoffTicks), c.Retry.Max))
+	}
+	if c.Retry.Breaker.OrphanThreshold < 1 {
+		errs = append(errs, errors.New("retry.breaker.orphan_threshold must be at least 1"))
+	}
+	if c.Retry.Breaker.Cooldown.Std() <= 0 {
+		errs = append(errs, errors.New("retry.breaker.cooldown must be greater than zero"))
+	}
+
+	if c.TendPR && strings.TrimSpace(c.TendPrompt) == "" {
+		errs = append(errs, errors.New("tend_prompt is required when tend_pr is true"))
+	}
+
+	return errors.Join(errs...)
+}
