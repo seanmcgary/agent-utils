@@ -128,9 +128,16 @@ func Tail(ctx context.Context, out io.Writer, path string, d store.Dispatch, opt
 		line, err := r.ReadString('\n')
 		if len(line) > 0 {
 			if opts.Raw {
-				fmt.Fprint(out, line)
+				if _, werr := io.WriteString(out, line); werr != nil {
+					return werr
+				}
 			} else {
 				render.line(strings.TrimRight(line, "\n"))
+				if render.err != nil {
+					// The reader closed the pipe. Stop rather than following a
+					// live agent with nowhere to write.
+					return render.err
+				}
 			}
 		}
 		if err == nil {
@@ -150,14 +157,16 @@ func Tail(ctx context.Context, out io.Writer, path string, d store.Dispatch, opt
 			rest, _ := io.ReadAll(r)
 			if len(rest) > 0 {
 				if opts.Raw {
-					fmt.Fprint(out, string(rest))
+					if _, werr := out.Write(rest); werr != nil {
+						return werr
+					}
 				} else {
 					for _, l := range strings.Split(strings.TrimRight(string(rest), "\n"), "\n") {
 						render.line(l)
 					}
 				}
 			}
-			return nil
+			return render.err
 		}
 		select {
 		case <-ctx.Done():
@@ -175,10 +184,24 @@ func Tail(ctx context.Context, out io.Writer, path string, d store.Dispatch, opt
 type renderer struct {
 	out  io.Writer
 	opts LogOptions
+	// err holds the first write failure. Writing to standard output really can
+	// fail: `agent-utils logs -f | head` closes the pipe, and a renderer that
+	// ignored that would spin until the agent exited.
+	err error
 }
 
 func newRenderer(out io.Writer, opts LogOptions) *renderer {
 	return &renderer{out: out, opts: opts}
+}
+
+// printf writes unless a previous write already failed.
+func (r *renderer) printf(format string, args ...any) {
+	if r.err != nil {
+		return
+	}
+	if _, err := fmt.Fprintf(r.out, format, args...); err != nil {
+		r.err = err
+	}
 }
 
 type streamLine struct {
@@ -212,19 +235,19 @@ func (r *renderer) line(raw string) {
 	}
 	if !strings.HasPrefix(raw, "{") {
 		// A wrapper can print plain text. Show it rather than dropping it.
-		fmt.Fprintln(r.out, raw)
+		r.printf("%s\n", raw)
 		return
 	}
 	var l streamLine
 	if err := json.Unmarshal([]byte(raw), &l); err != nil {
-		fmt.Fprintln(r.out, raw)
+		r.printf("%s\n", raw)
 		return
 	}
 
 	switch l.Type {
 	case "system":
 		if l.Subtype == "init" {
-			fmt.Fprintf(r.out, "── session start  model=%s  permissions=%s\n   cwd=%s\n",
+			r.printf("── session start  model=%s  permissions=%s\n   cwd=%s\n",
 				l.Model, l.PermissionMode, l.Cwd)
 		}
 		// Every other system line is a hook or a token counter: noise here.
@@ -233,14 +256,14 @@ func (r *renderer) line(raw string) {
 			switch c.Type {
 			case "text":
 				if s := strings.TrimSpace(c.Text); s != "" {
-					fmt.Fprintf(r.out, "\n%s\n", s)
+					r.printf("\n%s\n", s)
 				}
 			case "thinking":
 				if r.opts.Thinking {
-					fmt.Fprintf(r.out, "\n[thinking] %s\n", strings.TrimSpace(c.Thinking))
+					r.printf("\n[thinking] %s\n", strings.TrimSpace(c.Thinking))
 				}
 			case "tool_use":
-				fmt.Fprintf(r.out, "  → %s %s\n", c.Name, summarise(c.Input, 100))
+				r.printf("  → %s %s\n", c.Name, summarise(c.Input, 100))
 			}
 		}
 	case "user":
@@ -250,18 +273,18 @@ func (r *renderer) line(raw string) {
 				if c.IsError {
 					marker = "←!"
 				}
-				fmt.Fprintf(r.out, "  %s %s\n", marker, summarise(c.Content, 100))
+				r.printf("  %s %s\n", marker, summarise(c.Content, 100))
 			}
 		}
 	case "result":
-		fmt.Fprintf(r.out, "\n── result: %s  turns=%d  cost=$%.4f  duration=%s\n",
+		r.printf("\n── result: %s  turns=%d  cost=$%.4f  duration=%s\n",
 			l.Subtype, l.NumTurns, l.TotalCostUSD,
 			(time.Duration(l.DurationMS) * time.Millisecond).Round(time.Second))
 		if l.APIError != nil && *l.APIError != "" {
-			fmt.Fprintf(r.out, "   api error: %s\n", *l.APIError)
+			r.printf("   api error: %s\n", *l.APIError)
 		}
 		if s := strings.TrimSpace(l.Result); s != "" {
-			fmt.Fprintf(r.out, "   %s\n", s)
+			r.printf("   %s\n", s)
 		}
 	}
 }
