@@ -4241,8 +4241,8 @@ func TestTickPostsCommentAndLabelsAtRetryCap(t *testing.T) {
 	if len(gh.added) != 1 || gh.added[0] != cfg.Labels.Blocked {
 		t.Errorf("added = %v, want [%s]", gh.added, cfg.Labels.Blocked)
 	}
-	if len(gh.removed) != 1 || gh.removed[0] != cfg.Labels.InFlight {
-		t.Errorf("removed = %v, want [%s]", gh.removed, cfg.Labels.InFlight)
+	if len(gh.removed) != 2 || gh.removed[0] != cfg.Labels.InFlight || gh.removed[1] != cfg.Labels.Trigger {
+		t.Errorf("removed = %v, want [%s %s]", gh.removed, cfg.Labels.InFlight, cfg.Labels.Trigger)
 	}
 }
 
@@ -4965,7 +4965,8 @@ func setup(configPath string) (*config.Config, loopcmd.Deps, func(), error) {
 	if err != nil {
 		return nil, loopcmd.Deps{}, nil, err
 	}
-	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+	// 0700: the state directory holds the database and the agent transcripts.
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return nil, loopcmd.Deps{}, nil, fmt.Errorf("create state directory: %w", err)
 	}
 
@@ -4990,16 +4991,20 @@ func setup(configPath string) (*config.Config, loopcmd.Deps, func(), error) {
 		return nil, loopcmd.Deps{}, nil, fmt.Errorf("resolve config path: %w", err)
 	}
 
+	wt := worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch)
 	deps := loopcmd.Deps{
 		Store:      s,
 		GH:         ghub.New(token),
-		WT:         worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch),
+		WT:         wt,
 		SelfPath:   self,
 		ConfigPath: abs,
 		Now:        time.Now,
 		Spawn:      runner.Spawn,
+		// Wire both seams. Leaving them nil would panic on the first tick that
+		// evaluates a running dispatch.
+		IsAlive: proc.IsAlive,
+		Fetch:   wt.Fetch,
 	}
-	_ = proc.DispatchFlag // keep the dependency explicit for readers
 	return cfg, deps, func() { s.Close() }, nil
 }
 ```
@@ -5452,7 +5457,7 @@ git commit -m "feat(examples): planning and execution loop configurations with p
 
 | Field   | Value                                                        |
 |---------|--------------------------------------------------------------|
-| stage   | 3 (implementation)                                           |
+| stage   | 4 (commit review)                                            |
 | class   | large (new subsystem, new schema, process supervision)        |
 | profile | backend                                                      |
 | branch  | feat/loop-engine                                             |
