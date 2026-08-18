@@ -1,0 +1,113 @@
+name: execution
+repo: mcgarylabs/lawndominator-monorepo
+
+checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
+# state_dir is optional. When omitted it defaults to
+# <project>/.agent-utils/state/<name>, which keeps every project's
+# database, lock and logs separate. Set it only to override that.
+default_branch: master
+
+labels:
+  trigger:   status:ready-for-execution
+  in_flight: status:executing
+  blocked:   status:needs-execution-input
+  review:    status:ready-for-review
+  # The execution loop has no terminal label. An issue leaves it when its pull
+  # request merges, so the field is omitted rather than invented.
+  veto:
+    - "blocked:*"
+
+agent:
+  model: opus
+  effort: high
+  permission_mode: bypassPermissions
+  worktree: per_issue
+  max_budget_usd: 50
+  timeout: 4h
+
+i_understand_bypass_permissions: true
+tend_pr: true
+
+retry:
+  max: 3
+  backoff_ticks: [0, 1, 2]
+  breaker:
+    orphan_threshold: 2
+    cooldown: 30m
+
+prompt: |
+  Run the build-feature skill for GitHub issue #{{.Issue.Number}}, repo {{.Repo}},
+  in ISSUE MODE. The issue carries {{.Labels.Trigger}}, which is the human's
+  approval of a plan already posted in the issue comments. Follow build-feature
+  EXACTLY, with these overrides.
+
+  YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
+  {{.Labels.InFlight}}.
+
+  WORKTREE AND PUSH DISCIPLINE. You run in an isolated git worktree, checked out
+  detached at the default branch. Resolve the branch yourself as build-feature's
+  phase 0 describes: check out the EXISTING remote feature branch if one exists
+  and never re-create it over the design assets, then rebase onto the default
+  branch. If the rebase conflicts, PARK with a comment listing the conflicted
+  files. Never force and never guess.
+  At the END of every phase AND before every park: commit and
+  `git push -u origin <branch>`. Your worktree may be removed before your next
+  dispatch, so unpushed work is lost.
+
+  A FRESH WORKTREE HAS NO node_modules. Run `pnpm install` before any Node gate.
+
+  HEADLESS. Never ask the human through the CLI and never block on a reply. All
+  human interaction is issue comments plus label transitions. Read the issue body
+  and comments, including the posted plan, as your specification.
+
+  PARKING ON BLOCKERS. On any of build-feature's five blockers, PARK: commit and
+  push, post a comment stating exactly what you need, remove
+  {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment with:
+  "To proceed: comment your decision and re-add the {{.Labels.Trigger}} label."
+  Never guess on a genuine blocker.
+
+  ON COMPLETION. Open the pull request, or promote plan-feature's draft, with
+  "Closes #{{.Issue.Number}}" in the body. Assign @seanmcgary. Remove
+  {{.Labels.InFlight}} and add {{.Labels.Review}}. Keep the "## Pipeline State"
+  block current at every phase transition.
+
+  NEVER MERGE. Merging is the human's decision, at every stage, without exception.
+
+resume_prompt: |
+  Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
+  in the SAME session you used before, so you already know what you built and why.
+  Remove {{.Labels.Trigger}} and add {{.Labels.InFlight}} as your first action.
+
+  Read the comments added since your last message. They answer the blocker you
+  parked on, or they ask for more work on a pull request you already opened.
+
+  Resume from your "## Pipeline State" block. Re-check out your branch and rebase
+  it onto the default branch before you continue. All other rules from your
+  original instructions still apply, including push discipline and never merging.
+
+tend_prompt: |
+  You are TENDING pull request #{{.PR.Number}} for issue #{{.Issue.Number}} in
+  {{.Repo}}. It is {{.PR.BehindBy}} commits behind {{.PR.BaseRef}}.
+
+  This is maintenance on a finished feature, NOT new feature work. Do not add
+  scope. Do not refactor beyond the rebase. NEVER merge or close the pull request.
+  Do not change any label unless you park.
+
+  You run in an isolated git worktree checked out detached at
+  origin/{{.PR.HeadRef}}.
+
+  1. `git fetch origin`, then rebase onto origin/{{.PR.BaseRef}}.
+  2. If the rebase is clean, push with
+     `git push --force-with-lease origin HEAD:refs/heads/{{.PR.HeadRef}}`.
+     Use --force-with-lease, never plain --force. If the lease check REJECTS the
+     push, another run touched the branch: change nothing and stop.
+  3. If the rebase CONFLICTS, run `git rebase --abort`, then PARK with a comment
+     listing the conflicted files. Never resolve a conflict by guessing.
+
+  PARK means: post the comment, remove {{.Labels.Review}}, add
+  {{.Labels.Blocked}}, and stop. End with: "To proceed: comment your decision and
+  re-add the {{.Labels.Trigger}} label."
+
+  If the branch turns out to be current, post NO comment and make NO push.
+  Silence is the correct output for a quiet pull request.

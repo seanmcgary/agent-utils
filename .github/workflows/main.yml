@@ -1,0 +1,211 @@
+name: build
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - "**"
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting
+  # ---------------------------------------------------------------------------
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Go
+        uses: actions/setup-go@19bb51245e9c80abacb2e91cc42b33fa478b8639 # v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # `gofmt -l` exits 0 even when it lists files, so its exit code cannot be
+      # the gate. The output has to be captured and tested. This is the same
+      # check `make fmtcheck` performs.
+      - name: Check formatting
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "The following files are not formatted properly:"
+            gofmt -d .
+            exit 1
+          fi
+          echo "All files are formatted correctly."
+
+  # ---------------------------------------------------------------------------
+  # Lint
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Go
+        uses: actions/setup-go@19bb51245e9c80abacb2e91cc42b33fa478b8639 # v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run linter
+        run: |
+          make deps
+          export PATH=$PATH:$(go env GOPATH)/bin
+          make lint
+
+  # ---------------------------------------------------------------------------
+  # Test
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Go
+        uses: actions/setup-go@19bb51245e9c80abacb2e91cc42b33fa478b8639 # v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The worktree package drives real git, so the runner needs an identity
+      # or `git commit` in the test fixtures fails with "empty ident name".
+      - name: Configure git identity for the worktree tests
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch master
+
+      - name: Run tests
+        run: make test
+
+      # Race detection is separate from `make test` locally because it roughly
+      # triples the runtime. CI is exactly where that cost is worth paying: this
+      # program spawns processes and supervises them.
+      - name: Run tests under the race detector
+        run: make test/race
+
+  # ---------------------------------------------------------------------------
+  # Build
+  # ---------------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-latest
+    needs: [fmt, lint, test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # version.sh runs `git rev-parse --short HEAD`, and the release job's
+          # ancestor check needs history.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@19bb51245e9c80abacb2e91cc42b33fa478b8639 # v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # On a branch this appends "+<sha>" to VERSION. On a tag it verifies the
+      # VERSION file matches the tag and FAILS the build if it does not, so a
+      # tag can never ship a binary that reports a different version.
+      - name: Check and set version
+        env:
+          REF: ${{ github.ref }}
+        run: ./scripts/version.sh $REF
+
+      - name: Build all release binaries
+        run: make release/binaries
+
+      - name: Verify each binary reports the expected version
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          # Only the native binary can be executed here; the others are checked
+          # by grepping the stamped string out of the binary itself.
+          got=$(./release/linux-amd64/agent-utils version)
+          echo "linux-amd64 reports: $got"
+          case "$got" in
+            *"$VERSION"*) ;;
+            *) echo "expected version '$VERSION' in '$got'"; exit 1 ;;
+          esac
+          # -a is required. BSD grep returns exit 1 on a binary file even when
+          # the pattern matches, while GNU grep returns 0. Without -a this check
+          # passes on CI and fails on a developer's Mac, which is worse than no
+          # check at all.
+          for target in linux-arm64 darwin-amd64 darwin-arm64; do
+            if grep -qa -- "$VERSION" "./release/$target/agent-utils"; then
+              echo "$target contains '$VERSION'"
+            else
+              echo "$target is missing the version stamp"
+              exit 1
+            fi
+          done
+
+  # ---------------------------------------------------------------------------
+  # Release
+  # ---------------------------------------------------------------------------
+  release:
+    runs-on: ubuntu-latest
+    # Only a pushed tag releases. The version.sh call below is what enforces
+    # that the tag and the VERSION file agree.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, lint, test, build]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      # A tag on an abandoned branch would otherwise publish code that never
+      # reached the default branch.
+      - name: Ensure tag is on the default branch
+        run: |
+          TAG="${{ github.ref_name }}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          git fetch origin "$DEFAULT_BRANCH"
+          TAG_COMMIT=$(git rev-parse "$TAG")
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" "origin/$DEFAULT_BRANCH"; then
+            echo "ERROR: Tag $TAG points to a commit not on $DEFAULT_BRANCH"
+            echo "Tag commit: $TAG_COMMIT"
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@19bb51245e9c80abacb2e91cc42b33fa478b8639 # v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Fails the release if the VERSION file does not equal the tag.
+      - name: Check release version
+        env:
+          REF: ${{ github.ref }}
+        run: ./scripts/version.sh $REF
+
+      - name: Build and bundle release binaries
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "Building release $VERSION"
+          make release
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          draft: false
+          prerelease: false
+          files: ./release/*.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

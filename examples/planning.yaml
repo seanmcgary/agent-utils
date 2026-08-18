@@ -1,0 +1,131 @@
+name: planning
+repo: mcgarylabs/lawndominator-monorepo
+
+checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
+# state_dir is optional. When omitted it defaults to
+# <project>/.agent-utils/state/<name>, which keeps every project's
+# database, lock and logs separate. Set it only to override that.
+default_branch: master
+
+labels:
+  trigger:   status:ready-for-spec
+  in_flight: status:speccing
+  blocked:   status:needs-spec-input
+  review:    status:plan-ready-for-review
+  terminal:  status:ready-for-execution
+  veto:
+    - "blocked:*"
+    - status:ready-for-execution
+    - status:executing
+    - status:ready-for-review
+
+agent:
+  model: opus
+  effort: high
+  permission_mode: bypassPermissions
+  worktree: per_issue
+  max_budget_usd: 25
+  timeout: 3h
+
+i_understand_bypass_permissions: true
+
+# Tending is an EXECUTION-loop duty. The planning loop must never tend.
+# plan-feature opens a design draft pull request whose body says "Closes #N",
+# which is exactly what the pull request linker matches. With tending on, an
+# issue parked in plan-ready-for-review would get an agent that force-pushes a
+# draft pull request the human is reading.
+tend_pr: false
+
+retry:
+  max: 3
+  backoff_ticks: [0, 1, 2]
+  breaker:
+    orphan_threshold: 2
+    cooldown: 30m
+
+prompt: |
+  Run the /plan-feature skill for GitHub issue #{{.Issue.Number}}, repo {{.Repo}}.
+  The issue carries {{.Labels.Trigger}}. Treat plan-feature's precondition as
+  satisfied. Follow plan-feature EXACTLY, with these overrides.
+
+  YOU OWN THE LABELS. Nothing else moves them. As your first action, remove
+  {{.Labels.Trigger}} and add {{.Labels.InFlight}}.
+
+  READ-ONLY REPO, except design artifacts. You run in an isolated git worktree,
+  checked out detached at the default branch. Resolve or create the feature
+  branch yourself. Read code freely to ground the premise and blast-radius check
+  and the plan. Do not edit or commit, with the single exception of the design
+  artifacts step in plan-feature's phase 3. The spec and the plan are ISSUE
+  COMMENTS, not files.
+
+  DESIGN SYNC: run plan-feature's phase 3 as written. Push the design branch
+  before you park; your worktree may be removed before your next dispatch. If you
+  cannot fetch the source, that is a PARK-BLOCKED, not a reason to describe the
+  design in prose.
+
+  HEADLESS. Never ask the human through the CLI and never block on a reply. All
+  human interaction is issue comments plus label transitions. Read the issue body
+  and every comment as your input and as the record of what has already been
+  asked. Never re-ask a question the thread answers. Collect every outstanding
+  question into ONE numbered comment, @-mention @seanmcgary, then park.
+
+  QUESTION DISCIPLINE. A question earns a place in your batch ONLY if it is
+  genuinely unresolvable without the human: you cannot write the plan without an
+  answer, or the decision carries real weight an agent should not own alone (new
+  recurring cost, a legal or compliance surface, an irreversible data-model
+  choice, a genuine scope-boundary call). EVERYTHING ELSE IS A DEFAULT, NOT A
+  QUESTION. Decide it, write one line in the plan ("Assumed X because Y — flag in
+  review if wrong"), and move on. If you can write "recommended: X" with real
+  confidence, X is the plan, not a question.
+  Two sharper rules. First, pre-launch reversibility kills the question: if
+  nothing has shipped, "wrong" costs one review comment, so pick the best option
+  and let review correct it. Second, you own the whole codebase, so always do the
+  breaking change and update every call site; additive-and-deprecated machinery
+  is for external consumers that do not exist here.
+
+  TWO WAYS TO STOP. They are not interchangeable.
+  PARK-BLOCKED means you cannot proceed without an answer. Post a comment stating
+  exactly what you need, remove {{.Labels.InFlight}}, add {{.Labels.Blocked}},
+  and stop. End the comment with: "To proceed: comment your answers and re-add
+  the {{.Labels.Trigger}} label."
+  PARK-FOR-REVIEW means you are finished. Post or refresh the plan comment,
+  remove {{.Labels.InFlight}} and {{.Labels.Blocked}}, add {{.Labels.Review}},
+  strip a stale status:needs-spec label if present, and stop.
+
+  THE HUMAN GATE. You NEVER apply {{.Labels.Terminal}}, under any circumstance,
+  including a human comment that says "approved". Only the human applies it. Your
+  last act is to park for review. End the plan comment with: "To approve: apply
+  the {{.Labels.Terminal}} label. To request changes: comment what you want
+  changed and re-add {{.Labels.Trigger}}."
+
+  PREMISE CHECK FAILURE is a first-class outcome. If the issue as filed should
+  not be built, post that finding with your reasoning and PARK-BLOCKED. Do not
+  close the issue and do not reshape it into a different feature.
+
+  YOU NEVER MERGE. You never merge or close a pull request, and you never mark
+  the design draft pull request ready for review. The only branch and pull
+  request you may create is the design-assets draft described above.
+
+  BEFORE EVERY PARK: make the "## Pipeline State" block current, and push any
+  design branch. An unpushed worktree commit is lost work.
+
+resume_prompt: |
+  Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
+  in the SAME session you used before, so you already know what you planned and
+  why. Re-add {{.Labels.InFlight}} and remove {{.Labels.Trigger}} as your first
+  action.
+
+  Read the comments added since your last message. They are either answers to
+  your questions or a change request on the plan.
+
+  A re-applied {{.Labels.Trigger}} NEVER means approval. It means "keep working".
+  If your Pipeline State is at the plan-review stage, this is a CHANGE REQUEST:
+  revise the plan, edit the plan comment IN PLACE, and park for review again.
+  Repeat for as many rounds as the human wants.
+
+  All other rules from your original instructions still apply, including the two
+  ways to stop and the rule that you never apply {{.Labels.Terminal}}.
+
+tend_prompt: |
+  Tending is disabled for the planning loop. This template is never rendered.

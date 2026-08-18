@@ -1,0 +1,41 @@
+version: "2"
+linters:
+  enable:
+    # Unchecked errors. The loop's whole failure model depends on recording
+    # outcomes, so a silently dropped error is a real defect here.
+    - errcheck
+    # Comparing a sentinel with == instead of errors.Is. This repo already had
+    # one (lock.ErrHeld), which works only until something wraps it.
+    - errorlint
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Deferred cleanup on a path that is already returning, or on a file the
+      # process is about to exit with. None of these can be acted on, and
+      # writing `_ =` in front of each would add noise without adding a check.
+      # An error from a Close that MATTERS -- one whose failure means lost data
+      # the caller could still recover from -- is handled explicitly in code.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*database/sql.DB).Close
+        # sql.Rows.Close is safe to defer: any error it would report is already
+        # returned by rows.Err(), which every query here checks.
+        - (*database/sql.Rows).Close
+        - (*github.com/seanmcgary/agent-utils/internal/store.Store).Close
+        - (*github.com/seanmcgary/agent-utils/internal/lock.Lock).Release
+    staticcheck:
+      # golangci-lint's default set, minus the ST1xxx naming checks it disables
+      # out of the box. Nothing is excluded beyond that: this repo has no
+      # deprecated-API usage to grandfather in.
+      checks: ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022"]
+  exclusions:
+    rules:
+      # Test helpers deliberately ignore errors while arranging fixtures; the
+      # assertion is the point of the test, not the setup call's return.
+      - path: _test\.go
+        linters:
+          - errcheck

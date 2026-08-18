@@ -1,0 +1,10 @@
+# Build output
+/bin/
+
+# Coverage
+coverage.out
+coverage.html
+
+# Local loop state, if anyone points a config at the repo
+/state/
+release/
