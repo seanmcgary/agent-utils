@@ -68,12 +68,13 @@ func configFlag() *cli.StringFlag {
 	}
 }
 
-// nameArgument lets a command be written as `agent-utils loop tick planning`,
-// naming a configuration in the local .agent-utils directory.
-func nameArgument() cli.Argument {
-	return &cli.StringArg{
-		Name:      "name",
-		UsageText: "name of a loop configuration in " + config.DirName + "/" + config.ConfigsSubdir,
+// nameFlag selects a configuration by name from the local .agent-utils
+// directory, as an alternative to giving a path with --config.
+func nameFlag() *cli.StringFlag {
+	return &cli.StringFlag{
+		Name: "name",
+		Usage: "name of a loop configuration in " + config.DirName + "/" +
+			config.ConfigsSubdir + " (without the .yaml extension)",
 	}
 }
 
@@ -82,13 +83,20 @@ func nameArgument() cli.Argument {
 // Precedence:
 //  1. --config, an explicit path. cron should use this: it depends on no
 //     directory layout and never prompts.
-//  2. A name argument, resolved against the local .agent-utils directory.
+//  2. --name, resolved against the local .agent-utils directory.
 //  3. The only configuration present, when there is exactly one.
 //  4. An interactive choice, but ONLY when stdin is a terminal. A prompt in a
 //     cron job would hang forever, so a non-interactive run gets an error
 //     listing the names instead.
 func resolveConfigPath(c *cli.Command) (string, error) {
-	if path := c.String("config"); path != "" {
+	path, name := c.String("config"), c.String("name")
+
+	// Both set is ambiguous. Silently preferring one would hide a mistake in a
+	// cron entry until it had been running against the wrong loop for a while.
+	if path != "" && name != "" {
+		return "", errors.New("--config and --name are alternatives; pass only one")
+	}
+	if path != "" {
 		return path, nil
 	}
 
@@ -102,7 +110,7 @@ func resolveConfigPath(c *cli.Command) (string, error) {
 			err, config.DirName, config.ConfigsSubdir)
 	}
 
-	if name := c.StringArg("name"); name != "" {
+	if name != "" {
 		return config.Resolve(dir, name)
 	}
 
@@ -124,7 +132,7 @@ func resolveConfigPath(c *cli.Command) (string, error) {
 			}
 		}
 		// FullName already includes the root command name.
-		return "", fmt.Errorf("%w: %s\n\nName one, for example:\n  %s %s",
+		return "", fmt.Errorf("%w: %s\n\nName one, for example:\n  %s --name %s",
 			config.ErrAmbiguous, strings.Join(config.Names(entries), ", "),
 			c.FullName(), example)
 	}
@@ -270,10 +278,9 @@ func loopCommand() *cli.Command {
 		Usage: "run and inspect an issue-driven agent loop",
 		Commands: []*cli.Command{
 			{
-				Name:      "tick",
-				Usage:     "run one reconcile and dispatch pass, then exit",
-				Flags:     []cli.Flag{configFlag()},
-				Arguments: []cli.Argument{nameArgument()},
+				Name:  "tick",
+				Usage: "run one reconcile and dispatch pass, then exit",
+				Flags: []cli.Flag{configFlag(), nameFlag()},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					path, err := resolveConfigPath(c)
 					if err != nil {
@@ -300,10 +307,9 @@ func loopCommand() *cli.Command {
 				},
 			},
 			{
-				Name:      "status",
-				Usage:     "print the reconciled view without changing anything",
-				Flags:     []cli.Flag{configFlag()},
-				Arguments: []cli.Argument{nameArgument()},
+				Name:  "status",
+				Usage: "print the reconciled view without changing anything",
+				Flags: []cli.Flag{configFlag(), nameFlag()},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					path, err := resolveConfigPath(c)
 					if err != nil {
@@ -328,9 +334,9 @@ func loopCommand() *cli.Command {
 				Usage: "drop the stored session and worktree for one issue",
 				Flags: []cli.Flag{
 					configFlag(),
+					nameFlag(),
 					&cli.IntFlag{Name: "issue", Usage: "issue number", Required: true},
 				},
-				Arguments: []cli.Argument{nameArgument()},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					path, err := resolveConfigPath(c)
 					if err != nil {

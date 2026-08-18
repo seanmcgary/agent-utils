@@ -137,10 +137,10 @@ the loop's name on the command line.
 mkdir -p .agent-utils/configs
 cp examples/planning.yaml .agent-utils/configs/
 
-agent-utils list                    # configs in THIS project
-agent-utils loop tick planning      # select by name
-agent-utils loop status             # the only one, or a prompt, or an error listing names
-agent-utils status                  # every project onboarded, across the machine
+agent-utils list                        # configs in THIS project
+agent-utils loop tick --name planning   # select by name
+agent-utils loop status                 # the only one, or a prompt, or an error listing names
+agent-utils status                      # every project onboarded, across the machine
 ```
 
 Each project keeps its own state under its own `.agent-utils/state/`, so two projects never

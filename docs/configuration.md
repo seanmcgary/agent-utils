@@ -18,8 +18,8 @@ without its extension is the loop's **name** on the command line.
 ```
 .agent-utils/
 └── configs/
-    ├── planning.yaml     -> agent-utils loop tick planning
-    └── execution.yaml    -> agent-utils loop tick execution
+    ├── planning.yaml     -> agent-utils loop tick --name planning
+    └── execution.yaml    -> agent-utils loop tick --name execution
 ```
 
 `agent-utils list` prints what it finds:
@@ -52,13 +52,18 @@ looked.
 
 ### How a configuration is chosen
 
+`--config` and `--name` are alternatives. Passing both is an error rather than a silent
+preference, so a mistake in a cron entry surfaces immediately instead of after it has been
+running against the wrong loop.
+
 | You run | What happens |
 |---|---|
 | `agent-utils loop tick --config path/to/file.yaml` | That exact file. Nothing is scanned. |
-| `agent-utils loop tick planning` | `planning.yaml` from the configs directory |
+| `agent-utils loop tick --name planning` | `planning.yaml` from the configs directory |
 | `agent-utils loop tick`, one config present | That one |
 | `agent-utils loop tick`, several present, terminal | Prompts you to pick one |
 | `agent-utils loop tick`, several present, **not** a terminal | Fails, listing the names |
+| `agent-utils loop tick --config … --name …` | Fails: pass only one |
 
 That last row matters. A prompt in a cron job would wait for input that never arrives, so the
 prompt appears only when stdin is a real terminal. **cron should use `--config` with an
