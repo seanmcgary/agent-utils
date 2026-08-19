@@ -18,20 +18,9 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/home"
 )
 
-// Label is the launchd service identifier. It doubles as the plist's
-// filename stem and as the last path component of the `launchctl
-// bootout`/`print` targets, so it must stay stable across releases: changing
-// it would silently orphan every previously installed agent, which would
-// keep running forever under the old label with no way for a later
-// Uninstall to find it.
-const Label = "com.seanmcgary.agent-utils.listener"
-
-// LaunchAgentsDirEnvVar overrides the LaunchAgents directory. A test needs
-// this the same way internal/home needs AGENT_UTILS_HOME: without an
-// override, `go test` would write a plist into the developer's real
-// ~/Library/LaunchAgents, and `launchctl bootstrap` would then load it into
-// their actual login session.
-const LaunchAgentsDirEnvVar = "AGENT_UTILS_LAUNCH_AGENTS_DIR"
+// Label and LaunchAgentsDirEnvVar live in service.go, not here: they carry
+// no launchd-specific behavior, and plist_test.go (which has no build tag,
+// so it type-checks on every platform CI runs) references both.
 
 // launchAgentsDir resolves the directory the plist lives in.
 func launchAgentsDir() (string, error) {
@@ -52,8 +41,9 @@ func launchAgentsDir() (string, error) {
 // executablePath resolves the path of the running process's own binary. It
 // is a variable, not a direct os.Executable() call at each use site, so a
 // test can point Install at a path inside a scratch directory without the
-// test binary itself needing to live there -- see resolveSelf for why the
-// caller-supplied binary argument is not used for this instead.
+// test binary itself needing to live there -- see resolveSelf for why this,
+// not Install's binary argument, is the SOURCE of the path that gets
+// installed.
 var executablePath = os.Executable
 
 // launchctl runs `launchctl <args...>` and returns its combined output. It
@@ -84,15 +74,18 @@ func (darwinManager) ServiceFilePath() (string, error) {
 // resolveSelf returns the absolute, symlink-resolved path to the running
 // binary and refuses one that a user other than its owner could overwrite.
 //
-// It resolves via os.Executable() (through the executablePath variable)
-// rather than trusting the binary argument Install receives: RunAtLoad and
-// KeepAlive are both true in the plist this produces, so whatever path ends
-// up in ProgramArguments[0] is permanent login-time execution. Accepting an
-// arbitrary caller-supplied path there would let exactly the kind of
-// injection this package's plist rendering guards against back in through a
-// different door. The only binary this method should ever install is the
-// one currently running it, and os.Executable() is the one source that
-// actually answers that question rather than asserting it.
+// It resolves via os.Executable() (through the executablePath variable),
+// not via Install's binary argument: RunAtLoad and KeepAlive are both true
+// in the plist this produces, so whatever path ends up in
+// ProgramArguments[0] is permanent login-time execution. Treating an
+// arbitrary caller-supplied string as the SOURCE of that path -- rather than
+// merely checking it -- would let exactly the kind of injection this
+// package's plist rendering guards against back in through a different
+// door. The only binary this method should ever install is the one
+// currently running it, and os.Executable() is the one source that actually
+// answers that question rather than asserting it. Install still verifies
+// its binary argument against this result and fails loudly on a mismatch,
+// rather than silently ignoring what the caller asked for.
 //
 // The writability check matters for the same reason: this program dispatches
 // agents that run with permission prompts disabled on untrusted text (see
@@ -128,9 +121,17 @@ func refuseIfWritableByOthers(real string) error {
 		if err != nil {
 			return fmt.Errorf("stat %s: %w", path, err)
 		}
-		// 0o022 is the group-write and other-write bits. Anything else in
-		// the mode (owner permissions, the sticky bit, setuid/setgid) does
-		// not let a second user modify this path.
+		// 0o022 is the group-write and other-write bits. Masking to just
+		// those and ignoring the rest of the mode (owner permissions,
+		// setuid/setgid) is deliberate, not an oversight about the sticky
+		// bit: on a directory, sticky (mode 1000) is exactly what stops
+		// another user renaming or unlinking an entry they don't own, but
+		// it only protects entries that already exist. It does nothing to
+		// stop another user CREATING a new entry at a path this plist will
+		// later name -- e.g. a binary that does not exist yet at install
+		// time, in a writable directory that is later populated. So a
+		// sticky, world-writable directory (mode 1777, like /tmp) is still
+		// refused here, correctly.
 		if info.Mode().Perm()&0o022 != 0 {
 			return fmt.Errorf("refusing to install: %s is writable by group or other", path)
 		}
@@ -144,21 +145,37 @@ func refuseIfWritableByOthers(real string) error {
 
 // Install writes the plist and registers it with launchd.
 //
-// binary is accepted to satisfy the Manager interface, but the path this
-// method actually installs comes from resolveSelf, not from binary -- see
-// resolveSelf's comment for why a caller-supplied path is not trusted here.
-func (m darwinManager) Install(_ string, args []string) error {
+// The path this method actually installs comes from resolveSelf, not from
+// binary: see resolveSelf's comment for why a caller-supplied path is not
+// trusted as the SOURCE of the installed path. binary is still checked, not
+// silently discarded -- a caller passing a different path is confused about
+// what this method does, and failing loudly here is cheaper than silently
+// installing something other than what it asked for. Pass "" to skip the
+// check (e.g. a caller that only ever wants "whatever is currently running,
+// no matter what").
+func (m darwinManager) Install(binary string, args []string) error {
 	self, err := resolveSelf()
 	if err != nil {
 		return err
 	}
+	if binary != "" {
+		want, evalErr := filepath.EvalSymlinks(binary)
+		if evalErr != nil || want != self {
+			return fmt.Errorf("refusing to install %s: this program can only install the binary it is running as (%s)", binary, self)
+		}
+	}
 
-	// home.Dir, not os.UserHomeDir: StandardOutPath, StandardErrorPath, and
-	// WorkingDirectory must agree with wherever the daemon itself resolves
-	// ~/.agent-utils/env from, including under AGENT_UTILS_HOME in a test.
-	// Two different notions of "home" here would point the log files
-	// somewhere other than where the running daemon actually is.
-	homeDir, err := home.Dir()
+	// home.EnsureDir, not home.Dir: WorkingDirectory below must exist by
+	// the time launchd spawns the process, or the spawn fails outright. With
+	// KeepAlive true that is a throttled respawn loop with no
+	// StandardErrorPath yet to explain why -- the daemon would silently
+	// never start. home.EnsureDir also keeps StandardOutPath,
+	// StandardErrorPath, and WorkingDirectory agreeing with wherever the
+	// daemon itself resolves ~/.agent-utils/env from, including under
+	// AGENT_UTILS_HOME in a test; os.UserHomeDir would not honor that
+	// override and would point the log files somewhere other than where the
+	// running daemon actually is.
+	homeDir, err := home.EnsureDir()
 	if err != nil {
 		return fmt.Errorf("locate agent-utils home directory: %w", err)
 	}

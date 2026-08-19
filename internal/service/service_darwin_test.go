@@ -177,6 +177,51 @@ func TestInstallRefusesWorldWritableFile(t *testing.T) {
 	}
 }
 
+// TestInstallRefusesMismatchedBinary is the regression test for a real
+// defect: Install used to accept its binary argument and silently ignore
+// it, so any caller passing a path other than the one it actually installed
+// would get no error and no signal that its argument had no effect. Every
+// other Install test in this file passes the SAME path it stubbed into
+// executablePath, which cannot tell "verified" apart from "ignored" -- this
+// is the one that can.
+func TestInstallRefusesMismatchedBinary(t *testing.T) {
+	self := writableSelf(t)
+	stubExecutable(t, self)
+	stubLaunchctl(t, func(args ...string) ([]byte, error) {
+		t.Fatalf("launchctl must not run when Install refuses a mismatched binary, got args %v", args)
+		return nil, nil
+	})
+	t.Setenv(LaunchAgentsDirEnvVar, t.TempDir())
+	t.Setenv("AGENT_UTILS_HOME", t.TempDir())
+
+	other := writableSelf(t) // a different, equally valid binary -- just not the running one.
+	if self == other {
+		t.Fatal("test fixture bug: writableSelf did not produce distinct paths")
+	}
+
+	err := New().Install(other, []string{"listener", "start"})
+	if err == nil {
+		t.Fatal("Install accepted a binary argument that does not match the running executable")
+	}
+	if !strings.Contains(err.Error(), other) || !strings.Contains(err.Error(), self) {
+		t.Errorf("error %q should name both the rejected path %q and the running one %q", err, other, self)
+	}
+}
+
+// TestInstallAllowsEmptyBinaryArgument proves "" opts out of the check
+// documented on Manager.Install, rather than being treated as a mismatch.
+func TestInstallAllowsEmptyBinaryArgument(t *testing.T) {
+	self := writableSelf(t)
+	stubExecutable(t, self)
+	stubLaunchctl(t, func(args ...string) ([]byte, error) { return nil, nil })
+	t.Setenv(LaunchAgentsDirEnvVar, t.TempDir())
+	t.Setenv("AGENT_UTILS_HOME", t.TempDir())
+
+	if err := New().Install("", []string{"listener", "start"}); err != nil {
+		t.Fatalf("Install(\"\", ...) should skip the binary check, got: %v", err)
+	}
+}
+
 func TestUninstallRemovesPlistEvenWhenBootoutFails(t *testing.T) {
 	launchAgents := t.TempDir()
 	t.Setenv(LaunchAgentsDirEnvVar, launchAgents)
