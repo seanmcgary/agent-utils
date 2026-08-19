@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -288,5 +289,78 @@ func TestEarliestRetryAfterIsReportedPerProject(t *testing.T) {
 	}
 	if !due.At.Equal(retryNow) {
 		t.Errorf("At = %v, want project A's earlier deadline %v", due.At, retryNow)
+	}
+}
+
+// The cooldown boundary is judged against the supplied clock, so the daemon can
+// freeze it against its own Now seam.
+func TestEarliestRetryAfterAtUsesTheSuppliedClock(t *testing.T) {
+	db := openDB(t)
+	s := db.Project(testProject)
+	seedRetryRow(t, s, 1, retryNow, true, false)
+	if err := s.SetCooldown("planning", retryNow.Add(time.Hour)); err != nil {
+		t.Fatalf("SetCooldown: %v", err)
+	}
+
+	if _, ok, err := db.EarliestRetryAfterAt(retryNow); err != nil || ok {
+		t.Fatalf("ok = %v (err %v), want false inside the cooldown", ok, err)
+	}
+	due, ok, err := db.EarliestRetryAfterAt(retryNow.Add(2 * time.Hour))
+	if err != nil {
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
+	}
+	if !ok || due.Number != 1 {
+		t.Errorf("due = %+v, ok = %v, want issue 1 once the clock is past the cooldown", due, ok)
+	}
+}
+
+// MarkNeedsRetry reads retry_count and then writes it back. Several processes
+// write this file -- every tick and every detached runner -- so the transaction
+// takes the write lock as it begins. A deferred transaction would try to
+// upgrade a read snapshot at the write, and SQLite answers that with
+// SQLITE_BUSY_SNAPSHOT WITHOUT invoking the busy handler, so busy_timeout would
+// not cover it: the failure flag would be lost and the issue stranded holding
+// the in-flight label.
+func TestConcurrentMarkNeedsRetryNeverLosesAFailureFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	const writers = 6
+
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(number int) {
+			defer wg.Done()
+			// A separate handle per goroutine, the way a separate process has one.
+			db, err := Open(path)
+			if err != nil {
+				t.Errorf("Open: %v", err)
+				return
+			}
+			defer db.Close()
+			if err := db.Project(testProject).MarkNeedsRetry(
+				"planning", "o/r", number, retryNow, retryBackoff()); err != nil {
+				t.Errorf("MarkNeedsRetry for issue %d: %v", number, err)
+			}
+		}(i + 1)
+	}
+	wg.Wait()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	states, err := db.Project(testProject).IssueStates("planning", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != writers {
+		t.Fatalf("len = %d, want %d rows; a failure flag was lost", len(states), writers)
+	}
+	for number, st := range states {
+		if !st.NeedsRetry || !st.RetryAfter.Equal(retryNow) {
+			t.Errorf("issue %d = %+v, want needs_retry with a deadline of %v",
+				number, st, retryNow)
+		}
 	}
 }

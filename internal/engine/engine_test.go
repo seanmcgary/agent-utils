@@ -330,7 +330,7 @@ func TestParksAtRetryCap(t *testing.T) {
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
 	st := State{
 		Issues: map[int]store.IssueState{
-			1: {Number: 1, RetryCount: 3, LastRetryTick: 1, NeedsRetry: true},
+			1: {Number: 1, RetryCount: 3, NeedsRetry: true},
 		},
 	}
 	p := Decide(cfg, snap, st, time.Now())

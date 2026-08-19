@@ -176,6 +176,11 @@ func TestRetryDeadlineEscalatesAcrossTheDispatch(t *testing.T) {
 	}
 
 	// The tick dispatches the retry. It must not touch the deadline.
+	//
+	// It runs AFTER the deadline, not on it. Backoff[0] is 0s, so a dispatch
+	// that stamped now + Backoff[state.RetryCount] before the increment would
+	// land on the very instant the assertion below expects and hide itself.
+	now = base.Add(5 * time.Minute)
 	if _, err := Tick(context.Background(), cfg, deps); err != nil {
 		t.Fatal(err)
 	}

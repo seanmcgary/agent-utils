@@ -36,7 +36,9 @@ type IssueState struct {
 	SessionID    string
 	WorktreePath string
 	RetryCount   int
-	// LastRetryTick is the tick counter value when the last retry was dispatched.
+	// LastRetryTick is dead. Nothing writes it since retries moved to a
+	// wall-clock deadline; the column and this field survive so a legacy import
+	// round-trips, and dropping a column costs a table rebuild.
 	LastRetryTick int64
 	// NeedsRetry is durable failure state. A dispatch that dies or exits non-zero
 	// sets it. Only a retry, a park, or a success clears it. It must NOT be

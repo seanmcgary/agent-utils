@@ -162,12 +162,22 @@ func Open(path string) (*DB, error) {
 	// this file. Passing the pragmas in the DSN is the only way to guarantee it.
 	//
 	// 30s, not 10s: this one file now takes the writes of every tick and every
-	// detached runner on the machine. Each write is a single small statement, so
-	// a wait this long only ever covers a queue, never a slow transaction.
+	// detached runner on the machine. Almost every write is a single small
+	// statement, and the transactions that are not (the schema pass, the legacy
+	// import, MarkNeedsRetry) hold the lock only for the few statements inside
+	// them, so a wait this long only ever covers a queue.
+	//
+	// _txlock=immediate takes the write lock when a transaction BEGINS.
+	// MarkNeedsRetry reads retry_count and then writes it back, and a deferred
+	// transaction would take a read snapshot first and try to upgrade at the
+	// write. SQLite answers that upgrade with SQLITE_BUSY_SNAPSHOT and does NOT
+	// invoke the busy handler, so busy_timeout would not cover it: the failure
+	// flag would be lost and the issue stranded holding the in-flight label.
 	dsn := "file:" + path +
 		"?_pragma=busy_timeout(30000)" +
 		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=foreign_keys(1)"
+		"&_pragma=foreign_keys(1)" +
+		"&_txlock=immediate"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -1017,8 +1027,6 @@ func (d *DB) LoopStates() ([]LoopState, error) {
 	return out, nil
 }
 
-// eachRow runs a query and calls scan for every row. It exists so the three
-// aggregates above do not each repeat the same close-and-check dance.
 // EarliestRetryAfter returns the soonest pending retry deadline, if there is one.
 //
 // It is scoped to rows that a retry can still act on. A parked issue, or one
@@ -1032,7 +1040,20 @@ func (d *DB) LoopStates() ([]LoopState, error) {
 // The deadline is selected as a column and ordered by, not read with MIN().
 // An aggregate has no declared type, so the driver hands back a value of a
 // different type than every other read of that column.
+//
+// The cooldown comparison is done in SQL. Every timestamp in this database is
+// written through time.Time.UTC(), which the driver stores as text with a fixed
+// "+0000 UTC" suffix, so a text comparison orders them correctly. A writer that
+// omitted .UTC() would break this and legacy.go's refresh comparison together.
 func (d *DB) EarliestRetryAfter() (RetryDue, bool, error) {
+	return d.EarliestRetryAfterAt(time.Now().UTC())
+}
+
+// EarliestRetryAfterAt is EarliestRetryAfter with the cooldown boundary judged
+// against a supplied clock. The daemon carries its own Now seam and has to be
+// able to freeze this boundary against it in a test; MarkNeedsRetry already
+// takes its time from the caller for the same reason.
+func (d *DB) EarliestRetryAfterAt(now time.Time) (RetryDue, bool, error) {
 	var (
 		due        RetryDue
 		retryAfter int64
@@ -1045,7 +1066,7 @@ func (d *DB) EarliestRetryAfter() (RetryDue, bool, error) {
 		WHERE i.retry_after > 0 AND i.needs_retry = 1 AND i.parked = 0
 		  AND (c.until IS NULL OR c.until <= ?)
 		ORDER BY i.retry_after ASC
-		LIMIT 1`, time.Now().UTC()).
+		LIMIT 1`, now.UTC()).
 		Scan(&due.ProjectID, &due.Loop, &due.Repo, &due.Number, &retryAfter)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RetryDue{}, false, nil
@@ -1057,6 +1078,8 @@ func (d *DB) EarliestRetryAfter() (RetryDue, bool, error) {
 	return due, true, nil
 }
 
+// eachRow runs a query and calls scan for every row. It exists so the three
+// aggregates above do not each repeat the same close-and-check dance.
 func (d *DB) eachRow(query string, scan func(*sql.Rows) error) error {
 	rows, err := d.db.Query(query)
 	if err != nil {
