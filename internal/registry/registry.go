@@ -1,9 +1,13 @@
 // Package registry records which projects this tool has been used against.
 //
-// It exists so `agent-utils status` can report every onboarded project without
+// It exists so `agent-utils list` can report every onboarded project without
 // being told where they are. It is a convenience index, never a source of
-// truth: a project's real configuration and state live in its own .agent-utils
-// directory, so deleting the registry loses nothing but the list.
+// truth: a project's real configuration lives in its own .agent-utils
+// directory, and its loop state lives in the canonical database.
+//
+// Deleting the registry costs the machine-wide sweep its list of projects. A
+// forgotten project keeps every row it already has, and is found again the next
+// time a command runs inside it.
 package registry
 
 import (
@@ -16,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/seanmcgary/agent-utils/internal/home"
 )
 
 // FileName is the registry file inside the user's home .agent-utils directory.
@@ -50,17 +56,20 @@ type file struct {
 	Projects []Project `json:"projects"`
 }
 
-// Path returns the registry location, $HOME/.agent-utils/registry.json.
+// Path returns the registry location inside the machine-wide directory.
 //
-// The registry is always in the home directory even when the project's own
+// The registry is always in that directory even when the project's own
 // .agent-utils lives elsewhere. A per-project registry could not list the other
 // projects, which is the whole point of it.
+//
+// It resolves the directory through internal/home, so the registry and the
+// canonical state database can never disagree about where home is.
 func Path() (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := home.Dir()
 	if err != nil {
-		return "", fmt.Errorf("locate home directory: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".agent-utils", FileName), nil
+	return filepath.Join(dir, FileName), nil
 }
 
 // Register records that a command ran against this project.

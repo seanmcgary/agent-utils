@@ -58,7 +58,7 @@ func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) 
 	live := map[int]store.Dispatch{}
 	dead := map[int]store.Dispatch{}
 	for _, d := range running {
-		if proc.IsAlive(d.PID, d.ID) {
+		if proc.IsAlive(d.PID, d.RunnerID()) {
 			live[d.Number] = d
 		} else {
 			dead[d.Number] = d

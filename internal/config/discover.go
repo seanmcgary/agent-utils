@@ -183,9 +183,10 @@ func Resolve(agentUtilsDir, name string) (string, error) {
 
 // Duplicates returns every name declared by more than one file, sorted.
 //
-// Two loops sharing a name is never benign: the name keys the state directory,
-// the lock file and every database row, so both would write one database and
-// contend for one lock while appearing to be separate loops.
+// Two loops sharing a name is never benign. The name is half the key of every
+// row a loop owns, together with the project, so both would read and write one
+// another's issue state and dispatches. It also names the lock file and the log
+// tree, so they would contend for one lock and write into one directory.
 func Duplicates(entries []Entry) []string {
 	seen := map[string]int{}
 	for _, e := range entries {
@@ -210,7 +211,8 @@ func Names(entries []Entry) []string {
 	return out
 }
 
-// StateSubdir is the directory inside DirName that holds per-loop state.
+// StateSubdir is the directory inside DirName that holds each loop's tick lock
+// and log tree. Loop state itself lives in the canonical database.
 const StateSubdir = "state"
 
 // DirFromPath returns the .agent-utils directory a file lives under, or "" when
@@ -233,14 +235,15 @@ func DirFromPath(path string) string {
 	}
 }
 
-// ResolveStateDir returns where this loop keeps its database, lock and logs.
+// ResolveStateDir returns where this loop keeps its tick lock and its logs.
 //
 // An explicit state_dir wins. Otherwise the directory is derived from the
 // configuration file's own location: <project>/.agent-utils/state/<name>.
 //
-// Deriving it is what keeps state distinct per project. A shared absolute
-// state_dir copied between two projects would point both of them at one
-// database, so each would see the other's dispatches and issue state.
+// It no longer decides where state is kept. Loop state lives in the one
+// canonical database, and every row there is keyed by the project's identifier,
+// so two loops that share a state_dir share a lock and a log tree, never state.
+// They must still have different names: the name is the other half of that key.
 func (c *Config) ResolveStateDir(configPath string) (string, error) {
 	if strings.TrimSpace(c.StateDir) != "" {
 		return expandHome(c.StateDir)

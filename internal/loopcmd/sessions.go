@@ -2,7 +2,6 @@ package loopcmd
 
 import (
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -46,69 +45,43 @@ type Session struct {
 // Sessions returns every session in a project, newest activity first.
 //
 // loopFilter restricts the result to one loop when it is not empty.
+//
+// It reads the whole project in one query. Before the canonical database it
+// opened one file per loop, which also meant a session in a loop whose
+// configuration had been deleted could not be found at all.
 func Sessions(p *Project, loopFilter string) ([]Session, error) {
-	entries, err := config.List(p.Dir)
+	db, err := openCanonical()
 	if err != nil {
 		return nil, err
 	}
+	defer db.Close()
 
-	var out []Session
-	for _, e := range entries {
-		if e.Err != nil {
-			continue // a configuration that does not load has no state to read
-		}
-		if loopFilter != "" && e.Name != loopFilter {
-			continue
-		}
-		cfg, err := config.Load(e.Path)
-		if err != nil {
-			continue
-		}
-		stateDir, err := cfg.ResolveStateDir(e.Path)
-		if err != nil {
-			continue
-		}
-		dbPath := filepath.Join(stateDir, "state.db")
-		if !fileExists(dbPath) {
-			continue // configured but never run
-		}
-
-		sessions, err := sessionsForLoop(dbPath, cfg)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, sessions...)
+	ds, err := db.DispatchesForProject(p.Config.ID)
+	if err != nil {
+		return nil, err
 	}
-
+	out := sessionsFrom(ds, loopFilter)
 	sort.Slice(out, func(i, j int) bool { return out[i].Last.After(out[j].Last) })
 	return out, nil
 }
 
-func sessionsForLoop(dbPath string, cfg *config.Config) ([]Session, error) {
-	s, err := store.Open(dbPath)
-	if err != nil {
-		return nil, err
-	}
-	defer s.Close()
-
-	ds, err := s.DispatchesForLoop(cfg.Name, cfg.Repo)
-	if err != nil {
-		return nil, err
-	}
-
-	// DispatchesForLoop is newest first, so the first row seen for a session is
-	// its most recent dispatch.
+// sessionsFrom groups dispatches into sessions. The rows arrive newest first, so
+// the first row seen for a session is its most recent dispatch.
+func sessionsFrom(ds []store.Dispatch, loopFilter string) []Session {
 	bySession := map[string]*Session{}
 	var order []string
 	for _, d := range ds {
 		if d.SessionID == "" {
 			continue
 		}
+		if loopFilter != "" && d.Loop != loopFilter {
+			continue
+		}
 		cur, ok := bySession[d.SessionID]
 		if !ok {
 			cur = &Session{
 				ID:         d.SessionID,
-				Loop:       cfg.Name,
+				Loop:       d.Loop,
 				Issue:      d.Number,
 				Title:      d.Title,
 				Last:       d.StartedAt,
@@ -116,7 +89,7 @@ func sessionsForLoop(dbPath string, cfg *config.Config) ([]Session, error) {
 				LastKind:   d.Kind,
 			}
 			if d.Status == store.StatusRunning {
-				if proc.IsAlive(d.PID, d.ID) {
+				if proc.IsAlive(d.PID, d.RunnerID()) {
 					cur.Live = true
 				} else {
 					cur.Orphaned = true
@@ -137,7 +110,7 @@ func sessionsForLoop(dbPath string, cfg *config.Config) ([]Session, error) {
 	for _, id := range order {
 		out = append(out, *bySession[id])
 	}
-	return out, nil
+	return out
 }
 
 // RenderSessions formats sessions for a terminal.
@@ -177,35 +150,28 @@ func RenderSessions(p *Project, sessions []Session) string {
 // alongside --session would make the operator supply something the identifier
 // already determines.
 func FindSession(p *Project, sessionID string) (Session, string, error) {
-	entries, err := config.List(p.Dir)
+	sessions, err := Sessions(p, "")
 	if err != nil {
 		return Session{}, "", err
 	}
-	for _, e := range entries {
-		if e.Err != nil {
-			continue
-		}
-		cfg, err := config.Load(e.Path)
-		if err != nil {
-			continue
-		}
-		stateDir, err := cfg.ResolveStateDir(e.Path)
-		if err != nil {
-			continue
-		}
-		dbPath := filepath.Join(stateDir, "state.db")
-		if !fileExists(dbPath) {
-			continue
-		}
-		sessions, err := sessionsForLoop(dbPath, cfg)
-		if err != nil {
-			return Session{}, "", err
-		}
-		for _, sess := range sessions {
-			if sess.ID == sessionID {
-				return sess, e.Path, nil
-			}
+	var found Session
+	for _, sess := range sessions {
+		if sess.ID == sessionID {
+			found = sess
+			break
 		}
 	}
-	return Session{}, "", fmt.Errorf("no session %q in project %s", sessionID, p.Config.Name)
+	if found.ID == "" {
+		return Session{}, "", fmt.Errorf("no session %q in project %s", sessionID, p.Config.Name)
+	}
+
+	// The session names its loop; the loop names its configuration file, which
+	// is what the caller needs to read the log.
+	path, err := config.Resolve(p.Dir, found.Loop)
+	if err != nil {
+		return Session{}, "", fmt.Errorf(
+			"session %s belongs to loop %q, whose configuration is gone: %w",
+			sessionID, found.Loop, err)
+	}
+	return found, path, nil
 }

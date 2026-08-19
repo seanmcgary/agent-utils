@@ -25,7 +25,8 @@ linters:
         # sql.Rows.Close is safe to defer: any error it would report is already
         # returned by rows.Err(), which every query here checks.
         - (*database/sql.Rows).Close
-        - (*github.com/seanmcgary/agent-utils/internal/store.Store).Close
+        - (*github.com/seanmcgary/agent-utils/internal/store.DB).Close
+        - (*github.com/seanmcgary/agent-utils/internal/legacydb.DB).Close
         - (*github.com/seanmcgary/agent-utils/internal/lock.Lock).Release
     staticcheck:
       # golangci-lint's default set, minus the ST1xxx naming checks it disables

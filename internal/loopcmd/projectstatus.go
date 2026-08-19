@@ -28,8 +28,19 @@ func Describe(p *Project) (*ProjectDetail, error) {
 		return d, nil
 	}
 	d.Entries = entries
+
+	db, err := openCanonical()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	snap, err := readSnapshot(db)
+	if err != nil {
+		return nil, err
+	}
 	for _, e := range entries {
-		d.Loops = append(d.Loops, summariseLoop(e))
+		d.Loops = append(d.Loops, summariseLoop(e, p.Config.ID, snap))
 	}
 	return d, nil
 }
@@ -83,9 +94,9 @@ func RenderProjectDetail(d *ProjectDetail) string {
 		}
 	}
 
-	// A duplicated name is not cosmetic: the name keys the state directory, the
-	// lock and every database row, so two loops sharing one would write the same
-	// database while looking separate.
+	// A duplicated name is not cosmetic: the name is half the key of every row
+	// this loop owns, and it names the lock and the log tree. Two loops sharing
+	// one would read and write each other's state while looking separate.
 	if dupes := config.Duplicates(d.Entries); len(dupes) > 0 {
 		fmt.Fprintf(&b, "\nWARNING: %d name(s) declared by more than one file: %s\n",
 			len(dupes), strings.Join(dupes, ", "))

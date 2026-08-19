@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
@@ -30,9 +31,13 @@ func RunnerLogPath(stateDir, loop string, dispatchID int64) string {
 // runs for a long time. Some process must therefore outlive the tick to record
 // how the agent ended. The runner is this program invoked again, so it survives
 // the tick and writes the outcome itself.
-func Spawn(selfPath string, dispatchID int64, configPath, runnerLog string) (int, error) {
+// projectID is passed explicitly because the runner resolves no project: it is
+// given a configuration path and nothing else, and every row it writes needs an
+// owner.
+func Spawn(selfPath string, dispatchID int64, projectID, configPath, runnerLog string) (int, error) {
 	cmd := exec.Command(selfPath, "internal", "run-agent",
 		proc.DispatchFlag, strconv.FormatInt(dispatchID, 10),
+		"--project", projectID,
 		"--config", configPath)
 
 	// Detach from the tick with a new session.
@@ -47,6 +52,15 @@ func Spawn(selfPath string, dispatchID int64, configPath, runnerLog string) (int
 	// environment hands it to the agent just as surely as putting it in the
 	// agent's own. RunAgent never uses a GitHub client.
 	cmd.Env = agentEnv()
+
+	// AGENT_UTILS_HOME is added back, and only here. It names the machine-wide
+	// directory, so a runner that did not inherit it would open a DIFFERENT
+	// canonical database from the tick that spawned it, and would finish a
+	// dispatch identifier belonging to some other project. It is deliberately NOT
+	// in agentEnv's allowlist, which also feeds the claude child.
+	if h := os.Getenv(home.EnvVar); h != "" {
+		cmd.Env = append(cmd.Env, home.EnvVar+"="+h)
+	}
 
 	// The runner does the long work, so its structured logs must go somewhere.
 	// Discarding them would make every failure inside the detached process
