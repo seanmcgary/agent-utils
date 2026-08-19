@@ -2,6 +2,8 @@ package wizard
 
 import (
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -96,5 +98,84 @@ func TestWriteRefusesToOverwriteAndNamesTheFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "planning.yaml") {
 		t.Fatalf("error does not name the file it refused to overwrite: %v", err)
+	}
+}
+
+// Nothing checked that toYAMLDoc's twenty-five field mappings carry the right
+// VALUES. TestWriteProducesAFileConfigLoadAccepts cannot: Write already calls
+// config.Load itself and returns its error, so the reload afterwards is a
+// tautology. Seven deliberate mis-mappings -- Blocked taking the review label,
+// a hardcoded model, a dropped veto list, a hardcoded budget, Prompt taking
+// resume_prompt, TendPR forced false, a dropped bypass acknowledgement --
+// survived the whole suite. A blocked/review swap alone would ship a wizard
+// that applies the wrong label to every issue it parks.
+//
+// So: reload the written file and require it to equal what went in, field for
+// field. A new field added to config.Config and forgotten in toYAMLDoc fails
+// here too, which is the other half of what this is for.
+func TestWriteRoundTripsEveryValue(t *testing.T) {
+	dir := t.TempDir()
+	cfg := validConfig("planning")
+
+	// Every optional field set as well, so nothing is compared as zero
+	// against zero -- a mapping that dropped one would otherwise pass.
+	cfg.StateDir = filepath.Join(dir, "state", "planning")
+	cfg.Labels.Terminal = "status:done"
+	cfg.Labels.Veto = []string{"blocked:*", "status:hold"}
+	// Not "opus": the fixture's default is what a hardcoded mapping would
+	// most plausibly be hardcoded TO, and this test has to catch that.
+	cfg.Agent.Model = "sonnet"
+	cfg.Agent.PermissionMode = "bypassPermissions"
+	cfg.AcknowledgeBypassPermissions = true
+	cfg.TendPR = true
+	cfg.TendPrompt = "rebase #{{.Issue.Number}}"
+	cfg.Retry.Max = 3
+	cfg.Retry.Backoff = []config.Duration{
+		config.Duration(0),
+		config.Duration(15 * time.Minute),
+		config.Duration(30 * time.Minute),
+	}
+
+	path, err := Write(dir, cfg)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load(%s): %v", path, err)
+	}
+	if !reflect.DeepEqual(got, cfg) {
+		t.Errorf("the written configuration does not round-trip.\n got: %+v\nwant: %+v", got, cfg)
+	}
+}
+
+// The reload at the end of Write is the wizard's own proof that the file it
+// just produced is one every other command can load. Its FAILURE path matters
+// as much: the file is kept (the path is still returned, so an operator can
+// look at it) and the loader's own error is reported rather than a generic
+// "write failed" that names nothing.
+func TestWriteReportsAReloadFailureAndKeepsTheFile(t *testing.T) {
+	dir := t.TempDir()
+	cfg := validConfig("planning")
+	// default_branch is required by config.validate, and toYAMLDoc copies it
+	// through, so an empty one produces a file the strict loader rejects.
+	cfg.DefaultBranch = ""
+
+	path, err := Write(dir, cfg)
+	if err == nil {
+		t.Fatal("Write returned no error for a file config.Load rejects")
+	}
+	if !strings.Contains(err.Error(), "failed to reload") {
+		t.Errorf("err = %v, want it to say the written file failed to reload", err)
+	}
+	if !strings.Contains(err.Error(), "default_branch") {
+		t.Errorf("err = %v, want the loader's own reason, not a generic write failure", err)
+	}
+	if path == "" {
+		t.Fatal("Write returned no path; the file it kept for inspection is unfindable")
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("the rejected file was not kept for inspection: %v", statErr)
 	}
 }

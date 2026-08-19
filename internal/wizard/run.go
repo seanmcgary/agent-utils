@@ -312,7 +312,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	// 22. retry.breaker.orphan_threshold
 	orphanAnswer, err := p.Ask(Question{
 		Key: "retry.breaker.orphan_threshold", Label: "Retry breaker orphan threshold",
-		Help: "Trips the breaker after this many orphaned dispatches on one issue.", Default: "2",
+		Help: "Trips the breaker when this many issues need a retry in the same tick.", Default: "2",
 		Validate: validatePositiveInt,
 	})
 	if err != nil {

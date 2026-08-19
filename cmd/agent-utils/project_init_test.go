@@ -397,7 +397,7 @@ func TestProjectInitMachineWideAgentUtilsDirRefusesAndWritesNothing(t *testing.T
 // TestProjectInitDefaultNameTakenReportsRename covers IMPORTANT 2: the
 // rename report openProject used to print (internal/loopcmd/resolve.go's
 // RenamedFrom, derived from the directory basename) must still fire when NO
-// positional name is given and project.Ensure has to uniquify the
+// positional name is given and project.EnsureNamed has to uniquify the
 // directory-derived name. Before the internal/project.EnsureNamed refactor,
 // mintProjectDescriptor's name == "" branch hard-returned "" for
 // renamedFrom, so this path silently produced "web-2" with no explanation.
@@ -405,9 +405,9 @@ func TestProjectInitDefaultNameTakenReportsRename(t *testing.T) {
 	withHome(t)
 
 	// Two directories cannot share one basename on a real filesystem, so the
-	// collision project.Ensure actually sees -- two projects whose directory
-	// basename slugs to the same name -- is built with two distinct parents
-	// both containing a directory named "web".
+	// collision project.EnsureNamed actually sees -- two projects whose
+	// directory basename slugs to the same name -- is built with two distinct
+	// parents both containing a directory named "web".
 	rootA := filepath.Join(t.TempDir(), "web")
 	rootB := filepath.Join(t.TempDir(), "web")
 	if err := os.MkdirAll(rootA, 0o755); err != nil {

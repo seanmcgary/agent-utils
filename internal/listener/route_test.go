@@ -1,13 +1,37 @@
 package listener
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 )
+
+// captureLogs redirects slog for one test and returns what was written.
+//
+// The two skips below are asserted through their log lines, not only through
+// the returned targets, and that is deliberate rather than lazy: without the
+// skip, a project whose directory is gone falls through to config.List and is
+// dropped there anyway, and a loop file that does not load carries an empty
+// Repo that matches nothing. The returned slice is therefore IDENTICAL either
+// way -- which is exactly why both branches survived a mutation and why these
+// tests proved nothing before. What the branch actually buys is the
+// diagnostic: an operator looking at a loop that stopped receiving deliveries
+// needs to be told WHICH condition it is, and the two fallthroughs say
+// something else or nothing at all.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return buf
+}
 
 // minimalConfig returns a valid loop configuration body for name and repo.
 // route.go only reads Name and Repo off the loaded config, but config.Load
@@ -103,6 +127,7 @@ func TestTargetsReturnsBothLoopsForASharedRepo(t *testing.T) {
 }
 
 func TestTargetsSkipsADeletedProjectDirectory(t *testing.T) {
+	logs := captureLogs(t)
 	home := setHome(t)
 	_, dirA := newProject(t, home, "alpha")
 	idB, dirB := newProject(t, home, "beta")
@@ -122,9 +147,16 @@ func TestTargetsSkipsADeletedProjectDirectory(t *testing.T) {
 	if len(targets) != 1 || targets[0].ProjectID != idB {
 		t.Fatalf("targets = %+v, want exactly beta's loop", targets)
 	}
+	if !strings.Contains(logs.String(), "directory no longer exists") {
+		t.Errorf("the vanished project was skipped silently; the log says:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), dirA) {
+		t.Errorf("the skip does not name the directory that vanished:\n%s", logs.String())
+	}
 }
 
 func TestTargetsSkipsAnUnparsableLoopFile(t *testing.T) {
+	logs := captureLogs(t)
 	home := setHome(t)
 	_, dir := newProject(t, home, "alpha")
 	writeLoop(t, dir, "broken.yaml", "name: broken\nthis_key_does_not_exist: true\n")
@@ -136,6 +168,10 @@ func TestTargetsSkipsAnUnparsableLoopFile(t *testing.T) {
 	}
 	if len(targets) != 1 || targets[0].LoopName != "planning" {
 		t.Fatalf("targets = %+v, want exactly the one parsable loop", targets)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "cannot load config") || !strings.Contains(out, "broken.yaml") {
+		t.Errorf("the unloadable loop was skipped without naming it; the log says:\n%s", out)
 	}
 }
 

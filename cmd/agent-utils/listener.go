@@ -394,13 +394,16 @@ func runListener(_ context.Context, addr string, port int, secret func() (string
 //     starting a fresh coding agent on the way out; see instrumentRetries'
 //     own doc comment for why this has to be a signal of its own rather
 //     than reusing serverCtx or workerCtx.
+//
 //  1. Stop accepting deliveries. Cancelling serverCtx makes
 //     Server.ListenAndServe run http.Server.Shutdown, which stops the
 //     listener socket and waits (up to 10s) for any still-active HTTP
 //     request to finish, before ListenAndServe returns.
+//
 //  2. Only now cancel the daemon context so the worker's retry timers stop
 //     (Worker.Serve's stopAll). Doing this earlier would let a retry fire
 //     concurrently with the database close in step 4.
+//
 //  3. Wait for every tick already started to finish. Two accountings, for
 //     two different origins: srv.Drain() waits on Server's own WaitGroup,
 //     which the HTTP pool goroutine increments before it starts (see
@@ -410,15 +413,31 @@ func runListener(_ context.Context, addr string, port int, secret func() (string
 //     runs. Neither alone is complete -- a retry-fired tick never passes
 //     through Server's pool, and an HTTP-delivered tick never passes
 //     through Worker.After -- so both run.
+//
+//     A tick started by Worker.Wake is the one origin deliberately CANCELLED
+//     rather than drained: Serve calls tickOne synchronously under workerCtx,
+//     which step 2 has just cancelled. That is a choice, not an oversight.
+//     Step 2 still WAITS for Serve to return, so the process never exits out
+//     from under such a tick; what it does not do is let it finish its GitHub
+//     calls, which have no client waiting on them and can run for minutes.
+//     The cost is bounded and self-correcting: the worst outcome is a park
+//     whose durable state was written but whose comment and label edit were
+//     not, and the next tick re-derives that from the issue's own labels. An
+//     unbounded shutdown is not similarly recoverable -- launchd SIGKILLs a
+//     daemon that takes too long, which is strictly worse than a cancelled
+//     GitHub call.
+//
 //  4. Only now close the database. A tickOne in flight when the database
 //     closes underneath it leaves the dispatches row it started stuck in
 //     "running", which the next tick has to reap as an orphan (see
 //     internal/loopcmd/tick.go's orphan sweep) rather than simply finishing.
+//
 //  5. Remove the pidfile, but only if it still names THIS process. A second
 //     `listener start` cannot get far enough to overwrite it now that the
 //     lock (step 6) serializes starts, but re-checking here costs nothing
 //     and means this function is never the one that deletes a pidfile some
 //     other process is relying on.
+//
 //  6. Release the lock last of all. Everything this process owns --
 //     socket, timers, in-flight ticks, database handle, pidfile -- is
 //     already gone by the time `stop`/`status` could observe the lock as
@@ -534,8 +553,11 @@ func wrapTick(tickCtx context.Context, deliver func(ctx context.Context, repo st
 // callback never runs, so it never touches tickWG at all, and there is
 // nothing to leak. The cost is a retry that fires in the microseconds
 // between Wait() observing zero and the database closing going
-// unaccounted; that is acceptable here because stopAll has already stopped
-// every still-armed timer by the time drainAndClose reaches that Wait.
+// unaccounted; what makes that harmless is the shuttingDown gate below, not
+// stopAll. stopAll runs when Worker.Serve returns -- drainAndClose step 2,
+// BEFORE the drain -- so a tick still draining afterwards can schedule a NEW
+// timer that stopAll never saw. Such a timer fires with shuttingDown already
+// cancelled and bails out without running a tick.
 //
 // shuttingDown is a second, independent problem this wrapper also has to
 // solve. work.go's schedule already checks its own captured ctx.Err()
@@ -556,7 +578,12 @@ func wrapTick(tickCtx context.Context, deliver func(ctx context.Context, repo st
 //
 // work.go's own comment on schedule says "a shared bound belongs in the
 // command that owns both" -- Server's semaphore and Worker's retry timers.
-// This command is that owner; this is where that bound is expressed.
+// This command is that owner. The bound itself is NOT shared today, and this
+// wrapper does not make it so: it acquires no semaphore. A retry-fired tick
+// runs outside Server's MaxInFlight, bounded only by the number of loops on
+// this machine (one timer per loop at a time, stopped before another is
+// armed). What this wrapper does own is accounting, panic recovery, and the
+// shutdown gate.
 func instrumentRetries(w *listener.Worker, tickWG *sync.WaitGroup, shuttingDown context.Context) {
 	inner := w.After
 	w.After = func(d time.Duration, f func()) *time.Timer {

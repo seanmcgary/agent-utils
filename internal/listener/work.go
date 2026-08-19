@@ -255,6 +255,13 @@ func (w *Worker) tickOne(ctx context.Context, t Target) {
 // may legitimately be 0, which means never retry and leaves retry.backoff
 // out of the file entirely, so an unguarded index would panic a daemon that
 // has no supervisor to restart it.
+//
+// The clamp is kept even though config.validate enforces
+// len(retry.backoff) >= retry.max, which makes n >= len unreachable through
+// the loaded-configuration path today. That invariant lives in another
+// package, and the cost of relying on it here is an index panic that takes
+// the whole daemon down -- every loop on the machine, not just the one with
+// the short list. Two lines is the right price for not owning that risk.
 func (w *Worker) backoffFor(cfg *config.Config, n int) time.Duration {
 	d := time.Duration(0)
 	if len(cfg.Retry.Backoff) > 0 {
@@ -317,15 +324,22 @@ func (w *Worker) schedule(ctx context.Context, t Target, kind retryKind, max int
 	n := *spent
 	// The callback runs the tick itself rather than handing it back to the
 	// caller, which means a retry does not pass through the handler's
-	// in-flight semaphore. That is bounded by the number of loops on this
-	// machine (one timer per loop at a time, stopped before another is
-	// armed), not by anything a stranger controls, and the brief mandates
-	// this shape; a shared bound belongs in the command that owns both.
+	// in-flight semaphore. It is bounded instead by the number of loops on
+	// this machine (one timer per loop at a time, stopped before another is
+	// armed), which is not something a stranger controls. The two bounds are
+	// separate, and nothing joins them today; a shared one would belong in
+	// the command that owns both, not here.
 	a.timer = w.After(d, func() {
-		// A cancelled context means the daemon is shutting down. Serve stops
-		// every pending timer on the way out, but a timer that had already
-		// fired and was waiting on the mutex would still be running here, so
-		// the check is repeated rather than assumed.
+		// A cancelled context here means the daemon is shutting down for ONE
+		// of the two retry origins: a retry armed from Wake captures Serve's
+		// workerCtx, which drainAndClose cancels. It proves nothing for a
+		// retry armed from an HTTP-delivered tick, which captures tickCtx --
+		// deliberately NOT cancelled during shutdown, so an in-flight tick is
+		// allowed to finish. That origin is covered by the shuttingDown gate
+		// in cmd/agent-utils/listener.go's instrumentRetries, which is why
+		// this check is not the whole story. It stays because a Wake-armed
+		// timer that had already fired and was waiting on the mutex is still
+		// running here, past everything stopAll could have stopped.
 		if ctx.Err() != nil {
 			return
 		}
@@ -349,8 +363,14 @@ func (w *Worker) clear(key loopKey) {
 	}
 }
 
-// stopAll stops every pending retry timer. It runs on shutdown, so a daemon
-// that has been told to stop starts no new agent.
+// stopAll stops every pending retry timer, so no ALREADY-ARMED timer fires.
+//
+// It is not, on its own, "a daemon that has been told to stop starts no new
+// agent": it runs when Serve returns, which is drainAndClose step 2, BEFORE
+// the drain in step 3. A tick still draining afterwards can call schedule and
+// arm a NEW timer that this pass never saw. That timer is stopped instead by
+// the shuttingDown gate in cmd/agent-utils/listener.go's instrumentRetries,
+// which is checked when the timer FIRES rather than when it is armed.
 func (w *Worker) stopAll() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
