@@ -17,7 +17,6 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
 	"github.com/seanmcgary/agent-utils/internal/migrate"
-	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/version"
@@ -87,22 +86,14 @@ func selectedProject(c *cli.Command) string {
 	return ""
 }
 
-// openProject resolves the project and reports it when this call onboarded it.
+// openProject resolves the project to act on.
+//
+// It used to also report when the call had minted a fresh descriptor, back
+// when ResolveProject could onboard a directory implicitly. `agent-utils
+// project init` (project.go) owns that reporting now: ResolveProject never
+// creates a descriptor, so there is nothing here left to report.
 func openProject(c *cli.Command) (*loopcmd.Project, error) {
-	p, err := loopcmd.ResolveProject(selectedProject(c))
-	if err != nil {
-		return nil, err
-	}
-	if p.Created {
-		fmt.Fprintf(os.Stderr, "Registered project %q (%s)\n", p.Config.Name, p.Dir)
-		if p.RenamedFrom != "" {
-			fmt.Fprintf(os.Stderr,
-				"The name %q was already taken by another project, so this one is %q.\n"+
-					"Change it by editing %s\n",
-				p.RenamedFrom, p.Config.Name, project.Path(p.Dir))
-		}
-	}
-	return p, nil
+	return loopcmd.ResolveProject(selectedProject(c))
 }
 
 // refOf names the project a command acts for.
