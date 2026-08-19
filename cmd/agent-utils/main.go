@@ -253,6 +253,57 @@ func projectListCommand() *cli.Command {
 	}
 }
 
+// projectStatusCommand describes one project: its identity, its configurations
+// and the state of each loop.
+func projectStatusCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "status",
+		Usage: "describe this project: identity, configurations and loop state",
+		Action: func(_ context.Context, c *cli.Command) error {
+			p, err := openProject(c)
+			if err != nil {
+				return err
+			}
+			detail, err := loopcmd.Describe(p)
+			if err != nil {
+				return err
+			}
+			fmt.Print(loopcmd.RenderProjectDetail(detail))
+			return nil
+		},
+	}
+}
+
+// sessionsCommand groups everything about claude sessions. A session spans the
+// resumes of one issue, so it is a different unit from a dispatch.
+func sessionsCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "sessions",
+		Usage: "inspect the claude sessions this project has created",
+		Commands: []*cli.Command{
+			{
+				Name:  "list",
+				Usage: "list every session with its issue, runs, cost and state",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "name", Usage: "restrict to one loop"},
+				},
+				Action: func(_ context.Context, c *cli.Command) error {
+					p, err := openProject(c)
+					if err != nil {
+						return err
+					}
+					sessions, err := loopcmd.Sessions(p, c.String("name"))
+					if err != nil {
+						return err
+					}
+					fmt.Print(loopcmd.RenderSessions(p, sessions))
+					return nil
+				},
+			},
+		},
+	}
+}
+
 // projectCommand groups everything scoped to one project. Naming it explicitly
 // is what makes the top level unambiguously machine-wide.
 func projectCommand() *cli.Command {
@@ -261,7 +312,9 @@ func projectCommand() *cli.Command {
 		Usage: "act on one project: its loops, configurations and logs",
 		Flags: []cli.Flag{projectSelectorFlag()},
 		Commands: []*cli.Command{
+			projectStatusCommand(),
 			projectListCommand(),
+			sessionsCommand(),
 			logsCommand(),
 			loopCommand(),
 		},
@@ -316,7 +369,16 @@ func logsCommand() *cli.Command {
 			if err != nil {
 				return err
 			}
-			path, err := resolveLoopConfig(c, p.Dir)
+
+			// A session identifier names its own loop, so --session alone is
+			// enough; asking for --name too would demand what the id already
+			// determines.
+			var path string
+			if sess := c.String("session"); sess != "" && c.String("name") == "" && c.String("config") == "" {
+				_, path, err = loopcmd.FindSession(p, sess)
+			} else {
+				path, err = resolveLoopConfig(c, p.Dir)
+			}
 			if err != nil {
 				return err
 			}

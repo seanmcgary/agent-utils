@@ -206,12 +206,33 @@ agent-utils list                       every project: NAME | PATH | LOOPS | LAST
 agent-utils logs --project X --session Y
 agent-utils forget <name|id|path>
 
+agent-utils project status             identity, configs and loop state
 agent-utils project list               this project's loop configs
+agent-utils project sessions list      every claude session, with runs and cost
 agent-utils project logs -f
 agent-utils project loop tick   --name planning
 agent-utils project loop status --name planning
 agent-utils project loop reset  --name planning --issue 42
 ```
+
+### Sessions
+
+A session is one claude conversation. It survives resumes, so an issue keeps a single session
+across a park and its answer, and several dispatches share it. That makes a session the unit
+to follow when you want the whole story of an issue rather than one run.
+
+```
+$ agent-utils project sessions list
+SESSION            LOOP       ISSUE  TITLE                  RUNS  COST     STATE      LAST RUN
+cc33-tend-run      planning   57     Fix timezone bug       1     $0.30    succeeded  2026-08-18 21:17
+bb22-session-two   planning   57     Fix timezone bug       1     $2.40    ORPHANED   2026-08-18 21:12
+aa11-session-one   planning   42     Add zone lookup        3     $5.05    succeeded  2026-08-18 20:52
+
+$ agent-utils project logs --session aa11-session-one
+```
+
+`--session` needs no `--name`: a session identifier already names its own loop. `ORPHANED`
+marks a session whose dispatch is still recorded as running but whose process is gone.
 
 Every `project` command takes `--name <project>` to act from any directory, or uses the
 project in the current directory when you omit it:
