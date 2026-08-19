@@ -39,6 +39,7 @@ func main() {
 			migrateCommand(),
 			versionCommand(),
 			configCommand(),
+			listenerCommand(),
 			// Everything project-scoped lives under `project`.
 			projectCommand(),
 			internalCommand(),
