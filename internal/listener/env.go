@@ -38,10 +38,9 @@ func Token() (string, error) {
 		return "", err
 	}
 
-	// The value is returned in a plain error, never logged: this function's
-	// whole reason to exist is to hand back a repository-write credential,
-	// and a log line that ever included it would leak it into a file most
-	// operators treat as far less sensitive than the credential itself.
+	// The token is returned only as the string result -- never in an error,
+	// never in a log line: an error from this function is read by an
+	// operator and may be copied into a bug report.
 	token, ok := parseEnvValue(data, tokenKey)
 	if !ok {
 		return "", fmt.Errorf("%s not set in %s", tokenKey, path)
@@ -61,7 +60,11 @@ func readTokenFile(path string) ([]byte, error) {
 	// means every check that follows is about the exact file this process
 	// now holds open, not about however the path happens to resolve at some
 	// other moment.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	//
+	// O_NONBLOCK as well: open(2) on a FIFO blocks until a writer appears,
+	// so without it the daemon wedges here, before the IsRegular check below
+	// ever runs. It is harmless on a regular file on both Darwin and Linux.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("%s is a symlink, refusing to follow it", path)
@@ -79,10 +82,13 @@ func readTokenFile(path string) ([]byte, error) {
 		return nil, fmt.Errorf("stat %s: %w", path, err)
 	}
 
-	// A FIFO (or any other non-regular file) placed at this path would make
-	// io.ReadAll below block forever waiting for a writer. Token is called
-	// once per tick, so a single wedged read stalls the whole daemon, not
-	// just one delivery.
+	// A FIFO (or any other non-regular file) placed at this path is refused
+	// even though O_NONBLOCK above already keeps Open itself from wedging
+	// on one: a non-blocking open of a FIFO with no writer present succeeds
+	// and returns a descriptor that reads EOF instead of the token, which
+	// would otherwise fail as a confusing "GITHUB_TOKEN not set" rather
+	// than naming the real problem. Token is called once per tick, so this
+	// still matters even though the open itself no longer blocks.
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file (mode %s)", path, info.Mode())
 	}

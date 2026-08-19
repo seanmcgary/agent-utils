@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // envHome points $AGENT_UTILS_HOME at a fresh temporary directory and
@@ -143,7 +145,16 @@ func TestTokenDoesNotTreatATrailingHashAsAComment(t *testing.T) {
 
 func TestTokenRejectsAWorldReadableFile(t *testing.T) {
 	home := envHome(t)
-	writeEnvFile(t, home, "GITHUB_TOKEN=abc\n", 0o644)
+	path := writeEnvFile(t, home, "GITHUB_TOKEN=abc\n", 0o644)
+	// os.WriteFile's mode argument is filtered through the process umask,
+	// so on a machine with a restrictive umask (e.g. 077) the file could
+	// land at 0600 despite asking for 0644 -- and the body parses fine at
+	// 0600, so the test would then fail for a reason that has nothing to do
+	// with the mode check under test. Chmod sets the mode exactly, with no
+	// umask involved.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := Token()
 	if err == nil {
@@ -151,6 +162,61 @@ func TestTokenRejectsAWorldReadableFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "0644") {
 		t.Errorf("err = %q, want it to name the offending mode 0644", err)
+	}
+}
+
+// The 64 KiB cap must actually be enforced, not merely documented: without
+// this test env.go:119's LimitReader could silently regress into an
+// unbounded read and nothing would catch it.
+func TestTokenRejectsAFileOverTheSizeCap(t *testing.T) {
+	home := envHome(t)
+	const limit = 64 * 1024
+	// One byte over the cap: enough to prove the boundary is enforced
+	// without asserting on some arbitrary larger size.
+	body := "GITHUB_TOKEN=" + strings.Repeat("a", limit+1) + "\n"
+	writeEnvFile(t, home, body, 0o600)
+
+	_, err := Token()
+	if err == nil {
+		t.Fatal("Token() = nil error for a file one byte over the 64 KiB cap")
+	}
+	if !strings.Contains(err.Error(), "65536") {
+		t.Errorf("err = %q, want it to name the 65536-byte limit", err)
+	}
+}
+
+// A FIFO at this path must be rejected, not read from -- and, more
+// importantly, must not wedge Token() forever. open(2) on a FIFO blocks
+// until a writer appears unless O_NONBLOCK is set; this test runs Token()
+// in a goroutine with a timeout specifically so a regression that drops
+// O_NONBLOCK fails this test instead of hanging the whole suite.
+func TestTokenRejectsAFIFOWithoutBlockingForever(t *testing.T) {
+	home := envHome(t)
+	path := filepath.Join(home, "env")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, err := Token()
+		done <- result{err: err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err == nil {
+			t.Fatal("Token() = nil error for a FIFO at the env path")
+		}
+	case <-time.After(2 * time.Second):
+		// This is exactly the wedge O_NONBLOCK exists to prevent: without
+		// it, open(2) on this FIFO blocks forever waiting for a writer that
+		// will never arrive, inside os.OpenFile, before IsRegular ever runs.
+		t.Fatal("Token() did not return within 2s: it is blocked opening a FIFO, " +
+			"the wedge O_NONBLOCK on the OpenFile call is supposed to prevent")
 	}
 }
 

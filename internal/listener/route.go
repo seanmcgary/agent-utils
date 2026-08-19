@@ -138,7 +138,19 @@ func TargetFor(projectID, loop string) (Target, bool, error) {
 		}
 
 		for _, e := range entries {
-			if e.Err != nil || e.Name != loop {
+			if e.Err != nil {
+				// Logged, unlike the bare `continue` below: a name mismatch
+				// is ordinary (most loops in a project are not the one being
+				// looked for), but a broken config is not. Without this a
+				// loop whose file breaks becomes permanently un-wakeable for
+				// a retry deadline with nothing in the log to explain why --
+				// the caller only ever sees ok=false, indistinguishable from
+				// "no such loop."
+				slog.Warn("skipping loop: cannot load config",
+					"loop", e.Name, "project", p.Name, "file", e.File, "err", e.Err)
+				continue
+			}
+			if e.Name != loop {
 				continue
 			}
 			return Target{
