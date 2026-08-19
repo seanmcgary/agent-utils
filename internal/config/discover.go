@@ -122,9 +122,14 @@ func FindDir(startDir string) (string, error) {
 		dir = parent
 	}
 
-	return "", fmt.Errorf(
-		"%w in %s or any parent directory; run `agent-utils project init` to create one",
-		ErrNoDir, startDir)
+	// The message used to end "; run `agent-utils project init` to create
+	// one" here too. loopcmd.ResolveProject wraps this error in a fuller
+	// message that already names that command, so the same instruction
+	// would otherwise print twice on the one path that actually reaches an
+	// operator (a bare FindDir caller has no such wrapper today, but this is
+	// a location, not a fix; the fix belongs to the caller that knows what a
+	// project is).
+	return "", fmt.Errorf("%w in %s or any parent directory", ErrNoDir, startDir)
 }
 
 // ConfigsDir returns the configurations directory inside a .agent-utils dir.

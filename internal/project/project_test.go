@@ -16,25 +16,31 @@ func mkDir(t *testing.T, root, name string) string {
 	return dir
 }
 
-func TestEnsureCreatesADescriptorNamedAfterTheDirectory(t *testing.T) {
+// TestEnsureNamedCreatesADescriptorNamedAfterTheBase covers what Ensure used
+// to cover for the directory-derived path (Ensure was deleted: it was a thin
+// wrapper around EnsureNamed with the directory's own slugged basename as
+// base, and after F5 removed its only production caller -- loopcmd's former
+// ResolveProject -- EnsureNamed had exactly one remaining caller,
+// mintProjectDescriptor, which always computes its own base first).
+func TestEnsureNamedCreatesADescriptorNamedAfterTheBase(t *testing.T) {
 	dir := mkDir(t, t.TempDir(), "lawndominator")
 
-	c, created, err := Ensure(dir, func(string) bool { return false })
+	c, created, _, err := EnsureNamed(dir, "lawndominator", func(string) bool { return false })
 	if err != nil {
-		t.Fatalf("Ensure: %v", err)
+		t.Fatalf("EnsureNamed: %v", err)
 	}
 	if !created {
 		t.Error("created = false on a fresh project")
 	}
 	if c.Name != "lawndominator" {
-		t.Errorf("Name = %q, want the directory name", c.Name)
+		t.Errorf("Name = %q, want the given base", c.Name)
 	}
 	if c.ID == "" {
 		t.Error("ID must be minted")
 	}
 
 	// A second call must load, not re-create: the id has to be stable.
-	again, created, err := Ensure(dir, func(string) bool { return false })
+	again, created, _, err := EnsureNamed(dir, "lawndominator", func(string) bool { return false })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,12 +52,12 @@ func TestEnsureCreatesADescriptorNamedAfterTheDirectory(t *testing.T) {
 	}
 }
 
-// Two projects can easily share a directory name. The name is the human handle
+// Two projects can easily share a base name. The name is the human handle
 // and must be unique, so the second one gets a suffix.
-func TestEnsureUniquifiesATakenName(t *testing.T) {
+func TestEnsureNamedUniquifiesATakenName(t *testing.T) {
 	dir := mkDir(t, t.TempDir(), "web")
 
-	c, _, err := Ensure(dir, func(n string) bool { return n == "web" || n == "web-2" })
+	c, _, _, err := EnsureNamed(dir, "web", func(n string) bool { return n == "web" || n == "web-2" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,10 +66,10 @@ func TestEnsureUniquifiesATakenName(t *testing.T) {
 	}
 }
 
-func TestEnsureSlugsAnAwkwardDirectoryName(t *testing.T) {
-	dir := mkDir(t, t.TempDir(), "My Project (v2)!")
+func TestEnsureNamedSlugsAnAwkwardBase(t *testing.T) {
+	dir := mkDir(t, t.TempDir(), "x")
 
-	c, _, err := Ensure(dir, func(string) bool { return false })
+	c, _, _, err := EnsureNamed(dir, Slug("My Project (v2)!"), func(string) bool { return false })
 	if err != nil {
 		t.Fatal(err)
 	}

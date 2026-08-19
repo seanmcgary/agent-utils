@@ -70,7 +70,7 @@ type projectInitDeps struct {
 	// Dir is the project's root directory: --dir, or the working directory.
 	Dir string
 	// Name is the positional project name. Empty lets mintProjectDescriptor
-	// (via project.Ensure) name the project after Dir's base name instead.
+	// (via project.EnsureNamed) name the project after Dir's base name instead.
 	Name        string
 	NoLoop      bool
 	Interactive bool
@@ -232,18 +232,13 @@ func reportf(out io.Writer, format string, args ...any) error {
 
 // mintProjectDescriptor creates the project's descriptor if it does not
 // already exist, using name as the base identity when it is non-empty and
-// falling back to the directory's own (slugged) basename otherwise -- the
-// same fallback project.Ensure computes internally.
+// falling back to the directory's own (slugged) basename otherwise.
 //
-// It calls project.EnsureNamed directly, rather than going through
-// project.Ensure for the empty-name case, so that BOTH paths can report a
-// rename. Ensure exists for callers (loopcmd.ResolveProject among them) that
-// compute their own "before" name separately and so have no use for
-// EnsureNamed's renamedFrom; `project init` is not one of those callers, and
-// discarding the report here would repeat exactly the gap this function used
-// to have when it hand-rolled its own uniquify loop only for the
-// explicit-name path: the directory-derived path could never say a name had
-// been taken.
+// It calls project.EnsureNamed so both paths -- an explicit positional name
+// and the directory-derived fallback -- report a rename via renamedFrom.
+// Before this function existed, only the explicit-name path had a uniquify
+// loop; the directory-derived path had none, so a taken directory-derived
+// name could never say so.
 func mintProjectDescriptor(agentUtilsDir, rootDir, name string) (*project.Config, bool, string, error) {
 	base := name
 	if base == "" {

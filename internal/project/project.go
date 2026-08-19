@@ -82,37 +82,11 @@ func Save(agentUtilsDir string, c *Config) error {
 	return nil
 }
 
-// Ensure loads a project's descriptor, creating one when it does not exist.
-//
-// A new project is named after its directory. When that name is already taken
-// by another project, a numeric suffix is added until it is unique. taken
+// EnsureNamed loads a project's descriptor, creating one when it does not
+// exist. A new project is named base; when base is already taken by another
+// project, a numeric suffix is added until it is unique, starting at 2, and
+// renamedFrom is set to base so the caller can report what happened. taken
 // reports whether a name is already in use elsewhere.
-//
-// It returns the descriptor and whether it had to be created. It is
-// EnsureNamed with the directory's own (slugged) basename as the base name,
-// and so never reports a rename: a caller that needs to know whether the
-// directory-derived name had to be suffixed -- `project init` with no
-// positional name is exactly that caller -- must call EnsureNamed directly.
-func Ensure(agentUtilsDir string, taken func(name string) bool) (*Config, bool, error) {
-	c, created, _, err := EnsureNamed(agentUtilsDir, Slug(filepath.Base(filepath.Dir(agentUtilsDir))), taken)
-	return c, created, err
-}
-
-// EnsureNamed is Ensure with an explicit base name instead of one derived
-// from the directory. `project init <name>` needs this: the positional name
-// cannot be threaded through Ensure, which always derives its base name from
-// filepath.Base(filepath.Dir(agentUtilsDir)) with no override.
-//
-// When base is already taken, a numeric suffix is added until the result is
-// unique (same %s-%d format, starting at 2, as Ensure), and renamedFrom is
-// set to base so the caller can report what happened -- the same
-// information Ensure's own directory-derived path needs to report a rename,
-// which is why Ensure is now defined in terms of this function rather than
-// the other way around: a second, hand-uniquified copy of this loop
-// (previously duplicated in cmd/agent-utils/project.go for the
-// positional-name path) could report a rename while Ensure's callers could
-// not, silently dropping the report for every project onboarded by
-// directory name.
 //
 // It returns the descriptor and whether it had to be created; renamedFrom is
 // only ever set when created is true.

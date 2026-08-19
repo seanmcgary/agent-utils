@@ -93,8 +93,20 @@ func TestResolveProjectNoAgentUtilsDirNamesInit(t *testing.T) {
 	if !errors.Is(err, config.ErrNoDir) {
 		t.Errorf("err = %v, want it to wrap config.ErrNoDir", err)
 	}
-	if !strings.Contains(err.Error(), "project init") {
-		t.Errorf("error = %q, want it to name `agent-utils project init`", err.Error())
+	// Assert on text only noProjectErr itself can produce, not a bare
+	// "project init" substring: config.ErrNoDir's own message used to name
+	// `agent-utils project init` too (removed in MINOR 2's fix), which meant
+	// this test passed identically whether or not ResolveProject wrapped the
+	// error at all -- it pinned errors.Is but not the requirement it is
+	// named for.
+	if !strings.Contains(err.Error(), "This command acts on the project you are in") {
+		t.Errorf("error = %q, want noProjectErr's own message", err.Error())
+	}
+	if !strings.Contains(err.Error(), "agent-utils project --name") {
+		t.Errorf("error = %q, want the registry-selector alternative noProjectErr names", err.Error())
+	}
+	if strings.Contains(err.Error(), "mkdir -p") {
+		t.Errorf("error = %q, must not contain the old `mkdir -p` shape", err.Error())
 	}
 }
 

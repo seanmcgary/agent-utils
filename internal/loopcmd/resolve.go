@@ -3,6 +3,7 @@ package loopcmd
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -33,10 +34,12 @@ type Project struct {
 // config.FindDir learned to skip it, the machine-wide ~/.agent-utils itself.
 // `agent-utils project init` is now the only path that creates a project, so
 // a directory with no descriptor is reported as an error rather than
-// silently adopted. This is backward compatible for every real user: a
-// project that was already onboarded has a descriptor on disk and resolves
-// exactly as before. Only a directory that was never a project now needs one
-// command run in it first.
+// silently adopted. This is backward compatible for every project that has
+// been used at least once: it has a descriptor on disk already and resolves
+// exactly as before. A directory that was hand-assembled (a .agent-utils/
+// with a configs/ someone wrote by hand, say) but never actually run through
+// a command has no descriptor either, and now needs one command run in it
+// first, the same as a directory that was never touched at all.
 func ResolveProject(selector string) (*Project, error) {
 	if selector != "" {
 		p, err := registry.Find(selector)
@@ -45,6 +48,13 @@ func ResolveProject(selector string) (*Project, error) {
 		}
 		cfg, err := project.Load(p.AgentUtilsDir)
 		if err != nil {
+			// A registered project whose descriptor was deleted out from under
+			// it hits this too: "project has no config.yaml at ..." alone gives
+			// no next step, the same gap noProjectErr closes for the
+			// directory-based path below.
+			if errors.Is(err, project.ErrNoConfig) {
+				return nil, noProjectErr(err)
+			}
 			return nil, err
 		}
 		return &Project{Config: cfg, Dir: p.AgentUtilsDir, Root: p.Root}, nil
@@ -69,9 +79,14 @@ func ResolveProject(selector string) (*Project, error) {
 
 	out := &Project{Config: cfg, Dir: dir, Root: parentOf(dir)}
 	if err := registry.Register(dir, cfg.ID, cfg.Name); err != nil {
-		// The registry is an index. Losing an update costs the project a line in
-		// `agent-utils list`, never a dispatch.
-		return out, nil
+		// The registry is an index. Losing an update costs the project a line
+		// in `agent-utils list`, never a dispatch, so this is logged and
+		// carried on rather than failed -- but it is now the ONLY side effect
+		// left on this path (minting moved to `project init`), which raises
+		// its profile: a silently dropped failure here used to be one of two
+		// things this call did, and is now the whole of what it does besides
+		// reading.
+		slog.Warn("registry update failed", "project", cfg.Name, "err", err)
 	}
 	return out, nil
 }

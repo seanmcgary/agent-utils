@@ -113,9 +113,9 @@ func TestFindDirDoesNotAdoptTheMachineWideDirectory(t *testing.T) {
 	if !errors.Is(err, ErrNoDir) {
 		t.Fatalf("err = %v, want ErrNoDir", err)
 	}
-	if !contains(err.Error(), "agent-utils project init") {
-		t.Errorf("err = %q, want it to name the fix (`agent-utils project init`)", err)
-	}
+	// FindDir's own message no longer names the fix (`agent-utils project
+	// init`): loopcmd.ResolveProject's noProjectErr is the one place that
+	// now does, so the same line is not printed twice on this exact path.
 }
 
 // Regression. home.Dir() and a walk candidate can name the same directory in
