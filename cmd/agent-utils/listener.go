@@ -271,12 +271,26 @@ func runListener(_ context.Context, addr string, port int, secret string) error 
 
 	w := listener.NewWorker(db)
 
+	// shuttingDown is cancelled at the very start of drainAndClose, before
+	// anything else. instrumentRetries checks it so a retry timer firing
+	// during shutdown does not start a fresh coding agent; see its doc
+	// comment for why work.go's own ctx.Err() check inside schedule cannot
+	// be trusted to catch this for every retry origin.
+	shuttingDown, cancelShuttingDown := context.WithCancel(context.Background())
+	// A safety net for every early-return path below, before drainAndClose
+	// ever runs: drainAndClose itself calls cancelShuttingDown explicitly,
+	// as its very first action, on the real shutdown path -- this defer
+	// only matters if runListener returns before reaching that call.
+	// CancelFuncs are idempotent, so the explicit call and this defer
+	// calling it again later cost nothing.
+	defer cancelShuttingDown()
+
 	var tickWG sync.WaitGroup
 	// instrumentRetries wraps Worker.After so a retry-fired tick is
 	// accounted for and panic-safe exactly like an HTTP-delivered one; see
 	// its own comment for why that gap existed and why fixing it belongs
 	// here rather than inside internal/listener.
-	instrumentRetries(w, &tickWG)
+	instrumentRetries(w, &tickWG, shuttingDown)
 
 	// tickCtx is a context of its own, deliberately NOT serverCtx (below):
 	// Handler(ctx) threads whatever ctx ListenAndServe was given into every
@@ -351,12 +365,18 @@ func runListener(_ context.Context, addr string, port int, secret string) error 
 		slog.Warn("listener's http server exited on its own")
 	}
 
-	return drainAndClose(cancelServer, cancelWorker, serverDone, workerDone, srv, &tickWG, db, lk, pidPath)
+	return drainAndClose(cancelShuttingDown, cancelServer, cancelWorker, serverDone, workerDone, srv, &tickWG, db, lk, pidPath)
 }
 
 // drainAndClose runs the shutdown sequence, in this exact order, and why:
 //
-//  1. Stop accepting deliveries first. Cancelling serverCtx makes
+//  0. Cancel shuttingDown FIRST, before anything else -- even before
+//     serverCtx. This is the signal instrumentRetries checks so a retry
+//     timer firing anywhere during the steps below bails out instead of
+//     starting a fresh coding agent on the way out; see instrumentRetries'
+//     own doc comment for why this has to be a signal of its own rather
+//     than reusing serverCtx or workerCtx.
+//  1. Stop accepting deliveries. Cancelling serverCtx makes
 //     Server.ListenAndServe run http.Server.Shutdown, which stops the
 //     listener socket and waits (up to 10s) for any still-active HTTP
 //     request to finish, before ListenAndServe returns.
@@ -367,10 +387,11 @@ func runListener(_ context.Context, addr string, port int, secret string) error 
 //     two different origins: srv.Drain() waits on Server's own WaitGroup,
 //     which the HTTP pool goroutine increments before it starts (see
 //     Server.Drain's comment); tickWG.Wait() waits on this command's own
-//     WaitGroup, which instrumentRetries increments around every retry
-//     Worker.After arms. Neither alone is complete -- a retry-fired tick
-//     never passes through Server's pool, and an HTTP-delivered tick never
-//     passes through Worker.After -- so both run.
+//     WaitGroup, which instrumentRetries increments (at FIRE time; see its
+//     comment for why not at arm time) around every retry that actually
+//     runs. Neither alone is complete -- a retry-fired tick never passes
+//     through Server's pool, and an HTTP-delivered tick never passes
+//     through Worker.After -- so both run.
 //  4. Only now close the database. A tickOne in flight when the database
 //     closes underneath it leaves the dispatches row it started stuck in
 //     "running", which the next tick has to reap as an orphan (see
@@ -386,11 +407,13 @@ func runListener(_ context.Context, addr string, port int, secret string) error 
 //     free, so there is no window where the lock says "not running" while
 //     any of that is still true.
 func drainAndClose(
-	cancelServer, cancelWorker context.CancelFunc,
+	cancelShuttingDown, cancelServer, cancelWorker context.CancelFunc,
 	serverDone <-chan error, workerDone <-chan struct{},
 	srv *listener.Server, tickWG *sync.WaitGroup,
 	db *store.DB, lk *lock.Lock, pidPath string,
 ) error {
+	cancelShuttingDown()
+
 	cancelServer()
 	serveErr := <-serverDone
 
@@ -457,7 +480,8 @@ func wrapTick(tickCtx context.Context, deliver func(ctx context.Context, repo st
 
 // instrumentRetries wraps w.After -- an exported seam on Worker specifically
 // so a caller can do this (internal/listener/work.go) -- so a retry-fired
-// tick is accounted for by tickWG and protected by recover, exactly like an
+// tick is accounted for by tickWG, protected by recover, and stopped from
+// starting a fresh coding agent once shutdown has begun, exactly like an
 // HTTP-delivered one.
 //
 // Without this, work.go's schedule runs tickOne directly inside the
@@ -472,22 +496,78 @@ func wrapTick(tickCtx context.Context, deliver func(ctx context.Context, repo st
 // that same callback is unrecovered and kills the whole process, same as an
 // unrecovered panic anywhere else.
 //
-// Add(1) happens synchronously inside the wrapped After, at the moment the
-// timer is ARMED (schedule calling After), not when it fires: time.AfterFunc
-// establishes a genuine happens-before between arming and the goroutine it
-// later starts to run the callback, the same guarantee "go func(){}()"
-// itself gives its own body, so there is no window where Wait could observe
-// a zero counter for a timer that is armed but has not yet fired.
+// Add(1) and Done are both at FIRE time -- the first and (deferred) last
+// things the wrapped callback does -- NOT at arm time. An earlier version of
+// this wrapper called Add(1) when After armed the timer, on the theory that
+// time.AfterFunc gives the same happens-before guarantee "go func(){}()"
+// does. That reasoning holds for WHETHER the callback eventually runs, but
+// not for whether it runs AT ALL: three paths in work.go stop an armed timer
+// before it ever fires -- schedule re-arming an existing key (a new
+// delivery or a fresh failure for a loop that already has a retry pending),
+// clear on a successful or lock-shed tick, and stopAll at shutdown -- and
+// Stop() succeeding means the callback that would have called Done() never
+// runs at all. Each of those paths left tickWG's counter permanently
+// incremented with no matching Done, which hangs drainAndClose's
+// tickWG.Wait() forever: the database is never closed, the pidfile is never
+// removed, and the listener lock (see lockFileName) is never released, so
+// the hung process keeps holding it and every later `listener start`
+// refuses with "already running" until something SIGKILLs the hung
+// process. Moving Add/Done to fire time closes that: a stopped timer's
+// callback never runs, so it never touches tickWG at all, and there is
+// nothing to leak. The cost is a retry that fires in the microseconds
+// between Wait() observing zero and the database closing going
+// unaccounted; that is acceptable here because stopAll has already stopped
+// every still-armed timer by the time drainAndClose reaches that Wait.
+//
+// shuttingDown is a second, independent problem this wrapper also has to
+// solve. work.go's schedule already checks its own captured ctx.Err()
+// before running tickOne, meant to catch "the daemon is shutting down."
+// That check works for a retry armed from Worker.Wake, which captures
+// workerCtx (cancelled by drainAndClose's step 2, before the drain). It
+// does NOT work for a retry armed from an HTTP-delivered tick, which
+// captures tickCtx (see wrapTick) -- deliberately not cancelled until AFTER
+// drainAndClose returns, so an in-flight tick is allowed to finish rather
+// than being cut off. That same property means work.go's own check can
+// never see tickCtx as cancelled while shutdown is actually happening, so
+// without shuttingDown, a retry timer armed from an HTTP delivery and
+// firing during shutdown would run a full tickOne -- starting a coding
+// agent -- while the rest of the process is being torn down around it.
+// shuttingDown is cancelled at the very start of drainAndClose (before
+// cancelServer), specifically to give this wrapper a signal that is
+// trustworthy regardless of which ctx the retry happened to capture.
 //
 // work.go's own comment on schedule says "a shared bound belongs in the
 // command that owns both" -- Server's semaphore and Worker's retry timers.
 // This command is that owner; this is where that bound is expressed.
-func instrumentRetries(w *listener.Worker, tickWG *sync.WaitGroup) {
+func instrumentRetries(w *listener.Worker, tickWG *sync.WaitGroup, shuttingDown context.Context) {
 	inner := w.After
 	w.After = func(d time.Duration, f func()) *time.Timer {
-		tickWG.Add(1)
 		return inner(d, func() {
+			// Brackets the ENTIRE callback -- whether it goes on to run f or
+			// bails below on shuttingDown -- which is what step 3 of
+			// drainAndClose is actually waiting to know: not "did a tick
+			// run," but "has every timer that fired finished deciding what
+			// to do."
+			tickWG.Add(1)
 			defer tickWG.Done()
+
+			if shuttingDown.Err() != nil {
+				// See this function's doc comment: work.go's own ctx.Err()
+				// check inside schedule cannot see this for an
+				// HTTP-delivered retry, because that ctx (tickCtx) is not
+				// cancelled until after this process has already finished
+				// shutting down. This is the diagnosable-but-unavoidable
+				// gap in a panic's log context too: a repo/loop identity
+				// would help here, but After's signature (f func()) carries
+				// none, and widening it would mean changing work.go's
+				// schedule and every fake in work_test.go for a minor
+				// logging improvement; the recovered panic below still logs
+				// a full stack trace, which is what actually locates the
+				// failure in code.
+				slog.Info("skipping a retry tick: the listener is shutting down")
+				return
+			}
+
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("retry tick panicked; recovered to keep the listener alive",
@@ -541,7 +621,31 @@ func readPidfile(path string) (pidfileContent, error) {
 // lockFileName's own comment for why kill(pid, 0) against the pidfile's pid
 // is not safe to use for this. A lock acquired successfully here is
 // released again immediately; this call is a probe, not a claim.
+//
+// Two caveats, both accepted rather than silently ignored:
+//
+// It skips lock.Acquire entirely, and returns "not live" straight away,
+// when lockPath has never existed. Without this, a read-only `status` or
+// `stop` on a machine that has never started a listener would still create
+// <home> and an empty lock file as a side effect (lock.Acquire's
+// os.MkdirAll and os.OpenFile with O_CREATE) -- the common case for a fresh
+// checkout or a CI box, hit every time those commands run.
+//
+// Once the lock file does exist, this still takes a real, briefly-held
+// LOCK_EX to answer the question, and internal/lock exposes no
+// non-exclusive "would this succeed" query. That means this probe can race
+// a concurrent `listener start`: if this probe's Acquire lands in the
+// narrow window before start's own, start's Acquire observes ErrHeld and
+// fails with "already running" even though nothing was actually running --
+// only this probe, for a moment. Adding a non-exclusive query to
+// internal/lock is out of this task's scope for what is a narrow,
+// self-correcting race (a retried `listener start` succeeds immediately
+// after), so it is documented here rather than fixed.
 func listenerLive(lockPath string) (bool, error) {
+	if _, err := os.Stat(lockPath); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
 	lk, err := lock.Acquire(lockPath)
 	if errors.Is(err, lock.ErrHeld) {
 		return true, nil

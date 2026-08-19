@@ -380,9 +380,10 @@ func TestDrainAndCloseWaitsForInFlightTickBeforeClosingDB(t *testing.T) {
 	// serverDone and workerDone stand in for a server and a worker that
 	// have already stopped -- this test is only about the ordering AFTER
 	// both of those have exited, which is exactly where the in-flight-tick
-	// hazard lives. cancelServer/cancelWorker are still real CancelFuncs so
-	// drainAndClose's calls to them are exercised, even though nothing
-	// downstream is listening on their contexts.
+	// hazard lives. cancelShuttingDown/cancelServer/cancelWorker are still
+	// real CancelFuncs so drainAndClose's calls to them are exercised, even
+	// though nothing downstream is listening on their contexts.
+	_, cancelShuttingDown := context.WithCancel(context.Background())
 	_, cancelServer := context.WithCancel(context.Background())
 	_, cancelWorker := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
@@ -397,7 +398,7 @@ func TestDrainAndCloseWaitsForInFlightTickBeforeClosingDB(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- drainAndClose(cancelServer, cancelWorker, serverDone, workerDone, srv, &tickWG, db, lk, pidPath)
+		done <- drainAndClose(cancelShuttingDown, cancelServer, cancelWorker, serverDone, workerDone, srv, &tickWG, db, lk, pidPath)
 	}()
 
 	// drainAndClose must still be blocked in tickWG.Wait(): it has not
@@ -464,6 +465,7 @@ func TestDrainAndCloseLeavesAnotherProcessesPidfileAlone(t *testing.T) {
 	}
 
 	var tickWG sync.WaitGroup
+	_, cancelShuttingDown := context.WithCancel(context.Background())
 	_, cancelServer := context.WithCancel(context.Background())
 	_, cancelWorker := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
@@ -478,7 +480,7 @@ func TestDrainAndCloseLeavesAnotherProcessesPidfileAlone(t *testing.T) {
 		t.Fatalf("write pidfile stand-in: %v", err)
 	}
 
-	if err := drainAndClose(cancelServer, cancelWorker, serverDone, workerDone, srv, &tickWG, db, lk, pidPath); err != nil {
+	if err := drainAndClose(cancelShuttingDown, cancelServer, cancelWorker, serverDone, workerDone, srv, &tickWG, db, lk, pidPath); err != nil {
 		t.Fatalf("drainAndClose: %v", err)
 	}
 
@@ -575,7 +577,9 @@ func TestInstrumentRetriesRecoversPanicAndTracksWaitGroup(t *testing.T) {
 
 	w := listener.NewWorker(db)
 	var tickWG sync.WaitGroup
-	instrumentRetries(w, &tickWG)
+	shuttingDown, cancelShuttingDown := context.WithCancel(context.Background())
+	defer cancelShuttingDown()
+	instrumentRetries(w, &tickWG, shuttingDown)
 
 	fired := make(chan struct{})
 	timer := w.After(time.Millisecond, func() {
@@ -600,5 +604,107 @@ func TestInstrumentRetriesRecoversPanicAndTracksWaitGroup(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("tickWG never reached zero after a recovered panic in a retry-fired tick; " +
 			"either Add/Done are unbalanced or the panic escaped and crashed the test binary")
+	}
+}
+
+// TestInstrumentRetriesDrainCompletesAfterAStoppedTimer covers the CRITICAL
+// regression a prior review round found: work.go stops an armed retry timer
+// before it fires along three paths (schedule re-arming an existing key,
+// clear on a success or a lock-shed tick, and stopAll at shutdown). If
+// tickWG's counter is incremented when the timer is ARMED rather than when
+// it FIRES, every one of those paths leaves the counter permanently
+// stuck above zero with no matching Done -- and since nothing bounds
+// drainAndClose's tickWG.Wait() with a timeout, that hangs the whole
+// shutdown forever: the database is never closed, the pidfile is never
+// removed, and the listener lock is never released, so every later
+// `listener start` refuses with "already running" until the process is
+// SIGKILLed. This test stops an armed timer and asserts the drain still
+// completes -- the case the previous round's suite did not cover.
+func TestInstrumentRetriesDrainCompletesAfterAStoppedTimer(t *testing.T) {
+	withHome(t)
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	w := listener.NewWorker(db)
+	var tickWG sync.WaitGroup
+	shuttingDown, cancelShuttingDown := context.WithCancel(context.Background())
+	defer cancelShuttingDown()
+	instrumentRetries(w, &tickWG, shuttingDown)
+
+	fired := false
+	timer := w.After(time.Hour, func() {
+		fired = true
+	})
+	if !timer.Stop() {
+		t.Fatal("Stop reported the timer had already fired or was already stopped; " +
+			"this test needs a timer it can genuinely stop before it fires")
+	}
+
+	waited := make(chan struct{})
+	go func() {
+		tickWG.Wait()
+		close(waited)
+	}()
+
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tickWG.Wait() did not return after an armed timer was stopped before firing; " +
+			"drainAndClose would hang forever, holding the database open and the listener lock held")
+	}
+
+	if fired {
+		t.Fatal("the stopped timer's callback ran; Stop() should have prevented that")
+	}
+}
+
+// TestInstrumentRetriesSkipsFiringDuringShutdown covers the IMPORTANT fix:
+// a retry timer that fires after shuttingDown has been cancelled must not
+// run the wrapped tick body at all -- it must not start a coding agent on
+// the way out -- while still accounting for itself in tickWG so the drain
+// does not hang waiting for a decision that has already been made.
+func TestInstrumentRetriesSkipsFiringDuringShutdown(t *testing.T) {
+	withHome(t)
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	w := listener.NewWorker(db)
+	var tickWG sync.WaitGroup
+	shuttingDown, cancelShuttingDown := context.WithCancel(context.Background())
+	instrumentRetries(w, &tickWG, shuttingDown)
+
+	// Shutdown is already underway before the timer ever fires -- exactly
+	// the case an HTTP-delivered retry can reach, since tickCtx (what
+	// work.go's own ctx.Err() check inside schedule would see for such a
+	// retry) is not cancelled until after the drain completes.
+	cancelShuttingDown()
+
+	ran := false
+	timer := w.After(time.Millisecond, func() {
+		ran = true
+	})
+	defer timer.Stop()
+
+	waited := make(chan struct{})
+	go func() {
+		tickWG.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tickWG never reached zero after a shutdown-skipped retry")
+	}
+
+	if ran {
+		t.Fatal("the wrapped callback ran the retry tick after shuttingDown was already cancelled")
 	}
 }
