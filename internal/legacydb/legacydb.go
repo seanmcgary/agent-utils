@@ -64,10 +64,16 @@ type DB struct {
 
 // Open opens a legacy per-loop database for reading.
 //
-// The pragmas match store.Open because they must: busy_timeout is what makes a
-// read wait for an old runner's write instead of failing the tick, and both are
-// per connection, so they only take effect from the DSN. No DDL, no added
-// column, no key upgrade and no chmod run here -- see the package comment.
+// busy_timeout is what makes a read wait for an old runner's write instead of
+// failing the tick. It is per connection, so it only takes effect from the DSN.
+//
+// journal_mode is deliberately NOT set. Setting it rewrites the file header on
+// any database not already in that mode, and this package promises to write
+// nothing. Every legacy file was created by store.Open in WAL mode, so a reader
+// has nothing to change anyway.
+//
+// No DDL, no added column, no key upgrade and no chmod run here -- see the
+// package comment.
 func Open(path string) (*DB, error) {
 	// The driver CREATES a database that does not exist, on the first
 	// connection. That would write a file this package promised never to touch,
@@ -77,10 +83,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("stat legacy database %s: %w", path, err)
 	}
 
-	dsn := "file:" + path +
-		"?_pragma=busy_timeout(30000)" +
-		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=foreign_keys(1)"
+	dsn := "file:" + path + "?_pragma=busy_timeout(30000)"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

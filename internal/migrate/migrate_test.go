@@ -2,10 +2,10 @@ package migrate
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -469,21 +469,156 @@ func TestASourceWithNoTablesIsSealedNotFailed(t *testing.T) {
 	}
 }
 
-// The write path must fail loudly. Carrying on against a database that is
-// missing this loop's rows would re-dispatch every open issue.
-func TestEnsureProjectFailsOnADiscoveryProblem(t *testing.T) {
+// The write path must fail loudly when a source it can see cannot be read.
+// Carrying on against a database missing this loop's rows would re-dispatch
+// every open issue and start a second agent in a worktree that already holds one.
+func TestEnsureProjectFailsOnAnUnreadableSource(t *testing.T) {
+	db := canonical(t)
+	dir := filepath.Join(t.TempDir(), "state", "planning")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, StateDBFile)
+	if err := os.WriteFile(path, []byte("this is not a database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := EnsureProject(db, []Source{sourceAt(path, projectA, "planning")}, nil)
+	if err == nil {
+		t.Fatal("EnsureProject accepted a source it could not read")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("the error must name the source it could not import: %v", err)
+	}
+}
+
+// A loop whose configuration does not load is not fatal. State is per loop, so a
+// broken sibling hides nothing the loop being run needs, and blocking its ticks
+// on someone else's YAML would be a new failure this change has no reason to add.
+func TestEnsureProjectToleratesADiscoverySkip(t *testing.T) {
 	db := canonical(t)
 	problems := []Result{{
-		Source: sourceAt("/gone/state.db", projectA, "planning"),
-		State:  StateFailed,
-		Reason: "planning.yaml does not load",
-		Err:    errors.New("bad yaml"),
+		Source: sourceAt("", projectA, "broken"),
+		State:  StateSkipped,
+		Reason: "broken.yaml does not load",
 	}}
-	err := EnsureProject(db, nil, problems)
-	if err == nil {
-		t.Fatal("EnsureProject accepted a configuration it could not read")
+	if err := EnsureProject(db, nil, problems); err != nil {
+		t.Errorf("a discovery skip blocked the write path: %v", err)
 	}
-	if got := err.Error(); got == "" {
-		t.Error("the error must name what could not be imported")
+}
+
+// A loop whose state_dir IS the home directory has already written into the
+// canonical file. Its rows arrive without a project and are stamped, not copied.
+//
+// The home path is reached through a symlink here on purpose. Sources are
+// recorded with symlinks resolved, so a comparison against an unresolved path
+// takes the wrong branch: the importer reads nothing, seals the source, and every
+// one of those rows stays invisible to every scoped query. The report says
+// "imported" while the loop has silently lost its whole history.
+func TestCanonicalSourceIsStampedThroughASymlinkedHome(t *testing.T) {
+	real := filepath.Join(t.TempDir(), "real-home")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "linked-home")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("this filesystem has no symlinks: %v", err)
+	}
+	t.Setenv(home.EnvVar, link)
+
+	path, err := home.StateDBPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// A row the schema upgrade carried over belongs to no project yet.
+	if err := db.Project("").PutIssueState(store.IssueState{
+		Loop: "planning", Repo: "o/r", Number: 42, SessionID: "keep-me",
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	src, ok := SourceFor(filepath.Dir(path), projectA, "p", "planning", "o/r")
+	if !ok {
+		t.Fatal("SourceFor did not find the canonical database")
+	}
+	if !IsCanonical(src.Path) {
+		t.Fatal("the canonical database was not recognised as itself")
+	}
+
+	report, err := Run(db, []Source{src}, Options{IsAlive: dead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Failed()) != 0 {
+		t.Fatalf("failed: %+v", report.Failed())
+	}
+	if report.Rows() != 1 {
+		t.Errorf("stamped %d rows, want the one row that was already here", report.Rows())
+	}
+
+	got, err := db.Project(projectA).IssueState("planning", "o/r", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SessionID != "keep-me" {
+		t.Errorf("the row was never claimed by its project: %+v", got)
+	}
+
+	// The note beside a legacy file must never appear beside the canonical one:
+	// it says the file is a backup that nothing reads.
+	if _, err := os.Stat(filepath.Join(real, MarkerFile)); err == nil {
+		t.Error("a MIGRATED note was left beside the canonical database")
+	}
+}
+
+// A runner that finishes between the read and the liveness check must not be
+// sealed away with a stale running row: the reaper would rewrite a successful
+// run as failed and re-dispatch the issue.
+func TestASourceIsRereadBeforeItIsSealed(t *testing.T) {
+	db := canonical(t)
+	dir := filepath.Join(t.TempDir(), "state", "planning")
+	path := legacyFile(t, dir, "planning", store.StatusRunning, 4242)
+
+	// The runner records its outcome while the importer is between its read and
+	// its liveness check, and is gone by the time the check runs.
+	finishOnce := false
+	isAlive := func(int, int64) bool {
+		if !finishOnce {
+			finishOnce = true
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			if _, err := raw.Exec(
+				`UPDATE dispatches SET status = ?, cost_usd = 7, finished_at = ? WHERE id = 1`,
+				store.StatusSucceeded, time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return false
+	}
+
+	if _, err := Run(db, []Source{sourceAt(path, projectA, "planning")},
+		Options{IsAlive: isAlive}); err != nil {
+		t.Fatal(err)
+	}
+
+	ds, err := db.Project(projectA).DispatchesForLoop("planning", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ds) != 1 {
+		t.Fatalf("dispatches = %d, want 1", len(ds))
+	}
+	if ds[0].Status != store.StatusSucceeded || ds[0].CostUSD != 7 {
+		t.Errorf("the outcome written between the read and the check was lost: %+v", ds[0])
 	}
 }

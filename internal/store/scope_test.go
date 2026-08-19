@@ -17,16 +17,17 @@ func TestTwoProjectsWithTheSameLoopStaySeparate(t *testing.T) {
 	db := openDB(t)
 	a, b := db.Project(testProject), db.Project(otherProject)
 
-	for _, tc := range []struct {
-		s       *Store
-		session string
-	}{{a, "session-a"}, {b, "session-b"}} {
-		if err := tc.s.PutIssueState(IssueState{
-			Loop: "planning", Repo: "o/r", Number: 7, SessionID: tc.session,
-			UpdatedAt: time.Now().UTC(),
-		}); err != nil {
-			t.Fatalf("PutIssueState: %v", err)
-		}
+	if err := a.PutIssueState(IssueState{
+		Loop: "planning", Repo: "o/r", Number: 7, SessionID: "session-a",
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("PutIssueState: %v", err)
+	}
+	if err := b.PutIssueState(IssueState{
+		Loop: "planning", Repo: "o/r", Number: 7, SessionID: "session-b",
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("PutIssueState: %v", err)
 	}
 
 	got, err := a.IssueState("planning", "o/r", 7)

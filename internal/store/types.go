@@ -148,11 +148,17 @@ type LoopKey struct {
 	Loop      string
 }
 
-// LoopState is one loop's totals, read machine-wide in a single query.
+// LoopState is one loop's totals, read machine-wide in a single pass.
 type LoopState struct {
 	ProjectID string
 	Loop      string
 	Ticks     int64
 	LastTick  time.Time
-	Cost      float64
+	// Cost is every dispatch this loop ever recorded, whatever repository it
+	// watched at the time.
+	Cost float64
+	// CostByRepo splits that by repository. A loop whose repo was changed in its
+	// configuration still holds the old repository's dispatches, and a report of
+	// what it costs today must not add the two together.
+	CostByRepo map[string]float64
 }

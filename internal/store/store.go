@@ -14,6 +14,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/seanmcgary/agent-utils/internal/home"
 	"modernc.org/sqlite"
 )
 
@@ -133,6 +134,10 @@ type DB struct {
 	db *sql.DB
 	// path is kept so the importer can recognise a legacy source that IS this
 	// file. A loop whose state_dir is the home directory has exactly that.
+	//
+	// It is stored resolved, in the same spelling the importer resolves its
+	// sources into. Comparing a raw path against a resolved one silently takes
+	// the wrong branch on any machine whose home traverses a symlink.
 	path string
 }
 
@@ -170,7 +175,7 @@ func Open(path string) (*DB, error) {
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		_ = os.Chmod(path+suffix, 0o600)
 	}
-	return &DB{db: db, path: path}, nil
+	return &DB{db: db, path: home.Resolve(path)}, nil
 }
 
 // Project returns a view of the database scoped to one project.
@@ -854,6 +859,11 @@ func (d *DB) DispatchesForProject(projectID string) ([]Dispatch, error) {
 // LoopStates returns the tick count, the last tick and the total cost of every
 // loop on the machine.
 //
+// Cost is keyed by repository as well as by loop, because a loop whose repo was
+// changed in its configuration still holds the old repository's dispatches. The
+// per-loop reads this replaced filtered on repo, and a report that silently
+// added the two together would overstate what the loop has spent.
+//
 // It runs two queries and merges them, rather than joining. The ticks table has
 // no repo column, and a loop that has ticked but never dispatched must still
 // appear: a join would drop it, and a report of "0 ticks" for a running loop is
@@ -904,14 +914,20 @@ func (d *DB) LoopStates() ([]LoopState, error) {
 	}
 
 	if err := d.eachRow(
-		`SELECT project_id, loop, SUM(cost_usd) FROM dispatches GROUP BY project_id, loop`,
+		`SELECT project_id, loop, repo, SUM(cost_usd) FROM dispatches
+		 GROUP BY project_id, loop, repo`,
 		func(rows *sql.Rows) error {
-			var projectID, loop string
+			var projectID, loop, repo string
 			var cost sql.NullFloat64
-			if err := rows.Scan(&projectID, &loop, &cost); err != nil {
+			if err := rows.Scan(&projectID, &loop, &repo, &cost); err != nil {
 				return err
 			}
-			at(projectID, loop).Cost = cost.Float64
+			st := at(projectID, loop)
+			if st.CostByRepo == nil {
+				st.CostByRepo = map[string]float64{}
+			}
+			st.CostByRepo[repo] = cost.Float64
+			st.Cost += cost.Float64
 			return nil
 		}); err != nil {
 		return nil, fmt.Errorf("sum dispatch cost: %w", err)

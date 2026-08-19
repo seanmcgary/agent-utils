@@ -183,9 +183,10 @@ func Resolve(agentUtilsDir, name string) (string, error) {
 
 // Duplicates returns every name declared by more than one file, sorted.
 //
-// Two loops sharing a name is never benign: the name keys the state directory,
-// the lock file and every database row, so both would write one database and
-// contend for one lock while appearing to be separate loops.
+// Two loops sharing a name is never benign. The name is half the key of every
+// row a loop owns, together with the project, so both would read and write one
+// another's issue state and dispatches. It also names the lock file and the log
+// tree, so they would contend for one lock and write into one directory.
 func Duplicates(entries []Entry) []string {
 	seen := map[string]int{}
 	for _, e := range entries {
@@ -210,7 +211,8 @@ func Names(entries []Entry) []string {
 	return out
 }
 
-// StateSubdir is the directory inside DirName that holds per-loop state.
+// StateSubdir is the directory inside DirName that holds each loop's tick lock
+// and log tree. Loop state itself lives in the canonical database.
 const StateSubdir = "state"
 
 // DirFromPath returns the .agent-utils directory a file lives under, or "" when

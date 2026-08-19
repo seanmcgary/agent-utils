@@ -170,6 +170,11 @@ state. The name is also what separates their rows when a database from the old p
 layout is imported, so two loops sharing one name would arrive in the canonical database as a
 single loop.
 
+That rule crosses projects too. Two **projects** whose loops share both a `state_dir` and a
+loop name cannot both own the rows in that one old database. The first project to run claims
+them, and every later command for the second reports which project claimed the file and stops.
+Give one of them its own `state_dir`, or rename one of the loops.
+
 ```yaml
 name: planning
 ```

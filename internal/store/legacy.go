@@ -109,8 +109,11 @@ func (d *DB) ImportLegacy(k LegacyKey, data LegacyData, seal bool) (int, error) 
 		return 0, err
 	}
 	if claimant != "" && claimant != k.ProjectID {
-		return 0, fmt.Errorf("%w: %s loop %q was imported by project %s",
-			ErrSourceClaimed, k.Path, k.Loop, claimant)
+		return 0, fmt.Errorf(
+			"%w: project %s already imported loop %q from %s. Two projects cannot "+
+				"both own one loop's rows. Give one of them its own state_dir, or "+
+				"rename one of the loops, and run the command again",
+			ErrSourceClaimed, claimant, k.Loop, k.Path)
 	}
 
 	prior, err := d.LegacySource(k)
@@ -160,42 +163,15 @@ func importAll(tx *sql.Tx, k LegacyKey, data LegacyData) (int, error) {
 	var n int
 
 	for _, st := range data.Issues {
-		_, err := tx.Exec(`
-			INSERT INTO issues (project_id, loop, repo, number, session_id, worktree_path,
-			                    retry_count, last_retry_tick, needs_retry, session_started,
-			                    parked, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(project_id, loop, repo, number) DO NOTHING`,
-			k.ProjectID, k.Loop, st.Repo, st.Number, st.SessionID, st.WorktreePath,
-			st.RetryCount, st.LastRetryTick, st.NeedsRetry, st.SessionStarted,
-			st.Parked, st.UpdatedAt.UTC())
-		if err != nil {
-			return n, fmt.Errorf("import issue %d of %s: %w", st.Number, k.Path, err)
+		if _, err := insertIssue(tx, k, st); err != nil {
+			return n, err
 		}
 		n++
 	}
 
 	for _, dp := range data.Dispatches {
-		// legacy_source and legacy_id are what keep the row identifiable after
-		// SQLite renumbers it, so a live runner is still recognised and its log
-		// file is still found.
-		//
-		// The ON CONFLICT target repeats the index predicate. SQLite matches a
-		// partial unique index only when the statement names it.
-		_, err := tx.Exec(`
-			INSERT INTO dispatches (project_id, loop, repo, number, kind, session_id,
-			                        pid, pid_start_at, status, started_at, finished_at,
-			                        exit_code, cost_usd, duration_ms, api_error, log_path,
-			                        pr_number, title, legacy_source, legacy_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(legacy_source, legacy_id, project_id, loop)
-			  WHERE legacy_source <> '' DO NOTHING`,
-			k.ProjectID, k.Loop, dp.Repo, dp.Number, dp.Kind, dp.SessionID,
-			dp.PID, nullTime(dp.PIDStartAt), dp.Status, dp.StartedAt.UTC(),
-			nullTime(dp.FinishedAt), dp.ExitCode, dp.CostUSD, dp.DurationMS,
-			dp.APIError, dp.LogPath, dp.PRNumber, dp.Title, k.Path, dp.ID)
-		if err != nil {
-			return n, fmt.Errorf("import dispatch %d of %s: %w", dp.ID, k.Path, err)
+		if _, err := insertDispatch(tx, k, dp); err != nil {
+			return n, err
 		}
 		n++
 	}
@@ -241,6 +217,59 @@ func importAll(tx *sql.Tx, k LegacyKey, data LegacyData) (int, error) {
 	return n, nil
 }
 
+// insertIssue inserts one imported issue row. It does nothing when the row is
+// already here, so a value this binary wrote is never overwritten by a frozen
+// copy from the source.
+func insertIssue(tx *sql.Tx, k LegacyKey, st IssueState) (int64, error) {
+	res, err := tx.Exec(`
+		INSERT INTO issues (project_id, loop, repo, number, session_id, worktree_path,
+		                    retry_count, last_retry_tick, needs_retry, session_started,
+		                    parked, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id, loop, repo, number) DO NOTHING`,
+		k.ProjectID, k.Loop, st.Repo, st.Number, st.SessionID, st.WorktreePath,
+		st.RetryCount, st.LastRetryTick, st.NeedsRetry, st.SessionStarted,
+		st.Parked, st.UpdatedAt.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("import issue %d of %s: %w", st.Number, k.Path, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("import issue %d of %s: %w", st.Number, k.Path, err)
+	}
+	return n, nil
+}
+
+// insertDispatch inserts one imported dispatch row.
+//
+// legacy_source and legacy_id are what keep the row identifiable after SQLite
+// renumbers it, so a live runner is still recognised and its log file is still
+// found. They are also the constraint that makes a repeated insert a no-op: the
+// ON CONFLICT target repeats the partial index predicate, because SQLite matches
+// a partial unique index only when the statement names it.
+func insertDispatch(tx *sql.Tx, k LegacyKey, dp Dispatch) (int64, error) {
+	res, err := tx.Exec(`
+		INSERT INTO dispatches (project_id, loop, repo, number, kind, session_id,
+		                        pid, pid_start_at, status, started_at, finished_at,
+		                        exit_code, cost_usd, duration_ms, api_error, log_path,
+		                        pr_number, title, legacy_source, legacy_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(legacy_source, legacy_id, project_id, loop)
+		  WHERE legacy_source <> '' DO NOTHING`,
+		k.ProjectID, k.Loop, dp.Repo, dp.Number, dp.Kind, dp.SessionID,
+		dp.PID, nullTime(dp.PIDStartAt), dp.Status, dp.StartedAt.UTC(),
+		nullTime(dp.FinishedAt), dp.ExitCode, dp.CostUSD, dp.DurationMS,
+		dp.APIError, dp.LogPath, dp.PRNumber, dp.Title, k.Path, dp.ID)
+	if err != nil {
+		return 0, fmt.Errorf("import dispatch %d of %s: %w", dp.ID, k.Path, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("import dispatch %d of %s: %w", dp.ID, k.Path, err)
+	}
+	return n, nil
+}
+
 // refresh re-reads a source that is still open.
 //
 // Only two tables can change in a source after the first import, because only
@@ -251,6 +280,14 @@ func refresh(tx *sql.Tx, k LegacyKey, data LegacyData) (int, error) {
 	var n int
 
 	for _, dp := range data.Dispatches {
+		// A row still marked running in the source carries no outcome to copy.
+		// Writing it back would resurrect a dispatch this database has already
+		// retired: the reaper would retire it a second time, mark the issue for
+		// retry, and re-run an agent whose work already landed.
+		if dp.Status == StatusRunning {
+			continue
+		}
+
 		// An outcome lands on a row this database still calls running, or on one
 		// the reaper retired on a guess. It must NOT overwrite a row that was
 		// finished here, which is a fact and not a guess.
@@ -270,6 +307,17 @@ func refresh(tx *sql.Tx, k LegacyKey, data LegacyData) (int, error) {
 		if err != nil {
 			return n, fmt.Errorf("refresh dispatch %d of %s: %w", dp.ID, k.Path, err)
 		}
+		if affected == 0 {
+			// Either this database finished the row itself, or the row is new: a
+			// tick from the old binary can still insert one after the first
+			// import. The insert does nothing when the row is already here, so
+			// only a genuinely new row lands.
+			inserted, err := insertDispatch(tx, k, dp)
+			if err != nil {
+				return n, err
+			}
+			affected = inserted
+		}
 		n += int(affected)
 	}
 
@@ -287,7 +335,7 @@ func refresh(tx *sql.Tx, k LegacyKey, data LegacyData) (int, error) {
 			SET needs_retry = ?, session_started = ?, parked = ?, retry_count = ?,
 			    updated_at = ?
 			WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?
-			  AND updated_at < ?`, // see the note on time comparison below
+			  AND updated_at < ?`,
 			st.NeedsRetry, st.SessionStarted, st.Parked, st.RetryCount,
 			st.UpdatedAt.UTC(), k.ProjectID, k.Loop, st.Repo, st.Number,
 			st.UpdatedAt.UTC())
@@ -297,6 +345,16 @@ func refresh(tx *sql.Tx, k LegacyKey, data LegacyData) (int, error) {
 		affected, err := res.RowsAffected()
 		if err != nil {
 			return n, fmt.Errorf("refresh issue %d of %s: %w", st.Number, k.Path, err)
+		}
+		if affected == 0 {
+			// A runner from the old binary can create an issue row after the
+			// first import, through MarkNeedsRetry. The insert does nothing when
+			// the row already exists, so a newer row here is never overwritten.
+			inserted, err := insertIssue(tx, k, st)
+			if err != nil {
+				return n, err
+			}
+			affected = inserted
 		}
 		n += int(affected)
 	}

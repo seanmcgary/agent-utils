@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/seanmcgary/agent-utils/internal/home"
 )
 
 func legacyKey(project, path string) LegacyKey {
@@ -374,7 +376,10 @@ func TestImportStampsRowsWhenTheSourceIsThisDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rows, err := db.ImportLegacy(legacyKey(testProject, path), LegacyData{}, true)
+	// The importer always resolves a source path before it gets here, so the
+	// test must too. Comparing a raw path against a resolved one is the bug this
+	// case exists to catch.
+	rows, err := db.ImportLegacy(legacyKey(testProject, home.Resolve(path)), LegacyData{}, true)
 	if err != nil {
 		t.Fatalf("ImportLegacy: %v", err)
 	}
@@ -428,5 +433,85 @@ func TestLegacySourceRecordsTheState(t *testing.T) {
 	}
 	if row.FirstImported.After(row.LastImported) {
 		t.Error("FirstImported must not move on a refresh")
+	}
+}
+
+// A source row still marked running carries no outcome. Writing it back would
+// resurrect a dispatch this database already retired, and the reaper would
+// retire it again and re-run an agent whose work already landed.
+func TestRefreshDoesNotResurrectARetiredDispatch(t *testing.T) {
+	db := openDB(t)
+	k := legacyKey(testProject, "/old/planning/state.db")
+	data := sampleData("sess-1")
+
+	if _, err := db.ImportLegacy(k, data, false); err != nil {
+		t.Fatal(err)
+	}
+	s := db.Project(testProject)
+	ds, err := s.RunningDispatches("planning", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The runner crashed without writing, so the tick retired the row.
+	if err := s.FinishDispatch(ds[0].ID, DispatchResult{
+		Status: StatusFailed, ExitCode: -1, APIError: reaperVerdict,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The source still says running, because nothing ever finished it there.
+	if _, err := db.ImportLegacy(k, data, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.RunningDispatches("planning", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("a stale running row was written back: %+v", got)
+	}
+}
+
+// A tick or a runner from the old binary can still create a row after the first
+// import. A refresh that only updated would drop it, and sealing would lose it.
+func TestRefreshInsertsARowTheSourceGainedLater(t *testing.T) {
+	db := openDB(t)
+	k := legacyKey(testProject, "/old/planning/state.db")
+	data := sampleData("sess-1")
+	if _, err := db.ImportLegacy(k, data, false); err != nil {
+		t.Fatal(err)
+	}
+
+	later := data
+	later.Dispatches = append([]Dispatch{}, data.Dispatches...)
+	later.Dispatches = append(later.Dispatches, Dispatch{
+		ID: 9, Loop: "planning", Repo: "o/r", Number: 43, Kind: KindStart,
+		SessionID: "sess-later", Status: StatusSucceeded, StartedAt: time.Now().UTC(),
+		CostUSD: 3,
+	})
+	later.Issues = append([]IssueState{}, data.Issues...)
+	later.Issues = append(later.Issues, IssueState{
+		Loop: "planning", Repo: "o/r", Number: 43, NeedsRetry: true,
+		UpdatedAt: time.Now().UTC(),
+	})
+
+	if _, err := db.ImportLegacy(k, later, true); err != nil {
+		t.Fatal(err)
+	}
+
+	s := db.Project(testProject)
+	ds, err := s.DispatchesForLoop("planning", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ds) != 2 {
+		t.Errorf("dispatches = %d, want the row the source gained after the import", len(ds))
+	}
+	st, err := s.IssueState("planning", "o/r", 43)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.NeedsRetry {
+		t.Error("an issue row the source gained after the import was dropped")
 	}
 }

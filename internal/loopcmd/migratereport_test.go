@@ -1,4 +1,4 @@
-package main
+package loopcmd
 
 import (
 	"errors"
@@ -11,7 +11,7 @@ import (
 // An empty report must say so in words. Printing a bare header with no rows
 // under it reads as a machine that lost the state it was asked about.
 func TestRenderMigrateReportEmptyReportSaysNothingIsLeft(t *testing.T) {
-	out := renderMigrateReport(migrate.Report{}, false)
+	out := RenderMigrateReport(migrate.Report{}, false)
 
 	if !strings.Contains(out, "Nothing left to import") {
 		t.Fatalf("empty report does not say there is nothing to import:\n%s", out)
@@ -24,7 +24,7 @@ func TestRenderMigrateReportEmptyReportSaysNothingIsLeft(t *testing.T) {
 // A dry run must state both halves of the truth: nothing was imported, and the
 // schema of the canonical database was upgraded anyway by opening it.
 func TestRenderMigrateReportDryRunSaysWhatItStillDid(t *testing.T) {
-	out := renderMigrateReport(migrate.Report{}, true)
+	out := RenderMigrateReport(migrate.Report{}, true)
 
 	if !strings.Contains(out, "no state was imported") {
 		t.Fatalf("dry run does not say nothing was imported:\n%s", out)
@@ -62,7 +62,7 @@ func TestRenderMigrateReportShowsImportedAndFailedSources(t *testing.T) {
 		},
 	}}
 
-	out := renderMigrateReport(report, false)
+	out := RenderMigrateReport(report, false)
 
 	for _, want := range []string{
 		"PROJECT", "LOOP", "STATE", "ROWS", "SOURCE",

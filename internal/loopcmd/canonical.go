@@ -50,16 +50,27 @@ func openCanonical() (*store.DB, error) {
 // Before the canonical database existed, each of these numbers cost one file
 // open per loop. Now they are three queries for the machine.
 type snapshot struct {
-	loops   map[store.LoopKey]store.LoopState
-	live    map[store.LoopKey]int
-	orphans map[store.LoopKey]int
+	loops map[store.LoopKey]store.LoopState
+	// live and orphans are keyed by repository as well, because a loop that was
+	// pointed at a new repository still holds the old one's dispatches. The
+	// per-loop reads this replaced filtered on repo, and a summary that counted
+	// both would report a live dispatch for a repository the loop no longer
+	// watches.
+	live    map[loopRepo]int
+	orphans map[loopRepo]int
+}
+
+// loopRepo is one loop's work on one repository.
+type loopRepo struct {
+	store.LoopKey
+	Repo string
 }
 
 func readSnapshot(db *store.DB) (*snapshot, error) {
 	snap := &snapshot{
 		loops:   map[store.LoopKey]store.LoopState{},
-		live:    map[store.LoopKey]int{},
-		orphans: map[store.LoopKey]int{},
+		live:    map[loopRepo]int{},
+		orphans: map[loopRepo]int{},
 	}
 
 	states, err := db.LoopStates()
@@ -75,7 +86,10 @@ func readSnapshot(db *store.DB) (*snapshot, error) {
 		return nil, err
 	}
 	for _, d := range running {
-		k := store.LoopKey{ProjectID: d.ProjectID, Loop: d.Loop}
+		k := loopRepo{
+			LoopKey: store.LoopKey{ProjectID: d.ProjectID, Loop: d.Loop},
+			Repo:    d.Repo,
+		}
 		// An imported dispatch carries the identifier its runner was started
 		// with, which is what the process actually advertises.
 		if proc.IsAlive(d.PID, d.RunnerID()) {

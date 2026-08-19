@@ -52,10 +52,13 @@ func (o Options) isAlive() func(pid int, dispatchID int64) bool {
 
 // Pending returns the sources that still need work.
 //
-// It is the fast path, and it matters: every command and every runner spawn
-// reaches this code, forever. A machine whose sources are all sealed pays one
-// indexed query here and never takes the lock. Taking a machine-wide lock on
-// every tick would serialize loops that have nothing to do with each other.
+// It is the fast path for the part that costs the most: a machine whose sources
+// are all sealed never takes the machine-wide lock and never opens a legacy
+// file. Taking that lock on every tick and every runner spawn would serialize
+// loops that have nothing to do with each other.
+//
+// Discovery still runs on every command, and so does this read of the whole
+// legacy_sources table. Both are small and local.
 func Pending(db *store.DB, sources []Source) ([]Source, error) {
 	if len(sources) == 0 {
 		return nil, nil
@@ -64,21 +67,28 @@ func Pending(db *store.DB, sources []Source) ([]Source, error) {
 	if err != nil {
 		return nil, err
 	}
-	sealed := map[string]bool{}
+	sealed := map[store.LegacyKey]bool{}
 	for _, r := range recorded {
 		if r.State == store.SourceSealed {
-			sealed[r.Key.Path+"\x00"+r.Key.Loop+"\x00"+r.Key.ProjectID] = true
+			sealed[sealKey(r.Key.Path, r.Key.ProjectID, r.Key.Loop)] = true
 		}
 	}
 
 	var out []Source
 	for _, s := range sources {
-		if sealed[s.Path+"\x00"+s.Loop+"\x00"+s.ProjectID] {
+		if sealed[sealKey(s.Path, s.ProjectID, s.Loop)] {
 			continue
 		}
 		out = append(out, s)
 	}
 	return out, nil
+}
+
+// sealKey is the identity of one source as the database records it: the file,
+// the loop inside it, and the project that claims that loop. The Repo field is
+// deliberately left out; it is reporting detail, not identity.
+func sealKey(path, projectID, loop string) store.LegacyKey {
+	return store.LegacyKey{Path: path, ProjectID: projectID, Loop: loop}
 }
 
 // Run imports every source that still needs it.
@@ -115,15 +125,23 @@ func Run(db *store.DB, sources []Source, opts Options) (Report, error) {
 // open issue and start a second agent in a worktree that already holds one, so
 // this path fails loudly instead.
 //
-// problems are the discovery failures the caller already collected. They are
-// fatal for the same reason: a configuration file that does not load still has
-// state behind it.
+// problems are what discovery could not look at: a loop whose configuration does
+// not load, or a state directory it could not resolve. They are NOT fatal. State
+// is per loop, so a broken sibling hides nothing this loop needs, and the loop a
+// command acts on is always passed in explicitly by the caller. They are logged
+// rather than dropped, because a source nobody ever mentions is a source nobody
+// ever fixes.
 func EnsureProject(db *store.DB, sources []Source, problems []Result) error {
 	report, err := Run(db, sources, Options{})
 	if err != nil {
 		return err
 	}
-	report.Results = append(report.Results, problems...)
+	for _, p := range append(problems, report.Results...) {
+		if p.State == StateSkipped {
+			slog.Warn("state from an earlier layout was not looked at",
+				"loop", p.Source.Loop, "path", p.Source.Path, "reason", p.Reason)
+		}
+	}
 	return report.Err()
 }
 
@@ -157,13 +175,14 @@ func importSource(db *store.DB, s Source, opts Options) Result {
 	}
 
 	var (
-		data legacydb.Data
-		live bool
+		data      legacydb.Data
+		live      bool
+		canonical = IsCanonical(s.Path)
 	)
-	if !IsCanonical(s.Path) {
+	if !canonical {
 		// The canonical database is not read through the legacy reader: its rows
-		// are already here, and opening the same file twice would deadlock the
-		// single connection this process holds.
+		// are already here, and opening the same file twice would contend with
+		// the single connection this process holds.
 		src, err := legacydb.Open(s.Path)
 		if err != nil {
 			return failed(res, "open the legacy database", err)
@@ -175,10 +194,22 @@ func importSource(db *store.DB, s Source, opts Options) Result {
 			return failed(res, "read the legacy database", err)
 		}
 		live = data.HasLiveRunner(opts.isAlive())
+
+		if !live {
+			// Read again before sealing. The first read is a snapshot, and the
+			// liveness check runs after it, so a runner that finished in between
+			// would leave a stale "running" row behind a seal that is never
+			// reopened. Every process was already gone when the check ran, so
+			// nothing can write the file during this second read.
+			data, err = src.Read(s.Loop)
+			if err != nil {
+				return failed(res, "re-read the legacy database before sealing", err)
+			}
+		}
 	}
 
 	if opts.DryRun {
-		res.Rows = data.Rows()
+		res.Rows = plannedRows(prior, data)
 		res.State = plannedState(prior, live)
 		return res
 	}
@@ -194,12 +225,27 @@ func importSource(db *store.DB, s Source, opts Options) Result {
 		return failed(res, "import the legacy database", err)
 	}
 
-	res.Rows = rows
-	res.State = plannedState(prior, live)
-	if !live {
+	// The canonical database is not a backup of itself, and a note beside it
+	// saying the file may be deleted would tell an operator to delete every
+	// project's state.
+	if !live && !canonical {
 		writeMarker(s)
 	}
+	res.Rows = rows
+	res.State = plannedState(prior, live)
 	return res
+}
+
+// plannedRows is what a dry run reports.
+//
+// A first import writes every row. A refresh writes only the rows a runner can
+// still have changed, so reporting the whole file would promise a number the
+// real run will not match.
+func plannedRows(prior store.LegacySourceRow, data legacydb.Data) int {
+	if prior.ExistsInRecord {
+		return len(data.Dispatches) + len(data.Issues)
+	}
+	return data.Rows()
 }
 
 // plannedState names what a pass does, for the report.
@@ -242,11 +288,12 @@ func writeMarker(s Source) {
 
     %s
 
-on %s. agent-utils no longer reads state.db in this directory.
+on %s. agent-utils reads that database now.
 
-The file is kept as a backup. Nothing writes it any more. You may delete it once
-you are satisfied the import is complete; `+"`agent-utils migrate`"+` prints what was
-imported.
+state.db in this directory is kept as a backup and is no longer read. Leave it
+in place: a second loop may share this directory, and a runner started by an
+older build can still be writing this file. `+"`agent-utils migrate`"+` prints what has
+been imported.
 `, canonical, time.Now().UTC().Format(time.RFC3339))
 
 	if err := os.WriteFile(path, []byte(note), 0o600); err != nil {

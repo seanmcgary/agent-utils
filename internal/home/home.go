@@ -75,11 +75,26 @@ func StateDBPath() (string, error) {
 	return filepath.Join(dir, StateDBFile), nil
 }
 
-// LockPath returns the path of a lock file in the home directory.
-func LockPath(name string) (string, error) {
-	dir, err := Dir()
+// Resolve returns a path in the one spelling everything compares against:
+// absolute, with symlinks resolved.
+//
+// One file reached by two spellings is otherwise two files to this tool. That
+// matters most for the canonical database: the importer decides whether a legacy
+// source IS the canonical file by comparing paths, and on a machine whose home
+// traverses a symlink (macOS resolves /var to /private/var) the raw and resolved
+// spellings differ. The importer would then take the wrong branch and seal a
+// source without importing a row.
+//
+// A path that cannot be resolved is returned as absolute, which is still better
+// than the raw string. A file that does not exist yet cannot be resolved at all.
+func Resolve(path string) string {
+	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", err
+		return path
 	}
-	return filepath.Join(dir, name), nil
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs
+	}
+	return real
 }

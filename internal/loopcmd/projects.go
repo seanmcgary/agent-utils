@@ -117,9 +117,12 @@ func summariseLoop(entry config.Entry, projectID string, snap *snapshot) LoopSum
 	st := snap.loops[k]
 	sum.Ticks = st.Ticks
 	sum.LastTick = st.LastTick
-	sum.Cost = st.Cost
-	sum.Live = snap.live[k]
-	sum.Orphans = snap.orphans[k]
+	// Ticks belong to the loop; everything else belongs to the loop's work on the
+	// repository it watches today.
+	sum.Cost = st.CostByRepo[cfg.Repo]
+	byRepo := loopRepo{LoopKey: k, Repo: cfg.Repo}
+	sum.Live = snap.live[byRepo]
+	sum.Orphans = snap.orphans[byRepo]
 	return sum
 }
 

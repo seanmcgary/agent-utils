@@ -736,6 +736,28 @@ Accepted limitations, recorded rather than fixed:
   issue-state write during the upgrade (Task 3). Keeping a compatible unique index would defeat
   project keying, and the tick's reaper recovers the issue on the next pass.
 
+## Commit-review findings, and what was done
+
+Three fresh-context reviewers (security, quality, standards) read the whole diff. The findings
+that changed code:
+
+| Finding | Fix |
+|---|---|
+| The canonical-source test compared a resolved path against an unresolved one, so a home directory reached through a symlink silently sealed a source with zero rows imported | One resolver, `home.Resolve`, used by both `store.Open` and `migrate`. Regression test proves the old code fails |
+| `MIGRATED.txt` was written beside the canonical database, telling the operator it was a deletable backup | A canonical source never gets a marker, and the note no longer advises deleting anything |
+| The seal decision read the source and then checked liveness, so a runner that finished in between was sealed away behind a stale `running` row | The source is read again after the liveness check, before it is sealed. Regression test proves the old code fails |
+| A refresh copied a source row still marked `running`, resurrecting a dispatch this database had already retired | A running source row is skipped; there is no outcome in it to carry |
+| A refresh only updated, so a row an old-binary tick created after the first import was dropped when the source sealed | A refresh inserts a row that has no counterpart here |
+| `EnsureProject`'s doc claimed discovery problems were fatal; they are skips, and were dropped in silence | The comment says what the code does, and a skip is logged rather than dropped. The test that asserted the old contract is replaced by one that covers a real failure |
+| `logs` failed outright when an unrelated loop's old file was broken | `setup` takes a migration policy: a command that writes fails, a command that only reads warns |
+| The snapshot dropped the repository dimension the per-loop reads had, so a loop whose repo changed reported both repositories added together | `LoopState.CostByRepo`, and live/orphan counts keyed by repository |
+| A dry run reported the whole file's row count for a source that would only be refreshed | It reports the rows a refresh can write |
+| An unreadable state directory was passed over in silence | It is reported as a skip |
+| The migrate renderer and the branch's only `cmd/` test sat outside `internal/loopcmd`, where every other renderer lives | Moved to `internal/loopcmd/migratereport.go` |
+| Three copies of a "duplicate loop name" comment still argued from the old one-database-per-loop world | Rewritten to name the failure that exists now |
+| `legacydb` set `journal_mode=WAL`, which rewrites the header of a file the package promises never to write | The pragma is gone; only `busy_timeout` remains |
+| `ErrSourceClaimed` left the write path wedged with no stated remedy | The error names the claiming project and what to change |
+
 ## Deviations from this plan, decided during execution
 
 - **A loop configuration that does not load is reported and skipped, not fatal** (Task 8). The

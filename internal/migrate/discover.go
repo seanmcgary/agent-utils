@@ -13,8 +13,9 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/registry"
 )
 
-// StateDBFile is the name a per-loop database has, in every layout.
-const StateDBFile = "state.db"
+// StateDBFile is the name a per-loop database has, in every layout. It is the
+// same name the canonical database carries.
+const StateDBFile = home.StateDBFile
 
 // Discover returns every legacy database one project still holds.
 //
@@ -85,7 +86,15 @@ func Discover(agentUtilsDir, projectID, projectName string) ([]Source, []Result)
 	// The derived layout, for a loop whose configuration is gone.
 	stateRoot := filepath.Join(agentUtilsDir, config.StateSubdir)
 	dirs, err := os.ReadDir(stateRoot)
-	if err == nil {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// A project that has never run has no state directory. Normal.
+	case err != nil:
+		// Anything else hides state this scan is the only way to find, so it is
+		// reported rather than passed over in silence.
+		results = append(results, skipped(projectID, projectName, "",
+			fmt.Sprintf("%s cannot be read: %v", stateRoot, err)))
+	default:
 		for _, d := range dirs {
 			if !d.IsDir() {
 				continue
@@ -158,6 +167,20 @@ func skipped(projectID, projectName, loop, reason string) Result {
 	}
 }
 
+// Add appends a source unless the list already holds that file and loop.
+//
+// The caller adds its own loop explicitly, and discovery usually found it too.
+// Importing it twice per command is wasted work, and would double-count it in
+// any report.
+func Add(sources []Source, s Source) []Source {
+	for _, existing := range sources {
+		if existing.Key() == s.Key() {
+			return sources
+		}
+	}
+	return append(sources, s)
+}
+
 // SourceFor returns the source for one already-resolved loop.
 //
 // The command line can name a configuration by an arbitrary path, and such a
@@ -185,19 +208,7 @@ func legacyPath(stateDir string) (string, bool) {
 	if _, err := os.Stat(path); err != nil {
 		return "", false
 	}
-	return resolve(path), true
-}
-
-func resolve(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return path
-	}
-	real, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return abs
-	}
-	return real
+	return home.Resolve(path), true
 }
 
 // IsCanonical reports whether a source IS the canonical database. Such a source
@@ -207,5 +218,5 @@ func IsCanonical(path string) bool {
 	if err != nil {
 		return false
 	}
-	return resolve(canonical) == path
+	return home.Resolve(canonical) == path
 }
