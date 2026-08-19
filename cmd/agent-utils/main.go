@@ -11,21 +11,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
-	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
 	"github.com/seanmcgary/agent-utils/internal/migrate"
-	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
-	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/version"
-	"github.com/seanmcgary/agent-utils/internal/worktree"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/term"
 )
@@ -110,8 +105,8 @@ func openProject(c *cli.Command) (*loopcmd.Project, error) {
 }
 
 // refOf names the project a command acts for.
-func refOf(p *loopcmd.Project) projectRef {
-	return projectRef{ID: p.Config.ID, Name: p.Config.Name, Dir: p.Dir}
+func refOf(p *loopcmd.Project) loopcmd.ProjectRef {
+	return loopcmd.ProjectRef{ID: p.Config.ID, Name: p.Config.Name, Dir: p.Dir}
 }
 
 func configFlag() *cli.StringFlag {
@@ -391,7 +386,11 @@ func logsCommand() *cli.Command {
 				return err
 			}
 			// Reading logs needs no GitHub access.
-			cfg, deps, cleanup, err := setup(refOf(p), path, false, warnOnUnimported)
+			cfg, deps, cleanup, err := loopcmd.Open(refOf(p), path, loopcmd.Options{
+				Token:           os.Getenv("GITHUB_TOKEN"),
+				RequireGitHub:   false,
+				MigrationPolicy: loopcmd.WarnOnUnimported,
+			})
 			if err != nil {
 				return err
 			}
@@ -521,23 +520,21 @@ func loopCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					cfg, deps, cleanup, err := setup(refOf(p), path, true, failOnUnimported)
+					cfg, deps, cleanup, err := loopcmd.Open(refOf(p), path, loopcmd.Options{
+						Token:           os.Getenv("GITHUB_TOKEN"),
+						RequireGitHub:   true,
+						MigrationPolicy: loopcmd.FailOnUnimported,
+					})
 					if err != nil {
 						return err
 					}
 					defer cleanup()
 
-					l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
+					_, err = loopcmd.RunTick(ctx, cfg, deps)
 					if errors.Is(err, lock.ErrHeld) {
 						slog.Info("another tick is running; exiting", "loop", cfg.Name)
 						return nil
 					}
-					if err != nil {
-						return err
-					}
-					defer l.Release()
-
-					_, err = loopcmd.Tick(ctx, cfg, deps)
 					return err
 				},
 			},
@@ -554,7 +551,11 @@ func loopCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					cfg, deps, cleanup, err := setup(refOf(p), path, true, failOnUnimported)
+					cfg, deps, cleanup, err := loopcmd.Open(refOf(p), path, loopcmd.Options{
+						Token:           os.Getenv("GITHUB_TOKEN"),
+						RequireGitHub:   true,
+						MigrationPolicy: loopcmd.FailOnUnimported,
+					})
 					if err != nil {
 						return err
 					}
@@ -585,7 +586,11 @@ func loopCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					cfg, deps, cleanup, err := setup(refOf(p), path, false, failOnUnimported)
+					cfg, deps, cleanup, err := loopcmd.Open(refOf(p), path, loopcmd.Options{
+						Token:           os.Getenv("GITHUB_TOKEN"),
+						RequireGitHub:   false,
+						MigrationPolicy: loopcmd.FailOnUnimported,
+					})
 					if err != nil {
 						return err
 					}
@@ -629,14 +634,18 @@ func internalCommand() *cli.Command {
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					configPath := c.String("config")
-					ref := projectRef{
+					ref := loopcmd.ProjectRef{
 						ID: c.String("project"),
 						// Derived, not passed: the runner must not depend on a
 						// lookup it cannot perform. An empty result simply means
 						// the loop's own state directory is the only source.
 						Dir: config.DirFromPath(configPath),
 					}
-					cfg, deps, cleanup, err := setup(ref, configPath, false, failOnUnimported)
+					cfg, deps, cleanup, err := loopcmd.Open(ref, configPath, loopcmd.Options{
+						Token:           os.Getenv("GITHUB_TOKEN"),
+						RequireGitHub:   false,
+						MigrationPolicy: loopcmd.FailOnUnimported,
+					})
 					if err != nil {
 						return err
 					}
@@ -646,123 +655,4 @@ func internalCommand() *cli.Command {
 			},
 		},
 	}
-}
-
-// migrationPolicy decides what an unimported legacy database means to a command.
-//
-// A command that WRITES must not proceed against state it could not import: a
-// tick would re-dispatch every open issue and start a second agent in a worktree
-// that already holds one. A command that only READS must not fail because some
-// other loop's old file is broken; it says so and carries on.
-type migrationPolicy bool
-
-const (
-	failOnUnimported migrationPolicy = false
-	warnOnUnimported migrationPolicy = true
-)
-
-// projectRef is the project a command acts for. The runner is given one
-// explicitly, because it resolves no project of its own.
-type projectRef struct {
-	ID   string
-	Name string
-	// Dir is the project's .agent-utils directory. It is empty when the runner
-	// was pointed at a configuration outside any such directory.
-	Dir string
-}
-
-func setup(ref projectRef, configPath string, needsGitHub bool, policy migrationPolicy) (*config.Config, loopcmd.Deps, func(), error) {
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return nil, loopcmd.Deps{}, nil, err
-	}
-
-	// Resolve the state directory before anything uses it. When state_dir is not
-	// set this derives <project>/.agent-utils/state/<name>. The database no
-	// longer lives there; the tick lock and the logs still do.
-	stateDir, err := cfg.ResolveStateDir(configPath)
-	if err != nil {
-		return nil, loopcmd.Deps{}, nil, err
-	}
-	cfg.StateDir = stateDir
-
-	// 0700: the state directory holds agent transcripts, which quote everything
-	// the agent read and ran.
-	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
-		return nil, loopcmd.Deps{}, nil, fmt.Errorf("create state directory: %w", err)
-	}
-
-	// The token must come from the environment, never a flag. A flag value
-	// shows up in `ps` output and in the shell history of anyone who typed it.
-	// The detached runner never calls the GitHub API, so it must neither require
-	// nor carry the token. Requiring it there would put a repository-write
-	// credential in the environment of a process whose child is the agent.
-	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" && needsGitHub {
-		return nil, loopcmd.Deps{}, nil, fmt.Errorf("GITHUB_TOKEN is not set")
-	}
-
-	if _, err := home.EnsureDir(); err != nil {
-		return nil, loopcmd.Deps{}, nil, err
-	}
-	dbPath, err := home.StateDBPath()
-	if err != nil {
-		return nil, loopcmd.Deps{}, nil, err
-	}
-	db, err := store.Open(dbPath)
-	if err != nil {
-		return nil, loopcmd.Deps{}, nil, err
-	}
-
-	// This is the WRITE path, so an unimported source is fatal. A tick against a
-	// database missing this loop's rows would re-dispatch every open issue and
-	// start a second agent in a worktree that already holds one.
-	//
-	// The loop's own state directory is always included. --config takes an
-	// arbitrary path, so this loop is not always inside the directory Discover
-	// scans.
-	var (
-		sources  []migrate.Source
-		problems []migrate.Result
-	)
-	if ref.Dir != "" {
-		sources, problems = migrate.Discover(ref.Dir, ref.ID, ref.Name)
-	}
-	if own, ok := migrate.SourceFor(cfg.StateDir, ref.ID, ref.Name, cfg.Name, cfg.Repo); ok {
-		sources = migrate.Add(sources, own)
-	}
-	if err := migrate.EnsureProject(db, sources, problems); err != nil {
-		if policy == failOnUnimported {
-			db.Close()
-			return nil, loopcmd.Deps{}, nil, err
-		}
-		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
-	}
-
-	self, err := os.Executable()
-	if err != nil {
-		db.Close()
-		return nil, loopcmd.Deps{}, nil, fmt.Errorf("locate this executable: %w", err)
-	}
-	abs, err := filepath.Abs(configPath)
-	if err != nil {
-		db.Close()
-		return nil, loopcmd.Deps{}, nil, fmt.Errorf("resolve config path: %w", err)
-	}
-
-	wt := worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch)
-
-	deps := loopcmd.Deps{
-		Store:      db.Project(ref.ID),
-		ProjectID:  ref.ID,
-		GH:         ghub.New(token),
-		WT:         wt,
-		SelfPath:   self,
-		ConfigPath: abs,
-		Now:        time.Now,
-		Spawn:      runner.Spawn,
-		IsAlive:    proc.IsAlive,
-		Fetch:      wt.Fetch,
-	}
-	return cfg, deps, func() { db.Close() }, nil
 }
