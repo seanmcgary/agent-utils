@@ -233,14 +233,15 @@ func DirFromPath(path string) string {
 	}
 }
 
-// ResolveStateDir returns where this loop keeps its database, lock and logs.
+// ResolveStateDir returns where this loop keeps its tick lock and its logs.
 //
 // An explicit state_dir wins. Otherwise the directory is derived from the
 // configuration file's own location: <project>/.agent-utils/state/<name>.
 //
-// Deriving it is what keeps state distinct per project. A shared absolute
-// state_dir copied between two projects would point both of them at one
-// database, so each would see the other's dispatches and issue state.
+// It no longer decides where state is kept. Loop state lives in the one
+// canonical database, and every row there is keyed by the project's identifier,
+// so two loops that share a state_dir share a lock and a log tree, never state.
+// They must still have different names: the name is the other half of that key.
 func (c *Config) ResolveStateDir(configPath string) (string, error) {
 	if strings.TrimSpace(c.StateDir) != "" {
 		return expandHome(c.StateDir)

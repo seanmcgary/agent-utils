@@ -66,6 +66,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils list` | Every project on this machine, with each loop's ticks, live dispatches, cost and last tick |
 | `agent-utils logs --project <p> --session <id>` | Log search across projects |
 | `agent-utils forget <name\|id\|path>` | Drop a project from the registry, touching none of its files |
+| `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
 | `agent-utils version` | Version and commit |
 
 ### Project
@@ -152,13 +153,40 @@ All three are mode `0600`: a transcript records everything the agent read and ra
 One YAML file per loop, in `.agent-utils/configs/`. A loop's name is the `name:` field inside
 the file, not the file name, and it must be unique within a directory.
 
-State is per-project by default: each loop keeps its database, lock and logs under
-`<project>/.agent-utils/state/<loop>/`, so two projects never share one.
+Loop state lives in one database for the machine, at `~/.agent-utils/state.db`. Every row is
+keyed by the project's UUID, so no project ever reads another's issue state, dispatches or
+sessions. `state_dir` still holds each loop's tick lock and its log tree, under
+`<project>/.agent-utils/state/<loop>/` by default. Only the database moved.
 
 **[`docs/configuration.md`](docs/configuration.md) documents every field** — what it means,
 what reads it, and what happens if you get it wrong. `examples/planning.yaml` and
 `examples/execution.yaml` are complete working files, ported from the reference planning and
 execution orchestrators.
+
+## Migration
+
+State used to live in one SQLite file per loop, at `{state_dir}/state.db`. Those files are
+imported into the canonical database automatically, the first time any command touches the
+project. There is nothing to run, and so nothing to forget.
+
+The old files are never deleted. A `MIGRATED.txt` note is left beside one that has been read
+for the last time. A runner started by the old binary keeps writing the old file, because an
+upgrade does not change a running process, so that file stays open and is read again until it
+is idle.
+
+`agent-utils migrate` sweeps every registered project and prints what it did. Run it when you
+want the report, not because anything waits on it. `--dry-run` writes no state and touches no
+legacy file:
+
+```
+$ agent-utils migrate --dry-run
+Dry run: no state was imported and no legacy file was touched.
+Opening the canonical database still brought its schema up to date;
+that part cannot be avoided.
+
+Nothing left to import. Every registered project's state is already
+in the canonical database.
+```
 
 ## Security
 
@@ -220,7 +248,7 @@ different version than the tag says.
 
 ```bash
 make build && ./bin/agent-utils version
-# agent-utils v0.2.0 (d6e9df9)
+# agent-utils v0.3.0 (d6e9df9)
 ```
 
 A `go install` binary has no linker stamp, so it falls back to the module version and VCS

@@ -62,12 +62,33 @@ In order:
 There is deliberately **no fallback to `$HOME/.agent-utils`**. Configurations are
 project-local: running in an unrelated directory reports that there is no project there
 rather than silently adopting some other project's loops. Note that `$HOME/.agent-utils`
-does exist on any machine that has used the tool, because the cross-project registry lives
-there — which is exactly why falling back to it was wrong.
+does exist on any machine that has used the tool, because the cross-project registry and the
+one state database both live there — which is exactly why falling back to it was wrong.
 
 If no directory is found, every command that needs a configuration fails with an error naming
 where it looked. A cron entry should pass `--config` with an absolute path, which needs no
 discovery at all.
+
+### The machine-wide directory
+
+`$AGENT_UTILS_HOME` names the machine-wide `.agent-utils` directory itself. It defaults to
+`~/.agent-utils`, and it holds the registry and the canonical state database. It is not a
+replacement for `$HOME`: nothing else the tool or the agent reads moves with it.
+
+Do not confuse it with `$AGENT_UTILS_DIR`: `AGENT_UTILS_HOME` names the ONE machine-wide
+directory, and `AGENT_UTILS_DIR` names ONE project's `.agent-utils` directory.
+
+| Variable | Names | Default |
+|---|---|---|
+| `AGENT_UTILS_HOME` | The machine-wide directory: the registry and the state database | `~/.agent-utils` |
+| `AGENT_UTILS_DIR` | One project's `.agent-utils` directory | Found by walking up from the working directory |
+
+Pointing `AGENT_UTILS_HOME` at a path that exists and is not a directory is an error rather
+than a silent fallback. Falling back would write this machine's state somewhere you did not
+ask for, and the mistake would surface much later as missing state.
+
+Set it to run a test, or a second machine-wide installation, against its own state. Moving
+`$HOME` instead would also move the git and ssh configuration the agent still needs.
 
 ### How a configuration is chosen
 
@@ -145,7 +166,9 @@ It must be unique across the configurations in one directory.
 
 Two loops that share a `state_dir` **must** have different names. They would otherwise share
 one lock, so only one of them could tick at a time, and they would read each other's issue
-state.
+state. The name is also what separates their rows when a database from the old per-loop
+layout is imported, so two loops sharing one name would arrive in the canonical database as a
+single loop.
 
 ```yaml
 name: planning
@@ -202,31 +225,41 @@ worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
 **Optional.** When omitted it defaults to `<project>/.agent-utils/state/<name>`, derived from
 the configuration file's own location.
 
-Leave it unset. The default is what keeps state distinct per project: a shared absolute path
-copied between two projects would point both at one database, so each would see the other's
-dispatches, sessions, and issue state. Set it only to deliberately place state elsewhere. A
-leading `~` is expanded.
+Leave it unset. The default puts each loop's lock and logs beside the project they belong to,
+and it moves with the project. A shared absolute path copied between two projects makes both
+of them take one tick lock and write into one log tree, so their ticks serialize and their
+transcripts mingle. Set it only to deliberately place those files elsewhere. A leading `~` is
+expanded.
 
 A configuration outside any `.agent-utils` directory has no project to derive from, so
 `state_dir` is required there and its absence is an error naming the file.
 
-It holds everything durable except the worktrees:
+It holds two things:
 
 | Path | Contents |
 |---|---|
-| `{state_dir}/state.db` | SQLite: issue state, dispatches, pull request links, ticks |
 | `{state_dir}/{name}.lock` | The per-loop tick lock |
 | `{state_dir}/logs/{name}/` | Agent transcripts and runner logs |
 
-Separately, `$HOME/.agent-utils/registry.json` records which projects have been used, so
-`agent-utils list` can list them. It is an index only: deleting it loses the list and
-nothing else, and every project's real configuration and state stay in its own directory.
+**The database is not one of them.** Issue state, dispatches, pull request links and ticks
+live in one canonical database for the machine, at `$HOME/.agent-utils/state.db`. Every row
+carries the UUID of the project that owns it, so one file holds every project without any of
+them seeing another's state. That is why a `state_dir` shared between two projects no longer
+mixes their state — only their lock and their logs.
 
-The loop creates this directory `0700`, the database `0600`, and every log file `0600`. The
-transcripts record everything the agent read and ran, so they are not world-readable by
-design.
+The same directory holds `registry.json`, which records which projects have been used so
+`agent-utils list` can list them. It is an index only: deleting it loses the list and nothing
+else. Every project's configuration stays in its own directory.
 
-Give each loop its own `state_dir` unless you have a reason not to.
+The loop creates this directory `0700` and every log file `0600`. The machine-wide directory
+is `0700`, and the canonical database and its `-wal` and `-shm` sidecars are `0600`. The
+transcripts record everything the agent read and ran, and the database carries claude session
+identifiers, so none of it is world-readable by design.
+
+Two loops may share a `state_dir` as long as their names differ: the lock file and the log
+directory are both named after the loop, and their rows are keyed by the loop name too. Give
+each loop its own anyway unless you have a reason not to — one directory per loop is easier
+to read and easier to delete.
 
 ```yaml
 state_dir: /Users/seanmcgary/.agent-utils/planning
