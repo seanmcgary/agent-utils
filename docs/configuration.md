@@ -1,6 +1,6 @@
 # Loop configuration reference
 
-One YAML file defines one loop. `agent-utils loop tick --config <file>` reads it on every
+One YAML file defines one loop. `agent-utils project loop tick --config <file>` reads it on every
 run.
 
 The parser is **strict**: an unknown key is an error, not a warning. A misspelled key fails
@@ -21,8 +21,8 @@ the command line selects the same thing the loop calls itself.
 ```
 .agent-utils/
 └── configs/
-    ├── planning.yaml     name: planning   -> agent-utils loop tick --name planning
-    └── execution.yaml    name: execution  -> agent-utils loop tick --name execution
+    ├── planning.yaml     name: planning   -> agent-utils project loop tick --name planning
+    └── execution.yaml    name: execution  -> agent-utils project loop tick --name execution
 ```
 
 File names are yours to choose; only `.yaml` and `.yml` are read. `backlog-planning.yaml`
@@ -32,10 +32,10 @@ declaring `name: planning` is still selected as `planning`.
 directory and a lock while looking like separate loops, so `--name` refuses to guess between
 them and `list` prints a warning.
 
-`agent-utils list` prints what it finds:
+`agent-utils project list` prints what it finds:
 
 ```
-$ agent-utils list
+$ agent-utils project list
 /Users/you/.agent-utils/configs
 
 NAME                 FILE                     REPO                                 STATUS
@@ -77,12 +77,12 @@ running against the wrong loop.
 
 | You run | What happens |
 |---|---|
-| `agent-utils loop tick --config path/to/file.yaml` | That exact file. Nothing is scanned. |
-| `agent-utils loop tick --name planning` | The file declaring `name: planning` |
-| `agent-utils loop tick`, one config present | That one |
-| `agent-utils loop tick`, several present, terminal | Prompts you to pick one |
-| `agent-utils loop tick`, several present, **not** a terminal | Fails, listing the names |
-| `agent-utils loop tick --config … --name …` | Fails: pass only one |
+| `agent-utils project loop tick --config path/to/file.yaml` | That exact file. Nothing is scanned. |
+| `agent-utils project loop tick --name planning` | The file declaring `name: planning` |
+| `agent-utils project loop tick`, one config present | That one |
+| `agent-utils project loop tick`, several present, terminal | Prompts you to pick one |
+| `agent-utils project loop tick`, several present, **not** a terminal | Fails, listing the names |
+| `agent-utils project loop tick --config … --name …` | Fails: pass only one |
 | `--name x` when two files declare `name: x` | Fails, naming both files |
 
 That last row matters. A prompt in a cron job would wait for input that never arrives, so the
@@ -219,7 +219,7 @@ It holds everything durable except the worktrees:
 | `{state_dir}/logs/{name}/` | Agent transcripts and runner logs |
 
 Separately, `$HOME/.agent-utils/registry.json` records which projects have been used, so
-`agent-utils status` can list them. It is an index only: deleting it loses the list and
+`agent-utils list` can list them. It is an index only: deleting it loses the list and
 nothing else, and every project's real configuration and state stay in its own directory.
 
 The loop creates this directory `0700`, the database `0600`, and every log file `0600`. The
@@ -615,17 +615,16 @@ Beyond the required fields in the quick reference:
 
 Every failure is reported at once, so one load tells you everything wrong with the file.
 
-To check a file, run:
+To check every configuration in a project without touching GitHub:
 
 ```bash
-agent-utils loop status --config planning.yaml
+agent-utils project list      # loads and validates each one; INVALID rows carry the reason
+agent-utils project status    # the same, plus each loop's state directory and tick history
 ```
 
-`status` loads and validates the config before it does anything else, so a bad file fails
-there and nothing is dispatched. It makes no change to the repository, the state, or the
-worktrees.
+Both read only local state, so they need no token and work offline. A file that fails to load
+is reported as `INVALID` with its error rather than being skipped.
 
-It is not a pure config check, though: it also needs `GITHUB_TOKEN` and network access,
-because it lists the repository's open issues to render its view. A config error and an
-authentication error look different, so you can tell them apart — a config error names the
-offending field.
+`agent-utils project loop status --name <loop>` validates too, but it also lists the
+repository's open issues, so it needs `GITHUB_TOKEN` and network access. A config error names
+the offending field, so it is easy to tell from an authentication error.
