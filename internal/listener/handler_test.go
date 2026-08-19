@@ -591,3 +591,89 @@ func TestFullPoolDropsWithoutSecondTick(t *testing.T) {
 
 	close(release)
 }
+
+// TestDrainWaitsForInFlightTickStartedByThePool proves Server.Drain gives a
+// real happens-before guarantee, not just an eventual one: it must not
+// return while a Tick the pool goroutine started is still running, and it
+// must return once that Tick finishes. A regression to Add(1) placed inside
+// the spawned goroutine (rather than before it is spawned) would make this
+// flaky rather than reliably fail, since the race is between Drain's Wait
+// and the goroutine's own first instruction -- this test's release gate is
+// what turns that race into something deterministic to assert against.
+func TestDrainWaitsForInFlightTickStartedByThePool(t *testing.T) {
+	tickStarted := make(chan struct{})
+	release := make(chan struct{})
+	s, err := New(&Server{
+		Secret: testSecret,
+		Port:   freePort(t),
+		Tick: func(context.Context, string) {
+			close(tickStarted)
+			<-release
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body := repoPayload(t, "octo/hello")
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	select {
+	case <-tickStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Tick to start")
+	}
+
+	drainDone := make(chan struct{})
+	go func() {
+		s.Drain()
+		close(drainDone)
+	}()
+
+	select {
+	case <-drainDone:
+		t.Fatal("Drain returned while Tick was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-drainDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return after Tick finished")
+	}
+}
+
+// TestDrainReturnsImmediatelyWithNothingInFlight covers the common case: a
+// caller shutting down a listener that has no in-flight delivery must not
+// block at all.
+func TestDrainReturnsImmediatelyWithNothingInFlight(t *testing.T) {
+	s, err := New(&Server{
+		Secret: testSecret,
+		Port:   freePort(t),
+		Tick:   func(context.Context, string) {},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.Drain()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Drain blocked with nothing in flight")
+	}
+}

@@ -248,8 +248,16 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// the same state, so nothing is lost by not queuing it here.
 		select {
 		case s.sem <- struct{}{}:
+			// Add happens here, synchronously, before the goroutine is
+			// spawned -- not inside it. A caller of Drain (see listener.go)
+			// waits on this same WaitGroup; Add inside the goroutine would
+			// let that Wait observe a zero counter before the goroutine
+			// ever ran, since nothing orders "go func(){...}()" returning
+			// against the Add its body would perform.
+			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.sem }()
+				defer s.wg.Done()
 				s.Tick(ctx, repo)
 			}()
 		default:

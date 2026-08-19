@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -57,6 +58,17 @@ type Server struct {
 
 	// sem is the bounded semaphore that gates concurrent ticks. Built by New.
 	sem chan struct{}
+	// wg counts every Tick call this Server's own pool goroutine has started
+	// but not yet finished. handleWebhook calls wg.Add(1) synchronously,
+	// before spawning that goroutine -- not inside it -- specifically so a
+	// caller of Drain that has observed wg reach zero has a real
+	// happens-before guarantee that no such goroutine is still running. A
+	// naive Add(1) placed inside the spawned goroutine would let Drain's
+	// Wait observe a zero counter before the goroutine ever ran it, since
+	// nothing establishes an ordering between "go func(){...}()" returning
+	// control to its caller and the Add inside it actually executing.
+	wg sync.WaitGroup
+
 	// seen remembers recent delivery ids so a GitHub redelivery does not
 	// dispatch a second tick. Built by New.
 	seen *deliveryCache
@@ -156,4 +168,18 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		}
 		return <-errCh
 	}
+}
+
+// Drain blocks until every Tick call the HTTP pool goroutine has started has
+// finished.
+//
+// This exists for a caller doing an ordered shutdown (stop accepting
+// deliveries, then wait for in-flight ones to finish, THEN close whatever
+// state Tick reads and writes -- see cmd/agent-utils/listener.go's
+// drainAndClose). ListenAndServe returning after Shutdown proves the HTTP
+// layer is quiet, but the pool goroutine handleWebhook spawns is detached
+// from its request by the time it runs Tick, so Shutdown's own wait for
+// "active requests" does not cover it. Drain does.
+func (s *Server) Drain() {
+	s.wg.Wait()
 }

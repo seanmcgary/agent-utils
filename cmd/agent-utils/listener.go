@@ -14,24 +14,45 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/listener"
+	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/service"
 	"github.com/seanmcgary/agent-utils/internal/settings"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/urfave/cli/v3"
 )
 
-// pidFileName is the listener's pidfile, at <home>/listener.pid.
+// pidFileName is the listener's pidfile, at <home>/listener.pid. It records
+// which pid and address a running listener bound, for `status` to report
+// and for `stop` to signal.
 //
-// It is required, not optional. internal/proc.IsAlive cannot be reused to
-// find this process: it matches a runner's command line against
-// "--dispatch <id>", and the listener carries no such argument. The pidfile
-// is therefore the only thing `stop` and `status` have to find and identify
-// a foreground listener, which is the only mode this program supports off
-// macOS (service.New's non-darwin stub refuses --daemon outright).
+// It is NOT the source of truth for whether a listener is alive -- see
+// lockFileName. internal/proc.IsAlive cannot be reused to find this process
+// either way: it matches a runner's command line against "--dispatch <id>",
+// and the listener carries no such argument.
 const pidFileName = "listener.pid"
+
+// lockFileName is the listener's single-instance and liveness lock, at
+// <home>/listener.lock, held for the whole lifetime of a running listener
+// (see runListener) and released by drainAndClose.
+//
+// This, not kill(pid, 0) against the pid recorded in the pidfile, is what
+// `stop` and `status` trust to answer "is a listener actually running":
+// pids are recycled by the OS, so a listener that was killed -9 or panicked
+// -- leaving its pidfile behind, since only drainAndClose's own clean
+// shutdown removes it -- can have its old pid handed to an unrelated
+// process this same user later starts. kill(pid, 0) would then report that
+// unrelated process alive, and `stop` would SIGTERM it. flock, by contrast,
+// is released by the kernel the instant the holding process's file
+// descriptor closes, on a clean exit OR a crash OR a kill -9, so
+// lock.Acquire succeeding is proof, not a guess, that nothing currently
+// holds it. It doubles as this command's single-instance guard: a second
+// `listener start` fails fast at lock.Acquire, before it can overwrite a
+// live listener's pidfile out from under it.
+const lockFileName = "listener.lock"
 
 // listenerCommand groups the webhook daemon's lifecycle: run it, stop it,
 // and ask what it is doing. It is top level, not project-scoped, because one
@@ -189,8 +210,10 @@ func explainInstallErr(err error) error {
 // containsWritableRefusal reports whether err is (or wraps) the specific
 // refusal refuseIfWritableByOthers produces. It matches on text rather than
 // a sentinel because that function returns a plain fmt.Errorf with no
-// exported error value to compare against, and adding one is out of scope
-// here: internal/service is landed and reviewed.
+// exported error value to compare against; see the cross-reference comment
+// left next to that error in internal/service/service_darwin.go, which
+// exists so a wording change there cannot silently break this match without
+// a reader noticing.
 func containsWritableRefusal(err error) bool {
 	return strings.Contains(err.Error(), "writable by group or other")
 }
@@ -204,45 +227,93 @@ func containsWritableRefusal(err error) bool {
 // otherwise be considered "done", which is exactly what a long-running
 // daemon is.
 func runListener(_ context.Context, addr string, port int, secret string) error {
-	if _, err := home.EnsureDir(); err != nil {
-		return err
-	}
-	dbPath, err := home.StateDBPath()
-	if err != nil {
-		return err
-	}
-	db, err := store.Open(dbPath)
+	dir, err := home.EnsureDir()
 	if err != nil {
 		return err
 	}
 
-	dir, err := home.Dir()
+	// Acquired first, before anything else opens or writes: see
+	// lockFileName. A second `listener start` must fail HERE, before it can
+	// touch the pidfile or the database a live listener already owns.
+	lockPath := filepath.Join(dir, lockFileName)
+	lk, err := lock.Acquire(lockPath)
+	if errors.Is(err, lock.ErrHeld) {
+		return errors.New(
+			"a listener is already running (its lock is held); " +
+				"run `agent-utils listener status` to check, or `listener stop` to stop it first")
+	}
 	if err != nil {
-		_ = db.Close()
+		return fmt.Errorf("acquire listener lock: %w", err)
+	}
+	releaseLock := func() {
+		if err := lk.Release(); err != nil {
+			slog.Warn("release listener lock", "path", lockPath, "err", err)
+		}
+	}
+
+	dbPath, err := home.StateDBPath()
+	if err != nil {
+		releaseLock()
 		return err
 	}
+	db, err := store.Open(dbPath)
+	if err != nil {
+		releaseLock()
+		return err
+	}
+	closeDB := func() {
+		if err := db.Close(); err != nil {
+			slog.Warn("close state database", "err", err)
+		}
+	}
+
 	pidPath := filepath.Join(dir, pidFileName)
 
 	w := listener.NewWorker(db)
 
 	var tickWG sync.WaitGroup
+	// instrumentRetries wraps Worker.After so a retry-fired tick is
+	// accounted for and panic-safe exactly like an HTTP-delivered one; see
+	// its own comment for why that gap existed and why fixing it belongs
+	// here rather than inside internal/listener.
+	instrumentRetries(w, &tickWG)
+
+	// tickCtx is a context of its own, deliberately NOT serverCtx (below):
+	// Handler(ctx) threads whatever ctx ListenAndServe was given into every
+	// Tick call, and cancelServer() -- drainAndClose step 1 -- cancels
+	// exactly that ctx to stop accepting new deliveries. If Tick's own work
+	// ran under that same ctx, step 1 would cancel every tick already IN
+	// FLIGHT too, and drainAndClose's later Wait would then only be timing
+	// how long they take to unwind under a dead context, not waiting for
+	// them to actually finish -- precisely the "cancelling mid-tick" half
+	// of the hazard drainAndClose's own comment names. wrapTick below
+	// discards the ctx Server passes it and substitutes this one, which
+	// nothing cancels until after the drain (see the defer below), by
+	// which point the process is exiting anyway.
+	tickCtx, cancelTickCtx := context.WithCancel(context.Background())
+	defer cancelTickCtx()
+
 	srv, err := listener.New(&listener.Server{
 		Addr:   addr,
 		Port:   port,
 		Secret: secret,
-		Tick:   wrapTick(w.Deliver, &tickWG),
+		Tick:   wrapTick(tickCtx, w.Deliver),
 	})
 	if err != nil {
-		_ = db.Close()
+		closeDB()
+		releaseLock()
 		return err
 	}
 
 	// Write the pidfile before Serve starts, not after: `status` and `stop`
 	// must be able to find this process from the moment it starts
 	// listening, and there is no point at which this process is "half
-	// running" that they should observe instead.
+	// running" that they should observe instead. Safe to do unconditionally
+	// here: the lock acquired above already proves no other listener could
+	// be holding this pidfile's identity.
 	if err := writePidfile(pidPath, os.Getpid(), addr, port); err != nil {
-		_ = db.Close()
+		closeDB()
+		releaseLock()
 		return fmt.Errorf("write pidfile: %w", err)
 	}
 
@@ -280,7 +351,7 @@ func runListener(_ context.Context, addr string, port int, secret string) error 
 		slog.Warn("listener's http server exited on its own")
 	}
 
-	return drainAndClose(cancelServer, cancelWorker, serverDone, workerDone, &tickWG, db, pidPath)
+	return drainAndClose(cancelServer, cancelWorker, serverDone, workerDone, srv, &tickWG, db, lk, pidPath)
 }
 
 // drainAndClose runs the shutdown sequence, in this exact order, and why:
@@ -292,22 +363,33 @@ func runListener(_ context.Context, addr string, port int, secret string) error 
 //  2. Only now cancel the daemon context so the worker's retry timers stop
 //     (Worker.Serve's stopAll). Doing this earlier would let a retry fire
 //     concurrently with the database close in step 4.
-//  3. Wait for every tick already handed to the HTTP handler's bounded pool
-//     to finish. Server keeps its own semaphore private (it is an
-//     unexported field), so tickWG -- incremented and decremented by
-//     wrapTick, around every call this process makes into Worker.Deliver --
-//     is this command's own accounting of the same in-flight set.
+//  3. Wait for every tick already started to finish. Two accountings, for
+//     two different origins: srv.Drain() waits on Server's own WaitGroup,
+//     which the HTTP pool goroutine increments before it starts (see
+//     Server.Drain's comment); tickWG.Wait() waits on this command's own
+//     WaitGroup, which instrumentRetries increments around every retry
+//     Worker.After arms. Neither alone is complete -- a retry-fired tick
+//     never passes through Server's pool, and an HTTP-delivered tick never
+//     passes through Worker.After -- so both run.
 //  4. Only now close the database. A tickOne in flight when the database
 //     closes underneath it leaves the dispatches row it started stuck in
 //     "running", which the next tick has to reap as an orphan (see
 //     internal/loopcmd/tick.go's orphan sweep) rather than simply finishing.
-//  5. Remove the pidfile last. `stop` and `status` must never observe a
-//     live pid for a process that has already given up its listening
-//     socket and its database handle.
+//  5. Remove the pidfile, but only if it still names THIS process. A second
+//     `listener start` cannot get far enough to overwrite it now that the
+//     lock (step 6) serializes starts, but re-checking here costs nothing
+//     and means this function is never the one that deletes a pidfile some
+//     other process is relying on.
+//  6. Release the lock last of all. Everything this process owns --
+//     socket, timers, in-flight ticks, database handle, pidfile -- is
+//     already gone by the time `stop`/`status` could observe the lock as
+//     free, so there is no window where the lock says "not running" while
+//     any of that is still true.
 func drainAndClose(
 	cancelServer, cancelWorker context.CancelFunc,
 	serverDone <-chan error, workerDone <-chan struct{},
-	tickWG *sync.WaitGroup, db *store.DB, pidPath string,
+	srv *listener.Server, tickWG *sync.WaitGroup,
+	db *store.DB, lk *lock.Lock, pidPath string,
 ) error {
 	cancelServer()
 	serveErr := <-serverDone
@@ -315,12 +397,26 @@ func drainAndClose(
 	cancelWorker()
 	<-workerDone
 
+	srv.Drain()
 	tickWG.Wait()
 
 	dbErr := db.Close()
 
-	if err := os.Remove(pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Warn("remove pidfile", "path", pidPath, "err", err)
+	if pf, err := readPidfile(pidPath); err == nil {
+		if pf.PID == os.Getpid() {
+			if rmErr := os.Remove(pidPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				slog.Warn("remove pidfile", "path", pidPath, "err", rmErr)
+			}
+		} else {
+			slog.Warn("pidfile no longer names this process; leaving it alone",
+				"path", pidPath, "pid", pf.PID, "this_pid", os.Getpid())
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("read pidfile before removing it", "path", pidPath, "err", err)
+	}
+
+	if err := lk.Release(); err != nil {
+		slog.Warn("release listener lock", "err", err)
 	}
 
 	if serveErr != nil {
@@ -330,37 +426,81 @@ func drainAndClose(
 }
 
 // wrapTick adapts deliver (production always passes Worker.Deliver) into the
-// Tick callback listener.Server.New requires, adding two things Server's own
-// pool goroutine does not have.
+// Tick callback listener.Server.New requires.
 //
-// The first is tickWG: see drainAndClose step 3.
+// It ignores the ctx Server passes it and calls deliver with tickCtx
+// instead; see runListener's comment on tickCtx for why substituting it is
+// required, not merely defensive: Handler(ctx) threads ListenAndServe's own
+// ctx into every Tick call, and that same ctx is what drainAndClose cancels
+// FIRST, to stop accepting new deliveries, before it waits for in-flight
+// ones to finish. Passing it straight through to deliver would cancel every
+// tick already running the instant shutdown begins, and the later wait
+// would then only be timing an unwind, not honoring a genuine "let it
+// finish" guarantee.
 //
-// The second is recover. Neither internal/listener's HTTP pool goroutine
-// (handler.go's handleWebhook) nor its retry callback (work.go's schedule)
-// recovers a panic, and an unrecovered panic in ANY goroutine kills the
-// whole Go process -- there is no per-goroutine isolation. This command is
-// the process owner, so the decision belongs here: recover is added at this
-// one point in the call chain, the only one reachable without editing
-// internal/listener, which is landed, reviewed, and out of this task's
-// scope. It does not close the gap in the retry callback, which still runs
-// unrecovered inside internal/listener's own time.AfterFunc; a delivery that
-// panics is contained, a retry that panics is not. See the E6 report.
-func wrapTick(deliver func(ctx context.Context, repo string), tickWG *sync.WaitGroup) func(context.Context, string) {
-	return func(ctx context.Context, repo string) {
-		tickWG.Add(1)
-		defer tickWG.Done()
+// It also recovers a panic. Neither internal/listener's HTTP pool goroutine
+// nor its retry callback (see instrumentRetries) recovers one, and an
+// unrecovered panic in ANY Go goroutine kills the whole process -- there is
+// no per-goroutine isolation. This command is the process owner, so the
+// decision belongs here.
+func wrapTick(tickCtx context.Context, deliver func(ctx context.Context, repo string)) func(context.Context, string) {
+	return func(_ context.Context, repo string) {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("webhook tick panicked; recovered to keep the listener alive",
 					"repo", repo, "panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
 			}
 		}()
-		deliver(ctx, repo)
+		deliver(tickCtx, repo)
 	}
 }
 
-// pidfile is the pidfile's on-disk content: not only the pid, but the
-// address status reports without needing to probe the socket itself.
+// instrumentRetries wraps w.After -- an exported seam on Worker specifically
+// so a caller can do this (internal/listener/work.go) -- so a retry-fired
+// tick is accounted for by tickWG and protected by recover, exactly like an
+// HTTP-delivered one.
+//
+// Without this, work.go's schedule runs tickOne directly inside the
+// time.AfterFunc callback After arms, entirely outside anything this
+// command tracks. Two consequences, both real: first, Worker.Serve's
+// stopAll only stops ARMED timers (see its own comment), so a timer that
+// had already fired and begun running tickOne by the time shutdown starts
+// is invisible to drainAndClose, which returns and lets the process exit
+// out from under it -- exactly how a dispatches row ends up inserted
+// `running` with no pid ever registered, which internal/loopcmd/tick.go
+// does not treat as an orphan and so never reaps. Second, a panic inside
+// that same callback is unrecovered and kills the whole process, same as an
+// unrecovered panic anywhere else.
+//
+// Add(1) happens synchronously inside the wrapped After, at the moment the
+// timer is ARMED (schedule calling After), not when it fires: time.AfterFunc
+// establishes a genuine happens-before between arming and the goroutine it
+// later starts to run the callback, the same guarantee "go func(){}()"
+// itself gives its own body, so there is no window where Wait could observe
+// a zero counter for a timer that is armed but has not yet fired.
+//
+// work.go's own comment on schedule says "a shared bound belongs in the
+// command that owns both" -- Server's semaphore and Worker's retry timers.
+// This command is that owner; this is where that bound is expressed.
+func instrumentRetries(w *listener.Worker, tickWG *sync.WaitGroup) {
+	inner := w.After
+	w.After = func(d time.Duration, f func()) *time.Timer {
+		tickWG.Add(1)
+		return inner(d, func() {
+			defer tickWG.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("retry tick panicked; recovered to keep the listener alive",
+						"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+				}
+			}()
+			f()
+		})
+	}
+}
+
+// pidfileContent is the pidfile's on-disk content: not only the pid, but the
+// address `status` reports without needing to probe the socket itself.
 type pidfileContent struct {
 	PID  int    `json:"pid"`
 	Addr string `json:"addr"`
@@ -396,20 +536,23 @@ func readPidfile(path string) (pidfileContent, error) {
 	return pf, nil
 }
 
-// pidAlive reports whether pid names a process this user can signal.
-//
-// Unlike internal/proc.IsAlive, it does not also match a command line: that
-// package's second check exists because a dispatch runner's pid could be
-// reused by an unrelated process and IsAlive has a specific "--dispatch <id>"
-// argument to key on. The listener carries no equivalent argument, so
-// kill(pid, 0) -- "does this pid exist and can I signal it" -- is all that
-// is available here. The pidfile itself is the identity check: it is
-// written only by this process, at 0600, at the moment it starts serving.
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
+// listenerLive reports whether a listener currently holds lockFileName,
+// which is the only thing this command trusts as proof of that -- see
+// lockFileName's own comment for why kill(pid, 0) against the pidfile's pid
+// is not safe to use for this. A lock acquired successfully here is
+// released again immediately; this call is a probe, not a claim.
+func listenerLive(lockPath string) (bool, error) {
+	lk, err := lock.Acquire(lockPath)
+	if errors.Is(err, lock.ErrHeld) {
+		return true, nil
 	}
-	return syscall.Kill(pid, 0) == nil
+	if err != nil {
+		return false, err
+	}
+	if err := lk.Release(); err != nil {
+		slog.Warn("release probe lock", "path", lockPath, "err", err)
+	}
+	return false, nil
 }
 
 func listenerStopCommand() *cli.Command {
@@ -431,29 +574,38 @@ func listenerStopCommand() *cli.Command {
 			// (internal/service's non-darwin stub) or a launchd this
 			// process cannot query. Either way there is nothing installed
 			// for this branch to remove, and stop must still work for a
-			// foreground listener -- see the pidfile handling below, which
-			// is the only way to stop a listener off macOS.
+			// foreground listener -- see the lock/pidfile handling below,
+			// which is the only way to stop a listener off macOS.
 
 			dir, err := home.Dir()
 			if err != nil {
 				return err
 			}
 			pidPath := filepath.Join(dir, pidFileName)
-			pf, err := readPidfile(pidPath)
-			switch {
-			case err == nil && pidAlive(pf.PID):
+			lockPath := filepath.Join(dir, lockFileName)
+
+			live, err := listenerLive(lockPath)
+			if err != nil {
+				return fmt.Errorf("check whether a listener is running: %w", err)
+			}
+			if live {
+				pf, err := readPidfile(pidPath)
+				if err != nil {
+					return fmt.Errorf(
+						"a listener is running (its lock is held) but its pidfile is unreadable: %w", err)
+				}
 				if err := syscall.Kill(pf.PID, syscall.SIGTERM); err != nil {
 					return fmt.Errorf("signal listener pid %d: %w", pf.PID, err)
 				}
 				fmt.Printf("sent SIGTERM to listener pid %d\n", pf.PID)
 				acted = true
-			case err == nil:
-				// A stale pidfile, left by a process that died without
-				// running its own shutdown (a kill -9, a crash). Clean it
-				// up so `status` does not keep reporting a dead pid
-				// forever; the live process's own drainAndClose already
-				// removes it on an ordinary shutdown, so this only ever
-				// fires on the unclean path.
+			} else if _, statErr := os.Stat(pidPath); statErr == nil {
+				// The lock is free, so whatever the pidfile says is stale:
+				// left by a process that died without running its own
+				// shutdown (a kill -9, a crash). Clean it up so `status`
+				// does not keep reporting a dead pid forever; a listener's
+				// own drainAndClose already removes this on an ordinary
+				// shutdown, so this only ever fires on the unclean path.
 				if rmErr := os.Remove(pidPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 					slog.Warn("remove stale pidfile", "path", pidPath, "err", rmErr)
 				}
@@ -476,8 +628,8 @@ func listenerStatusCommand() *cli.Command {
 			status, statusErr := mgr.Status()
 			if statusErr != nil {
 				// Unsupported platform or an unreadable launchd state; not
-				// fatal to this command, since the pidfile below may still
-				// have something to report -- see listenerStopCommand.
+				// fatal to this command, since the lock/pidfile below may
+				// still have something to report -- see listenerStopCommand.
 				fmt.Printf("launchd: unavailable (%v)\n", statusErr)
 			} else {
 				fmt.Printf("launchd: installed=%t running=%t", status.Installed, status.Running)
@@ -492,6 +644,14 @@ func listenerStatusCommand() *cli.Command {
 				return err
 			}
 			pidPath := filepath.Join(dir, pidFileName)
+			lockPath := filepath.Join(dir, lockFileName)
+
+			live, err := listenerLive(lockPath)
+			if err != nil {
+				fmt.Printf("pidfile: cannot determine liveness (%v)\n", err)
+				live = false
+			}
+
 			pf, err := readPidfile(pidPath)
 			switch {
 			case errors.Is(err, os.ErrNotExist):
@@ -500,7 +660,7 @@ func listenerStatusCommand() *cli.Command {
 				fmt.Printf("pidfile: unreadable (%v)\n", err)
 			default:
 				fmt.Printf("pidfile: pid=%d alive=%t addr=%s:%d\n",
-					pf.PID, pidAlive(pf.PID), pf.Addr, pf.Port)
+					pf.PID, live, pf.Addr, pf.Port)
 			}
 			return nil
 		},

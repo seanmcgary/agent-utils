@@ -132,6 +132,12 @@ func refuseIfWritableByOthers(real string) error {
 		// time, in a writable directory that is later populated. So a
 		// sticky, world-writable directory (mode 1777, like /tmp) is still
 		// refused here, correctly.
+		// cmd/agent-utils/listener.go's explainInstallErr matches this exact
+		// phrase ("writable by group or other") to decide whether to append
+		// operator-facing context (the Intel-Mac Homebrew /usr/local case)
+		// to this error. Changing the wording here without updating that
+		// match would silently turn a would-be explained refusal back into
+		// a bare one.
 		if info.Mode().Perm()&0o022 != 0 {
 			return fmt.Errorf("refusing to install: %s is writable by group or other", path)
 		}
