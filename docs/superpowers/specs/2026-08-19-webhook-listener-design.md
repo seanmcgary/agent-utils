@@ -70,7 +70,7 @@ The change touches one repository. No other program consumes this code.
 | `README.md` | The cron section and the security section change. |
 | `internal/settings/` | New package. |
 | `internal/listener/` | New package. |
-| `internal/launchd/` | New package. |
+| `internal/service/` | New package. |
 
 ### Prior art
 
@@ -87,17 +87,33 @@ Reuse these. Do not write a second version of any of them.
 
 ### Contradictions found
 
-Five findings contradict the first shape of the design.
+Six findings contradict the first shape of the design.
 
-**1. `github.ValidatePayload` accepts a SHA-1 signature.**
+**1. `github.ValidatePayload` accepts a SHA-1 signature, in two different ways.**
 
 At `messages.go:256-260` the function reads `X-Hub-Signature-256`. If that header is absent,
-the function reads `X-Hub-Signature`, which is HMAC-SHA1. A caller that wants SHA-256 only
-cannot use this function.
+the function reads `X-Hub-Signature`, which is HMAC-SHA1.
 
-The listener reads `github.SHA256SignatureHeader` itself. An empty value is rejected with 400.
-The listener then calls `github.ValidatePayloadFromBody`, which does the constant-time
+Reading the SHA-256 header directly is **not** enough. At `messages.go:149-176` `messageMAC`
+selects the hash function from the signature string's own prefix, not from the header name:
+
+```go
+switch sigParts[0] {
+case sha1Prefix:   hashFunc = sha1.New
+case sha256Prefix: hashFunc = sha256.New
+case sha512Prefix: hashFunc = sha512.New
+```
+
+So `X-Hub-Signature-256: sha1=<hmac-sha1>` is verified with SHA-1.
+
+The listener therefore does three things. It reads `github.SHA256SignatureHeader` itself and
+rejects an empty value with 400. It rejects a signature that does not begin with `sha256=`
+with 400. It then calls `github.ValidatePayloadFromBody`, which does the constant-time
 comparison. The listener also wraps the body in `http.MaxBytesReader`.
+
+A third trap sits beside these two: at `messages.go:230-236` the library validates only when
+the secret or the signature is non-empty, and an empty secret makes the HMAC key empty. The
+listener refuses to serve when the configured secret is empty.
 
 **2. `proc.IsAlive` cannot report on the listener.**
 
@@ -215,12 +231,20 @@ registration again.
 ### Registering the webhook
 
 ```
-agent-utils project register-webhook [--name <loop>] [--all]
+agent-utils project register-webhook [--name <loop>] [--yes]
 ```
 
 The command resolves the project the same way every other `project` command does. It reads the
 project's loop configurations and collects the distinct `repo:` values. `--name` limits the
-work to one loop. `--all` accepts every repository without a prompt.
+work to one loop.
+
+The command asks before it writes, because a webhook grants GitHub the right to trigger an
+agent. `--yes` skips the question. The question appears only when stdin is a terminal; a
+non-interactive run without `--yes` gets an error that lists the repositories. That rule is
+already written into `resolveLoopConfig`: a prompt in a cron job hangs forever.
+
+(The flag was named `--all` in an earlier draft of this design. It is `--yes`, because it
+answers a confirmation rather than widening a selection.)
 
 For each repository the command:
 
@@ -317,7 +341,7 @@ waits for unrelated repository activity.
 environment: it passes the value to `loopcmd.Open`. A rotated token therefore needs no
 restart. The daemon refuses to start when the file is readable by group or other.
 
-### launchd
+### The service manager
 
 `listener start --daemon` writes
 `~/Library/LaunchAgents/com.seanmcgary.agent-utils.listener.plist` and runs
@@ -334,7 +358,7 @@ The plist:
 
 The plist is written at mode 0644, which is what launchd expects, and it holds no secret.
 
-A `serviceManager` interface hides launchd:
+A `service.Manager` interface hides launchd:
 
 ```go
 type ServiceManager interface {
@@ -344,7 +368,7 @@ type ServiceManager interface {
 }
 ```
 
-The launchd implementation goes in `service_darwin.go`. A build for another platform gets a
+The package is `internal/service`, named for the concept rather than the tool, because systemd is meant to follow. The launchd implementation goes in `service_darwin.go`. A build for another platform gets a
 stub that reports that `--daemon` is not supported yet. This is what lets systemd follow
 without a change to the command.
 

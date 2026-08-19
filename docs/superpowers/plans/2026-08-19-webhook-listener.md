@@ -46,7 +46,7 @@ internal/store   (issues.retry_after)
 A second path wakes a loop with no repository activity:
 
 ```
-store.DB.EarliestRetryAfter()  ->  RetryDue{ProjectID, Loop, Repo, At}
+store.DB.EarliestRetryAfter()  ->  RetryDue{ProjectID, Loop, Repo, Number, At}
   |
   v
 listener.TargetFor(projectID, loop)   -- scoped to ONE loop, never fanned out by repo
@@ -469,9 +469,19 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
     there. Say that in the comment.
   - `Save` calls `home.EnsureDir` first and writes a header comment above the YAML, the way
     `project.Save` does.
-  - Applied defaults: `ListenAddr` defaults to `127.0.0.1` and `ListenPort` to `8787` when the
-    field is empty or zero. Bind to loopback by default, because `0.0.0.0` would accept
-    deliveries from the local network before the operator asked for that.
+  - Defaults are applied by an explicit method, never inside `Load`:
+
+    ```go
+    // WithDefaults returns a copy with unset fields filled in.
+    func (s Settings) WithDefaults() Settings
+    ```
+
+    `ListenAddr` defaults to `127.0.0.1` and `ListenPort` to `8787`. Bind to loopback by
+    default, because `0.0.0.0` would accept deliveries from the local network before the
+    operator asked for that. Keeping this out of `Load` is what lets `Load` return a true zero
+    value for an absent file and lets `Save`/`Load` round-trip a stored value unchanged. The
+    `listener` command calls `WithDefaults`; the `config` command does not, so `show` prints
+    what is really in the file.
 
   Field validation, in the `Set` functions:
   - `webhook.url` must parse with `net/url`, must have a host, and must use scheme `https`.
@@ -507,10 +517,10 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
 
   ```
   agent-utils config show [--reveal]
-  agent-utils config get <key>
+  agent-utils config get <key> [--reveal]
   agent-utils config set <key> <value>
   agent-utils config unset <key>
-  agent-utils config webhook --enable|--disable [--url U] [--port N] [--addr A] [--rotate-secret]
+  agent-utils config webhook --enable|--disable [--url U] [--listen-port N] [--listen-addr A] [--rotate-secret]
   ```
 
   The command's `Usage` string must disambiguate it from loop configuration, which already owns
@@ -532,7 +542,10 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   `configFlag()` and `nameFlag()`, and reuse them in E6 so the two commands cannot drift to
   different spellings. Precedent: `cmd/agent-utils/main.go` declares each shared flag once.
 
-  **Acceptance:** the CLI-level tests assert wiring only, because B1 owns the rules:
+  **Acceptance:** `cmd/agent-utils` has no test file today; this task adds the first one
+  (`cmd/agent-utils/config_test.go`). That is a deliberate new precedent, and it is justified
+  only because these assertions are about flag wiring, which cannot be reached from
+  `internal/`. Every parse and validation rule stays in B1's tests. The CLI tests assert:
   - `webhook --enable` with no URL exits non-zero and `settings.Load` still returns a zero
     value.
   - `webhook --enable --url https://x/y` writes a 64-character secret and the defaults.
@@ -568,10 +581,33 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   past deadline, and E4's `Wake` would then re-tick that loop forever, each iteration calling
   the GitHub API with a repository-write token.
 
-  - `MarkNeedsRetry` gains a parameter: `MarkNeedsRetry(loop, repo string, number int,
-    retryAfter time.Time) error`, and writes `retry_after`. Update both callers,
-    `internal/runner/runner.go:242` and `internal/loopcmd/tick.go:162`; `cfg` is in scope at
-    both. This is what makes the first entry of the backoff list reachable — see C3.
+  **`MarkNeedsRetry` is the ONE writer of `retry_after`.** Nothing else may write it. A second
+  writer in `dispatch` would be overwritten on the very next failure — every `needs_retry`
+  transition runs through `MarkNeedsRetry` — so the escalating list would collapse to its first
+  entry forever. Recording the deadline where the failure is recorded also keeps the index
+  where the old code read it: `BackoffTicks[state.RetryCount]` was evaluated against the
+  failure, not against the dispatch.
+
+  ```go
+  // MarkNeedsRetry records that a dispatch for this issue failed, and stamps the
+  // earliest time a retry may run.
+  //
+  // It reads retry_count inside the same transaction and indexes backoff with it,
+  // clamped to the last entry. An empty list means no deadline: retry.max may be
+  // 0, in which case retry.backoff is absent and no retry will ever be decided.
+  func (s *Store) MarkNeedsRetry(loop, repo string, number int, now time.Time, backoff []time.Duration) error
+  ```
+
+  Threading the list to the call sites is a real refactor, so do it deliberately:
+
+  - `internal/loopcmd/tick.go:162` (reaping a dead runner) has `cfg` and `now`. Pass them.
+  - `internal/runner/runner.go:242` is inside **`finish(st, d, res)`** at `runner.go:226`,
+    which has neither `cfg` nor `now`. Add a parameter to `finish` and thread it from its
+    **seven** internal call sites (`runner.go:108, 116, 138, 148, 157, 213, 223`) and from the
+    exported `Finish` at `runner.go:222`. `Supervise` has `cfg`; so does `Finish`'s caller at
+    `internal/loopcmd/tick.go:472`. Pass `cfg.Retry.Backoff` converted to `[]time.Duration`.
+
+  Clearing, so no stale deadline survives:
   - `ClearNeedsRetry` (line 461) also sets `retry_after = 0`.
   - `MarkSucceeded` (line 493) also sets `retry_after = 0`.
   - `parkRetryExhausted` in `internal/loopcmd/tick.go` clears `state.RetryAfter` where it sets
@@ -598,7 +634,15 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   func (d *DB) EarliestRetryAfter() (RetryDue, bool, error)
   ```
 
-  The predicate is `WHERE retry_after > 0 AND needs_retry = 1 AND parked = 0`. Return the row
+  The predicate is `WHERE retry_after > 0 AND needs_retry = 1 AND parked = 0`, and it must also
+  **exclude a loop whose circuit breaker is in cooldown**. `engine.Decide` returns with no
+  decisions at all while `now.Before(st.CooldownUntil)` (`internal/engine/engine.go:18-20`),
+  leaving `needs_retry = 1` and a past deadline untouched, so without this exclusion `Wake`
+  re-ticks that loop every `minWakeInterval` for the whole cooldown — the exact spin the
+  predicate exists to prevent. Left-join `cooldowns` and require `until IS NULL OR until <= ?`,
+  passing `now`.
+
+  Return the row
   with the smallest `retry_after`, with `ok=false` when there is none — a named struct plus a
   boolean, not a positional tuple of three bare strings, and following `DB.LoopStates` in
   shape. Select the column and order by it; do **not** use `MIN()`. `LoopStates` avoids
@@ -638,6 +682,10 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
     ```
 
   - Keep the validation that the list has at least `retry.max` entries, now against `Backoff`.
+  - `retry.max: 0` is legal and means "never retry" (`internal/config/config.go:193-200`), so
+    `Backoff` may legitimately be **empty**. No code may index it without a length check. C1's
+    `MarkNeedsRetry` treats an empty list as "no deadline"; add a test for a config with
+    `max: 0` and no `backoff` key, and confirm it loads.
 
   **Acceptance:** tests in `internal/config/config_test.go`:
   - A file with `backoff: [0s, 15m, 30m]` loads, and `cfg.Retry.Backoff[1].Std()` is 15
@@ -663,21 +711,29 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
     truth. `Store.TickCount` and `Store.RecordTick` are unaffected and stay.
 
   In `internal/loopcmd/tick.go`:
-  - Where a dead runner is reaped (line 162), pass `now.Add(cfg.Retry.Backoff[0].Std())` to
-    `MarkNeedsRetry`. This is what makes entry 0 of the list reachable. Today the first retry
-    is always immediate, because `LastRetryTick` is 0 and the loop's lifetime tick count
-    exceeds any window; `docs/configuration.md` describes entry 0 as a real wait, so the
-    documentation has been describing behaviour the code did not have. Fix both.
-  - Do the same at `internal/runner/runner.go:242`.
-  - In `dispatch`, where the code sets `state.LastRetryTick` for
-    `KindRetryStart`/`KindRetryResume`, also set `state.RetryAfter =
-    now.Add(cfg.Retry.Backoff[n].Std())`, where `n` is `state.RetryCount` **after** the
-    increment, clamped to the last entry. This reproduces today's arithmetic exactly: the old
-    code indexed `BackoffTicks[state.RetryCount]` at decision time, and that value is the
-    post-increment count stamped by the previous retry dispatch.
+  - **`dispatch` must NOT write `state.RetryAfter`.** C1's `MarkNeedsRetry` is the only writer.
+    Two writers would fight: `dispatch` stamps a deadline before the agent runs, the agent
+    fails, and `MarkNeedsRetry` overwrites it — so the escalating list would collapse to one
+    entry and never be observed.
+  - Keep the existing `state.RetryCount++` and `state.LastRetryTick` assignment. `RetryCount`
+    is what `MarkNeedsRetry` indexes the list with on the next failure, so the increment is
+    load-bearing.
   - Clear `state.RetryAfter` where the code clears `NeedsRetry` on a human trigger.
   - `last_retry_tick` stays in the table and stops being read. Dropping a column costs a table
     rebuild and buys nothing.
+
+  The resulting arithmetic, stated once so it can be tested:
+
+  | Event | `retry_count` | `retry_after` written |
+  |---|---|---|
+  | First failure recorded | 0 | `t₀ + Backoff[0]` |
+  | Retry 1 dispatches | 0 → 1 | untouched |
+  | Second failure recorded | 1 | `t₁ + Backoff[1]` |
+  | Retry 2 dispatches | 1 → 2 | untouched |
+  | Success, park, or clear | — | 0 |
+
+  Every entry of the list is reachable, and the index never exceeds `retry.max`, which C2
+  guarantees is no longer than the list.
 
   **Acceptance:** tests in `internal/engine/engine_test.go` and `internal/loopcmd`:
   - An issue with `NeedsRetry`, the in-flight label, and `RetryAfter` in the future produces no
@@ -685,9 +741,21 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   - The same issue with `RetryAfter` in the past produces a retry decision.
   - An issue with a zero `RetryAfter` and `NeedsRetry` retries at once.
   - The retry cap still parks, regardless of `RetryAfter`.
-  - A retry dispatch writes `RetryAfter == now + Backoff[postIncrementCount]`.
-  - A reaped dead runner writes `RetryAfter == now + Backoff[0]`.
   - `grep -rn "TickCount" internal/engine/` shows no `State` field.
+
+  Pin the arithmetic with **literal** expectations, not a formula recomputed from the same
+  fields the implementation reads — a test that computes `Backoff[state.RetryCount]` passes
+  against an off-by-one. With `backoff: [0s, 15m, 30m]` and a fixed `now`:
+  - A first failure (`retry_count` 0) writes `retry_after == now`.
+  - A second failure (`retry_count` 1) writes `retry_after == now + 15m`.
+  - A third failure (`retry_count` 2) writes `retry_after == now + 30m`.
+  - A failure at `retry_count` 5 with a three-entry list writes `now + 30m`, not a panic.
+  - An empty `Backoff` writes a zero `retry_after`, not a panic.
+
+  **One test must drive the whole sequence**, because that is the only thing that catches the
+  two-writer bug: record a failure, run a tick that dispatches the retry, record a second
+  failure, and assert the deadline is `Backoff[1]` from the second failure — not `Backoff[0]`,
+  and not a value stamped by the dispatch.
 
 - [ ] **C4. Update the examples and the configuration reference.**  `review: yes`
 
@@ -809,7 +877,9 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
      error listing the repositories and naming `--yes`. A prompt in a cron job hangs forever;
      that rule is already written into `resolveLoopConfig`.
   6. For each repository: `ListHooks`, find a hook whose `URL` equals `webhook.url`, then
-     `EditHook` or `CreateHook`.
+     `EditHook` or `CreateHook`. Compare the found hook's `Events` against `ghub.HookEvents`
+     and say `updated` when they differ, so re-running after this list grows re-subscribes an
+     already-registered repository. This is what `Hook.Events` and `Hook.Active` are for.
   7. Print one line per repository saying `created` or `updated`, with the hook id.
 
   When `webhook.enabled` is false, do the work and warn that the listener will refuse to start.
@@ -844,7 +914,7 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   }
 
   func New(s *Server) (*Server, error)   // refuses an empty Secret
-  func (s *Server) Handler() http.Handler
+  func (s *Server) Handler(ctx context.Context) http.Handler
   func (s *Server) ListenAndServe(ctx context.Context) error
   ```
 
@@ -888,8 +958,9 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   state.
 
   **Context.** The goroutine must NOT use `r.Context()`. `net/http` cancels it the moment the
-  handler returns, which is before the tick makes its first GitHub call. `ListenAndServe` holds
-  a daemon-scoped context and the `Server` passes that to `Tick`.
+  handler returns, which is before the tick makes its first GitHub call. `Handler` takes the
+  daemon-scoped context explicitly and closes over it, and `ListenAndServe` passes its own
+  context to `Handler`. Do not store a context in the `Server` struct.
 
   Rejections write a fixed generic body and never `err.Error()`. `messageMAC` interpolates the
   attacker's signature into its error text, and the stage that failed is itself information.
@@ -909,7 +980,7 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   Handle the `errcheck` linter on every `w.Write` and `fmt.Fprintf(w, ...)`: `.golangci.yml`
   excludes only `Close` variants and `lock.Lock.Release`.
 
-  **Acceptance:** tests using `httptest.NewServer(s.Handler())`, with the fake `Tick` closing a
+  **Acceptance:** tests using `httptest.NewServer(s.Handler(ctx))`, with the fake `Tick` closing a
   channel the test waits on. Never sleep and never read a plain counter — CI runs the suite
   again under `-race`.
   - A body signed with the correct secret gives 202 and calls `Tick` once with the repository
@@ -1053,10 +1124,27 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
       Open      func(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error)
       Run       func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps) (loopcmd.Summary, error)
       Now       func() time.Time
+      // After schedules f. It is a seam: production wires it to time.AfterFunc,
+      // and a test substitutes a controlled clock. Without it the retry tests
+      // would have to sleep for the real delays, which the acceptance forbids.
+      After func(d time.Duration, f func()) *time.Timer
+
+      // Delays are fields, not constants, so a test can shrink them.
+      OpenRetryDelay  time.Duration // default 1m
+      MinRetryDelay   time.Duration // default 30s
+      MinWakeInterval time.Duration // default 30s
 
       mu      sync.Mutex
       pending map[loopKey]*attempt   // guarded by mu
   }
+
+  // NewWorker returns a Worker with production seams and defaults.
+  //
+  // A constructor is required, not optional: pending is unexported, so a caller
+  // in package main cannot initialise it in a composite literal, and the first
+  // failing tick would write to a nil map and panic the daemon. Worker also
+  // holds a mutex, so it must never be copied.
+  func NewWorker(db *store.DB) *Worker
 
   // Deliver ticks every loop that watches repo.
   func (w *Worker) Deliver(ctx context.Context, repo string)
@@ -1079,7 +1167,7 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
      opens a `*store.DB`; in a long-lived daemon a missed cleanup is one leaked handle per
      delivery per target. Every existing call site defers it.
      On error there is no `cfg`, so the backoff list is unknown: log and schedule a retry using
-     a fixed `openRetryDelay` (1 minute) rather than an undefined value.
+     `w.OpenRetryDelay` rather than an undefined value.
   3. `w.Run(ctx, cfg, deps)`.
   4. `errors.Is(err, lock.ErrHeld)`: log at info, clear any pending attempt, return. The
      delivery carries no state, so the tick that holds the lock reads the same GitHub state.
@@ -1089,19 +1177,25 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   Retry scheduling, stated precisely because `-race` runs in CI:
   - `pending` is keyed by `loopKey{ProjectID, LoopName}` and is read and written only under
     `w.mu`.
-  - An entry holds the attempt count and a `*time.Timer` created with `time.AfterFunc`.
-  - The delay is `cfg.Retry.Backoff[attempt]`, clamped to the last entry, with a floor of
-    `minRetryDelay` (30 seconds). The migrated first entry is `0s`, so an unfloored delay
-    would retry a failing tick with no pause up to `retry.max` times.
+  - An entry holds the attempt count and a `*time.Timer` created with `w.After`, never
+    `time.AfterFunc` directly. The seam is what makes the retry acceptance tests writable
+    without sleeping for the real delay.
+  - The delay is `cfg.Retry.Backoff[attempt]`, clamped to the last entry and to zero for an
+    empty list, with a floor of `w.MinRetryDelay`. The migrated first entry is `0s`, so an
+    unfloored delay would retry a failing tick with no pause up to `retry.max` times.
   - Stop after `cfg.Retry.Max` attempts and log that the loop waits for the next delivery.
   - Scheduling again for a key that already has a timer stops the old timer first.
   - Every timer is stopped when the context is cancelled, so a shut-down daemon starts no work.
-  - `Now` is set once before the worker is shared and is not written afterwards.
+  - Every seam field is set once by `NewWorker`, before the worker is shared, and is never
+    written afterwards. Only `pending` is mutated at run time, and only under `w.mu`.
 
   `Wake`:
   1. `w.DB.EarliestRetryAfter()`. `ok=false` returns `ok=false`.
   2. If `due.At` is in the future, return it — the caller sets its timer and does not tick.
-  3. Otherwise `w.TargetFor(due.ProjectID, due.Loop)`, then `tickOne` on that one target.
+  3. Otherwise log `slog.Info("waking a loop for a retry deadline", "loop", due.Loop,
+     "issue", due.Number, "due", due.At)` — `Number` exists for this line, so the operator can
+     see which issue woke the daemon — then `w.TargetFor(due.ProjectID, due.Loop)`, then
+     `tickOne` on that one target.
      **Never route a deadline through `Targets(due.Repo)`**: the deadline belongs to one
      project's issue, and repository routing would dispatch agents in every other project that
      watches the same repository, on that project's token budget.
@@ -1115,7 +1209,7 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   ```
 
   It selects over `ctx.Done()` and a single `time.Timer` reset from `Wake`'s return, with a
-  floor of `minWakeInterval` (30 seconds) so a clock skew or a stale row cannot spin. A dynamic
+  floor of `w.MinWakeInterval` so a clock skew or a stale row cannot spin. A dynamic
   set of retry timers is not selected over; `time.AfterFunc` callbacks do their own work.
 
   **Acceptance:** tests with fake seams and a controlled clock, all synchronising on channels:
@@ -1123,8 +1217,8 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   - A tick returning another error is retried after the configured delay.
   - The retry stops after `retry.max` attempts.
   - A `Token` error schedules no retry.
-  - An `Open` error schedules a retry at `openRetryDelay`.
-  - A backoff entry of `0s` still waits `minRetryDelay`.
+  - An `Open` error schedules a retry at `OpenRetryDelay`.
+  - A backoff entry of `0s` still waits `MinRetryDelay`.
   - `cleanup` is called exactly once per `tickOne`, including on the `Run`-error path.
   - Two targets both run when the first returns an error.
   - `Wake` with a past deadline ticks exactly the loop named by `RetryDue`, and a second loop
@@ -1150,7 +1244,7 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
       Install(binary string, args []string) error
       Uninstall() error
       Status() (Status, error)
-      PlistPath() (string, error)
+      ServiceFilePath() (string, error)
   }
 
   func New() Manager   // launchd on darwin, an unsupported stub elsewhere
@@ -1222,9 +1316,18 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
     an unauthenticated listener.
   - Check the token file up front by calling `listener.Token()` once and reporting its error.
     Without this a daemon with a 0644 env file starts happily and fails every tick after.
-  - Without `--daemon`: open the state database, build the `Worker`, build the `Server` with
-    `listener.New`, write a pidfile, and run `Server.ListenAndServe` and `Worker.Serve` until
-    SIGINT or SIGTERM, then shut down and remove the pidfile.
+  - Without `--daemon`: open the state database, then `w := listener.NewWorker(db)`, then
+    `listener.New(&listener.Server{Addr: ..., Port: ..., Secret: ..., Tick: w.Deliver})`.
+    `NewWorker` already wires `Targets`, `TargetFor`, `Token`, `Open`, `Run`, `Now`, `After`,
+    and the three delays; the command overrides none of them. Write the pidfile, then run
+    `Server.ListenAndServe` and `Worker.Serve` on one daemon-scoped context until SIGINT or
+    SIGTERM.
+
+    **Shut down in this order**, and say why in a comment: stop accepting deliveries with
+    `http.Server.Shutdown` first, then cancel the daemon context so timers stop, then wait for
+    the in-flight semaphore to drain, then close the state database, then remove the pidfile.
+    Closing the database or cancelling the context while a `tickOne` is mid-flight leaves
+    `dispatches` rows stuck in `running`, which the next tick has to reap as orphans.
   - With `--daemon`: `service.New().Install(self, args)` where `self` is E5's resolved
     executable path and `args` carries any validated override. Print the plist path.
 
@@ -1242,13 +1345,15 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
     command.
   - `listener start` with an empty secret exits non-zero.
   - `listener --help` lists three subcommands.
-  - A test drives `start` in-process against a temporary `$AGENT_UTILS_HOME` with
-    `--listen-port 0`, waits for the bound address, confirms `/healthz` answers 200, cancels
-    the context, and confirms a clean shutdown and a removed pidfile. Port 0 is required so the
-    test never binds the real default port; B1's "zero means default" rule applies to the
-    stored setting, and the flag override must pass 0 through to the listener unchanged. State
-    that distinction in a comment.
+  - The end-to-end serve test lives in `internal/listener`, not here, and constructs
+    `listener.New(&Server{Addr: "127.0.0.1", Port: 0, ...})` directly. Port 0 means "any free
+    port" to the kernel, but `settings` rejects it as a stored value and `WithDefaults` would
+    turn it into 8787, so it must not travel through the settings path. The CLI override keeps
+    the 1..65535 rule with no exception.
+  - A `cmd/agent-utils` test asserts the wiring only: `listener --help` lists three
+    subcommands, and `start` fails fast for a disabled webhook and for an empty secret.
   - `status` reports a live foreground listener through the pidfile.
+  - A test proves shutdown drains an in-flight tick before the database is closed.
 
 ### Phase F — documentation and version
 
