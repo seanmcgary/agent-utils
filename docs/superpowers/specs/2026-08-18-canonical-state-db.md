@@ -202,22 +202,30 @@ finds sources in two ways:
 
 ```sql
 CREATE TABLE legacy_sources (
-  path             TEXT PRIMARY KEY,   -- absolute path of the source file
-  project_id       TEXT NOT NULL,
-  loop             TEXT NOT NULL,
-  state            TEXT NOT NULL,      -- 'open' or 'sealed'
+  path              TEXT NOT NULL,      -- absolute, symlink-resolved source path
+  project_id        TEXT NOT NULL,
+  loop              TEXT NOT NULL,
+  repo              TEXT NOT NULL DEFAULT '',
+  state             TEXT NOT NULL,      -- 'open' or 'sealed'
   first_imported_at TIMESTAMP NOT NULL,
-  last_imported_at  TIMESTAMP NOT NULL
+  last_imported_at  TIMESTAMP NOT NULL,
+  PRIMARY KEY (path, project_id, loop)
 );
 ```
+
+The key is a triple, not a path. Two loops may share one `state_dir`
+(`docs/configuration.md:146`), so one file can hold two loops. The import therefore reads and
+copies the rows of ONE loop, and the loop name is what separates them.
 
 **Import.** For one source, inside one transaction on the canonical database:
 
 1. Copy `issues`, `pr_links`, `ticks`, and `cooldowns`, stamped with the project identifier.
 2. Copy `dispatches`, stamped with the project identifier, `legacy_source`, and `legacy_id`.
    The new `id` is assigned by SQLite.
-3. Set the source state. It is `open` when the source still holds a dispatch with status
-   `running`. It is `sealed` otherwise.
+3. Set the source state. It is `open` when the source still holds a `running` dispatch whose
+   process is alive. It is `sealed` otherwise. Both facts come from ONE read transaction on the
+   source, so a runner that finishes mid-import cannot leave a stale `running` row behind a
+   seal.
 4. Write `MIGRATED.txt` next to a sealed source. The note says where the state went and that
    the file is now a backup.
 
@@ -235,7 +243,9 @@ by a runner (`internal/runner/runner.go:212-236`, `internal/loopcmd/tick.go:413`
 writes to the canonical database, so these three tables are copied on the first import and are
 never read again.
 
-A source is sealed when it holds no running dispatch.
+A source is sealed when no dispatch row in it is `running` with a live process. The test is
+liveness, not status: a row left `running` by a crashed runner would otherwise pin the source
+open forever.
 
 **The file is never deleted.** A sealed source stays on disk as a backup.
 
