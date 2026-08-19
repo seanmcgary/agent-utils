@@ -109,6 +109,7 @@ type harness struct {
 	tokenErr     error
 	openErr      error
 	targetsCalls int
+	nowCalls     int
 	opens        []openCall
 	ran          []string
 	cleanups     int
@@ -124,7 +125,7 @@ func newHarness(db *store.DB) *harness {
 		max:    1,
 	}
 	w := NewWorker(db)
-	w.Now = func() time.Time { return workNow }
+	w.Now = h.now
 	w.After = h.timers.After
 	w.Token = h.token
 	w.Open = h.open
@@ -162,6 +163,16 @@ func (h *harness) targetsSeam(repo string) ([]Target, error) {
 	defer h.mu.Unlock()
 	h.targetsCalls++
 	return h.targets, nil
+}
+
+// now is the frozen clock. It counts its calls, which is how a test proves
+// Serve did or did not enter Wake: Wake reads the clock before it touches
+// anything else, and nothing else in a tick reads it.
+func (h *harness) now() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.nowCalls++
+	return workNow
 }
 
 func (h *harness) token() (string, error) {
@@ -624,12 +635,29 @@ func TestWakeWithNoDeadlineReturnsFalse(t *testing.T) {
 	}
 }
 
+// stillPending reports whether the seeded deadline is still in the wake
+// query, i.e. whether its failure flag survived.
+func (h *harness) stillPending(t *testing.T, db *store.DB) bool {
+	t.Helper()
+	_, ok, err := db.EarliestRetryAfterAt(workNow)
+	if err != nil {
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
+	}
+	return ok
+}
+
 // The project or the loop can be deleted while a retry row survives. The row
 // is then permanently past due and permanently unroutable, and without a
 // break Serve would re-enter Wake every MinWakeInterval forever, re-logging
 // the same warning and re-reading the database. Wake clears the flag, which
 // is the same thing a tick does for a failure no retry can act on.
-func TestWakeClearsAnOrphanedDeadlineSoItCannotSpin(t *testing.T) {
+//
+// But it does not clear it at once: TargetFor cannot distinguish a loop that
+// is gone from one whose yaml is unparsable this minute or whose volume is
+// not mounted yet, and a cleared flag is not re-derivable, so an immediate
+// clear would let a config broken for an hour destroy a loop's whole pending
+// retry set, one issue per wake.
+func TestAnOrphanedDeadlineIsClearedOnlyAfterRepeatedObservations(t *testing.T) {
 	db := openWorkDB(t)
 	h := newHarness(db)
 	h.targetFor = func(projectID, loop string) (Target, bool, error) {
@@ -637,17 +665,70 @@ func TestWakeClearsAnOrphanedDeadlineSoItCannotSpin(t *testing.T) {
 	}
 	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Minute))
 
-	if _, ok := h.w.Wake(context.Background()); !ok {
-		t.Fatal("ok = false, want the past deadline on the first wake")
-	}
-	if got := h.ranLoops(); len(got) != 0 {
-		t.Errorf("ran %v, want nothing for a loop that no longer exists", got)
+	// The counts below are written out rather than derived from
+	// orphanClearAfter, so that lowering the constant fails this test instead
+	// of quietly rewriting what it checks. Two wakes must preserve the
+	// deadline; the third clears it.
+	if orphanClearAfter != 3 {
+		t.Fatalf("orphanClearAfter = %d; this test is written against 3 wakes and must be updated with it",
+			orphanClearAfter)
 	}
 
-	// The cycle is broken in the database, so the very next wake finds
-	// nothing at all rather than the same orphan.
-	if _, ok := h.w.Wake(context.Background()); ok {
+	for i := 1; i <= 2; i++ {
+		if _, ok := h.w.Wake(context.Background()); !ok {
+			t.Fatalf("wake %d: ok = false, want the past deadline", i)
+		}
+		if !h.stillPending(t, db) {
+			t.Fatalf("wake %d cleared the deadline; a transient unroutable window must not destroy it", i)
+		}
+	}
+
+	if _, ok := h.w.Wake(context.Background()); !ok {
+		t.Fatal("the clearing wake returned ok = false, want the past deadline it acted on")
+	}
+	if h.stillPending(t, db) {
 		t.Error("the orphaned deadline is still pending; Wake would spin on it forever")
+	}
+	if got := h.ranLoops(); len(got) != 0 {
+		t.Errorf("ran %v, want nothing for a loop that cannot be routed", got)
+	}
+}
+
+// A loop that becomes routable again starts the count over. Without the
+// reset, a loop whose config is momentarily unreadable once a day would
+// eventually accumulate enough observations to have a live deadline deleted.
+func TestRoutingAgainResetsTheOrphanCount(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	routable := false
+	h.targetFor = func(projectID, loop string) (Target, bool, error) {
+		if !routable {
+			return Target{}, false, nil
+		}
+		return h.target(loop), true, nil
+	}
+	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Minute))
+
+	// Two wakes: one short of the threshold, matching the test above.
+	for i := 1; i <= 2; i++ {
+		h.w.Wake(context.Background())
+	}
+
+	// The config file is saved correctly again: the loop routes and ticks.
+	routable = true
+	h.w.Wake(context.Background())
+	if got := h.ranLoops(); len(got) != 1 {
+		t.Fatalf("ran %v, want the one tick for the loop that came back", got)
+	}
+
+	// The window reopens. The count started over, so the deadline survives
+	// exactly as long as it did the first time.
+	routable = false
+	for i := 1; i <= 2; i++ {
+		h.w.Wake(context.Background())
+		if !h.stillPending(t, db) {
+			t.Fatalf("wake %d after the loop routed cleared the deadline; the count did not reset", i)
+		}
 	}
 }
 
@@ -684,5 +765,135 @@ func TestServeStopsEveryPendingTimerOnCancel(t *testing.T) {
 	}
 	if !h.timers.stopped(t, 0) {
 		t.Error("a retry timer was left armed after shutdown")
+	}
+}
+
+// The wake delay is the only thing standing between a stale past-due row and
+// a loop that re-ticks as fast as the GitHub API answers, and Serve has no
+// other guard. Each row is a way that arithmetic can be got wrong.
+func TestWakeDelay(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		next     time.Time
+		ok       bool
+		interval time.Duration
+		want     time.Duration
+	}{
+		{
+			name:     "no deadline waits the interval",
+			ok:       false,
+			interval: 30 * time.Second,
+			want:     30 * time.Second,
+		},
+		{
+			name:     "a past deadline waits the interval, never zero",
+			next:     workNow.Add(-2 * time.Hour),
+			ok:       true,
+			interval: 30 * time.Second,
+			want:     30 * time.Second,
+		},
+		{
+			name:     "a future deadline waits for it",
+			next:     workNow.Add(2 * time.Hour),
+			ok:       true,
+			interval: 30 * time.Second,
+			want:     2 * time.Hour,
+		},
+		{
+			name:     "a deadline inside the interval still waits the interval",
+			next:     workNow.Add(time.Second),
+			ok:       true,
+			interval: 30 * time.Second,
+			want:     30 * time.Second,
+		},
+		{
+			// The field is exported and documented as shrinkable, so a
+			// caller can zero it. Without the reassertion this row is a
+			// tight database-poll-and-tick loop.
+			name:     "a zero interval falls back to the default floor",
+			ok:       false,
+			interval: 0,
+			want:     defaultMinWakeInterval,
+		},
+		{
+			name:     "a negative interval falls back too",
+			next:     workNow.Add(-time.Hour),
+			ok:       true,
+			interval: -time.Minute,
+			want:     defaultMinWakeInterval,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(nil)
+			h.w.MinWakeInterval = tc.interval
+
+			if got := h.w.wakeDelay(tc.next, tc.ok); got != tc.want {
+				t.Errorf("wakeDelay(%v, %v) = %v, want %v", tc.next, tc.ok, got, tc.want)
+			}
+		})
+	}
+}
+
+// Wake is synchronous and runs a whole tick. Entering it after cancellation
+// would start an agent during shutdown and hold the shutdown open for the
+// length of that tick, so Serve checks the context before every wake, not
+// only in its select.
+func TestServeDoesNotWakeWithAnAlreadyCancelledContext(t *testing.T) {
+	h := newHarness(openWorkDB(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.w.Serve(ctx)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return for an already cancelled context")
+	}
+
+	// Wake reads the clock before it does anything else, and nothing else in
+	// a tick reads it, so an untouched clock means Wake was never entered.
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.nowCalls != 0 {
+		t.Errorf("the clock was read %d times; Serve entered Wake after cancellation", h.nowCalls)
+	}
+}
+
+// The Open budget and the tick budget are separate counters. Sharing one
+// would let two Open failures spend a loop's whole retry.max, so the first
+// genuine tick failure after them would get no retry at all -- the failure
+// the operator actually cares about, silently dropped.
+func TestOpenFailuresDoNotSpendTheTickRetryBudget(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.max = 1
+	h.backoff = []time.Duration{45 * time.Minute}
+	h.openErr = errors.New("unimported legacy database")
+
+	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r")
+	if n := h.timers.len(); n != 2 {
+		t.Fatalf("armed %d timers for two Open failures, want 2", n)
+	}
+
+	// The database is imported; the next tick reaches Run and fails for a
+	// real reason.
+	h.mu.Lock()
+	h.openErr = nil
+	h.mu.Unlock()
+	h.runFn = func(*config.Config) error { return errBoom }
+
+	h.w.Deliver(context.Background(), "o/r")
+
+	if n := h.timers.len(); n != 3 {
+		t.Fatalf("armed %d timers, want a third for the tick failure", n)
+	}
+	if got := h.timers.at(t, 2).d; got != 45*time.Minute {
+		t.Errorf("tick retry delay = %v, want the loop's own first backoff entry 45m", got)
 	}
 }

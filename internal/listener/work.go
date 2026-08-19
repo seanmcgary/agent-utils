@@ -40,6 +40,25 @@ const (
 // delivery, exactly as an exhausted ordinary retry does.
 const openRetryMax = 3
 
+// orphanClearAfter is how many consecutive wakes must find a deadline
+// unroutable before its failure flag is cleared. At the default wake
+// interval that is about 90 seconds.
+//
+// It is not 1. listener.TargetFor reports ok=false for five different
+// conditions and cannot tell them apart -- an unregistered project, a
+// directory that is not currently present, a configs directory it could not
+// list, a loop whose yaml does not currently parse, and a loop that really
+// is gone. Three of those are transient: an operator saving a half-finished
+// yaml file, a volume that is not mounted yet, a permission changed mid
+// restore. Clearing needs_retry is irreversible -- store.IssueState says
+// only a retry, a park, or a success clears it, and nothing re-derives it --
+// so clearing on the first observation would let a config file that is
+// broken for an hour silently destroy every pending retry that loop had,
+// one issue per wake. Requiring the condition to outlive several wake
+// intervals keeps the spin bounded without attaching a permanent delete to
+// a signal that cannot distinguish "gone" from "cannot tell right now".
+const orphanClearAfter = 3
+
 // loopKey identifies one loop of one project. Two projects may run loops of
 // the same name, so the project is part of the key: without it, one
 // project's failure would cancel the other's pending retry.
@@ -48,12 +67,39 @@ type loopKey struct {
 	LoopName  string
 }
 
+// retryKind names which failure a retry is being scheduled for. It selects
+// the counter to spend, which is why it exists at all: see attempt.
+type retryKind int
+
+const (
+	kindTick retryKind = iota
+	kindOpen
+)
+
 // attempt is the retry state of one loop: how many retries have been
 // scheduled for the current run of failures, and the timer that will run the
 // next one.
+//
+// The two counters are deliberate. A failed tick spends the loop's own
+// retry.max, and a failed Open spends openRetryMax, because the loop's value
+// lives in the file Open could not read. One shared counter would mix the
+// two budgets: two Open failures followed by a genuine tick failure on a
+// loop with retry.max: 1 would give that real failure no retry at all, and a
+// single Open failure would drop a loop already four attempts into a
+// five-attempt budget. Only the timer is shared, because a loop may have
+// only one retry armed at a time.
 type attempt struct {
 	n     int
+	openN int
 	timer *time.Timer
+}
+
+// counter returns the budget kind spends.
+func (a *attempt) counter(kind retryKind) *int {
+	if kind == kindOpen {
+		return &a.openN
+	}
+	return &a.n
 }
 
 // Worker turns a delivery, or a retry deadline that has passed, into a tick.
@@ -89,14 +135,20 @@ type Worker struct {
 
 	mu      sync.Mutex
 	pending map[loopKey]*attempt // guarded by mu
+	// orphans counts consecutive wakes that could not route a loop's
+	// deadline, guarded by mu. See orphanClearAfter: a loop is unroutable
+	// for transient reasons too, and clearing needs_retry is irreversible,
+	// so the flag is only cleared once the condition has outlived several
+	// wake intervals. An entry is dropped as soon as the loop routes again.
+	orphans map[loopKey]int // guarded by mu
 }
 
 // NewWorker returns a Worker with production seams and defaults.
 //
-// A constructor is required, not optional: pending is unexported, so a caller
-// in package main cannot initialise it in a composite literal, and the first
-// failing tick would write to a nil map and panic the daemon. Worker also
-// holds a mutex, so it must never be copied.
+// A constructor is required, not optional: pending and orphans are
+// unexported, so a caller in package main cannot initialise them in a
+// composite literal, and the first failing tick would write to a nil map and
+// panic the daemon. Worker also holds a mutex, so it must never be copied.
 func NewWorker(db *store.DB) *Worker {
 	return &Worker{
 		DB:              db,
@@ -111,6 +163,7 @@ func NewWorker(db *store.DB) *Worker {
 		MinRetryDelay:   defaultMinRetryDelay,
 		MinWakeInterval: defaultMinWakeInterval,
 		pending:         make(map[loopKey]*attempt),
+		orphans:         make(map[loopKey]int),
 	}
 }
 
@@ -173,7 +226,7 @@ func (w *Worker) tickOne(ctx context.Context, t Target) {
 		// retry runs at OpenRetryDelay rather than at some undefined value.
 		slog.Error("cannot open loop", "loop", t.LoopName, "project", t.ProjectName,
 			"config", t.ConfigPath, "err", err)
-		w.schedule(ctx, t, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		w.schedule(ctx, t, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
 		return
 	}
 
@@ -190,7 +243,7 @@ func (w *Worker) tickOne(ctx context.Context, t Target) {
 			return
 		}
 		slog.Error("tick failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
-		w.schedule(ctx, t, cfg.Retry.Max, func(n int) time.Duration {
+		w.schedule(ctx, t, kindTick, cfg.Retry.Max, func(n int) time.Duration {
 			return w.backoffFor(cfg, n)
 		})
 		return
@@ -230,7 +283,7 @@ func (w *Worker) backoffFor(cfg *config.Config, n int) time.Duration {
 // delay is a function rather than a value because the two callers know
 // different things: a failed tick has the loop's configuration and reads its
 // backoff list, and a failed Open has no configuration at all.
-func (w *Worker) schedule(ctx context.Context, t Target, max int, delay func(n int) time.Duration) {
+func (w *Worker) schedule(ctx context.Context, t Target, kind retryKind, max int, delay func(n int) time.Duration) {
 	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
 
 	w.mu.Lock()
@@ -241,6 +294,9 @@ func (w *Worker) schedule(ctx context.Context, t Target, max int, delay func(n i
 		a = &attempt{}
 		w.pending[key] = a
 	}
+	// The budget spent is the one belonging to this failure kind; see
+	// attempt.
+	spent := a.counter(kind)
 	// Scheduling again for a key that already has a timer stops the old one
 	// first. Without this a burst of deliveries for one loop would leave
 	// several timers armed for it and run several ticks at once, each of
@@ -250,19 +306,25 @@ func (w *Worker) schedule(ctx context.Context, t Target, max int, delay func(n i
 		a.timer = nil
 	}
 
-	if a.n >= max {
+	if *spent >= max {
 		// The budget is spent. The entry is dropped rather than kept at the
 		// cap, so the next delivery for this loop starts a fresh run of
 		// attempts instead of inheriting an exhausted one.
 		delete(w.pending, key)
 		slog.Warn("retry budget spent; waiting for the next delivery",
-			"loop", t.LoopName, "project", t.ProjectName, "attempts", a.n)
+			"loop", t.LoopName, "project", t.ProjectName, "attempts", *spent)
 		return
 	}
 
-	d := delay(a.n)
-	a.n++
-	n := a.n
+	d := delay(*spent)
+	*spent++
+	n := *spent
+	// The callback runs the tick itself rather than handing it back to the
+	// caller, which means a retry does not pass through the handler's
+	// in-flight semaphore. That is bounded by the number of loops on this
+	// machine (one timer per loop at a time, stopped before another is
+	// armed), not by anything a stranger controls, and the brief mandates
+	// this shape; a shared bound belongs in the command that owns both.
 	a.timer = w.After(d, func() {
 		// A cancelled context means the daemon is shutting down. Serve stops
 		// every pending timer on the way out, but a timer that had already
@@ -342,10 +404,15 @@ func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 			"project", due.ProjectID, "issue", due.Number, "err", err)
 		return due.At, true
 	}
+	key := loopKey{ProjectID: due.ProjectID, LoopName: due.Loop}
 	if !found {
-		w.clearOrphanedDeadline(due)
+		w.noteUnroutable(key, due)
 		return due.At, true
 	}
+	// The loop routed, so whatever made it unroutable before is over. The
+	// count starts again from zero, which is what keeps a loop that is
+	// briefly unreadable every so often from ever reaching the threshold.
+	w.forgetUnroutable(key)
 
 	w.tickOne(ctx, t)
 
@@ -356,27 +423,60 @@ func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 	return due.At, true
 }
 
-// clearOrphanedDeadline clears the failure flag behind a deadline whose loop
-// no longer exists.
+// noteUnroutable records that a past-due deadline could not be routed, and
+// clears its failure flag once the condition has persisted.
 //
 // A project can be deleted, or a loop's configuration file removed, while an
 // issue row carrying needs_retry survives in the canonical database. That row
-// is permanently past due and permanently unroutable, so without this the
-// wake loop would re-enter Wake every MinWakeInterval for the life of the
-// daemon, re-logging the same warning and re-reading the same row -- the very
-// hot loop EarliestRetryAfter's own predicate exists to prevent. Clearing the
-// flag removes the row from that predicate, which is exactly what a tick does
-// for a failure no retry can act on (loopcmd.act, KindClearRetry).
+// is permanently past due and permanently unroutable, so leaving it alone
+// would make the wake loop re-enter Wake every MinWakeInterval for the life
+// of the daemon, re-logging the same warning and re-reading the same row --
+// the very hot loop EarliestRetryAfter's own predicate exists to prevent.
+// Clearing the flag removes the row from that predicate, which is exactly
+// what a tick does for a failure no retry can act on (loopcmd.act,
+// KindClearRetry), and it is durable: an in-memory skip list would lose the
+// fix on the next restart and spin again.
 //
-// A failed clear is left to the next wake. It means the database itself is
-// unwritable, and there is no state a daemon could keep that would fix that.
-func (w *Worker) clearOrphanedDeadline(due store.RetryDue) {
-	slog.Warn("clearing a retry deadline whose loop no longer exists",
-		"loop", due.Loop, "project", due.ProjectID, "issue", due.Number)
+// The clear waits for orphanClearAfter consecutive observations because it is
+// irreversible and the signal it acts on is ambiguous; see orphanClearAfter.
+// Until then the wake loop is already bounded by its own MinWakeInterval, so
+// the delay costs nothing but a repeated warning.
+//
+// A failed clear leaves the count in place, so the next wake retries it at
+// once: a write that fails means the database itself is unwritable, and there
+// is no state a daemon could keep that would fix that.
+func (w *Worker) noteUnroutable(key loopKey, due store.RetryDue) {
+	w.mu.Lock()
+	w.orphans[key]++
+	seen := w.orphans[key]
+	w.mu.Unlock()
+
+	if seen < orphanClearAfter {
+		slog.Warn("cannot route a retry deadline; the loop is not resolvable right now",
+			"loop", due.Loop, "project", due.ProjectID, "issue", due.Number,
+			"observations", seen)
+		return
+	}
+
+	slog.Warn("clearing a retry deadline whose loop has stayed unresolvable",
+		"loop", due.Loop, "project", due.ProjectID, "issue", due.Number,
+		"observations", seen)
 	if err := w.DB.Project(due.ProjectID).ClearNeedsRetry(due.Loop, due.Repo, due.Number); err != nil {
 		slog.Error("cannot clear an orphaned retry deadline", "loop", due.Loop,
 			"project", due.ProjectID, "issue", due.Number, "err", err)
+		return
 	}
+	// The row is out of the wake query now, so the counter has nothing left
+	// to count. Dropping it keeps the map bounded by the loops that are
+	// currently unroutable rather than by every loop that ever was.
+	w.forgetUnroutable(key)
+}
+
+// forgetUnroutable drops a loop's unroutable count.
+func (w *Worker) forgetUnroutable(key loopKey) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.orphans, key)
 }
 
 // Serve runs the wake loop until ctx is done.
@@ -396,19 +496,17 @@ func (w *Worker) Serve(ctx context.Context) {
 	defer timer.Stop()
 
 	for {
-		next, ok := w.Wake(ctx)
-
-		// The floor is what keeps a stale row or a clock skew from spinning:
-		// Wake returns a past deadline whenever the tick it ran decided
-		// nothing, and an unfloored wait would then re-tick that loop as
-		// fast as the GitHub API answers.
-		d := w.MinWakeInterval
-		if ok {
-			if until := next.Sub(w.Now()); until > d {
-				d = until
-			}
+		// Checked before Wake, not only in the select below. Wake is
+		// synchronous and runs a whole tick, so a cancellation that arrived
+		// while the timer was firing would otherwise start an agent during
+		// shutdown and hold the shutdown open for the length of that tick.
+		if ctx.Err() != nil {
+			w.stopAll()
+			return
 		}
-		timer.Reset(d)
+
+		next, ok := w.Wake(ctx)
+		timer.Reset(w.wakeDelay(next, ok))
 
 		select {
 		case <-ctx.Done():
@@ -417,4 +515,32 @@ func (w *Worker) Serve(ctx context.Context) {
 		case <-timer.C:
 		}
 	}
+}
+
+// wakeDelay returns how long Serve waits before the next Wake, given what
+// the last one reported.
+//
+// It is split out of Serve because this arithmetic is the only thing
+// standing between a stale past-due row and a loop that re-ticks as fast as
+// the GitHub API answers: Wake returns a deadline already in the past
+// whenever the tick it ran decided nothing (its own backoff, a tripped
+// breaker), and a wait taken straight from that value would be zero or
+// negative. Inside Serve it could only be tested through a goroutine and a
+// real clock; here three table rows cover it.
+func (w *Worker) wakeDelay(next time.Time, ok bool) time.Duration {
+	d := w.MinWakeInterval
+	// MinWakeInterval is exported and documented as shrinkable for tests, so
+	// a caller can set it to zero -- which would produce exactly the tight
+	// poll-and-tick loop the floor exists to prevent. The default is
+	// reasserted here rather than only in NewWorker, so no assignment to the
+	// field can falsify the floor.
+	if d <= 0 {
+		d = defaultMinWakeInterval
+	}
+	if ok {
+		if until := next.Sub(w.Now()); until > d {
+			d = until
+		}
+	}
+	return d
 }
