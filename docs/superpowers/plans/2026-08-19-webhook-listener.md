@@ -9,12 +9,12 @@ Design: [`docs/superpowers/specs/2026-08-19-webhook-listener-design.md`](../spec
 
 | Field   | Value                                                                 |
 |---------|-----------------------------------------------------------------------|
-| stage   | 2 (plan review complete, awaiting the human gate)                     |
+| stage   | 3 (implementation)                                                    |
 | class   | large (new subsystem, schema migration, remote-triggered code execution) |
 | profile | backend                                                               |
 | branch  | feat/webhook-listener                                                 |
 | pr      | #4                                                                    |
-| gate    | pending                                                               |
+| gate    | approved 2026-08-19                                                   |
 | round   | 0                                                                     |
 
 ## Architecture
