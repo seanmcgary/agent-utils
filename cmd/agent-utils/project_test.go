@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -11,6 +13,30 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/settings"
 )
+
+// captureStderr runs fn with os.Stderr redirected to a pipe and returns what
+// was written. collectRepos' skip-a-broken-loop warning and
+// registerWebhookRun's disabled-daemon warning both write directly to
+// os.Stderr rather than through an injectable io.Writer (matching this
+// program's existing prompt/warning convention elsewhere in cmd/agent-utils),
+// so asserting on them needs this rather than a Deps field.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = old
+	w.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return buf.String()
+}
 
 // fakeHookAdmin is the narrow fake register-webhook's tests use in place of a
 // real GitHub client, per B1/D1 review note 4: ghub.HookAdmin is a separate,
@@ -86,9 +112,15 @@ func TestCollectReposSkipsBrokenEntries(t *testing.T) {
 		{Name: "broken", Err: errors.New("boom")},
 		{Name: "ok", Repo: "acme/widgets"},
 	}
-	repos := collectRepos(entries, "")
+	var repos []string
+	stderr := captureStderr(t, func() {
+		repos = collectRepos(entries, "")
+	})
 	if len(repos) != 1 || repos[0] != "acme/widgets" {
 		t.Fatalf("collectRepos = %v, want exactly [acme/widgets]", repos)
+	}
+	if !strings.Contains(stderr, "broken") || !strings.Contains(stderr, "boom") {
+		t.Errorf("stderr = %q, want it to name the skipped loop %q and its error", stderr, "broken")
 	}
 }
 
@@ -249,10 +281,56 @@ func TestRegisterWebhookWarnsWhenDisabled(t *testing.T) {
 	}}
 	deps := registerWebhookDeps{Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
 
-	if err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps); err != nil {
-		t.Fatalf("run with webhook disabled: %v", err)
+	var runErr error
+	stderr := captureStderr(t, func() {
+		runErr = registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps)
+	})
+	if runErr != nil {
+		t.Fatalf("run with webhook disabled: %v", runErr)
 	}
 	if fake.createCalls != 1 {
 		t.Fatalf("createCalls = %d, want 1: disabled must still do the work", fake.createCalls)
+	}
+	if !strings.Contains(stderr, "webhook.enabled is false") {
+		t.Errorf("stderr = %q, want the disabled-daemon warning", stderr)
+	}
+}
+
+// TestNoReposErrNamesFlagOnlyWhenGiven covers MINOR 6 from the B2+D2 review:
+// pointing an operator at --name only when they actually passed it, since
+// with no --name at all the real cause is every loop configuration failing
+// to load (already reported by collectRepos on stderr), not a bad flag.
+func TestNoReposErrNamesFlagOnlyWhenGiven(t *testing.T) {
+	err := noReposErr("planning")
+	if !strings.Contains(err.Error(), "--name") || !strings.Contains(err.Error(), "planning") {
+		t.Errorf("noReposErr(%q) = %q, want it to name --name and the loop", "planning", err.Error())
+	}
+
+	err = noReposErr("")
+	if strings.Contains(err.Error(), "--name") {
+		t.Errorf("noReposErr(\"\") = %q, want it not to mention --name: none was passed", err.Error())
+	}
+	if !strings.Contains(err.Error(), "every loop configuration failed to load") {
+		t.Errorf("noReposErr(\"\") = %q, want it to say every loop failed to load", err.Error())
+	}
+}
+
+// TestMissingWebhookFieldsNamesOnlyWhatIsEmpty covers MINOR 5: `config set
+// webhook.enabled true` followed by `config set webhook.url <url>` sets a
+// URL without ever minting a secret, so the error must name only
+// webhook.secret in that case, not both fields.
+func TestMissingWebhookFieldsNamesOnlyWhatIsEmpty(t *testing.T) {
+	s := &settings.Settings{Webhook: settings.Webhook{URL: "https://x/y", Secret: ""}}
+	deps := registerWebhookDeps{Hooks: newFakeHookAdmin(), Settings: s, Token: "tok", Yes: true, Out: io.Discard}
+
+	err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "webhook.secret") {
+		t.Errorf("error = %q, want it to name webhook.secret", err.Error())
+	}
+	if strings.Contains(err.Error(), "webhook.url") {
+		t.Errorf("error = %q, want it NOT to name webhook.url, which was set", err.Error())
 	}
 }

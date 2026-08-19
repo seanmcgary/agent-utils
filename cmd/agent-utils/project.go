@@ -45,9 +45,10 @@ func registerWebhookCommand() *cli.Command {
 			}
 			// c.String("name") is THIS command's own --name (the loop), not
 			// project's; see the doc comment above.
-			repos := collectRepos(entries, c.String("name"))
+			loopName := c.String("name")
+			repos := collectRepos(entries, loopName)
 			if len(repos) == 0 {
-				return errors.New("no repositories to register; check --name")
+				return noReposErr(loopName)
 			}
 
 			s, err := settings.Load()
@@ -70,6 +71,20 @@ func registerWebhookCommand() *cli.Command {
 			})
 		},
 	}
+}
+
+// noReposErr explains why register-webhook found nothing to do.
+//
+// Two different causes read very differently to an operator: a typo'd
+// --name should be told to check the flag it passed, but with no --name at
+// all, every loop's entry failing to load (each already reported on stderr
+// by collectRepos) is the only way to reach here, and pointing at a flag
+// never given would send them looking in the wrong place.
+func noReposErr(loopName string) error {
+	if loopName != "" {
+		return fmt.Errorf("no repository named by loop %q; check --name", loopName)
+	}
+	return errors.New("no repositories to register: every loop configuration failed to load")
 }
 
 // collectRepos gathers the distinct repositories this project's loops watch.
@@ -115,6 +130,36 @@ type registerWebhookDeps struct {
 	Out     io.Writer
 }
 
+// missingWebhookFields names whichever of webhook.url and webhook.secret is
+// actually empty. Reachable independently of each other: `config set
+// webhook.enabled true` plus `config set webhook.url <url>` sets a URL
+// without ever minting a secret, so naming both when only one is empty would
+// misdirect the operator.
+func missingWebhookFields(s *settings.Settings) []string {
+	var missing []string
+	if strings.TrimSpace(s.Webhook.URL) == "" {
+		missing = append(missing, "webhook.url")
+	}
+	if strings.TrimSpace(s.Webhook.Secret) == "" {
+		missing = append(missing, "webhook.secret")
+	}
+	return missing
+}
+
+// missingWebhookFieldsErr turns missingWebhookFields' result into an error
+// with correct subject-verb agreement, so "webhook.url is not set" reads
+// naturally alone and "webhook.url and webhook.secret are not set" does too
+// when both are empty.
+func missingWebhookFieldsErr(missing []string) error {
+	verb := "is"
+	if len(missing) > 1 {
+		verb = "are"
+	}
+	return fmt.Errorf(
+		"%s %s not set; run `agent-utils config webhook --enable --url <url>` first",
+		strings.Join(missing, " and "), verb)
+}
+
 // registerWebhookRun validates, confirms, and then registers repos.
 //
 // Every early return here happens before Hooks.ListHooks/CreateHook/EditHook
@@ -123,10 +168,8 @@ type registerWebhookDeps struct {
 // checking: this command grants GitHub the right to trigger agent dispatch,
 // so nothing gets called until the operator (or --yes) has agreed to that.
 func registerWebhookRun(ctx context.Context, repos []string, deps registerWebhookDeps) error {
-	if strings.TrimSpace(deps.Settings.Webhook.URL) == "" || strings.TrimSpace(deps.Settings.Webhook.Secret) == "" {
-		return errors.New(
-			"webhook.url and webhook.secret are not set; run " +
-				"`agent-utils config webhook --enable --url <url>` first")
+	if missing := missingWebhookFields(deps.Settings); len(missing) > 0 {
+		return missingWebhookFieldsErr(missing)
 	}
 	if deps.Token == "" {
 		return errors.New("GITHUB_TOKEN is not set")
@@ -165,12 +208,19 @@ func registerWebhookRun(ctx context.Context, repos []string, deps registerWebhoo
 // registerWebhooks does the actual GitHub work: for each repository it edits
 // the existing hook whose Config.URL equals webhook.url, or creates one.
 //
-// A found hook is always edited, never left alone, even when its Events and
-// Active already look correct: ghub.HookEvents can grow between releases, and
-// GitHub itself can flip Active to false after a run of failed deliveries.
-// Always sending the current, full HookEvents/Active=true is what makes
-// re-running this command after HookEvents grows re-subscribe an
-// already-registered repository, rather than leaving it silently behind.
+// A found hook is always edited, never conditionally skipped, and the
+// strongest reason is the secret: GitHub returns Config.Secret obfuscated
+// (see ghub.Hook), so nothing in a listed hook can ever be compared against
+// the stored secret to detect that it has been rotated. After `config
+// webhook --rotate-secret` (which tells the operator to re-run this
+// command), a comparison-gated skip would silently decline to push the new
+// secret to a repository whose hook otherwise looks unchanged — every
+// later delivery would then be signed with the old secret and rejected by
+// the listener, while this command reported success. Unconditional EditHook
+// also happens to re-subscribe an already-registered repository when
+// ghub.HookEvents grows between releases, and repairs a hook GitHub flipped
+// Active=false on after a run of failed deliveries, but the secret is why
+// this is not optional.
 func registerWebhooks(ctx context.Context, hooks ghub.HookAdmin, repos []string, s *settings.Settings, out io.Writer) error {
 	spec := ghub.HookSpec{URL: s.Webhook.URL, Secret: s.Webhook.Secret, Events: ghub.HookEvents}
 	for _, repo := range repos {
@@ -199,11 +249,10 @@ func registerWebhooks(ctx context.Context, hooks ghub.HookAdmin, repos []string,
 			if err := hooks.EditHook(ctx, owner, name, found.ID, spec); err != nil {
 				return err
 			}
-			// The hook is already registered with GitHub at this point; a
-			// failure to print the confirmation line is not worth aborting the
-			// rest of the repositories over, but errcheck still requires the
-			// return value be looked at, so report it the same way a later
-			// repository's real failure would be.
+			// A failure writing this line means the operator cannot see which
+			// repositories already succeeded, so continuing on to the next
+			// repository would register more hooks whose outcome is now
+			// invisible to them. Treat it the same as a real failure.
 			if _, err := fmt.Fprintf(out, "updated %s (hook %d)\n", repo, found.ID); err != nil {
 				return fmt.Errorf("report update for %s: %w", repo, err)
 			}

@@ -185,13 +185,18 @@ func configWebhookCommand() *cli.Command {
 				return err
 			}
 
-			if v := c.String("url"); v != "" {
-				if err := setField(s, "webhook.url", v); err != nil {
+			// c.IsSet, not c.String(...) != "", for every flag here: an
+			// explicitly empty value should be rejected by settings' own
+			// validation (it already does, for a value that ends up empty),
+			// not silently treated the same as "flag omitted". --listen-port
+			// already had this right; url and listen-addr did not.
+			if c.IsSet("url") {
+				if err := setField(s, "webhook.url", c.String("url")); err != nil {
 					return err
 				}
 			}
-			if v := c.String("listen-addr"); v != "" {
-				if err := setField(s, "webhook.listen_addr", v); err != nil {
+			if c.IsSet("listen-addr") {
+				if err := setField(s, "webhook.listen_addr", c.String("listen-addr")); err != nil {
 					return err
 				}
 			}
@@ -201,18 +206,19 @@ func configWebhookCommand() *cli.Command {
 				}
 			}
 
+			// rotated tracks whether a new secret was minted here, so the
+			// re-register message below is printed only after Save actually
+			// commits it. Printing it earlier (before Save can still fail, on
+			// a missing URL or an I/O error) would tell the operator to
+			// re-register a secret that was never written to disk.
+			rotated := false
 			if c.Bool("rotate-secret") {
 				secret, err := settings.GenerateSecret()
 				if err != nil {
 					return err
 				}
 				s.Webhook.Secret = secret
-				// The old secret still verifies deliveries at every repository
-				// GitHub already has it configured on, until each one is
-				// re-registered with the new value below.
-				fmt.Fprintln(os.Stderr,
-					"A new secret was minted. Run `agent-utils project register-webhook` "+
-						"again for every repository so GitHub is given the new value.")
+				rotated = true
 			}
 
 			if enable {
@@ -237,7 +243,20 @@ func configWebhookCommand() *cli.Command {
 				s.Webhook.Enabled = false
 			}
 
-			return settings.Save(s)
+			if err := settings.Save(s); err != nil {
+				return err
+			}
+
+			if rotated {
+				// The old secret still verifies deliveries at every repository
+				// GitHub already has it configured on, until each one is
+				// re-registered with the new value. This only runs once Save
+				// has actually committed the new secret to disk.
+				fmt.Fprintln(os.Stderr,
+					"A new secret was minted. Run `agent-utils project register-webhook` "+
+						"again for every repository so GitHub is given the new value.")
+			}
+			return nil
 		},
 	}
 }

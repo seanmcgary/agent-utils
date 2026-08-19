@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -22,30 +23,45 @@ func withHome(t *testing.T) {
 }
 
 // runConfigCLI runs the config command tree against args and returns what it
-// printed to stdout. It builds a bare root rather than the real main() tree
-// so a test cannot accidentally exercise `project` or `loop` and touch a real
-// project directory.
-func runConfigCLI(t *testing.T, args ...string) (string, error) {
+// printed to stdout and stderr. It builds a bare root rather than the real
+// main() tree so a test cannot accidentally exercise `project` or `loop` and
+// touch a real project directory.
+//
+// Both streams are captured, not just stdout: config webhook's operator
+// messages (the --rotate-secret re-register line, warnings) go to stderr by
+// the same convention as the rest of this program's prompts, and a test that
+// only reads stdout cannot tell a message from a typo in it from a message
+// that was never printed at all.
+func runConfigCLI(t *testing.T, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	root := &cli.Command{
 		Name:     "agent-utils",
 		Commands: []*cli.Command{configCommand()},
 	}
 
-	r, w, err := os.Pipe()
+	outR, outW, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("pipe: %v", err)
+		t.Fatalf("stdout pipe: %v", err)
 	}
-	old := os.Stdout
-	os.Stdout = w
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = outW, errW
 	runErr := root.Run(context.Background(), append([]string{"agent-utils"}, args...))
-	os.Stdout = old
-	w.Close()
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
+	os.Stdout, os.Stderr = oldOut, oldErr
+	outW.Close()
+	errW.Close()
+
+	var outBuf, errBuf bytes.Buffer
+	if _, err := io.Copy(&outBuf, outR); err != nil {
 		t.Fatalf("read captured stdout: %v", err)
 	}
-	return buf.String(), runErr
+	if _, err := io.Copy(&errBuf, errR); err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return outBuf.String(), errBuf.String(), runErr
 }
 
 // TestConfigWebhookEnableWithoutURLFailsAndWritesNothing covers B2's bullet:
@@ -54,7 +70,7 @@ func runConfigCLI(t *testing.T, args ...string) (string, error) {
 func TestConfigWebhookEnableWithoutURLFailsAndWritesNothing(t *testing.T) {
 	withHome(t)
 
-	if _, err := runConfigCLI(t, "config", "webhook", "--enable"); err == nil {
+	if _, _, err := runConfigCLI(t, "config", "webhook", "--enable"); err == nil {
 		t.Fatal("webhook --enable with no url and none stored: want an error, got nil")
 	}
 
@@ -65,6 +81,17 @@ func TestConfigWebhookEnableWithoutURLFailsAndWritesNothing(t *testing.T) {
 	if *s != (settings.Settings{}) {
 		t.Errorf("Load = %+v, want the zero value: the failed --enable must not have written anything", *s)
 	}
+
+	// Load() alone cannot distinguish "wrote nothing" from "wrote a
+	// zero-valued file": a missing file and an empty-but-present one both
+	// read back as the zero value. Assert the file itself was never created.
+	path, err := settings.Path()
+	if err != nil {
+		t.Fatalf("settings.Path: %v", err)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("settings file exists at %s after a failed --enable, want no file (stat err = %v)", path, statErr)
+	}
 }
 
 // TestConfigWebhookEnableWithURLWritesSecretAndDefaults covers: "webhook
@@ -72,7 +99,7 @@ func TestConfigWebhookEnableWithoutURLFailsAndWritesNothing(t *testing.T) {
 func TestConfigWebhookEnableWithURLWritesSecretAndDefaults(t *testing.T) {
 	withHome(t)
 
-	if _, err := runConfigCLI(t, "config", "webhook", "--enable", "--url", "https://x/y"); err != nil {
+	if _, _, err := runConfigCLI(t, "config", "webhook", "--enable", "--url", "https://x/y"); err != nil {
 		t.Fatalf("webhook --enable --url: %v", err)
 	}
 
@@ -105,7 +132,7 @@ func TestConfigWebhookEnableWithURLWritesSecretAndDefaults(t *testing.T) {
 func TestConfigWebhookEnableAndDisableTogetherFails(t *testing.T) {
 	withHome(t)
 
-	if _, err := runConfigCLI(t, "config", "webhook", "--enable", "--disable", "--url", "https://x/y"); err == nil {
+	if _, _, err := runConfigCLI(t, "config", "webhook", "--enable", "--disable", "--url", "https://x/y"); err == nil {
 		t.Fatal("webhook --enable --disable: want an error, got nil")
 	}
 }
@@ -116,7 +143,7 @@ func TestConfigWebhookEnableAndDisableTogetherFails(t *testing.T) {
 func TestConfigWebhookRotateSecretMintsNewSecretAndSaysReregister(t *testing.T) {
 	withHome(t)
 
-	if _, err := runConfigCLI(t, "config", "webhook", "--enable", "--url", "https://x/y"); err != nil {
+	if _, _, err := runConfigCLI(t, "config", "webhook", "--enable", "--url", "https://x/y"); err != nil {
 		t.Fatalf("enable: %v", err)
 	}
 	before, err := settings.Load()
@@ -124,7 +151,8 @@ func TestConfigWebhookRotateSecretMintsNewSecretAndSaysReregister(t *testing.T) 
 		t.Fatalf("Load: %v", err)
 	}
 
-	if _, err := runConfigCLI(t, "config", "webhook", "--rotate-secret"); err != nil {
+	_, stderr, err := runConfigCLI(t, "config", "webhook", "--rotate-secret")
+	if err != nil {
 		t.Fatalf("rotate-secret: %v", err)
 	}
 	after, err := settings.Load()
@@ -133,6 +161,40 @@ func TestConfigWebhookRotateSecretMintsNewSecretAndSaysReregister(t *testing.T) 
 	}
 	if after.Webhook.Secret == before.Webhook.Secret {
 		t.Error("--rotate-secret did not change the stored secret")
+	}
+
+	// The re-register line goes to stderr (config.go), not stdout, so it must
+	// be asserted against stderr specifically — a prior version of this test
+	// checked only the stored secret and left this message unverified, which
+	// meant deleting the Fprintln would not have failed any test.
+	if !strings.Contains(stderr, "register-webhook") {
+		t.Errorf("stderr = %q, want it to direct the operator to re-run register-webhook", stderr)
+	}
+}
+
+// TestConfigWebhookRotateSecretDoesNotPrintBeforeSaveSucceeds covers MINOR 2
+// from the B2+D2 review: `--rotate-secret --enable` with no stored URL and
+// no --url fails at the --enable check, after the secret has already been
+// minted in memory but before Save is ever called. The re-register message
+// must not appear in that case — it would tell the operator to re-register a
+// secret that was never written to disk.
+func TestConfigWebhookRotateSecretDoesNotPrintBeforeSaveSucceeds(t *testing.T) {
+	withHome(t)
+
+	_, stderr, err := runConfigCLI(t, "config", "webhook", "--rotate-secret", "--enable")
+	if err == nil {
+		t.Fatal("rotate-secret --enable with no url: want an error, got nil")
+	}
+	if strings.Contains(stderr, "register-webhook") {
+		t.Errorf("stderr = %q, must not print the re-register message: nothing was saved", stderr)
+	}
+
+	s, loadErr := settings.Load()
+	if loadErr != nil {
+		t.Fatalf("Load: %v", loadErr)
+	}
+	if *s != (settings.Settings{}) {
+		t.Errorf("Load = %+v, want the zero value: the failed command must not have written anything", *s)
 	}
 }
 
@@ -150,7 +212,7 @@ func TestConfigShowRedactsSecretUnlessRevealed(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	out, err := runConfigCLI(t, "config", "show")
+	out, _, err := runConfigCLI(t, "config", "show")
 	if err != nil {
 		t.Fatalf("show: %v", err)
 	}
@@ -161,7 +223,7 @@ func TestConfigShowRedactsSecretUnlessRevealed(t *testing.T) {
 		t.Errorf("show output leaked the secret: %q", out)
 	}
 
-	out, err = runConfigCLI(t, "config", "show", "--reveal")
+	out, _, err = runConfigCLI(t, "config", "show", "--reveal")
 	if err != nil {
 		t.Fatalf("show --reveal: %v", err)
 	}
@@ -180,7 +242,7 @@ func TestConfigGetRedactsSecretUnlessRevealed(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	out, err := runConfigCLI(t, "config", "get", "webhook.secret")
+	out, _, err := runConfigCLI(t, "config", "get", "webhook.secret")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -188,7 +250,7 @@ func TestConfigGetRedactsSecretUnlessRevealed(t *testing.T) {
 		t.Errorf("get output = %q, want %q", out, settings.Redacted)
 	}
 
-	out, err = runConfigCLI(t, "config", "get", "webhook.secret", "--reveal")
+	out, _, err = runConfigCLI(t, "config", "get", "webhook.secret", "--reveal")
 	if err != nil {
 		t.Fatalf("get --reveal: %v", err)
 	}
@@ -202,7 +264,7 @@ func TestConfigGetRedactsSecretUnlessRevealed(t *testing.T) {
 func TestConfigSetUnknownKeyNamesKnownKeys(t *testing.T) {
 	withHome(t)
 
-	_, err := runConfigCLI(t, "config", "set", "webhook.nope", "x")
+	_, _, err := runConfigCLI(t, "config", "set", "webhook.nope", "x")
 	if err == nil {
 		t.Fatal("set webhook.nope: want an error, got nil")
 	}
@@ -220,7 +282,7 @@ func TestConfigSetUnknownKeyNamesKnownKeys(t *testing.T) {
 func TestConfigSetSecretDoesNotPanic(t *testing.T) {
 	withHome(t)
 
-	_, err := runConfigCLI(t, "config", "set", "webhook.secret", "x")
+	_, _, err := runConfigCLI(t, "config", "set", "webhook.secret", "x")
 	if err == nil {
 		t.Fatal("set webhook.secret: want an error, got nil")
 	}
@@ -234,7 +296,7 @@ func TestConfigSetSecretDoesNotPanic(t *testing.T) {
 func TestConfigSetThenUnsetRoundTrips(t *testing.T) {
 	withHome(t)
 
-	if _, err := runConfigCLI(t, "config", "set", "webhook.listen_port", "9999"); err != nil {
+	if _, _, err := runConfigCLI(t, "config", "set", "webhook.listen_port", "9999"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	s, err := settings.Load()
@@ -245,7 +307,7 @@ func TestConfigSetThenUnsetRoundTrips(t *testing.T) {
 		t.Fatalf("ListenPort = %d, want 9999", s.Webhook.ListenPort)
 	}
 
-	if _, err := runConfigCLI(t, "config", "unset", "webhook.listen_port"); err != nil {
+	if _, _, err := runConfigCLI(t, "config", "unset", "webhook.listen_port"); err != nil {
 		t.Fatalf("unset: %v", err)
 	}
 	s, err = settings.Load()
