@@ -1382,8 +1382,8 @@ path, and the cause is implicit onboarding rather than the file name.
   an ordinary parent. Correct the code, then correct the comment.
 
   Skip a candidate equal to `home.Dir()` and keep walking. Return `ErrNoDir` naming
-  `agent-utils project init` when nothing else matches. `home` must not import `config`; check
-  the import direction before wiring this, and invert it if needed.
+  `agent-utils project init` when nothing else matches. `internal/home` imports no `config`,
+  verified, so `config` may import `home` with no cycle.
 
   **Acceptance:** a test with a temporary tree proves `FindDir` called from
   `<home>/Downloads/scratch`, where `<home>/.agent-utils` exists and no nearer directory does,
@@ -1391,38 +1391,227 @@ path, and the cause is implicit onboarding rather than the file name.
   nested under the machine-wide directory's parent still resolves. `$AGENT_UTILS_DIR` still
   wins and is still allowed to name any directory, because it is the documented escape hatch.
 
-- [ ] **F2. `agent-utils project init`.**  `review: yes`
+- [ ] **F2. `internal/wizard`: prompting primitives and git detection.**  `review: yes`
+
+  A new package, because two commands use it (`project init` and `project loop new`) and
+  because a wizard driven only through a terminal cannot be tested.
+
+  ```go
+  // Question is one field of a loop configuration.
+  type Question struct {
+      Key      string   // the dotted yaml key, used in errors: "agent.effort"
+      Label    string   // what the operator reads
+      Help     string   // one line under the label; why this field exists
+      Default  string   // shown in brackets; empty input takes it
+      Choices  []string // non-empty makes this an enum, shown numbered
+      List     bool     // answer is a comma-separated list
+      Optional bool     // empty is allowed and means "unset"
+      Validate func(string) error
+  }
+
+  // Prompter asks one question and returns the answer.
+  //
+  // It is a seam. The terminal implementation is the only one that reads stdin;
+  // every test drives the script with a scripted Prompter and never opens a
+  // terminal.
+  type Prompter interface {
+      Ask(q Question) (string, error)
+      Confirm(label, help string, def bool) (bool, error)
+  }
+
+  func NewTerminalPrompter(in io.Reader, out io.Writer) Prompter
+
+  // Detected holds what git can tell us about the working directory.
+  type Detected struct {
+      Repo            string // owner/name, from the origin remote
+      DefaultBranch   string // from origin/HEAD
+      CheckoutBaseDir string // the work tree root
+  }
+
+  // Detect never fails. A field it cannot determine is empty, and the question
+  // for that field simply has no default.
+  func Detect(dir string) Detected
+  ```
+
+  `Detect` shells out to git the way `internal/worktree` already does
+  (`worktree.go:127`, `exec.Command("git", ...)`):
+  - `git -C <dir> rev-parse --show-toplevel` → `CheckoutBaseDir`
+  - `git -C <dir> remote get-url origin` → parse `owner/name` from both the
+    `git@github.com:owner/name.git` and `https://github.com/owner/name.git` forms
+  - `git -C <dir> symbolic-ref --short refs/remotes/origin/HEAD` → strip the `origin/` prefix
+    for `DefaultBranch`
+
+  Every one of these fails in a directory that is not a git work tree. That is not an error:
+  `Detect` returns what it found and leaves the rest empty. A loop may legitimately point at a
+  repository the operator has not cloned here.
+
+  The terminal prompter:
+  - Writes prompts to its `out` writer, never to stdout directly, so a test captures them and
+    a piped stdout stays clean. Precedent: `promptForConfig` writes to stderr for this reason.
+  - Renders `Label`, then `Help` indented, then `[default]`.
+  - Renders `Choices` as a numbered list and accepts either the number or the exact value.
+  - Re-asks on a failed `Validate`, printing the error. It does not abort: a typo in question
+    14 of 24 must not discard the previous 13 answers.
+  - Returns the default on empty input; returns an error on EOF.
+
+  **Acceptance:** tests in `internal/wizard`:
+  - A scripted prompter drives `Ask` for a plain field, an enum by number, an enum by value, a
+    list, and an optional field left empty.
+  - A failed `Validate` re-asks and the second answer is taken; the prompt text contains the
+    error.
+  - Empty input takes the default; EOF returns an error.
+  - `Detect` in a `t.TempDir()` that is not a git repository returns three empty strings and no
+    error.
+  - `Detect` in a real repository created by the test (`git init`, a remote added in each URL
+    form) returns the parsed `owner/name` for both forms.
+  - No test reads os.Stdin.
+
+- [ ] **F3. `internal/wizard`: the loop-configuration script.**  `review: yes`
+
+  Ask for **every** field of `config.Config`, in this order, each with the default shown. The
+  operator answers 24 questions and gets a file that loads.
+
+  | # | Key | Default | Notes |
+  |---|---|---|---|
+  | 1 | `name` | `planning` | the loop name, unique in this project |
+  | 2 | `repo` | `Detected.Repo` | validated as `owner/name` |
+  | 3 | `checkout_base_dir` | `Detected.CheckoutBaseDir` | |
+  | 4 | `worktree_dir` | `<home>/worktrees` | from `home.Dir()` |
+  | 5 | `state_dir` | empty | optional; empty means the derived default |
+  | 6 | `default_branch` | `Detected.DefaultBranch` | |
+  | 7 | `labels.trigger` | template's | |
+  | 8 | `labels.in_flight` | template's | |
+  | 9 | `labels.blocked` | template's | |
+  | 10 | `labels.review` | template's | |
+  | 11 | `labels.terminal` | template's | optional; the execution loop has none |
+  | 12 | `labels.veto` | template's | list |
+  | 13 | `agent.model` | `opus` | |
+  | 14 | `agent.effort` | `high` | enum: low, medium, high, xhigh, max |
+  | 15 | `agent.permission_mode` | `acceptEdits` | enum; see the confirmation below |
+  | 16 | `agent.worktree` | `per_issue` | enum: per_issue, none |
+  | 17 | `agent.max_budget_usd` | `25` | |
+  | 18 | `agent.timeout` | `3h` | duration |
+  | 19 | `tend_pr` | template's | bool |
+  | 20 | `retry.max` | `3` | |
+  | 21 | `retry.backoff` | `0s, 15m, 30m` | list of durations; needs `retry.max` entries |
+  | 22 | `retry.breaker.orphan_threshold` | `2` | |
+  | 23 | `retry.breaker.cooldown` | `30m` | duration |
+  | 24 | prompt template | `planning` | enum, see below |
+
+  **`agent.permission_mode` is the one security-relevant answer.** The default is
+  `acceptEdits`, not `bypassPermissions`. When the operator chooses `bypassPermissions`, ask a
+  separate `Confirm` defaulting to **No**, whose help text is the reason `config.validate`
+  already gives: it disables every permission prompt on third-party issue text, and an
+  instruction hidden in an issue comment executes. Only an explicit yes sets
+  `i_understand_bypass_permissions: true`. Declining returns to question 15.
+
+  **The three prompt bodies are not typed.** `prompt`, `resume_prompt`, and `tend_prompt` are
+  multi-line templates. Question 24 chooses which template supplies them:
+
+  ```go
+  // Template supplies the prompt bodies and the label and tend defaults that go
+  // with them.
+  type Template struct {
+      Name         string
+      Labels       config.Labels
+      TendPR       bool
+      Prompt       string
+      ResumePrompt string
+      TendPrompt   string
+  }
+
+  func Templates() []Template          // "planning", "execution"
+  func TemplateNamed(name string) (Template, bool)
+  ```
+
+  **Embed the templates.** `examples/planning.yaml` and `examples/execution.yaml` are not on
+  disk for a binary installed with `go install`, so read them at build time:
+
+  ```go
+  //go:embed templates/planning.yaml templates/execution.yaml
+  var templateFS embed.FS
+  ```
+
+  Copy the two example files into `internal/wizard/templates/` as the embedded source. Add a
+  test that loads each embedded file with `config.Load` and fails if it does not validate, so a
+  broken template cannot ship. Do **not** try to read `examples/` at run time.
+
+  Ask questions 7-12 and 19 **after** the template is chosen, so the template's values are the
+  defaults. Implement this by asking question 24 first and presenting it as "start from which
+  template", then the rest in the table's order.
+
+  ```go
+  // Run asks every question and returns a configuration that config.validate accepts.
+  func Run(p Prompter, d Detected) (*config.Config, error)
+
+  // Write marshals a configuration to a loop file, with a header comment.
+  func Write(dir string, cfg *config.Config) (path string, err error)
+  ```
+
+  `Write` writes `<dir>/configs/<name>.yaml` at 0600 through the temp-file-and-rename pattern,
+  refuses to overwrite an existing file of that name, and then calls `config.Load` on what it
+  wrote. A wizard that produces a file the loader rejects is worse than no wizard; the reload
+  is the proof. Report the loader's error and keep the file for inspection.
+
+  **Acceptance:** tests in `internal/wizard`:
+  - A scripted prompter accepting every default produces a `*config.Config` that
+    `config.Load` accepts after `Write`, for each of the two templates.
+  - Choosing `bypassPermissions` and declining the confirmation re-asks question 15; accepting
+    sets `i_understand_bypass_permissions: true`.
+  - `retry.backoff` with fewer entries than `retry.max` re-asks.
+  - `repo` of `not-a-repo` re-asks; `owner/name` is accepted.
+  - An invalid duration for `agent.timeout` re-asks.
+  - `Write` refuses to overwrite an existing file and says which.
+  - The written file is mode 0600 and contains a header comment.
+  - A test loads every embedded template with `config.Load` and asserts it validates.
+
+- [ ] **F4. `agent-utils project init` and `project loop new`.**  `review: yes`
 
   ```
-  agent-utils project init [<name>] [--dir <path>]
+  agent-utils project init [<name>] [--dir <path>] [--no-loop]
+  agent-utils project loop new
   ```
 
-  The name is a **positional argument**, following `forget <project>`. It must not be `--name`:
-  `project` already declares `--name` as the project selector, and a child flag of the same
-  name shadows it — the hazard `selectedProject` documents.
+  The project name is a **positional argument**, following `forget <project>`. It must not be
+  `--name`: `project` already declares `--name` as the project selector, and a child flag of
+  the same name shadows it — the hazard `selectedProject` documents.
 
-  Steps:
-  1. Resolve the target directory: `--dir`, else the working directory. Refuse when it
-     resolves to `home.Dir()`, naming why.
-  2. Create `<dir>/.agent-utils/` at 0700 and `<dir>/.agent-utils/configs/` at 0700.
+  `project init`:
+  1. Resolve the target directory: `--dir`, else the working directory. Refuse when it resolves
+     to `home.Dir()`, naming why.
+  2. Create `<dir>/.agent-utils/` and `<dir>/.agent-utils/configs/`, both 0700.
   3. Mint the descriptor with `project.Ensure`, which already uniquifies a taken name against
-     `registry.NameTaken`. Use the positional name when given.
+     `registry.NameTaken`. Use the positional name when given. Report a rename the way
+     `openProject` does today — that reporting moves here.
   4. Register with `registry.Register`.
-  5. Print the name, the directory, and the next step: drop a loop configuration into
-     `configs/`. Report a rename the way `openProject` already does.
+  5. Unless `--no-loop`, run the wizard and write the first loop configuration.
+  6. Print the project name, the directory, the loop file written, and the next command to run.
 
-  Re-running on an initialised project is **not** an error: report the existing identity and
-  re-register, so a moved project is found again. Never mint a second id.
+  Re-running on an initialised project is **not** an error: report the existing identity,
+  re-register, and offer the wizard again for an additional loop. Never mint a second id.
 
-  **Acceptance:** tests with a temporary `$AGENT_UTILS_HOME`:
-  - `init` in an empty directory creates `.agent-utils/configs/`, writes a descriptor with a
-    uuid, and registers exactly one project.
+  `project loop new` resolves an existing project with `openProject`, then runs the same
+  wizard against it. This is the entry point for a second loop.
+
+  **Both commands prompt, so both must refuse to prompt when stdin is not a terminal.** Reuse
+  `isInteractive()`. A non-interactive `project init` runs steps 1-4 and skips the wizard,
+  printing that it did and naming `project loop new`; a non-interactive `project loop new` is
+  an error naming the same rule. A prompt in a cron job hangs forever — that is already the
+  documented rule in `resolveLoopConfig`.
+
+  **Acceptance:** tests with a temporary `$AGENT_UTILS_HOME` and a scripted prompter:
+  - `init --no-loop` in an empty directory creates `.agent-utils/configs/`, writes a descriptor
+    with a uuid, and registers exactly one project.
   - The descriptor is mode 0600 and both directories are 0700.
   - Running `init` twice keeps the same id and registers once.
   - `init` with a positional name uses it; a taken name gets a suffix and says so.
   - `init` in the machine-wide directory exits non-zero and writes nothing.
+  - `init` with the wizard writes a loop file that `config.Load` accepts.
+  - A non-interactive `init` skips the wizard, still creates the project, and names
+    `project loop new`.
+  - A non-interactive `loop new` exits non-zero and prompts nothing.
 
-- [ ] **F3. `ResolveProject` stops onboarding implicitly.**  `review: yes`
+- [ ] **F5. `ResolveProject` stops onboarding implicitly.**  `review: yes`
 
   `internal/loopcmd/resolve.go` currently calls `project.Ensure`, so the first `project` command
   in any directory mints a descriptor and registers it. That is what turns an accidental
@@ -1436,8 +1625,8 @@ path, and the cause is implicit onboarding rather than the file name.
   This is backward compatible: every already-onboarded project has a descriptor and keeps
   working. Only a directory that was never a project now needs one command.
 
-  Delete `Project.Created` and `Project.RenamedFrom` if `init` is their only remaining writer,
-  and move the reporting into F2 rather than leaving dead fields.
+  Delete `Project.Created` and `Project.RenamedFrom`, and the branch in `openProject` that
+  reads them; F4 owns that reporting now.
 
   **Acceptance:**
   - A directory with `.agent-utils/` but no descriptor gives an error naming `project init`,
@@ -1445,20 +1634,23 @@ path, and the cause is implicit onboarding rather than the file name.
   - A directory with no `.agent-utils/` anywhere in its parents gives an error naming
     `project init`.
   - An initialised project resolves and is re-registered.
-  - Existing tests that relied on implicit onboarding are updated to call `init` first; list
-    them in the commit message.
+  - Existing tests that relied on implicit onboarding are updated to call the init path first;
+    list them in the commit message.
 
 ### Phase G — documentation and version
 
 - [ ] **G1. README, configuration reference, and VERSION.**  `review: no`
 
   `README.md`:
-  - Add `config` and `listener` rows to the "Global" command table, and
-    `project init` and `project register-webhook` rows to the "Project" table.
+  - Add `config` and `listener` rows to the "Global" command table, and `project init`,
+    `project loop new`, and `project register-webhook` rows to the "Project" table.
   - **Rewrite "Quick start".** It currently says "There is no init step" and describes
-    `mkdir -p .agent-utils/configs` followed by any project command. After F2 the first step is
-    `agent-utils project init`. The paragraph describing the automatic registration and the
-    rename message moves to `project init`.
+    `mkdir -p .agent-utils/configs` followed by any project command. After F4 the first step is
+    `agent-utils project init`, which prompts for every field of the first loop and writes it.
+    Show the session. The paragraph describing automatic registration and the rename message
+    moves to `project init`.
+  - Say in the "Configuration" section that `project loop new` writes a loop file by asking,
+    and that `docs/configuration.md` remains the reference for editing one by hand.
   - Add a "Webhooks" section after "Cron", giving the setup in order:
     `config webhook --enable --url ...`, `project register-webhook`,
     `listener start --daemon`. State that the daemon speaks plain HTTP and expects nginx,
@@ -1521,12 +1713,20 @@ path, and the cause is implicit onboarding rather than the file name.
    `listener start --daemon`, `stop`, and `status` by hand once on this machine before the PR
    is marked ready, and record the result in the PR body.
 
-6. **Phase F changes how a project is onboarded.** `agent-utils project init` becomes required
+6. **The wizard duplicates the example configurations.** `internal/wizard/templates/*.yaml`
+   are copies of `examples/*.yaml`, because a `go install` binary has no `examples/` directory
+   and the prompt bodies must be embedded. They will drift. F3 requires a test that loads every
+   embedded template through `config.Load`, so a template that stops validating fails the
+   build; nothing detects a template that merely falls behind its example. Accept the
+   duplication, or make `examples/` a symlink to the embedded copies in a later change.
+
+7. **Phase F changes how a project is onboarded.** `agent-utils project init` becomes required
    for a directory that is not yet a project; every existing project keeps working, because it
    already has a descriptor. The phase is separable and can be reverted, or shipped as its own
    pull request ahead of this one. It is in scope because implicit onboarding is what lets the
-   machine-wide `config.yaml` and a project descriptor land on the same path.
+   machine-wide `config.yaml` and a project descriptor land on the same path. It now also
+   carries the setup wizard, which is the larger part of the phase.
 
-7. **`MarkNeedsRetry` changes signature**, touching `internal/runner`. That package spawns real
+8. **`MarkNeedsRetry` changes signature**, touching `internal/runner`. That package spawns real
    processes in its tests, which is why the suite runs `-p 1`. Run
    `go test ./internal/runner/...` explicitly after C1.

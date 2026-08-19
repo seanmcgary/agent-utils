@@ -20,7 +20,8 @@ In scope:
 - A top-level `config` command that reads and writes that file.
 - A `project register-webhook` command that creates the webhook at GitHub.
 - A `listener` command that runs the daemon, with a `--daemon` flag for launchd.
-- A `project init` command, and the end of implicit project onboarding.
+- A `project init` command that asks for every field of a loop configuration and writes it,
+  the same wizard as `project loop new`, and the end of implicit project onboarding.
 - A refactor that lets the daemon and the command share one tick path.
 - A change from tick-counted retry backoff to wall-clock retry backoff.
 
@@ -165,7 +166,16 @@ The design fixes the cause and keeps a guard for the symptom:
 
 - `FindDir` skips a candidate equal to the machine-wide directory.
 - A new `agent-utils project init` command creates a project's directory, mints its descriptor,
-  and registers it. `ResolveProject` stops minting a descriptor on its own.
+  registers it, and then asks for every field of the first loop configuration and writes it.
+  `agent-utils project loop new` runs the same wizard for a later loop. Neither prompts when
+  stdin is not a terminal. `ResolveProject` stops minting a descriptor on its own.
+
+  The wizard lives in `internal/wizard`. It reads `repo`, `default_branch`, and
+  `checkout_base_dir` from git when the directory is a work tree, and offers them as defaults.
+  The three prompt bodies are multi-line templates and are not typed: the operator picks
+  `planning` or `execution`, and the bodies come from files embedded with `//go:embed`, because
+  a binary installed with `go install` has no `examples/` directory. Choosing
+  `bypassPermissions` requires a separate confirmation that defaults to No.
 - `settings.Load` and `settings.Save` both refuse a file that carries the `id` and `name` keys
   of a project descriptor, which still covers an `$AGENT_UTILS_HOME` pointed at a project.
 
