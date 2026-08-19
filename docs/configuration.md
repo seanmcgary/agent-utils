@@ -72,15 +72,17 @@ discovery at all.
 ### The machine-wide directory
 
 `$AGENT_UTILS_HOME` names the machine-wide `.agent-utils` directory itself. It defaults to
-`~/.agent-utils`, and it holds the registry and the canonical state database. It is not a
-replacement for `$HOME`: nothing else the tool or the agent reads moves with it.
+`~/.agent-utils`, and it holds the registry, the canonical state database, and the machine-wide
+`config.yaml` the webhook listener reads (see [Two different `config.yaml` files](#two-different-configyaml-files)
+below). It is not a replacement for `$HOME`: nothing else the tool or the agent reads moves
+with it.
 
 Do not confuse it with `$AGENT_UTILS_DIR`: `AGENT_UTILS_HOME` names the ONE machine-wide
 directory, and `AGENT_UTILS_DIR` names ONE project's `.agent-utils` directory.
 
 | Variable | Names | Default |
 |---|---|---|
-| `AGENT_UTILS_HOME` | The machine-wide directory: the registry and the state database | `~/.agent-utils` |
+| `AGENT_UTILS_HOME` | The machine-wide directory: the registry, the state database, and `config.yaml` | `~/.agent-utils` |
 | `AGENT_UTILS_DIR` | One project's `.agent-utils` directory | Found by walking up from the working directory |
 
 Pointing `AGENT_UTILS_HOME` at a path that exists and is not a directory is an error rather
@@ -89,6 +91,22 @@ ask for, and the mistake would surface much later as missing state.
 
 Set it to run a test, or a second machine-wide installation, against its own state. Moving
 `$HOME` instead would also move the git and ssh configuration the agent still needs.
+
+### Two different `config.yaml` files
+
+`~/.agent-utils/config.yaml` (the machine-wide settings file, `AGENT_UTILS_HOME`) and
+`<project>/.agent-utils/config.yaml` (one project's descriptor: its name and its UUID) are
+**different files that happen to share a base name**, distinguished only by which directory
+holds them. The machine-wide one is never described by this document — it is not a loop
+configuration — and is read and written entirely through `agent-utils config`.
+
+That name collision is not a coincidence to shrug off: it is exactly why `agent-utils project
+init` refuses to run inside the machine-wide directory. Without that refusal, `cd ~ &&
+agent-utils project init` would mint a *project* descriptor at `~/.agent-utils/config.yaml`,
+overwriting the machine-wide settings file — or, run the other way, pointing `$AGENT_UTILS_HOME`
+at a project's `.agent-utils` directory would hand a project descriptor to code expecting the
+machine-wide settings shape. Both `internal/settings` (Load and Save) and `project init` guard
+against this explicitly, by probing the file's shape before trusting it.
 
 ### How a configuration is chosen
 

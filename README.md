@@ -36,24 +36,55 @@ make install     # into GOBIN, with the VERSION file's value stamped in
 
 ## Quick start
 
-There is no init step. Create the directory, drop in a loop config, run a project command:
+`agent-utils project init` is the first step. A hand-made `.agent-utils/configs/` directory is
+no longer enough to make something a project — the machine-wide directory
+(`~/.agent-utils`) looks like an ordinary directory too, and without an explicit init step a
+stray `cd ~ && agent-utils project status` would happily register it as one. `project init`
+refuses to run there, and is otherwise the one place a project is born:
 
 ```bash
 cd ~/Code/my-repo
-mkdir -p .agent-utils/configs
-cp examples/planning.yaml .agent-utils/configs/
-agent-utils project status
+agent-utils project init
 ```
 
-The first project command writes `.agent-utils/config.yaml` with a name (from the directory)
-and a UUID that never changes, then registers the project. If that name is already taken by
-another project, a suffix is added and you are told:
+```
+Created project "my-repo" (/Users/you/Code/my-repo/.agent-utils)
+Start from which template?
+  Supplies the label and tend_pr defaults below, and the three prompt bodies.
+  1) planning
+  2) execution
+[planning]:
+Loop name
+  Unique in this project. Keys the loop's state, its lock file, and its state directory.
+[planning]:
+Repository
+  owner/name: the GitHub repository this loop watches.
+[you/my-repo]:
+Checkout base directory
+  The work tree root this loop's per-issue worktrees branch from.
+[/Users/you/Code/my-repo]:
+... asks for every remaining field: worktree and state directories, labels, the agent's
+model and permission mode, retry policy, and the three prompt bodies ...
+Wrote loop configuration /Users/you/Code/my-repo/.agent-utils/configs/planning.yaml
+Next: agent-utils project --name my-repo loop tick --name planning
+```
+
+`project init` writes `.agent-utils/config.yaml` with a name (from the directory, or the
+positional argument you give it) and a UUID that never changes, then registers the project. If
+that name is already taken by another project, a suffix is added and you are told:
 
 ```
-Registered project "lawndominator-2" (/tmp/wsB/lawndominator/.agent-utils)
+Created project "lawndominator-2" (/tmp/wsB/lawndominator/.agent-utils)
 The name "lawndominator" was already taken by another project, so this one is "lawndominator-2".
 Change it by editing /tmp/wsB/lawndominator/.agent-utils/config.yaml
 ```
+
+Unless you pass `--no-loop`, `project init` then walks an interactive wizard that asks for
+every field the first loop needs — labels, repository, agent model, retry policy, the prompts
+— and writes `.agent-utils/configs/<name>.yaml`. Run from a script or a cron job (any
+non-terminal stdin), it skips the wizard rather than hanging on a prompt that will never come;
+add the loop later with `agent-utils project loop new`, which runs the same wizard for a
+second (or first) loop on an already-initialised project.
 
 ## Commands
 
@@ -68,18 +99,23 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils forget <name\|id\|path>` | Drop a project from the registry, touching none of its files |
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
 | `agent-utils version` | Version and commit |
+| `agent-utils config show [--reveal] \| get <key> \| set <key> <value> \| unset <key> \| webhook ...` | Read and write the machine-wide `~/.agent-utils/config.yaml`: the webhook daemon's URL, bind address and secret |
+| `agent-utils listener start [--daemon] \| stop \| status` | Run the webhook listener in the foreground, or install/remove/inspect it as a launchd agent |
 
 ### Project
 
 | Command | Does |
 |---|---|
+| `agent-utils project init [<name>] [--dir <path>] [--no-loop]` | Create a project explicitly and, unless `--no-loop`, walk the loop-configuration wizard for its first loop |
+| `agent-utils project loop new` | Add another loop configuration to this project, via the same wizard |
 | `agent-utils project status` | Identity, file locations, and every loop's state |
 | `agent-utils project list` | This project's loop configurations |
 | `agent-utils project sessions list` | Every claude session with its issue, runs, cost and state |
 | `agent-utils project logs` | Watch a dispatched agent, live or after the fact |
-| `agent-utils project loop tick --name <loop>` | One reconcile-and-dispatch pass, then exit. This is what cron runs |
+| `agent-utils project loop tick --name <loop>` | One reconcile-and-dispatch pass, then exit. This is what cron (and the webhook daemon) runs |
 | `agent-utils project loop status --name <loop>` | The reconciled view of one loop: issues, titles, dispatch state, retries |
 | `agent-utils project loop reset --name <loop> --issue <n>` | Drop an issue's stored session and worktree so its next trigger starts fresh |
+| `agent-utils project register-webhook [--name <loop>] [--yes]` | Register this project's repositories with GitHub as webhook delivery targets |
 
 Every `project` command takes `--name <project>` to act from any directory, or uses the
 project in the current directory when you omit it:
@@ -156,12 +192,14 @@ the file, not the file name, and it must be unique within a directory.
 Loop state lives in one database for the machine, at `~/.agent-utils/state.db`. Every row is
 keyed by the project's UUID, so no project ever reads another's issue state, dispatches or
 sessions. `state_dir` still holds each loop's tick lock and its log tree, under
-`<project>/.agent-utils/state/<loop>/` by default. Only the database moved.
+`<project>/.agent-utils/state/<loop>/` by default. Only the database moved. `~/.agent-utils`
+also holds `config.yaml` (the machine-wide settings `agent-utils config` edits — see
+[Webhooks](#webhooks)), `listener.pid`, and the webhook listener's own logs.
 
-**[`docs/configuration.md`](docs/configuration.md) documents every field** — what it means,
-what reads it, and what happens if you get it wrong. `examples/planning.yaml` and
-`examples/execution.yaml` are complete working files, ported from the reference planning and
-execution orchestrators.
+`agent-utils project loop new` writes a loop file for you, by asking; **[`docs/configuration.md`](docs/configuration.md)
+remains the reference for editing one by hand** — what each field means, what reads it, and
+what happens if you get it wrong. `examples/planning.yaml` and `examples/execution.yaml` are
+complete working files, ported from the reference planning and execution orchestrators.
 
 ## Migration
 
@@ -210,7 +248,25 @@ engine reduces the blast radius in three ways, none of which is a substitute for
   the target repository, is ever linked to an issue or tended.
 - `bypassPermissions` requires `i_understand_bypass_permissions: true` in the loop config.
 
+The webhook listener adds one more thing worth naming plainly: it accepts a request from the
+internet that starts an agent. That is a stronger claim than "a cron job reads issues on a
+timer," so it is verified accordingly. Every delivery is checked with HMAC-SHA256 over the raw
+request body; a `sha1=` signature is refused no matter which header carries it, closing the
+downgrade GitHub's own client library would otherwise allow; and an empty `webhook.secret`
+makes the listener refuse to serve at all, rather than start up "verifying" deliveries against
+a key an attacker also knows. What the listener changes is the delay: an issue comment used to
+wait for the next cron tick before an agent read it, and now it does not. It does not change
+the trust rule above — point a loop, webhook-driven or not, only at a repository whose issue
+and pull request population you trust.
+
 ## Cron
+
+Cron is optional. `loop tick` is what any driver runs — a cron entry, or the webhook listener
+on a GitHub delivery — and the per-loop lock (`internal/lock`) makes it safe to run both at
+once: an overlapping tick simply finds the lock held and exits rather than double-dispatching.
+Keep the cron entry as a heartbeat even after the listener is running, if you want ticks to
+keep happening on schedule when no webhook fires — a quiet repository, or a proxy that is
+briefly down, otherwise waits for the next event with no fallback.
 
 Do NOT put the token inline in the crontab. cron runs the whole line through `/bin/sh -c`, so
 a `VAR=value command` prefix puts the token in the shell's argument list, where `ps` shows it
@@ -230,6 +286,80 @@ echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
 Naming the project explicitly is what makes the entry independent of cron's working directory.
 Passing `--config` with an absolute path works too and skips discovery entirely.
 
+## Webhooks
+
+The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
+request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
+Set it up in this order:
+
+```bash
+agent-utils config webhook --enable --url https://hooks.example.com/webhook
+agent-utils project register-webhook
+agent-utils listener start --daemon
+```
+
+`agent-utils listener start` speaks plain HTTP and never terminates TLS itself — it expects
+nginx, cloudflared, or ngrok in front of it to do that. `webhook.url` is therefore the proxy's
+public URL, not the listener's own bind address, and it must be `https`: over plain HTTP both
+the delivery body and the `X-Hub-Signature-256` header that authorizes running an agent would
+cross the internet in the clear, replayable by anyone who observed one. The only exception is
+a loopback host (`http://localhost:...` or `http://127.0.0.1:...`), allowed so a local
+end-to-end test needs no certificate. The listener itself binds `127.0.0.1` by default —
+`0.0.0.0` would accept deliveries from anything on the local network before you asked for
+that — so the reverse proxy is also what makes it reachable from GitHub at all.
+
+The listener needs the same `~/.agent-utils/env` file the [Cron](#cron) section has you
+create, with `GITHUB_TOKEN` in it: `listener start` refuses to start without it, and once
+running, the daemon re-reads it on every delivery so a rotated token needs no restart. If you
+have not created it yet:
+
+```bash
+install -m 600 /dev/null ~/.agent-utils/env
+echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
+```
+
+`agent-utils project register-webhook` reads the repositories your project's loops watch and
+registers (or updates) a GitHub webhook on each, pointed at `webhook.url` and signed with
+`webhook.secret`. It asks for confirmation before it does — this grants GitHub the right to
+trigger agent dispatch — unless you pass `--yes`, and it refuses to run unattended (no
+terminal, no `--yes`) for the same reason a config wizard does. Run it again after
+`config webhook --rotate-secret`: GitHub returns a hook's secret obfuscated, so there is no way
+to detect that a hook's secret is stale short of always re-pushing it.
+
+`agent-utils listener start --daemon` installs the listener as a launchd user agent (macOS
+only) instead of running it in your terminal — `RunAtLoad` and `KeepAlive`, so it starts at
+login and restarts if it dies. Without `--daemon` it just runs in the foreground, useful for
+watching its logs while you get the proxy working. `agent-utils listener status` reports
+whether it is installed and running; `agent-utils listener stop` removes it, or signals a
+foreground instance, or both.
+
+**A launchd agent with `RunAtLoad` and `KeepAlive` is permanent login-time execution of
+whatever binary path it names**, so `listener start --daemon` refuses to install itself when
+that binary, or any parent directory of it, is group- or world-writable — another local
+account could otherwise replace the binary launchd runs at every login. This is a real
+operator gotcha on an Intel Mac with Homebrew, where `/usr/local/bin` is commonly
+`drwxrwxr-x`, owned by group `admin`, and the refusal fires the first time you try `--daemon`.
+The fix is the same either way: move the binary to a location only you can write to (for
+example `~/bin`) and run `listener start --daemon` again.
+
+## Upgrading
+
+**`retry.backoff_ticks` was renamed to `retry.backoff`, and its values are now durations, not
+tick counts.** A tick was a fixed interval only under cron; the webhook listener can tick a
+loop at any moment, so a count of ticks no longer names a stable wait. A config that still sets
+the old key fails to load, naming the new one as the replacement. Multiply the old tick count
+by the cron interval you were running to get a starting duration:
+
+```yaml
+# before
+retry:
+  backoff_ticks: [0, 1, 2]
+
+# after, on a 15-minute cron interval
+retry:
+  backoff: [0s, 15m, 30m]
+```
+
 ## Versioning and releases
 
 The semantic version lives in the `VERSION` file at the repository root. It is the single
@@ -248,7 +378,7 @@ different version than the tag says.
 
 ```bash
 make build && ./bin/agent-utils version
-# agent-utils v0.3.0 (d6e9df9)
+# agent-utils v0.4.0 (d6e9df9)
 ```
 
 A `go install` binary has no linker stamp, so it falls back to the module version and VCS
