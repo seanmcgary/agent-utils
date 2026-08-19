@@ -46,10 +46,6 @@ type State struct {
 	// confirmed alive. The caller performs the liveness check, so Decide stays
 	// pure.
 	Running []store.Dispatch
-	// TickCount is how many ticks this loop has recorded, NOT including this
-	// one: the tick reads it before it records itself. The backoff arithmetic
-	// relies on that, because LastRetryTick is stamped from the same value.
-	TickCount int64
 	// CooldownUntil is the time before which the loop must not dispatch.
 	CooldownUntil time.Time
 }

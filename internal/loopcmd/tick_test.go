@@ -66,7 +66,14 @@ func tickConfig(t *testing.T) *config.Config {
 			Model: "opus", Worktree: config.WorktreeNone, Timeout: config.Duration(time.Hour),
 		},
 		Retry: config.Retry{
-			Max: 3, BackoffTicks: []int{0, 1, 2},
+			// 0s, 15m, 30m: the first retry is immediate and the rest escalate,
+			// so a test that advances no clock sees exactly one retry.
+			Max: 3,
+			Backoff: []config.Duration{
+				0,
+				config.Duration(15 * time.Minute),
+				config.Duration(30 * time.Minute),
+			},
 			Breaker: config.Breaker{OrphanThreshold: 2, Cooldown: config.Duration(30 * time.Minute)},
 		},
 		Prompt:       "plan #{{.Issue.Number}}",

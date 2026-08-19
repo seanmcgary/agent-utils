@@ -48,8 +48,11 @@ type IssueState struct {
 	// session that was never created fails every time.
 	SessionStarted bool
 	// Parked records that the loop gave up after the retry cap.
-	Parked    bool
-	UpdatedAt time.Time
+	Parked bool
+	// RetryAfter is the deadline before which no retry for this issue may run.
+	// The zero value means no deadline, so a pending retry runs at once.
+	RetryAfter time.Time
+	UpdatedAt  time.Time
 }
 
 // Dispatch is one agent run.
@@ -146,6 +149,17 @@ type Cooldown struct {
 type LoopKey struct {
 	ProjectID string
 	Loop      string
+}
+
+// RetryDue is the earliest pending retry deadline on this machine. It names the
+// project as well as the loop, because one file holds every project and the
+// daemon has to tick the right one.
+type RetryDue struct {
+	ProjectID string
+	Loop      string
+	Repo      string
+	Number    int
+	At        time.Time
 }
 
 // LoopState is one loop's totals, read machine-wide in a single pass.

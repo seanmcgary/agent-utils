@@ -105,18 +105,18 @@ func Supervise(
 	}
 
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-		return finish(st, d, store.DispatchResult{
+		return finish(cfg, st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("create log directory: %v", err),
-		})
+		}, time.Now())
 	}
 	// 0600: the transcript records everything the agent read and ran.
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return finish(st, d, store.DispatchResult{
+		return finish(cfg, st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("create log file: %v", err),
-		})
+		}, time.Now())
 	}
 	defer logFile.Close()
 
@@ -135,29 +135,29 @@ func Supervise(
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return finish(st, d, store.DispatchResult{
+		return finish(cfg, st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("stdout pipe: %v", err),
-		})
+		}, time.Now())
 	}
 	// Give stderr its own file. Sharing one file description between the child
 	// and the parent's tee splices plain text into the middle of a JSON line and
 	// makes the transcript unparseable.
 	errFile, err := os.OpenFile(logPath+".stderr", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return finish(st, d, store.DispatchResult{
+		return finish(cfg, st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("create stderr log: %v", err),
-		})
+		}, time.Now())
 	}
 	defer errFile.Close()
 	cmd.Stderr = errFile
 
 	if err := cmd.Start(); err != nil {
-		return finish(st, d, store.DispatchResult{
+		return finish(cfg, st, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1,
 			APIError: fmt.Sprintf("start claude: %v", err),
-		})
+		}, time.Now())
 	}
 
 	// Tee the stream to the log file and parse it at the same time, so one read
@@ -210,7 +210,7 @@ func Supervise(
 		res.Status = store.StatusFailed
 	}
 
-	return finish(st, d, res)
+	return finish(cfg, st, d, res, time.Now())
 }
 
 // finish records the outcome of a dispatch AND the durable issue state that the
@@ -219,11 +219,15 @@ func Supervise(
 // Finish records a dispatch outcome and the durable issue state that the next
 // tick's decision depends on. Every failure path must go through it, or the
 // issue keeps its trigger label and redispatches with no cap.
-func Finish(st *store.Store, d store.Dispatch, res store.DispatchResult) error {
-	return finish(st, d, res)
+//
+// cfg and now are here for the retry deadline: a failure stamps the wall-clock
+// time before which no retry may run, and both halves of that come from the
+// caller so nothing in the store reads a clock the tests cannot set.
+func Finish(cfg *config.Config, st *store.Store, d store.Dispatch, res store.DispatchResult, now time.Time) error {
+	return finish(cfg, st, d, res, now)
 }
 
-func finish(st *store.Store, d store.Dispatch, res store.DispatchResult) error {
+func finish(cfg *config.Config, st *store.Store, d store.Dispatch, res store.DispatchResult, now time.Time) error {
 	if err := st.FinishDispatch(d.ID, res); err != nil {
 		return fmt.Errorf("record dispatch %d: %w", d.ID, err)
 	}
@@ -239,7 +243,7 @@ func finish(st *store.Store, d store.Dispatch, res store.DispatchResult) error {
 			}
 		}
 		if res.Status == store.StatusFailed {
-			if err := st.MarkNeedsRetry(d.Loop, d.Repo, d.Number); err != nil {
+			if err := st.MarkNeedsRetry(d.Loop, d.Repo, d.Number, now, RetryBackoff(cfg)); err != nil {
 				return fmt.Errorf("mark needs retry: %w", err)
 			}
 		} else if err := st.MarkSucceeded(d.Loop, d.Repo, d.Number); err != nil {
@@ -251,6 +255,21 @@ func finish(st *store.Store, d store.Dispatch, res store.DispatchResult) error {
 		return fmt.Errorf("dispatch %d failed: exit %d: %s", d.ID, res.ExitCode, res.APIError)
 	}
 	return nil
+}
+
+// RetryBackoff converts a loop's configured retry waits into the standard
+// duration type.
+//
+// The store must not import config, and both the tick and the runner hand the
+// same list to MarkNeedsRetry, so the conversion lives in exactly one place. An
+// absent list is not an error: retry.max may be 0, and MarkNeedsRetry reads an
+// empty list as "no deadline".
+func RetryBackoff(cfg *config.Config) []time.Duration {
+	out := make([]time.Duration, len(cfg.Retry.Backoff))
+	for i, d := range cfg.Retry.Backoff {
+		out[i] = d.Std()
+	}
+	return out
 }
 
 // agentEnv returns the environment for the claude child.

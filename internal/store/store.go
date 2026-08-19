@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS issues (
   needs_retry     INTEGER NOT NULL DEFAULT 0,
   session_started INTEGER NOT NULL DEFAULT 0,
   parked          INTEGER NOT NULL DEFAULT 0,
+  -- retry_after is Unix seconds, and 0 means "no deadline". It is an INTEGER
+  -- where every other timestamp in this schema is a TIMESTAMP
+  -- (issues.updated_at, cooldowns.until, ticks.started_at, the dispatches time
+  -- columns). It does NOT match that precedent: addedColumns needs a literal
+  -- DEFAULT so an existing database gains the column without a backfill, and no
+  -- literal TIMESTAMP default reads back as the zero time.
+  retry_after     INTEGER NOT NULL DEFAULT 0,
   updated_at      TIMESTAMP NOT NULL,
   PRIMARY KEY (project_id, loop, repo, number)
 );
@@ -282,6 +289,7 @@ var addedColumns = []struct{ table, column, def string }{
 	{"dispatches", "legacy_source", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "legacy_id", "INTEGER NOT NULL DEFAULT 0"},
 	{"ticks", "project_id", "TEXT NOT NULL DEFAULT ''"},
+	{"issues", "retry_after", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // addColumns adds any column missing from an existing database. Each column has
@@ -307,7 +315,8 @@ func addColumns(tx *sql.Tx) error {
 // columns to carry over. SQLite cannot ALTER a key, so each is rebuilt.
 var rebuilt = []struct{ table, columns string }{
 	{"issues", `loop, repo, number, session_id, worktree_path, retry_count,
-		last_retry_tick, needs_retry, session_started, parked, updated_at`},
+		last_retry_tick, needs_retry, session_started, parked, retry_after,
+		updated_at`},
 	{"pr_links", `loop, repo, number, pr_number, head_ref, base_ref, behind_by`},
 	{"cooldowns", `loop, until`},
 }
@@ -390,7 +399,7 @@ func hasColumn(q querier, table, column string) (bool, error) {
 func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	rows, err := s.db.Query(`
 		SELECT number, session_id, worktree_path, retry_count, last_retry_tick,
-		       needs_retry, session_started, parked, updated_at
+		       needs_retry, session_started, parked, retry_after, updated_at
 		FROM issues WHERE project_id = ? AND loop = ? AND repo = ?`,
 		s.projectID, loop, repo)
 	if err != nil {
@@ -401,14 +410,34 @@ func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	out := make(map[int]IssueState)
 	for rows.Next() {
 		st := IssueState{ProjectID: s.projectID, Loop: loop, Repo: repo}
+		var retryAfter int64
 		if err := rows.Scan(&st.Number, &st.SessionID, &st.WorktreePath,
 			&st.RetryCount, &st.LastRetryTick, &st.NeedsRetry, &st.SessionStarted,
-			&st.Parked, &st.UpdatedAt); err != nil {
+			&st.Parked, &retryAfter, &st.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan issue: %w", err)
 		}
+		st.RetryAfter = retryAfterTime(retryAfter)
 		out[st.Number] = st
 	}
 	return out, rows.Err()
+}
+
+// retryAfterSeconds encodes a deadline for the retry_after column. The zero
+// time is stored as 0, which is also the column's default, so a row that never
+// carried a deadline and a row whose deadline was cleared read back the same.
+func retryAfterSeconds(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
+// retryAfterTime decodes the retry_after column back into a deadline.
+func retryAfterTime(sec int64) time.Time {
+	if sec == 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0).UTC()
 }
 
 // PutIssueState inserts or replaces one issue record.
@@ -419,8 +448,8 @@ func (s *Store) PutIssueState(st IssueState) error {
 	_, err := s.db.Exec(`
 		INSERT INTO issues (project_id, loop, repo, number, session_id, worktree_path,
 		                    retry_count, last_retry_tick, needs_retry,
-		                    session_started, parked, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                    session_started, parked, retry_after, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
 		  session_id      = excluded.session_id,
 		  worktree_path   = excluded.worktree_path,
@@ -429,27 +458,71 @@ func (s *Store) PutIssueState(st IssueState) error {
 		  needs_retry     = excluded.needs_retry,
 		  session_started = excluded.session_started,
 		  parked          = excluded.parked,
+		  retry_after     = excluded.retry_after,
 		  updated_at      = excluded.updated_at`,
 		s.projectID, st.Loop, st.Repo, st.Number, st.SessionID, st.WorktreePath,
 		st.RetryCount, st.LastRetryTick, st.NeedsRetry, st.SessionStarted,
-		st.Parked, st.UpdatedAt.UTC())
+		st.Parked, retryAfterSeconds(st.RetryAfter), st.UpdatedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("put issue state: %w", err)
 	}
 	return nil
 }
 
-// MarkNeedsRetry records that a dispatch for this issue failed. It is durable,
-// so a tick that declines to act on the failure (backoff or circuit breaker)
-// does not lose it.
-func (s *Store) MarkNeedsRetry(loop, repo string, number int) error {
-	_, err := s.db.Exec(`
-		INSERT INTO issues (project_id, loop, repo, number, needs_retry, updated_at)
-		VALUES (?, ?, ?, ?, 1, ?)
-		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
-		  needs_retry = 1, updated_at = excluded.updated_at`,
-		s.projectID, loop, repo, number, time.Now().UTC())
+// MarkNeedsRetry records that a dispatch for this issue failed, and stamps the
+// earliest time a retry may run. It is durable, so a tick that declines to act
+// on the failure (backoff or circuit breaker) does not lose it.
+//
+// It is the ONE writer of retry_after. Every needs-retry transition runs
+// through here, so a second writer -- a deadline stamped by the dispatch, say --
+// would be overwritten by the very next failure, and the escalating list would
+// collapse to its first entry forever.
+//
+// It reads retry_count inside the same transaction and indexes backoff with it,
+// clamped to the last entry. An empty list means no deadline: retry.max may be
+// 0, in which case retry.backoff is absent and no retry will ever be decided.
+func (s *Store) MarkNeedsRetry(loop, repo string, number int, now time.Time, backoff []time.Duration) error {
+	tx, err := s.db.Begin()
 	if err != nil {
+		return fmt.Errorf("mark needs retry: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// The count is read here rather than taken from the caller because it is
+	// what the index must agree with: the row on disk is the only thing every
+	// failure path shares.
+	var retryCount int
+	err = tx.QueryRow(
+		`SELECT retry_count FROM issues
+		 WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
+		s.projectID, loop, repo, number).Scan(&retryCount)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read retry count: %w", err)
+	}
+
+	var deadline int64
+	if len(backoff) > 0 {
+		i := retryCount
+		if i >= len(backoff) {
+			i = len(backoff) - 1
+		}
+		if i < 0 {
+			i = 0
+		}
+		deadline = retryAfterSeconds(now.Add(backoff[i]))
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO issues (project_id, loop, repo, number, needs_retry, retry_after, updated_at)
+		VALUES (?, ?, ?, ?, 1, ?, ?)
+		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
+		  needs_retry = 1,
+		  retry_after = excluded.retry_after,
+		  updated_at  = excluded.updated_at`,
+		s.projectID, loop, repo, number, deadline, time.Now().UTC()); err != nil {
+		return fmt.Errorf("mark needs retry: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("mark needs retry: %w", err)
 	}
 	return nil
@@ -458,9 +531,13 @@ func (s *Store) MarkNeedsRetry(loop, repo string, number int) error {
 // ClearNeedsRetry clears a failure flag that no retry can act on. Without it an
 // issue whose failure was recorded while it was not in flight is stranded
 // permanently.
+//
+// The deadline goes with the flag. A deadline that is never cleared is a
+// permanent past deadline, and the daemon's wake query would then re-tick this
+// loop forever, each pass reading the GitHub API with a repository-write token.
 func (s *Store) ClearNeedsRetry(loop, repo string, number int) error {
 	_, err := s.db.Exec(`
-		UPDATE issues SET needs_retry = 0, updated_at = ?
+		UPDATE issues SET needs_retry = 0, retry_after = 0, updated_at = ?
 		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
 		time.Now().UTC(), s.projectID, loop, repo, number)
 	if err != nil {
@@ -494,7 +571,7 @@ func (s *Store) MarkSucceeded(loop, repo string, number int) error {
 	_, err := s.db.Exec(`
 		UPDATE issues
 		SET needs_retry = 0, parked = 0, retry_count = 0, session_started = 1,
-		    updated_at = ?
+		    retry_after = 0, updated_at = ?
 		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
 		time.Now().UTC(), s.projectID, loop, repo, number)
 	if err != nil {
@@ -942,6 +1019,44 @@ func (d *DB) LoopStates() ([]LoopState, error) {
 
 // eachRow runs a query and calls scan for every row. It exists so the three
 // aggregates above do not each repeat the same close-and-check dance.
+// EarliestRetryAfter returns the soonest pending retry deadline, if there is one.
+//
+// It is scoped to rows that a retry can still act on. A parked issue, or one
+// whose failure flag was cleared, keeps its old deadline in the row, and
+// returning that value would give the daemon a deadline permanently in the past
+// to spin on. A loop whose circuit breaker is in cooldown is excluded for the
+// same reason: Decide returns with no decisions at all while the cooldown runs,
+// so needs_retry stays set and the deadline stays in the past for its whole
+// length.
+//
+// The deadline is selected as a column and ordered by, not read with MIN().
+// An aggregate has no declared type, so the driver hands back a value of a
+// different type than every other read of that column.
+func (d *DB) EarliestRetryAfter() (RetryDue, bool, error) {
+	var (
+		due        RetryDue
+		retryAfter int64
+	)
+	err := d.db.QueryRow(`
+		SELECT i.project_id, i.loop, i.repo, i.number, i.retry_after
+		FROM issues i
+		LEFT JOIN cooldowns c
+		  ON c.project_id = i.project_id AND c.loop = i.loop
+		WHERE i.retry_after > 0 AND i.needs_retry = 1 AND i.parked = 0
+		  AND (c.until IS NULL OR c.until <= ?)
+		ORDER BY i.retry_after ASC
+		LIMIT 1`, time.Now().UTC()).
+		Scan(&due.ProjectID, &due.Loop, &due.Repo, &due.Number, &retryAfter)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RetryDue{}, false, nil
+	}
+	if err != nil {
+		return RetryDue{}, false, fmt.Errorf("earliest retry after: %w", err)
+	}
+	due.At = retryAfterTime(retryAfter)
+	return due, true, nil
+}
+
 func (d *DB) eachRow(query string, scan func(*sql.Rows) error) error {
 	rows, err := d.db.Query(query)
 	if err != nil {

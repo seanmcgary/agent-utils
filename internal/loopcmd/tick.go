@@ -71,8 +71,8 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 
 	// A failed fetch makes branch comparisons stale, so it suppresses TENDING.
 	// It must not abandon the tick: reaping dead runners, retrying, and parking
-	// have nothing to do with git, and skipping RecordTick would freeze the tick
-	// counter that every backoff window is measured in.
+	// have nothing to do with git, and abandoning the pass would leave a dead
+	// runner's issue with no failure flag at all.
 	fetchOK := true
 	if deps.Fetch != nil {
 		if err := deps.Fetch(); err != nil {
@@ -108,8 +108,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 			if err != nil {
 				// One unusable pull request must not abandon the whole tick. If
 				// this returned early, anyone able to open a pull request could
-				// stop the loop, and the tick counter would freeze with it,
-				// which also freezes every backoff window.
+				// stop the loop for every issue it watches.
 				slog.Warn("compare failed; skipping this pull request",
 					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
 				continue
@@ -159,13 +158,20 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 			return sum, fmt.Errorf("retire dead dispatch %d: %w", d.ID, err)
 		}
 		if d.Kind != store.KindTend {
-			if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, d.Number); err != nil {
+			if err := deps.Store.MarkNeedsRetry(
+				cfg.Name, cfg.Repo, d.Number, now, runner.RetryBackoff(cfg)); err != nil {
 				return sum, fmt.Errorf("mark issue %d for retry: %w", d.Number, err)
 			}
-			// Reflect the write in the snapshot this tick decides from.
-			sIssue := states[d.Number]
-			sIssue.Number = d.Number
-			sIssue.NeedsRetry = true
+			// Reflect the write in the snapshot this tick decides from. The row
+			// is read back rather than patched by hand: MarkNeedsRetry stamps a
+			// retry deadline as well as the flag, and a tick deciding from a
+			// snapshot without it would dispatch the retry immediately and skip
+			// the first backoff entry entirely.
+			sIssue, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Number)
+			if err != nil {
+				return sum, fmt.Errorf("re-read issue %d after marking it for retry: %w",
+					d.Number, err)
+			}
 			states[d.Number] = sIssue
 		}
 		sum.Orphans++
@@ -174,9 +180,6 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	st.Issues = states
 
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
-		return sum, err
-	}
-	if st.TickCount, err = deps.Store.TickCount(cfg.Name); err != nil {
 		return sum, err
 	}
 
@@ -192,7 +195,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	}
 
 	for _, d := range plan.Decisions {
-		if err := act(ctx, cfg, deps, d, st, now, &sum); err != nil {
+		if err := act(ctx, cfg, deps, d, now, &sum); err != nil {
 			// One failed decision must not abandon the rest of the tick.
 			slog.Error("decision failed", "loop", cfg.Name, "kind", d.Kind,
 				"issue", d.Issue, "err", err)
@@ -212,7 +215,6 @@ func act(
 	cfg *config.Config,
 	deps Deps,
 	d engine.Decision,
-	st engine.State,
 	now time.Time,
 	sum *Summary,
 ) error {
@@ -226,18 +228,18 @@ func act(
 	case engine.KindParkRetryExhausted:
 		return count(&sum.Parked, parkRetryExhausted(ctx, cfg, deps, d))
 	case engine.KindTend:
-		return count(&sum.Tended, dispatch(ctx, cfg, deps, d, st, now, store.KindTend))
+		return count(&sum.Tended, dispatch(ctx, cfg, deps, d, now, store.KindTend))
 	case engine.KindResume:
-		return count(&sum.Resumed, dispatch(ctx, cfg, deps, d, st, now, store.KindResume))
+		return count(&sum.Resumed, dispatch(ctx, cfg, deps, d, now, store.KindResume))
 	case engine.KindRetryResume:
-		return count(&sum.Retried, dispatch(ctx, cfg, deps, d, st, now, store.KindResume))
+		return count(&sum.Retried, dispatch(ctx, cfg, deps, d, now, store.KindResume))
 	case engine.KindRetryStart:
 		// The previous attempt never created a usable session, so resuming would
 		// fail every time. Start instead, with a NEW identifier: the decision
 		// carries no session id precisely so dispatch mints a fresh one.
-		return count(&sum.Retried, dispatch(ctx, cfg, deps, d, st, now, store.KindStart))
+		return count(&sum.Retried, dispatch(ctx, cfg, deps, d, now, store.KindStart))
 	case engine.KindStart:
-		return count(&sum.Started, dispatch(ctx, cfg, deps, d, st, now, store.KindStart))
+		return count(&sum.Started, dispatch(ctx, cfg, deps, d, now, store.KindStart))
 	default:
 		return fmt.Errorf("unknown decision kind %q", d.Kind)
 	}
@@ -248,7 +250,6 @@ func dispatch(
 	cfg *config.Config,
 	deps Deps,
 	d engine.Decision,
-	st engine.State,
 	now time.Time,
 	kind string,
 ) error {
@@ -280,11 +281,22 @@ func dispatch(
 		state.Parked = false
 		switch d.Kind {
 		case engine.KindRetryStart, engine.KindRetryResume:
+			// RetryCount is load-bearing: MarkNeedsRetry indexes the backoff
+			// list with it on the NEXT failure. RetryAfter is deliberately left
+			// alone here. MarkNeedsRetry is its only writer, and a deadline
+			// stamped before the agent runs would be overwritten by the failure
+			// that follows, collapsing the escalating list to one entry.
+			//
+			// LastRetryTick is no longer stamped. The wait is wall-clock now, so
+			// a tick number names nothing a decision can use. The column stays
+			// in the table because dropping one costs a rebuild and buys
+			// nothing.
 			state.RetryCount++
-			state.LastRetryTick = st.TickCount
 		default:
-			// A human trigger begins a new episode, so the budget starts over.
+			// A human trigger begins a new episode, so the budget starts over
+			// and any deadline left from the previous one goes with it.
 			state.RetryCount = 0
+			state.RetryAfter = time.Time{}
 		}
 		if err := deps.Store.PutIssueState(state); err != nil {
 			return err
@@ -377,6 +389,9 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 	// storm on the next tick.
 	state.Parked = true
 	state.NeedsRetry = false
+	// The deadline goes with the flag. A parked issue that kept one would leave
+	// a permanent past deadline in the row for the daemon's wake query to find.
+	state.RetryAfter = time.Time{}
 	state.UpdatedAt = deps.Now()
 	if err := deps.Store.PutIssueState(state); err != nil {
 		return err
@@ -469,9 +484,9 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		// Calling FinishDispatch alone would skip MarkNeedsRetry, and the issue
 		// would keep its trigger label and redispatch every tick with no cap:
 		// one detached process per tick, forever, on a single template typo.
-		_ = runner.Finish(deps.Store, d, store.DispatchResult{
+		_ = runner.Finish(cfg, deps.Store, d, store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
-		})
+		}, deps.Now())
 		return err
 	}
 

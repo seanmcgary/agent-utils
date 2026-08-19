@@ -79,7 +79,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				})
 				continue
 			}
-			d, eligible := retryDecision(cfg, iss.Number, state, st)
+			d, eligible := retryDecision(cfg, iss.Number, state, now)
 			if eligible {
 				eligibleRetries++
 			}
@@ -145,7 +145,12 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 // retryDecision returns the action for one failed issue. The second result
 // reports whether the failure cleared its backoff window, which is what the
 // circuit breaker counts.
-func retryDecision(cfg *config.Config, number int, state store.IssueState, st State) (*Decision, bool) {
+//
+// The window is a wall-clock deadline stored on the issue, not a count of
+// ticks. A tick used to be a fixed cron interval, but the webhook daemon can
+// tick a loop at any moment, so a tick count no longer names a stable wait.
+// MarkNeedsRetry stamps the deadline where the failure is recorded.
+func retryDecision(cfg *config.Config, number int, state store.IssueState, now time.Time) (*Decision, bool) {
 	if state.RetryCount >= cfg.Retry.Max {
 		return &Decision{
 			Kind:   KindParkRetryExhausted,
@@ -154,11 +159,7 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, st St
 		}, false
 	}
 
-	wait := 0
-	if state.RetryCount < len(cfg.Retry.BackoffTicks) {
-		wait = cfg.Retry.BackoffTicks[state.RetryCount]
-	}
-	if wait > 0 && st.TickCount-state.LastRetryTick < int64(wait) {
+	if !state.RetryAfter.IsZero() && now.Before(state.RetryAfter) {
 		// Still inside the backoff window. Take no action and post no comment.
 		// NeedsRetry stays set in the store, so the next tick sees it again.
 		return nil, false

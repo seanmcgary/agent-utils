@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -116,6 +117,53 @@ func TestSuperviseRecordsFailureWhenStreamHasNoResult(t *testing.T) {
 	got, _ := s.GetDispatch(id)
 	if got.Status != store.StatusFailed {
 		t.Errorf("Status = %q, want failed when no result line is present", got.Status)
+	}
+}
+
+// The detached runner is the second MarkNeedsRetry call site, and the one with
+// neither a configuration nor a clock in scope before this change. A failure
+// recorded here must carry the configured wait, indexed by the retry count the
+// row already holds, or every agent that dies under the runner retries with no
+// backoff at all.
+func TestFinishStampsTheRetryDeadlineFromTheConfiguration(t *testing.T) {
+	s := newStore(t)
+	id, _ := s.CreateDispatch(store.Dispatch{
+		Loop: "planning", Repo: "o/r", Number: 9, Kind: store.KindStart, SessionID: "z",
+	})
+	d, _ := s.GetDispatch(id)
+	if err := s.PutIssueState(store.IssueState{
+		Loop: "planning", Repo: "o/r", Number: 9, RetryCount: 1,
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Retry: config.Retry{
+		Max: 3,
+		Backoff: []config.Duration{
+			0,
+			config.Duration(15 * time.Minute),
+			config.Duration(30 * time.Minute),
+		},
+	}}
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	// Finish returns the failure it recorded; the record is what is under test.
+	_ = Finish(cfg, s, d, store.DispatchResult{
+		Status: store.StatusFailed, ExitCode: 1, APIError: "boom",
+	}, now)
+
+	st, err := s.IssueState("planning", "o/r", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.NeedsRetry {
+		t.Error("NeedsRetry = false, want true")
+	}
+	want := now.Add(15 * time.Minute)
+	if !st.RetryAfter.Equal(want) {
+		t.Errorf("RetryAfter = %v, want %v (Backoff[1], indexed by retry_count 1)",
+			st.RetryAfter, want)
 	}
 }
 
