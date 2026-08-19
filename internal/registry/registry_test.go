@@ -21,7 +21,7 @@ func TestRegisterIsIdempotentAndRecordsTheRoot(t *testing.T) {
 	dir := mkProject(t, t.TempDir())
 
 	for i := 0; i < 3; i++ {
-		if err := Register(dir); err != nil {
+		if err := Register(dir, "id-"+filepath.Base(filepath.Dir(dir)), filepath.Base(filepath.Dir(dir))); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
 	}
@@ -60,14 +60,14 @@ func TestListOrdersMostRecentFirst(t *testing.T) {
 	a := mkProject(t, t.TempDir())
 	b := mkProject(t, t.TempDir())
 
-	if err := Register(a); err != nil {
+	if err := Register(a, "id-"+filepath.Base(filepath.Dir(a)), filepath.Base(filepath.Dir(a))); err != nil {
 		t.Fatal(err)
 	}
-	if err := Register(b); err != nil {
+	if err := Register(b, "id-"+filepath.Base(filepath.Dir(b)), filepath.Base(filepath.Dir(b))); err != nil {
 		t.Fatal(err)
 	}
 	// Touch a again so it becomes the most recent.
-	if err := Register(a); err != nil {
+	if err := Register(a, "id-"+filepath.Base(filepath.Dir(a)), filepath.Base(filepath.Dir(a))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,10 +84,10 @@ func TestForgetRemovesOnlyTheNamedProject(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	a := mkProject(t, t.TempDir())
 	b := mkProject(t, t.TempDir())
-	if err := Register(a); err != nil {
+	if err := Register(a, "id-"+filepath.Base(filepath.Dir(a)), filepath.Base(filepath.Dir(a))); err != nil {
 		t.Fatal(err)
 	}
-	if err := Register(b); err != nil {
+	if err := Register(b, "id-"+filepath.Base(filepath.Dir(b)), filepath.Base(filepath.Dir(b))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,7 +111,7 @@ func TestExistsReportsAMovedProject(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 	dir := mkProject(t, root)
-	if err := Register(dir); err != nil {
+	if err := Register(dir, "id-"+filepath.Base(filepath.Dir(dir)), filepath.Base(filepath.Dir(dir))); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(dir); err != nil {
@@ -146,7 +146,7 @@ func TestConcurrentRegistrationsAllSurvive(t *testing.T) {
 		wg.Add(1)
 		go func(dir string) {
 			defer wg.Done()
-			if err := Register(dir); err != nil {
+			if err := Register(dir, "id-"+filepath.Base(filepath.Dir(dir)), filepath.Base(filepath.Dir(dir))); err != nil {
 				t.Errorf("Register(%s): %v", dir, err)
 			}
 		}(d)

@@ -18,6 +18,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
 	"github.com/seanmcgary/agent-utils/internal/proc"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -35,12 +36,13 @@ func main() {
 		Usage:   "utilities for agent workflows",
 		Version: version.GetVersion(),
 		Commands: []*cli.Command{
-			loopCommand(),
-			projectStatusCommand(),
+			// Top level spans the machine.
 			listCommand(),
 			logsCommand(),
 			forgetCommand(),
 			versionCommand(),
+			// Everything project-scoped lives under `project`.
+			projectCommand(),
 			internalCommand(),
 		},
 	}
@@ -59,6 +61,49 @@ func versionCommand() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// projectSelectorFlag names the project a command acts on, so it works from any
+// directory. Omitted, the project in the current directory is used.
+func projectSelectorFlag() *cli.StringFlag {
+	return &cli.StringFlag{
+		Name:    "name",
+		Aliases: []string{"project"},
+		Usage:   "project to act on; omit to use the project in the current directory",
+	}
+}
+
+// selectedProject reads the project selector off the `project` command itself.
+//
+// It cannot use c.String("name"): the loop subcommands define their OWN --name
+// for the loop, and urfave/cli lets a child shadow a parent's flag of the same
+// name. Reading the flag from the command that declares it is what keeps
+// `project --name web loop tick --name planning` unambiguous.
+func selectedProject(c *cli.Command) string {
+	for _, cmd := range c.Lineage() {
+		if cmd.Name == "project" {
+			return cmd.String("name")
+		}
+	}
+	return ""
+}
+
+// openProject resolves the project and reports it when this call onboarded it.
+func openProject(c *cli.Command) (*loopcmd.Project, error) {
+	p, err := loopcmd.ResolveProject(selectedProject(c))
+	if err != nil {
+		return nil, err
+	}
+	if p.Created {
+		fmt.Fprintf(os.Stderr, "Registered project %q (%s)\n", p.Config.Name, p.Dir)
+		if p.RenamedFrom != "" {
+			fmt.Fprintf(os.Stderr,
+				"The name %q was already taken by another project, so this one is %q.\n"+
+					"Change it by editing %s\n",
+				p.RenamedFrom, p.Config.Name, project.Path(p.Dir))
+		}
+	}
+	return p, nil
 }
 
 func configFlag() *cli.StringFlag {
@@ -89,7 +134,14 @@ func nameFlag() *cli.StringFlag {
 //  4. An interactive choice, but ONLY when stdin is a terminal. A prompt in a
 //     cron job would hang forever, so a non-interactive run gets an error
 //     listing the names instead.
-func resolveConfigPath(c *cli.Command) (string, error) {
+//
+// resolveLoopConfig decides which loop configuration a command should use,
+// within an already-resolved project.
+//
+// Precedence: an explicit --config path, then --name, then the only loop
+// present, then an interactive choice. The prompt appears only on a terminal;
+// a cron run gets an error listing the names instead.
+func resolveLoopConfig(c *cli.Command, dir string) (string, error) {
 	path, name := c.String("config"), c.String("name")
 
 	// Both set is ambiguous. Silently preferring one would hide a mistake in a
@@ -99,18 +151,6 @@ func resolveConfigPath(c *cli.Command) (string, error) {
 	}
 	if path != "" {
 		return path, nil
-	}
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	dir, err := config.FindDir(cwd)
-	if err != nil {
-		return "", fmt.Errorf(
-			"%w\n\nLoop configurations are project-local. To set this directory up:\n"+
-				"  mkdir -p %s/%s\n\nOr point at a file directly with --config <path>",
-			err, config.DirName, config.ConfigsSubdir)
 	}
 
 	if name != "" {
@@ -191,17 +231,39 @@ func promptForConfig(entries []config.Entry) (string, error) {
 
 // projectStatusCommand reports every project this tool has been used against.
 // It reads only local state, so it needs no token and works offline.
-func projectStatusCommand() *cli.Command {
+// listCommand reports every project registered on this machine. It reads only
+// local state, so it needs no token and works offline.
+// projectListCommand prints one project's loop configurations.
+func projectListCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "status",
-		Usage: "list every onboarded project and the state of its loops",
-		Action: func(_ context.Context, _ *cli.Command) error {
-			projects, err := loopcmd.Projects()
+		Name:  "list",
+		Usage: "list this project's loop configurations",
+		Action: func(_ context.Context, c *cli.Command) error {
+			p, err := openProject(c)
 			if err != nil {
 				return err
 			}
-			fmt.Print(loopcmd.RenderProjects(projects))
+			entries, err := config.List(p.Dir)
+			if err != nil {
+				return err
+			}
+			fmt.Print(loopcmd.RenderConfigs(p, entries))
 			return nil
+		},
+	}
+}
+
+// projectCommand groups everything scoped to one project. Naming it explicitly
+// is what makes the top level unambiguously machine-wide.
+func projectCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "project",
+		Usage: "act on one project: its loops, configurations and logs",
+		Flags: []cli.Flag{projectSelectorFlag()},
+		Commands: []*cli.Command{
+			projectListCommand(),
+			logsCommand(),
+			loopCommand(),
 		},
 	}
 }
@@ -212,27 +274,21 @@ func forgetCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "forget",
 		Usage:     "remove a project from the registry without touching its files",
-		Arguments: []cli.Argument{&cli.StringArg{Name: "path"}},
+		Arguments: []cli.Argument{&cli.StringArg{Name: "project"}},
 		Action: func(_ context.Context, c *cli.Command) error {
-			root := c.StringArg("path")
-			if root == "" {
-				return errors.New("usage: agent-utils forget <project path>")
+			selector := c.StringArg("project")
+			if selector == "" {
+				return errors.New("usage: agent-utils forget <project name, id or path>")
 			}
-			dir := root
-			if filepath.Base(dir) != config.DirName {
-				dir = filepath.Join(root, config.DirName)
-			}
-			if err := registry.Forget(dir); err != nil {
+			if err := registry.ForgetSelector(selector); err != nil {
 				return err
 			}
-			fmt.Printf("forgot %s\n", dir)
+			fmt.Printf("forgot %s\n", selector)
 			return nil
 		},
 	}
 }
 
-// logsCommand shows what a dispatched agent is doing. The tick only starts the
-// agent and exits, so this is how a run is observed while it happens.
 func logsCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "logs",
@@ -240,6 +296,8 @@ func logsCommand() *cli.Command {
 		Flags: []cli.Flag{
 			configFlag(),
 			nameFlag(),
+			&cli.StringFlag{Name: "session",
+				Usage: "show the dispatches that used this claude session id"},
 			&cli.IntFlag{Name: "issue", Usage: "show the newest dispatch for this issue"},
 			&cli.IntFlag{Name: "dispatch", Usage: "show this dispatch id exactly"},
 			&cli.BoolFlag{Name: "follow", Aliases: []string{"f"},
@@ -254,7 +312,11 @@ func logsCommand() *cli.Command {
 			&cli.IntFlag{Name: "limit", Value: 20, Usage: "how many dispatches --list shows"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			path, err := resolveConfigPath(c)
+			p, err := openProject(c)
+			if err != nil {
+				return err
+			}
+			path, err := resolveLoopConfig(c, p.Dir)
 			if err != nil {
 				return err
 			}
@@ -284,6 +346,7 @@ func logsCommand() *cli.Command {
 			}
 
 			opts := loopcmd.LogOptions{
+				Session:  c.String("session"),
 				Issue:    c.Int("issue"),
 				Dispatch: int64(c.Int("dispatch")),
 				Stream:   stream,
@@ -309,58 +372,18 @@ func logsCommand() *cli.Command {
 	}
 }
 
-// listCommand prints the configurations in the local .agent-utils directory.
+// listCommand reports every project registered on this machine. It reads only
+// local state, so it needs no token and works offline.
 func listCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "list",
-		Usage: "list the loop configurations in the local " + config.DirName + " directory",
+		Usage: "list every project on this machine and the state of its loops",
 		Action: func(_ context.Context, _ *cli.Command) error {
-			cwd, err := os.Getwd()
+			projects, err := loopcmd.Projects()
 			if err != nil {
 				return err
 			}
-			dir, err := config.FindDir(cwd)
-			if err != nil {
-				return fmt.Errorf(
-					"%w\n\nLoop configurations are project-local. To set this directory up:\n"+
-						"  mkdir -p %s/%s",
-					err, config.DirName, config.ConfigsSubdir)
-			}
-
-			entries, err := config.List(dir)
-			if err != nil {
-				return err
-			}
-
-			fmt.Printf("%s\n\n", config.ConfigsDir(dir))
-			// NAME is the `name` field inside each file; FILE is where it came
-			// from. They are shown separately because they need not agree.
-			fmt.Printf("%-20s %-24s %-40s %s\n", "NAME", "FILE", "REPO", "STATUS")
-			for _, e := range entries {
-				status := "ok"
-				repo := e.Repo
-				if e.Err != nil {
-					status = "INVALID"
-					repo = "-"
-				}
-				fmt.Printf("%-20s %-24s %-40s %s\n", e.Name, e.File, repo, status)
-			}
-
-			// A duplicated name is not cosmetic: the name keys the state
-			// directory, the lock and every database row, so two loops sharing
-			// one would write the same database while looking separate.
-			if dupes := config.Duplicates(entries); len(dupes) > 0 {
-				fmt.Printf("\nWARNING: %d name(s) declared by more than one file: %s\n",
-					len(dupes), strings.Join(dupes, ", "))
-				fmt.Printf("Each loop needs a unique name; they share a state directory and lock otherwise.\n")
-			}
-			// Print the reason for each broken file after the table, so the
-			// table stays readable and the error is still visible.
-			for _, e := range entries {
-				if e.Err != nil {
-					fmt.Printf("\n%s: %v\n", e.Name, e.Err)
-				}
-			}
+			fmt.Print(loopcmd.RenderProjects(projects))
 			return nil
 		},
 	}
@@ -376,7 +399,11 @@ func loopCommand() *cli.Command {
 				Usage: "run one reconcile and dispatch pass, then exit",
 				Flags: []cli.Flag{configFlag(), nameFlag()},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					path, err := resolveConfigPath(c)
+					p, err := openProject(c)
+					if err != nil {
+						return err
+					}
+					path, err := resolveLoopConfig(c, p.Dir)
 					if err != nil {
 						return err
 					}
@@ -405,7 +432,11 @@ func loopCommand() *cli.Command {
 				Usage: "print the reconciled view without changing anything",
 				Flags: []cli.Flag{configFlag(), nameFlag()},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					path, err := resolveConfigPath(c)
+					p, err := openProject(c)
+					if err != nil {
+						return err
+					}
+					path, err := resolveLoopConfig(c, p.Dir)
 					if err != nil {
 						return err
 					}
@@ -432,7 +463,11 @@ func loopCommand() *cli.Command {
 					&cli.IntFlag{Name: "issue", Usage: "issue number", Required: true},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					path, err := resolveConfigPath(c)
+					p, err := openProject(c)
+					if err != nil {
+						return err
+					}
+					path, err := resolveLoopConfig(c, p.Dir)
 					if err != nil {
 						return err
 					}
@@ -503,14 +538,6 @@ func setup(configPath string, needsGitHub bool) (*config.Config, loopcmd.Deps, f
 	}
 	cfg.StateDir = stateDir
 
-	// Record the project so `agent-utils status` can find it later. This is an
-	// index, not state anything depends on, so a failure is logged and the
-	// command carries on.
-	if dir := config.DirFromPath(configPath); dir != "" {
-		if err := registry.Register(dir); err != nil {
-			slog.Warn("could not record project in the registry", "dir", dir, "err", err)
-		}
-	}
 	// 0700: the state directory holds the sqlite database, which carries
 	// session identifiers and transcript logs.
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {

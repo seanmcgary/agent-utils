@@ -199,41 +199,50 @@ Prebuilt static binaries for linux and darwin on amd64 and arm64 are attached to
 
 ## Configuration
 
-Configuration files live in `.agent-utils/configs/`, one YAML file per loop. A loop's name is
-the `name:` field inside the file, not the file name, and it must be unique within a
-directory.
+Commands split by scope. **Top level spans the machine; `project` acts on one project.**
+
+```
+agent-utils list                       every project: NAME | PATH | LOOPS | LAST TICK
+agent-utils logs --project X --session Y
+agent-utils forget <name|id|path>
+
+agent-utils project list               this project's loop configs
+agent-utils project logs -f
+agent-utils project loop tick   --name planning
+agent-utils project loop status --name planning
+agent-utils project loop reset  --name planning --issue 42
+```
+
+Every `project` command takes `--name <project>` to act from any directory, or uses the
+project in the current directory when you omit it:
+
+```bash
+cd ~/Code/lawndominator && agent-utils project loop tick --name planning
+agent-utils project --name lawndominator loop tick --name planning   # from anywhere
+```
+
+The outer `--name` is the project, the inner one is the loop. `--project` is an alias for the
+outer one if you prefer it spelled out.
+
+### Onboarding a project
+
+There is no init step. Create the directory, drop in a loop config, and run a project command:
 
 ```bash
 mkdir -p .agent-utils/configs
 cp examples/planning.yaml .agent-utils/configs/
-
-agent-utils list                        # configs in THIS project
-agent-utils loop tick --name planning   # select by name
-agent-utils loop status                 # the only one, or a prompt, or an error listing names
-agent-utils status                      # every project onboarded, across the machine
+agent-utils project list
 ```
 
-Each project keeps its own state under its own `.agent-utils/state/`, so two projects never
-share a database. `agent-utils status` reads only local state, so it needs no token and works
-offline:
+The first project command writes `.agent-utils/config.yaml` with a name (taken from the
+directory) and a UUID that never changes, then registers the project. If the directory name is
+already taken by another project, a suffix is added and you are told:
 
 ```
-$ agent-utils status
-/Users/you/Code/lawndominator
-  LOOP           REPO                             TICKS  LIVE   COST     LAST TICK
-  execution      mcgarylabs/lawndominator-monorepo  128   1      $84.20   2026-08-18 14:55
-  planning       mcgarylabs/lawndominator-monorepo   96   0+1!   $31.05   2026-08-18 14:50
+Registered project "lawndominator-2" (/tmp/wsB/lawndominator/.agent-utils)
+The name "lawndominator" was already taken by another project, so this one is "lawndominator-2".
+Change it by editing /tmp/wsB/lawndominator/.agent-utils/config.yaml
 ```
-
-`LIVE` shows running agents; a `+n!` suffix marks dispatches whose process is gone. A project
-is recorded the first time any command runs against it; `agent-utils forget <path>` removes it
-from the list without touching its files.
-
-The directory is found in `$AGENT_UTILS_DIR`, then by walking up from the working directory the
-way git finds `.git`. There is no fallback to `$HOME`: configurations are project-local, so
-running in an unrelated directory says there is no project there rather than adopting another
-project's loops. A cron entry should pass `--config` with an absolute path instead: it depends
-on no working directory and never prompts.
 
 `docs/configuration.md` documents every field: what it means, what reads it, and what happens
 if you get it wrong. `examples/planning.yaml` and `examples/execution.yaml` are complete

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -22,6 +23,11 @@ const FileName = "registry.json"
 
 // Project is one recorded project.
 type Project struct {
+	// ID is the project's stable identifier, minted once in its descriptor. It
+	// is the key: a project keeps its identity when renamed or moved.
+	ID string `json:"id"`
+	// Name identifies the project to a human and is unique across the machine.
+	Name string `json:"name"`
 	// Root is the directory that contains the .agent-utils directory.
 	Root string `json:"root"`
 	// AgentUtilsDir is the .agent-utils directory itself.
@@ -57,12 +63,15 @@ func Path() (string, error) {
 	return filepath.Join(home, ".agent-utils", FileName), nil
 }
 
-// Register records that a command ran against this .agent-utils directory.
+// Register records that a command ran against this project.
 //
 // It is best effort by contract: the caller should log a failure and carry on.
 // Failing a tick because an index could not be updated would trade a real
 // operation for a cosmetic one.
-func Register(agentUtilsDir string) error {
+//
+// Matching is by ID, not by path, so a project that moves is updated in place
+// rather than recorded twice.
+func Register(agentUtilsDir, id, name string) error {
 	abs, err := filepath.Abs(agentUtilsDir)
 	if err != nil {
 		return err
@@ -90,12 +99,17 @@ func Register(agentUtilsDir string) error {
 
 	now := time.Now().UTC()
 	for i := range f.Projects {
-		if f.Projects[i].AgentUtilsDir == abs {
+		if f.Projects[i].ID == id || (id == "" && f.Projects[i].AgentUtilsDir == abs) {
+			f.Projects[i].Name = name
+			f.Projects[i].Root = filepath.Dir(abs)
+			f.Projects[i].AgentUtilsDir = abs
 			f.Projects[i].LastSeen = now
 			return write(path, f)
 		}
 	}
 	f.Projects = append(f.Projects, Project{
+		ID:            id,
+		Name:          name,
 		Root:          filepath.Dir(abs),
 		AgentUtilsDir: abs,
 		FirstSeen:     now,
@@ -118,6 +132,69 @@ func List() ([]Project, error) {
 		return f.Projects[i].LastSeen.After(f.Projects[j].LastSeen)
 	})
 	return f.Projects, nil
+}
+
+// NameTaken reports whether another project already uses a name. It is what
+// keeps project names unique across the machine.
+func NameTaken(name string) bool {
+	projects, err := List()
+	if err != nil {
+		return false
+	}
+	for _, p := range projects {
+		if strings.EqualFold(p.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// Find returns the project matching a name, an id, or a path.
+//
+// A name is matched first and case-insensitively, because that is what an
+// operator types. An unambiguous path is accepted too, so a cron entry can name
+// a directory without knowing the project name.
+func Find(selector string) (Project, error) {
+	projects, err := List()
+	if err != nil {
+		return Project{}, err
+	}
+	if len(projects) == 0 {
+		return Project{}, fmt.Errorf("%w: no projects are registered yet", ErrNoProject)
+	}
+
+	var names []string
+	for _, p := range projects {
+		names = append(names, p.Name)
+		if strings.EqualFold(p.Name, selector) || p.ID == selector {
+			return p, nil
+		}
+	}
+
+	// Fall back to a path, exact or as a suffix of the root.
+	if abs, err := filepath.Abs(selector); err == nil {
+		for _, p := range projects {
+			if p.Root == abs || p.AgentUtilsDir == abs {
+				return p, nil
+			}
+		}
+	}
+
+	return Project{}, fmt.Errorf("%w %q; known projects: %s",
+		ErrNoProject, selector, strings.Join(names, ", "))
+}
+
+// ErrNoProject reports that no registered project matched.
+var ErrNoProject = errors.New("no such project")
+
+// Forget removes a project from the registry by name, id, or path. It does not
+// touch the project's own files.
+func ForgetSelector(selector string) error {
+	p, err := Find(selector)
+	if err != nil {
+		return err
+	}
+	return Forget(p.AgentUtilsDir)
 }
 
 // Forget removes a project from the registry. It does not touch the project's

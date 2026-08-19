@@ -479,6 +479,29 @@ func (s *Store) RecentDispatches(loop, repo string, issue, limit int) ([]Dispatc
 	return out, rows.Err()
 }
 
+// DispatchesBySession returns every dispatch that used a claude session,
+// newest first. A session survives resumes, so this is how one issue's whole
+// conversation is found across several runs.
+func (s *Store) DispatchesBySession(sessionID string) ([]Dispatch, error) {
+	rows, err := s.db.Query(
+		`SELECT `+dispatchColumns+` FROM dispatches
+		 WHERE session_id = ? ORDER BY id DESC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("query dispatches by session: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Dispatch
+	for rows.Next() {
+		d, err := scanDispatch(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan dispatch: %w", err)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // GetDispatch returns one dispatch by identifier.
 func (s *Store) GetDispatch(id int64) (Dispatch, error) {
 	row := s.db.QueryRow(`SELECT `+dispatchColumns+` FROM dispatches WHERE id = ?`, id)
