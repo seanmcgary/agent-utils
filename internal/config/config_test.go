@@ -137,7 +137,10 @@ func TestRejectsUnknownPermissionMode(t *testing.T) {
 }
 
 func TestLoadRejectsShortBackoff(t *testing.T) {
-	body := replaceOnce(validYAML, "backoff: [0s, 15m, 30m]", "backoff: [0s]")
+	// max: 3 with two backoff entries: the acceptance criterion is literal
+	// about "two entries", so use two rather than relying on one to exercise
+	// the same len(backoff) < retry.max branch.
+	body := replaceOnce(validYAML, "backoff: [0s, 15m, 30m]", "backoff: [0s, 15m]")
 	_, err := Load(writeTemp(t, body))
 	if err == nil {
 		t.Fatal("want error when len(backoff) < retry.max, got nil")
@@ -146,15 +149,23 @@ func TestLoadRejectsShortBackoff(t *testing.T) {
 
 // retry.backoff_ticks is a rejection shim: a stale config that still uses it
 // must fail with a message that names the old key, the new key, and a value
-// to copy, not a bare "unknown field" error.
+// to copy, not a bare "unknown field" error. This asserts on text only the
+// shim's own error branch can produce (not the separate "len(backoff) <
+// retry.max" length error, which would also contain "retry.backoff" and so
+// would let this test pass even if the shim were deleted).
 func TestLoadRejectsBackoffTicks(t *testing.T) {
 	body := replaceOnce(validYAML, "backoff: [0s, 15m, 30m]", "backoff_ticks: [0, 1, 2]")
 	_, err := Load(writeTemp(t, body))
 	if err == nil {
 		t.Fatal("want error for retry.backoff_ticks, got nil")
 	}
-	if !strings.Contains(err.Error(), "retry.backoff") {
-		t.Errorf("error %q does not mention retry.backoff", err.Error())
+	for _, want := range []string{
+		"retry.backoff_ticks is no longer supported",
+		"backoff: [0s, 15m, 30m]",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err.Error(), want)
+		}
 	}
 }
 
