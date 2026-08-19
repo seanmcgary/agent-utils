@@ -69,7 +69,22 @@ func readTokenFile(path string) ([]byte, error) {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("%s is a symlink, refusing to follow it", path)
 		}
-		return nil, fmt.Errorf("open %s: %w", path, err)
+		// An absent file is the ordinary first-run case, not a fault, and the
+		// fix is one command. Saying so here is what keeps an operator from
+		// reading a bare ENOENT as a bug in the daemon.
+		//
+		// os.OpenFile's error is an *os.PathError, which already renders as
+		// "open <path>: ...", so wrapping it with another "open %s" prefix
+		// prints the path twice.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf(
+				"%s does not exist. The daemon reads %s from it on every tick, so a "+
+					"rotated token needs no restart. Create it with:\n\n"+
+					"  install -m 600 /dev/null %s\n"+
+					"  echo 'export %s=ghp_...' >> %s",
+				path, tokenKey, path, tokenKey, path)
+		}
+		return nil, err
 	}
 	defer f.Close()
 

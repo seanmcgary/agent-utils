@@ -46,7 +46,16 @@ func main() {
 		},
 	}
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		slog.Error("fatal", "err", err)
+		// Plain text to stderr, NOT slog. The default handler here is a JSON
+		// one, and several of this program's errors are deliberately
+		// multi-line: the retry.backoff_ticks migration message, the "run
+		// `agent-utils project init`" guidance, the launchd writable-path
+		// refusal, and the missing env file all print a command for the
+		// operator to run. Through a JSON handler those arrive as one line
+		// with literal \n escapes, which makes the remediation unreadable
+		// exactly when it is needed. Structured logging is for the tick's own
+		// records; a fatal is for a human at a terminal.
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
