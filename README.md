@@ -20,7 +20,7 @@ go install github.com/seanmcgary/agent-utils/cmd/agent-utils@latest
 Pin a release when you want a known version:
 
 ```bash
-go install github.com/seanmcgary/agent-utils/cmd/agent-utils@v0.2.0
+go install github.com/seanmcgary/agent-utils/cmd/agent-utils@v0.4.0
 ```
 
 Prebuilt static binaries for linux and darwin on amd64 and arm64 are attached to each
@@ -64,7 +64,8 @@ Checkout base directory
   The work tree root this loop's per-issue worktrees branch from.
 [/Users/you/Code/my-repo]:
 ... asks for every remaining field: worktree and state directories, labels, the agent's
-model and permission mode, retry policy, and the three prompt bodies ...
+model and permission mode, and retry policy; the three prompt bodies come from the template
+already chosen above, not from a question ...
 Wrote loop configuration /Users/you/Code/my-repo/.agent-utils/configs/planning.yaml
 Next: agent-utils project --name my-repo loop tick --name planning
 ```
@@ -80,8 +81,9 @@ Change it by editing /tmp/wsB/lawndominator/.agent-utils/config.yaml
 ```
 
 Unless you pass `--no-loop`, `project init` then walks an interactive wizard that asks for
-every field the first loop needs — labels, repository, agent model, retry policy, the prompts
-— and writes `.agent-utils/configs/<name>.yaml`. Run from a script or a cron job (any
+every field the first loop needs — labels, repository, agent model, retry policy — and takes
+the three prompt bodies from the template, which you edit in the written file. It writes
+`.agent-utils/configs/<name>.yaml`. Run from a script or a cron job (any
 non-terminal stdin), it skips the wizard rather than hanging on a prompt that will never come;
 add the loop later with `agent-utils project loop new`, which runs the same wizard for a
 second (or first) loop on an already-initialised project.
@@ -100,7 +102,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
 | `agent-utils version` | Version and commit |
 | `agent-utils config show [--reveal] \| get <key> \| set <key> <value> \| unset <key> \| webhook ...` | Read and write the machine-wide `~/.agent-utils/config.yaml`: the webhook daemon's URL, bind address and secret |
-| `agent-utils listener start [--daemon] \| stop \| status` | Run the webhook listener in the foreground, or install/remove/inspect it as a launchd agent |
+| `agent-utils listener start [--daemon] [--listen-addr <a>] [--listen-port <p>] \| stop \| status` | Run the webhook listener in the foreground, or install/remove/inspect it as a launchd agent |
 
 ### Project
 
@@ -194,7 +196,10 @@ keyed by the project's UUID, so no project ever reads another's issue state, dis
 sessions. `state_dir` still holds each loop's tick lock and its log tree, under
 `<project>/.agent-utils/state/<loop>/` by default. Only the database moved. `~/.agent-utils`
 also holds `config.yaml` (the machine-wide settings `agent-utils config` edits — see
-[Webhooks](#webhooks)), `listener.pid`, and the webhook listener's own logs.
+[Webhooks](#webhooks)), `env` (the `GITHUB_TOKEN` file the [Cron](#cron) and
+[Webhooks](#webhooks) sections have you create), `listener.pid` and `listener.lock` (the
+liveness source `listener stop` and `listener status` trust), and the webhook listener's own
+logs.
 
 `agent-utils project loop new` writes a loop file for you, by asking; **[`docs/configuration.md`](docs/configuration.md)
 remains the reference for editing one by hand** — what each field means, what reads it, and
@@ -240,8 +245,9 @@ engine reduces the blast radius in three ways, none of which is a substitute for
 
   **This does not make the agent unprivileged.** It keeps `HOME` and `SSH_AUTH_SOCK`, because
   it has to push branches and use `gh`. Anything readable by your user is readable by the
-  agent: `~/.config/gh/hosts.yml`, `~/.ssh`, git credential helpers, and the very
-  `~/.agent-utils/env` file this README tells you to create. Treat the environment filter as
+  agent: `~/.config/gh/hosts.yml`, `~/.ssh`, git credential helpers, the `~/.agent-utils/env`
+  file this README tells you to create, and `~/.agent-utils/config.yaml`, which holds the
+  webhook HMAC secret. Treat the environment filter as
   defence in depth, not as a boundary. If you need a real boundary, run the loop as a separate
   user with its own `HOME` and a narrowly scoped token.
 - Only a pull request opened by an OWNER, MEMBER, or COLLABORATOR, whose head branch lives in
@@ -304,9 +310,15 @@ public URL, not the listener's own bind address, and it must be `https`: over pl
 the delivery body and the `X-Hub-Signature-256` header that authorizes running an agent would
 cross the internet in the clear, replayable by anyone who observed one. The only exception is
 a loopback host (`http://localhost:...` or `http://127.0.0.1:...`), allowed so a local
-end-to-end test needs no certificate. The listener itself binds `127.0.0.1` by default —
+end-to-end test needs no certificate. The listener itself binds `127.0.0.1:8787` by default —
 `0.0.0.0` would accept deliveries from anything on the local network before you asked for
-that — so the reverse proxy is also what makes it reachable from GitHub at all.
+that — so the reverse proxy is also what makes it reachable from GitHub at all. Point the proxy
+at `POST /webhook`; it also serves `GET /healthz`, unauthenticated, for the proxy's own health
+check. Change the bind address or port with `agent-utils config set webhook.listen_addr` /
+`webhook.listen_port`, or override either for a single run with `listener start --listen-addr`
+/ `--listen-port` (the `--daemon` form writes its override into the launchd plist, not into
+`config.yaml` — `config show` still reports the configured value, not what the installed agent
+actually binds).
 
 The listener needs the same `~/.agent-utils/env` file the [Cron](#cron) section has you
 create, with `GITHUB_TOKEN` in it: `listener start` refuses to start without it, and once
@@ -342,6 +354,13 @@ operator gotcha on an Intel Mac with Homebrew, where `/usr/local/bin` is commonl
 The fix is the same either way: move the binary to a location only you can write to (for
 example `~/bin`) and run `listener start --daemon` again.
 
+Every other step in this section that widens what can reach the machine is gated — a typed
+confirmation, an acknowledgement flag, a flat refusal. `config set webhook.listen_addr 0.0.0.0`
+is the one that is not: it prints nothing and takes effect on the next `listener start`, and
+the endpoint it widens is the one that starts agents. Treat it the way you would treat any
+other change that opens a port to the LAN — deliberately, and behind your own firewall rule if
+this machine is not already trusted network-wide.
+
 ## Upgrading
 
 **`retry.backoff_ticks` was renamed to `retry.backoff`, and its values are now durations, not
@@ -359,6 +378,17 @@ retry:
 retry:
   backoff: [0s, 15m, 30m]
 ```
+
+**Implicit project onboarding is gone.** Before this branch, a directory with a hand-assembled
+`.agent-utils/configs/` in it was a project the moment any command looked at it — the directory
+itself was the only signal required. See [Quick start](#quick-start) for why that stopped being
+enough: `~/.agent-utils` looks like an ordinary directory too, and nothing stood between a stray
+`cd ~` and registering the machine-wide directory as a project. Now a project needs
+`.agent-utils/config.yaml`, and only `project init` writes it. If you built loop configs by hand
+and never ran `project init` or `project loop new` in that directory, commands that used to find
+the project now fail — run `agent-utils project init --no-loop` there once to mint the missing
+descriptor without touching the loop files already in `configs/`, and everything that pointed at
+the directory before resumes working.
 
 ## Versioning and releases
 
@@ -386,11 +416,11 @@ revision the Go toolchain embeds. A build from a dirty tree is marked `-dirty`.
 
 ### Cutting a release
 
-1. Bump `VERSION` (e.g. `v0.3.0`) and merge it to the default branch.
+1. Bump `VERSION` (e.g. `v0.4.0`) and merge it to the default branch.
 2. Tag that commit with exactly the same string and push the tag:
 
    ```bash
-   git tag v0.3.0 && git push origin v0.3.0
+   git tag v0.4.0 && git push origin v0.4.0
    ```
 
 The release workflow verifies the tag is an ancestor of the default branch, verifies `VERSION`

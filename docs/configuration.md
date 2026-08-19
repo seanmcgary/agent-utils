@@ -166,7 +166,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `tend_pr` | bool | no | `false` |
 | `retry.max` | int | no | `0`, meaning never retry |
 | `retry.backoff` | list of duration | yes if `retry.max > 0` | empty |
-| `retry.backoff_ticks` | removed; see below | — | — |
+| `retry.backoff_ticks` (removed) | — | — | — |
 | `retry.breaker.orphan_threshold` | int ≥ 1 | yes | — |
 | `retry.breaker.cooldown` | duration | yes | — |
 | `prompt` | template | yes | — |

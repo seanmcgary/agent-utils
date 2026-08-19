@@ -234,7 +234,7 @@ agent-utils config show [--reveal]
 agent-utils config get <key>
 agent-utils config set <key> <value>
 agent-utils config unset <key>
-agent-utils config webhook --enable|--disable [--url U] [--port N] [--addr A] [--rotate-secret]
+agent-utils config webhook --enable|--disable [--url U] [--listen-port N] [--listen-addr A] [--rotate-secret]
 ```
 
 `show` prints the file. The secret prints as `***redacted***`. `--reveal` prints the true

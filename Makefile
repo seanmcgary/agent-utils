@@ -145,6 +145,11 @@ lint:
 .PHONY: vet
 vet:
 	$(GO) vet ./...
+	# internal/service/service_darwin.go only compiles under GOOS=darwin, and
+	# CI runs entirely on ubuntu-latest (see .github/workflows/main.yml), so
+	# without this the darwin-only service code is built by the cross-compile
+	# `build` job but never vetted or linted.
+	GOOS=darwin $(GO) vet ./...
 
 .PHONY: fmt
 fmt:
