@@ -147,7 +147,8 @@ absolute path** — it depends on no working directory and can never prompt.
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
 | `tend_pr` | bool | no | `false` |
 | `retry.max` | int | no | `0`, meaning never retry |
-| `retry.backoff_ticks` | list of int | yes if `retry.max > 0` | empty |
+| `retry.backoff` | list of duration | yes if `retry.max > 0` | empty |
+| `retry.backoff_ticks` | removed; see below | — | — |
 | `retry.breaker.orphan_threshold` | int ≥ 1 | yes | — |
 | `retry.breaker.cooldown` | duration | yes | — |
 | `prompt` | template | yes | — |
@@ -532,20 +533,33 @@ its lifetime with successes in between is not parked on its next single failure.
 max: 3
 ```
 
-### `retry.backoff_ticks`
+### `retry.backoff`
 
-How many ticks to wait before each retry. One entry per retry, so the list must be at least
-as long as `retry.max`.
+How long to wait before each retry. One entry per retry, so the list must be at least as long
+as `retry.max`. Entry 0 is the wait before the first retry.
 
-`[0, 1, 2]` means: retry 1 on the tick the failure is noticed, retry 2 at least 1 tick later,
-retry 3 at least 2 ticks after that. `[0, 0, 0]` retries as fast as the cron interval allows.
+`[0s, 15m, 30m]` means: retry 1 as soon as the failure is noticed, retry 2 at least 15 minutes
+later, retry 3 at least 30 minutes after that. `[0s, 0s, 0s]` retries as fast as the loop is
+ticked.
 
-Waiting costs nothing. A deferred retry stays pending in the database, so a tick that
-declines to act changes nothing and the next tick sees the same failure.
+The computed deadline is a wall-clock timestamp stored on the issue's row, not a tick count.
+That is what makes it correct under both drivers: `loop tick` running on a cron interval and
+the webhook daemon ticking on delivery both read the same stored deadline and compare it
+against the current time, so a retry due in 15 minutes waits 15 minutes regardless of which
+one next calls tick. Waiting costs nothing — a deferred retry stays pending in the database,
+so a tick that declines to act changes nothing and the next tick, from either driver, sees the
+same failure.
 
 ```yaml
-backoff_ticks: [0, 1, 2]
+backoff: [0s, 15m, 30m]
 ```
+
+#### `retry.backoff_ticks` (removed)
+
+A tick was a fixed interval only under cron; the webhook daemon can tick a loop at any moment,
+so a count of ticks no longer names a stable wait. A config that still sets it fails to load
+with an error naming `retry.backoff` as the replacement. Multiply the old tick count by the
+cron interval you were running to get a starting duration.
 
 ### `retry.breaker.orphan_threshold`
 
@@ -644,7 +658,8 @@ Beyond the required fields in the quick reference:
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
 | `agent.timeout` > 0 | `agent.timeout must be greater than zero` |
 | `retry.max` ≥ 0 | `retry.max must not be negative` |
-| `len(retry.backoff_ticks)` ≥ `retry.max` | `it needs one entry per retry` |
+| `len(retry.backoff)` ≥ `retry.max` | `it needs one entry per retry` |
+| `retry.backoff_ticks` must be empty | `is no longer supported; ... replace it with retry.backoff` |
 | `retry.breaker.orphan_threshold` ≥ 1 | `must be at least 1` |
 | `retry.breaker.cooldown` > 0 | `must be greater than zero` |
 | `tend_prompt` non-empty when `tend_pr` | `tend_prompt is required when tend_pr is true` |

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -33,7 +34,7 @@ agent:
 tend_pr: true
 retry:
   max: 3
-  backoff_ticks: [0, 1, 2]
+  backoff: [0s, 15m, 30m]
   breaker:
     orphan_threshold: 2
     cooldown: 30m
@@ -68,6 +69,12 @@ func TestLoadValid(t *testing.T) {
 	if got := cfg.Retry.Breaker.Cooldown.Std(); got != 30*time.Minute {
 		t.Errorf("Cooldown = %v, want 30m", got)
 	}
+	if len(cfg.Retry.Backoff) != 3 {
+		t.Fatalf("Backoff = %v, want 3 entries", cfg.Retry.Backoff)
+	}
+	if got := cfg.Retry.Backoff[1].Std(); got != 15*time.Minute {
+		t.Errorf("Backoff[1] = %v, want 15m", got)
+	}
 	if !cfg.TendPR {
 		t.Error("TendPR = false, want true")
 	}
@@ -96,7 +103,7 @@ labels:
   in_flight: f
   blocked: b
 agent: {model: opus, worktree: per_issue, timeout: 1h}
-retry: {max: 1, backoff_ticks: [0], breaker: {orphan_threshold: 2, cooldown: 1m}}
+retry: {max: 1, backoff: [0s], breaker: {orphan_threshold: 2, cooldown: 1m}}
 prompt: p
 resume_prompt: rp
 `
@@ -130,10 +137,37 @@ func TestRejectsUnknownPermissionMode(t *testing.T) {
 }
 
 func TestLoadRejectsShortBackoff(t *testing.T) {
-	body := replaceOnce(validYAML, "backoff_ticks: [0, 1, 2]", "backoff_ticks: [0]")
+	body := replaceOnce(validYAML, "backoff: [0s, 15m, 30m]", "backoff: [0s]")
 	_, err := Load(writeTemp(t, body))
 	if err == nil {
-		t.Fatal("want error when len(backoff_ticks) < retry.max, got nil")
+		t.Fatal("want error when len(backoff) < retry.max, got nil")
+	}
+}
+
+// retry.backoff_ticks is a rejection shim: a stale config that still uses it
+// must fail with a message that names the old key, the new key, and a value
+// to copy, not a bare "unknown field" error.
+func TestLoadRejectsBackoffTicks(t *testing.T) {
+	body := replaceOnce(validYAML, "backoff: [0s, 15m, 30m]", "backoff_ticks: [0, 1, 2]")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want error for retry.backoff_ticks, got nil")
+	}
+	if !strings.Contains(err.Error(), "retry.backoff") {
+		t.Errorf("error %q does not mention retry.backoff", err.Error())
+	}
+}
+
+// retry.max: 0 means never retry, so retry.backoff may legitimately be
+// empty. Nothing may index it without a length check first.
+func TestLoadAcceptsEmptyBackoffWhenMaxZero(t *testing.T) {
+	body := replaceOnce(validYAML, "max: 3\n  backoff: [0s, 15m, 30m]", "max: 0")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Retry.Backoff) != 0 {
+		t.Errorf("Backoff = %v, want empty", cfg.Retry.Backoff)
 	}
 }
 

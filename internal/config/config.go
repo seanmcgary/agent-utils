@@ -59,7 +59,21 @@ type Agent struct {
 
 // Retry holds the failure policy.
 type Retry struct {
-	Max          int     `yaml:"max"`
+	Max int `yaml:"max"`
+
+	// Backoff is how long to wait before each retry, one entry per retry.
+	// Entry 0 is the wait before the first retry. retry.max: 0 means never
+	// retry, so this may legitimately be empty; nothing may index it
+	// without a length check.
+	Backoff []Duration `yaml:"backoff"`
+
+	// BackoffTicks is a rejection shim, not a live field. A tick used to be
+	// a fixed interval under cron, but the webhook daemon can tick a loop
+	// at any moment, so a tick count no longer names a stable wait. validate
+	// rejects a non-empty value with a message that names the replacement,
+	// rather than letting KnownFields(true) reject it with a bare "field
+	// backoff_ticks not found" that does not tell the operator what to
+	// write instead.
 	BackoffTicks []int   `yaml:"backoff_ticks"`
 	Breaker      Breaker `yaml:"breaker"`
 }
@@ -193,10 +207,21 @@ func (c *Config) validate() error {
 	if c.Retry.Max < 0 {
 		errs = append(errs, errors.New("retry.max must not be negative"))
 	}
-	if len(c.Retry.BackoffTicks) < c.Retry.Max {
+	if len(c.Retry.BackoffTicks) > 0 {
+		// A tick was a fixed interval only under cron. The webhook daemon
+		// can tick a loop at any moment, so a tick count no longer names a
+		// stable wait; give the operator the replacement rather than a bare
+		// "unknown field" once the field is removed from the struct.
+		errs = append(errs, errors.New(
+			"retry.backoff_ticks is no longer supported; a tick is no longer a fixed\n"+
+				"interval, because a webhook can tick a loop at any moment. Replace it with\n"+
+				"retry.backoff, a list of durations:\n\n"+
+				"  backoff: [0s, 15m, 30m]"))
+	}
+	if len(c.Retry.Backoff) < c.Retry.Max {
 		errs = append(errs, fmt.Errorf(
-			"retry.backoff_ticks has %d entries but retry.max is %d; it needs one entry per retry",
-			len(c.Retry.BackoffTicks), c.Retry.Max))
+			"retry.backoff has %d entries but retry.max is %d; it needs one entry per retry",
+			len(c.Retry.Backoff), c.Retry.Max))
 	}
 	if c.Retry.Breaker.OrphanThreshold < 1 {
 		errs = append(errs, errors.New("retry.breaker.orphan_threshold must be at least 1"))
