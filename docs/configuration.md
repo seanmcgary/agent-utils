@@ -58,10 +58,16 @@ In order:
    than a silent fallback.
 2. A `.agent-utils` directory in the working directory or any parent, the way git finds
    `.git`. This is what makes the tool work from a subdirectory of a project.
-3. `$HOME/.agent-utils`.
 
-If none exists, every command that needs a configuration fails with an error naming where it
-looked.
+There is deliberately **no fallback to `$HOME/.agent-utils`**. Configurations are
+project-local: running in an unrelated directory reports that there is no project there
+rather than silently adopting some other project's loops. Note that `$HOME/.agent-utils`
+does exist on any machine that has used the tool, because the cross-project registry lives
+there — which is exactly why falling back to it was wrong.
+
+If no directory is found, every command that needs a configuration fails with an error naming
+where it looked. A cron entry should pass `--config` with an absolute path, which needs no
+discovery at all.
 
 ### How a configuration is chosen
 

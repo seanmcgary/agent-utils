@@ -75,6 +75,35 @@ func TestFindDirErrorsWhenNothingExists(t *testing.T) {
 	}
 }
 
+// Regression. The home directory holds the cross-project registry, so
+// $HOME/.agent-utils exists as soon as any project is used. Falling back to it
+// made an unrelated directory report "configs does not exist" instead of
+// honestly saying there is no project here -- and would have let one project's
+// loops be run from another project's directory.
+func TestFindDirDoesNotFallBackToHome(t *testing.T) {
+	t.Setenv("AGENT_UTILS_DIR", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// A home .agent-utils exists, exactly as the registry creates it.
+	if err := os.MkdirAll(filepath.Join(home, DirName, ConfigsSubdir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(home, DirName, ConfigsSubdir, "elsewhere.yaml"),
+		[]byte(validYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindDir(t.TempDir())
+	if err == nil {
+		t.Fatalf("FindDir = %q, want an error; a home directory must never be adopted", got)
+	}
+	if !errors.Is(err, ErrNoDir) {
+		t.Fatalf("err = %v, want ErrNoDir", err)
+	}
+}
+
 // The name of a loop is the `name` field inside the file, never the file name.
 func TestListTakesTheNameFromTheFileContents(t *testing.T) {
 	t.Setenv("AGENT_UTILS_DIR", "")

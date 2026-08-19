@@ -52,16 +52,24 @@ type Entry struct {
 	Err error
 }
 
-// FindDir locates the .agent-utils directory.
+// FindDir locates the project's .agent-utils directory.
 //
-// It looks in three places, in order:
+// It looks in two places, in order:
 //
 //  1. $AGENT_UTILS_DIR, when set. This is the escape hatch for an unusual
-//     layout, and for a cron entry that does not want to depend on a directory.
+//     layout.
 //  2. A .agent-utils directory in startDir or any parent of it, the way git
 //     finds .git. This is what makes the tool work from a subdirectory.
-//  3. $HOME/.agent-utils. cron runs with an unpredictable working directory,
-//     so the walk above frequently finds nothing.
+//
+// It deliberately does NOT fall back to $HOME/.agent-utils. Configurations are
+// project-local: running in an unrelated directory must say there is no project
+// here, not silently adopt some other project's loops. The home directory holds
+// the cross-project registry, which is why it exists at all and why falling
+// back to it produced a confusing "configs does not exist" error rather than an
+// honest "no project here".
+//
+// A cron entry should pass --config with an absolute path, which needs no
+// discovery at all.
 func FindDir(startDir string) (string, error) {
 	if env := strings.TrimSpace(os.Getenv("AGENT_UTILS_DIR")); env != "" {
 		if isDir(env) {
@@ -87,16 +95,8 @@ func FindDir(startDir string) (string, error) {
 		dir = parent
 	}
 
-	if home, err := os.UserHomeDir(); err == nil {
-		candidate := filepath.Join(home, DirName)
-		if isDir(candidate) {
-			return candidate, nil
-		}
-	}
-
 	return "", fmt.Errorf(
-		"%w: looked in %s and every parent directory, and in $HOME/%s",
-		ErrNoDir, startDir, DirName)
+		"%w in %s or any parent directory", ErrNoDir, startDir)
 }
 
 // ConfigsDir returns the configurations directory inside a .agent-utils dir.

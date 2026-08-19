@@ -229,9 +229,11 @@ $ agent-utils status
 is recorded the first time any command runs against it; `agent-utils forget <path>` removes it
 from the list without touching its files.
 
-The directory is found in `$AGENT_UTILS_DIR`, then by walking up from the working directory,
-then in `$HOME/.agent-utils`. A cron entry should pass `--config` with an absolute path
-instead: it depends on no working directory and never prompts.
+The directory is found in `$AGENT_UTILS_DIR`, then by walking up from the working directory the
+way git finds `.git`. There is no fallback to `$HOME`: configurations are project-local, so
+running in an unrelated directory says there is no project there rather than adopting another
+project's loops. A cron entry should pass `--config` with an absolute path instead: it depends
+on no working directory and never prompts.
 
 `docs/configuration.md` documents every field: what it means, what reads it, and what happens
 if you get it wrong. `examples/planning.yaml` and `examples/execution.yaml` are complete

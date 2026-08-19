@@ -107,7 +107,9 @@ func resolveConfigPath(c *cli.Command) (string, error) {
 	}
 	dir, err := config.FindDir(cwd)
 	if err != nil {
-		return "", fmt.Errorf("%w\n\nCreate one with:\n  mkdir -p %s/%s\n\nOr pass a file directly with --config",
+		return "", fmt.Errorf(
+			"%w\n\nLoop configurations are project-local. To set this directory up:\n"+
+				"  mkdir -p %s/%s\n\nOr point at a file directly with --config <path>",
 			err, config.DirName, config.ConfigsSubdir)
 	}
 
@@ -319,7 +321,9 @@ func listCommand() *cli.Command {
 			}
 			dir, err := config.FindDir(cwd)
 			if err != nil {
-				return fmt.Errorf("%w\n\nCreate one with:\n  mkdir -p %s/%s",
+				return fmt.Errorf(
+					"%w\n\nLoop configurations are project-local. To set this directory up:\n"+
+						"  mkdir -p %s/%s",
 					err, config.DirName, config.ConfigsSubdir)
 			}
 
