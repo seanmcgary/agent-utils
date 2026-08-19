@@ -135,11 +135,12 @@ func TestRetryLadderFiresThreeTimesThenParksOnce(t *testing.T) {
 // Regression: the two-writer bug that plan review caught and no unit test would
 // have.
 //
-// MarkNeedsRetry is the ONE writer of retry_after. If dispatch also stamped a
-// deadline, every needs-retry transition would still run through
-// MarkNeedsRetry and overwrite it, so the escalating list would collapse to its
-// first entry forever -- and after the migration that entry is 0s, which means
-// the backoff would silently be nothing at all.
+// MarkNeedsRetry is the only writer of a NON-ZERO retry_after; every other
+// statement that touches the column only ever clears it (see store.go). If
+// dispatch also stamped a deadline, every needs-retry transition would still
+// run through MarkNeedsRetry and overwrite it, so the escalating list would
+// collapse to its first entry forever -- and after the migration that entry is
+// 0s, which means the backoff would silently be nothing at all.
 //
 // The whole sequence is driven here, because only the sequence catches it:
 // record a failure, tick so the retry dispatches, record a second failure, and
@@ -193,7 +194,7 @@ func TestRetryDeadlineEscalatesAcrossTheDispatch(t *testing.T) {
 	}
 	if !st.RetryAfter.Equal(base) {
 		t.Errorf("the dispatch stamped RetryAfter = %v, want it untouched at %v; "+
-			"MarkNeedsRetry is the only writer", st.RetryAfter, base)
+			"MarkNeedsRetry is the only writer of a real deadline", st.RetryAfter, base)
 	}
 	if st.RetryCount != 1 {
 		t.Fatalf("RetryCount = %d, want 1; it is what the next failure indexes with",
