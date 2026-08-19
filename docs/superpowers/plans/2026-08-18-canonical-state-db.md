@@ -22,7 +22,7 @@ source whose runner processes still run stays open, and is read again until it i
 
 | Field   | Value                                                              |
 |---------|--------------------------------------------------------------------|
-| stage   | 3 (implementation)                                                  |
+| stage   | 4 (commit review)                                                   |
 | class   | large (schema change, data migration, concurrency, data integrity)  |
 | profile | backend                                                             |
 | branch  | feat/canonical-state-db                                             |
@@ -735,3 +735,20 @@ Accepted limitations, recorded rather than fixed:
 - When a loop's `state_dir` IS the home directory, a still-running old-binary runner loses its
   issue-state write during the upgrade (Task 3). Keeping a compatible unique index would defeat
   project keying, and the tick's reaper recovers the issue on the next pass.
+
+## Deviations from this plan, decided during execution
+
+- **A loop configuration that does not load is reported and skipped, not fatal** (Task 8). The
+  plan made it fatal on the write path. That would stop a tick of loop A because loop B's YAML
+  is broken, which is a new failure this change has no reason to introduce. State is per loop,
+  so a broken sibling hides nothing loop A needs, and `setup()` always adds loop A's own state
+  directory through `migrate.SourceFor`. A source that exists and cannot be READ is still fatal
+  on the write path, which is the case the rule was written for.
+- **`PRAGMA user_version` was dropped** (Task 3). The upgrade decides by column presence, and a
+  second version mechanism that nothing reads invites a later reader to trust it.
+- **`store.Open` retries while the database is busy** (Task 3, not in the plan). A connection
+  applies `journal_mode=WAL` as it opens, and on a database another process is writing that
+  pragma can return SQLITE_BUSY without waiting out the busy handler. Per-loop files never
+  opened that window; one shared file does.
+- **The schema DDL is split into tables and indexes** (Task 3, not in the plan). The new indexes
+  name columns an older database only gains during the upgrade, so creating them first fails.
