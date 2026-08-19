@@ -361,9 +361,10 @@ func TestRunVetoListIsSplitFromTemplateDefault(t *testing.T) {
 
 // TestRunRequiredFieldWithEmptyDefaultReasks covers the exact failure a
 // reviewer found end to end: outside a git work tree (or when home.Dir()
-// cannot resolve), Detect leaves checkout_base_dir and default_branch with
-// no default, and worktree_dir's own default depends on home.Dir()
-// succeeding. Before Ask consulted Question.Optional, an empty answer to any
+// cannot resolve), Detect leaves default_branch with no default, and
+// worktree_dir's own default depends on home.Dir() succeeding.
+// (checkout_base_dir no longer belongs in that list: its default is the
+// literal ".", which is portable and never empty.) Before Ask consulted Question.Optional, an empty answer to any
 // of those sailed through as "", and the resulting invalid file only failed
 // at Write's reload — by which point the target filename was already
 // claimed, so a retry was refused by the overwrite guard. This proves the
@@ -388,8 +389,7 @@ func TestRunRequiredFieldWithEmptyDefaultReasks(t *testing.T) {
 		"planning",       // 24. prompt template
 		"",               // 1.  name
 		"acme/example",   // 2.  repo
-		"",               // 3.  checkout_base_dir, attempt 1: no default, required -> re-asked
-		"/tmp/example",   // 3.  checkout_base_dir, re-asked
+		"",               // 3.  checkout_base_dir: defaults to "." -- resolved against the project root, so it is never empty
 		"",               // 4.  worktree_dir, attempt 1: home.Dir() errored, no default -> re-asked
 		"/tmp/worktrees", // 4.  worktree_dir, re-asked
 		"",               // 5.  state_dir (optional; empty is fine)
@@ -418,8 +418,8 @@ func TestRunRequiredFieldWithEmptyDefaultReasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if cfg.CheckoutBaseDir != "/tmp/example" {
-		t.Fatalf("CheckoutBaseDir = %q, want %q", cfg.CheckoutBaseDir, "/tmp/example")
+	if cfg.CheckoutBaseDir != "." {
+		t.Fatalf("CheckoutBaseDir = %q, want %q", cfg.CheckoutBaseDir, ".")
 	}
 	if cfg.WorktreeDir != "/tmp/worktrees" {
 		t.Fatalf("WorktreeDir = %q, want %q", cfg.WorktreeDir, "/tmp/worktrees")

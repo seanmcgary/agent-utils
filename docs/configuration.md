@@ -146,8 +146,8 @@ absolute path** — it depends on no working directory and can never prompt.
 |---|---|---|---|
 | `name` | string | yes | — |
 | `repo` | string `owner/name` | yes | — |
-| `checkout_base_dir` | path | yes | — |
-| `worktree_dir` | path | yes | — |
+| `checkout_base_dir` | path, relative to the project root | yes | — |
+| `worktree_dir` | path, relative to the project root | yes | — |
 | `state_dir` | path | no | `<project>/.agent-utils/state/<name>` |
 | `default_branch` | string | yes | — |
 | `labels.trigger` | string | yes | — |
@@ -221,8 +221,18 @@ branch. You can keep working in it yourself while the loop runs.
 When `agent.worktree` is `none`, this directory is also the agent's working directory. That
 is only safe with one issue at a time.
 
+**A relative path is resolved against the project root** — the directory containing
+`.agent-utils` — never against the working directory of whatever ran the command. That is
+what makes `.` correct, and what the wizard writes: the same file then works for a CLI run
+from anywhere, for `--name <project>` typed in another directory, and for the listener
+daemon, whose working directory is `~/.agent-utils`. A leading `~` is expanded. An absolute
+path is used as written.
+
+A configuration outside any `.agent-utils` directory has no project root, so a relative path
+there is an error naming the file; use an absolute path.
+
 ```yaml
-checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+checkout_base_dir: .   # the project itself; an absolute path works too
 ```
 
 ### `worktree_dir`
@@ -239,6 +249,11 @@ The path is stable across ticks, so a resumed run finds the branch state it left
 
 Each worktree is a full checkout. Nothing prunes them today: an issue the loop has touched
 keeps its worktree until you run `loop reset`. Budget disk accordingly.
+
+It is resolved exactly like `checkout_base_dir`: a relative path against the project root, a
+leading `~` expanded, an absolute path as written. The wizard defaults it to
+`<home>/worktrees` rather than something relative, so a second full checkout does not land
+inside the repository the agent works in.
 
 ```yaml
 worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
@@ -689,6 +704,7 @@ Beyond the required fields in the quick reference:
 | `retry.backoff_ticks` must be empty | `is no longer supported; ... replace it with retry.backoff` |
 | `retry.breaker.orphan_threshold` ≥ 1 | `must be at least 1` |
 | `retry.breaker.cooldown` > 0 | `must be greater than zero` |
+| `checkout_base_dir`/`worktree_dir` relative needs a project root | `… so there is no project root to resolve it against` |
 | `tend_prompt` non-empty when `tend_pr` | `tend_prompt is required when tend_pr is true` |
 | All three prompts parse as templates | `prompt: template: …` |
 | No unknown keys anywhere | `field … not found in type config.Config` |

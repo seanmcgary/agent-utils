@@ -334,3 +334,79 @@ func TestDuplicatesReportsSharedNames(t *testing.T) {
 		t.Error("Duplicates should be empty when every name is unique")
 	}
 }
+
+// An absolute checkout_base_dir or worktree_dir is what every configuration
+// written before this resolution existed contains, so it must come back
+// byte-identical: resolution may not rewrite a working configuration.
+func TestResolveWorkDirsLeavesAbsolutePathsUnchanged(t *testing.T) {
+	cfg := &Config{CheckoutBaseDir: "/srv/checkout", WorktreeDir: "/srv/worktrees"}
+
+	checkout, worktrees, err := cfg.ResolveWorkDirs(
+		filepath.Join(t.TempDir(), DirName), "/anywhere/loop.yaml")
+	if err != nil {
+		t.Fatalf("ResolveWorkDirs: %v", err)
+	}
+	if checkout != "/srv/checkout" {
+		t.Errorf("checkout_base_dir = %q, want it unchanged", checkout)
+	}
+	if worktrees != "/srv/worktrees" {
+		t.Errorf("worktree_dir = %q, want it unchanged", worktrees)
+	}
+}
+
+// A leading ~ is expanded exactly as state_dir's is, so one configuration can
+// be written portably across machines whose home directories differ.
+func TestResolveWorkDirsExpandsALeadingTilde(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := &Config{CheckoutBaseDir: "~/Code/example", WorktreeDir: "~/worktrees"}
+
+	checkout, worktrees, err := cfg.ResolveWorkDirs(
+		filepath.Join(t.TempDir(), DirName), "/anywhere/loop.yaml")
+	if err != nil {
+		t.Fatalf("ResolveWorkDirs: %v", err)
+	}
+	if want := filepath.Join(home, "Code", "example"); checkout != want {
+		t.Errorf("checkout_base_dir = %q, want %q", checkout, want)
+	}
+	if want := filepath.Join(home, "worktrees"); worktrees != want {
+		t.Errorf("worktree_dir = %q, want %q", worktrees, want)
+	}
+}
+
+// The whole point: a relative path means "under the project", never "under
+// whatever directory this process happens to have been started in".
+func TestResolveWorkDirsJoinsARelativePathToTheProjectRoot(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{CheckoutBaseDir: ".", WorktreeDir: "build/worktrees"}
+
+	checkout, worktrees, err := cfg.ResolveWorkDirs(
+		filepath.Join(root, DirName), filepath.Join(root, DirName, "configs", "loop.yaml"))
+	if err != nil {
+		t.Fatalf("ResolveWorkDirs: %v", err)
+	}
+	if checkout != root {
+		t.Errorf("checkout_base_dir = %q, want the project root %q", checkout, root)
+	}
+	if want := filepath.Join(root, "build", "worktrees"); worktrees != want {
+		t.Errorf("worktree_dir = %q, want %q", worktrees, want)
+	}
+}
+
+// --config can name a file outside any .agent-utils directory, and then there
+// is no project root to resolve against. Saying so beats silently resolving
+// against the process's working directory, which for the launchd daemon is
+// the machine-wide ~/.agent-utils.
+func TestResolveWorkDirsRejectsARelativePathWithNoProjectRoot(t *testing.T) {
+	cfg := &Config{CheckoutBaseDir: ".", WorktreeDir: "/srv/worktrees"}
+
+	_, _, err := cfg.ResolveWorkDirs("", "/elsewhere/loop.yaml")
+	if err == nil {
+		t.Fatal("want an error for a relative path with no project root, got nil")
+	}
+	for _, want := range []string{"checkout_base_dir", "/elsewhere/loop.yaml", DirName} {
+		if !contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
+	}
+}

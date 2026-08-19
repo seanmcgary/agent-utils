@@ -289,6 +289,60 @@ func (c *Config) ResolveStateDir(configPath string) (string, error) {
 			"per-project state directory cannot be derived", configPath, DirName)
 }
 
+// ResolveWorkDirs returns checkout_base_dir and worktree_dir as absolute
+// paths, resolved against the project root the way state_dir already is.
+//
+// agentUtilsDir is the project's .agent-utils directory, so the project root
+// is its parent. configPath names the file only so an error can point at it.
+//
+// A relative value used raw resolves against the working directory of
+// whichever process reads the configuration, and the three processes that read
+// it do not share one:
+//
+//   - a CLI command run inside the project -- the project root, correct only
+//     by luck;
+//   - `--name <project>` run from anywhere else -- the operator's shell;
+//   - the listener daemon -- ~/.agent-utils, because its launchd plist sets
+//     WorkingDirectory to the machine-wide directory. A relative
+//     checkout_base_dir there silently means ~/.agent-utils, and
+//     checkout_base_dir becomes the agent's cmd.Dir, so the daemon would run
+//     the agent in the directory holding the registry and the state database
+//     rather than in the repository.
+//
+// Resolving here, from the project, makes every one of those contexts produce
+// the same absolute path.
+func (c *Config) ResolveWorkDirs(agentUtilsDir, configPath string) (checkout, worktrees string, err error) {
+	checkout, err = resolveProjectPath("checkout_base_dir", c.CheckoutBaseDir, agentUtilsDir, configPath)
+	if err != nil {
+		return "", "", err
+	}
+	worktrees, err = resolveProjectPath("worktree_dir", c.WorktreeDir, agentUtilsDir, configPath)
+	if err != nil {
+		return "", "", err
+	}
+	return checkout, worktrees, nil
+}
+
+// resolveProjectPath is ResolveWorkDirs for one field. An absolute path is
+// returned unchanged, so every configuration written before this existed is
+// unaffected; a leading ~ expands as state_dir's does.
+func resolveProjectPath(field, value, agentUtilsDir, configPath string) (string, error) {
+	expanded, err := expandHome(strings.TrimSpace(value))
+	if err != nil {
+		return "", err
+	}
+	if filepath.IsAbs(expanded) {
+		return expanded, nil
+	}
+	if agentUtilsDir == "" {
+		return "", fmt.Errorf(
+			"%s is relative (%q) in %s, which is not inside a %s directory, so there "+
+				"is no project root to resolve it against; use an absolute path",
+			field, expanded, configPath, DirName)
+	}
+	return filepath.Join(filepath.Dir(agentUtilsDir), expanded), nil
+}
+
 // expandHome expands a leading ~ so a configuration can be written portably.
 func expandHome(path string) (string, error) {
 	if path != "~" && !strings.HasPrefix(path, "~/") {

@@ -79,6 +79,22 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 	}
 	cfg.StateDir = stateDir
 
+	// Resolve the two working directories against the PROJECT, for the same
+	// reason. Both are used raw downstream: checkout_base_dir becomes the
+	// agent's cmd.Dir, and worktree_dir is where every worktree is created. A
+	// relative value would therefore mean whatever directory the reading
+	// process was started in -- and the listener daemon's launchd plist sets
+	// WorkingDirectory to the machine-wide ~/.agent-utils, so the daemon would
+	// run the agent inside the directory that holds the registry and the state
+	// database instead of inside the repository. Open is the one path every
+	// context reaches a tick through, so resolving here fixes all of them.
+	checkoutDir, worktreeDir, err := cfg.ResolveWorkDirs(ref.Dir, configPath)
+	if err != nil {
+		return nil, Deps{}, nil, err
+	}
+	cfg.CheckoutBaseDir = checkoutDir
+	cfg.WorktreeDir = worktreeDir
+
 	// 0700: the state directory holds agent transcripts, which quote everything
 	// the agent read and ran.
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {

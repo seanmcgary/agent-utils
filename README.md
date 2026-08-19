@@ -61,8 +61,9 @@ Repository
   owner/name: the GitHub repository this loop watches.
 [you/my-repo]:
 Checkout base directory
-  The work tree root this loop's per-issue worktrees branch from.
-[/Users/you/Code/my-repo]:
+  The work tree root this loop's per-issue worktrees branch from. A relative path is
+  resolved against the project root, so "." is the project itself.
+[.]:
 ... asks for every remaining field: worktree and state directories, labels, the agent's
 model and permission mode, and retry policy; the three prompt bodies come from the template
 already chosen above, not from a question ...

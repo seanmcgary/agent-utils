@@ -68,25 +68,38 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	}
 
 	// 3. checkout_base_dir
+	//
+	// "." rather than Detected.CheckoutBaseDir, which is git's absolute path
+	// to this machine's checkout. A relative value is resolved against the
+	// project root (config.ResolveWorkDirs), so "." is the project itself and
+	// the generated file survives being cloned to another machine or another
+	// path. The detected absolute path would have baked one layout in.
 	cfg.CheckoutBaseDir, err = p.Ask(Question{
-		Key:     "checkout_base_dir",
-		Label:   "Checkout base directory",
-		Help:    "The work tree root this loop's per-issue worktrees branch from.",
-		Default: d.CheckoutBaseDir,
+		Key:   "checkout_base_dir",
+		Label: "Checkout base directory",
+		Help: "The work tree root this loop's per-issue worktrees branch from. " +
+			"A relative path is resolved against the project root, so \".\" is the project itself.",
+		Default: ".",
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	// 4. worktree_dir
+	//
+	// Deliberately NOT relative, unlike question 3: a worktree under the
+	// repository would put a full second checkout inside the tree the agent
+	// works in, where git status and the agent's own file searches would both
+	// see it.
 	worktreeDefault := ""
 	if h, err := home.Dir(); err == nil {
 		worktreeDefault = filepath.Join(h, "worktrees")
 	}
 	cfg.WorktreeDir, err = p.Ask(Question{
-		Key:     "worktree_dir",
-		Label:   "Worktree directory",
-		Help:    "Where this loop's per-issue worktrees are checked out.",
+		Key:   "worktree_dir",
+		Label: "Worktree directory",
+		Help: "Where this loop's per-issue worktrees are checked out. " +
+			"A relative path is resolved against the project root.",
 		Default: worktreeDefault,
 	})
 	if err != nil {
