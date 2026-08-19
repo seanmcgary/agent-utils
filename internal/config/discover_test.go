@@ -75,32 +75,76 @@ func TestFindDirErrorsWhenNothingExists(t *testing.T) {
 	}
 }
 
-// Regression. The home directory holds the cross-project registry, so
-// $HOME/.agent-utils exists as soon as any project is used. Falling back to it
-// made an unrelated directory report "configs does not exist" instead of
-// honestly saying there is no project here -- and would have let one project's
-// loops be run from another project's directory.
-func TestFindDirDoesNotFallBackToHome(t *testing.T) {
+// Regression. The machine-wide directory ($AGENT_UTILS_HOME, or plain
+// $HOME/.agent-utils) is a parent of everything under the home tree, so an
+// unmodified walk-up reaches it as an ORDINARY ancestor for any command run
+// from a directory under $HOME that is not inside a project -- e.g.
+// ~/Downloads/scratch. FindDir must not treat that ancestor as a match: doing
+// so would make the caller write a project descriptor into the machine-wide
+// directory the registry and the canonical state database also live in.
+//
+// $AGENT_UTILS_HOME, not $HOME, is set here: $HOME also steers git and ssh,
+// which a test must not disturb.
+func TestFindDirDoesNotAdoptTheMachineWideDirectory(t *testing.T) {
 	t.Setenv("AGENT_UTILS_DIR", "")
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
-	// A home .agent-utils exists, exactly as the registry creates it.
-	if err := os.MkdirAll(filepath.Join(home, DirName, ConfigsSubdir), 0o700); err != nil {
+	machineWide := filepath.Join(home, DirName)
+	t.Setenv("AGENT_UTILS_HOME", machineWide)
+	// The machine-wide directory itself, exactly as the registry creates it.
+	if err := os.MkdirAll(filepath.Join(machineWide, ConfigsSubdir), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(
-		filepath.Join(home, DirName, ConfigsSubdir, "elsewhere.yaml"),
+		filepath.Join(machineWide, ConfigsSubdir, "elsewhere.yaml"),
 		[]byte(validYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := FindDir(t.TempDir())
+	scratch := filepath.Join(home, "Downloads", "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindDir(scratch)
 	if err == nil {
-		t.Fatalf("FindDir = %q, want an error; a home directory must never be adopted", got)
+		t.Fatalf("FindDir = %q, want an error; the machine-wide directory must never be adopted", got)
 	}
 	if !errors.Is(err, ErrNoDir) {
 		t.Fatalf("err = %v, want ErrNoDir", err)
+	}
+	if !contains(err.Error(), "agent-utils project init") {
+		t.Errorf("err = %q, want it to name the fix (`agent-utils project init`)", err)
+	}
+}
+
+// A genuine project nested under the same tree as the machine-wide directory
+// (e.g. ~/Downloads/myproject) must still resolve. Skipping the machine-wide
+// directory must not turn into skipping every ancestor.
+func TestFindDirStillResolvesAProjectNearTheMachineWideDirectory(t *testing.T) {
+	t.Setenv("AGENT_UTILS_DIR", "")
+
+	home := t.TempDir()
+	machineWide := filepath.Join(home, DirName)
+	t.Setenv("AGENT_UTILS_HOME", machineWide)
+	if err := os.MkdirAll(filepath.Join(machineWide, ConfigsSubdir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	project := filepath.Join(home, "Downloads", "myproject")
+	want := mkConfigs(t, project, nil)
+
+	deep := filepath.Join(project, "sub", "dir")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindDir(deep)
+	if err != nil {
+		t.Fatalf("FindDir: %v", err)
+	}
+	if got != want {
+		t.Errorf("FindDir = %q, want the project's own %q", got, want)
 	}
 }
 

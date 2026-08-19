@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/seanmcgary/agent-utils/internal/home"
 )
 
 // DirName is the directory that holds this tool's local files.
@@ -57,16 +59,20 @@ type Entry struct {
 // It looks in two places, in order:
 //
 //  1. $AGENT_UTILS_DIR, when set. This is the escape hatch for an unusual
-//     layout.
+//     layout, and it is trusted to name any directory -- including the
+//     machine-wide one, if that is really what the caller wants.
 //  2. A .agent-utils directory in startDir or any parent of it, the way git
 //     finds .git. This is what makes the tool work from a subdirectory.
 //
-// It deliberately does NOT fall back to $HOME/.agent-utils. Configurations are
-// project-local: running in an unrelated directory must say there is no project
-// here, not silently adopt some other project's loops. The home directory holds
-// the cross-project registry, which is why it exists at all and why falling
-// back to it produced a confusing "configs does not exist" error rather than an
-// honest "no project here".
+// Step 2 skips the machine-wide directory (internal/home.Dir()) when the
+// walk reaches it. That directory is an ORDINARY ancestor of everything under
+// $HOME, so an unguarded walk-up would silently adopt it as the project
+// directory for any command run outside a project -- e.g. from
+// ~/Downloads/scratch, once any project on the machine has been used and so
+// created ~/.agent-utils. The caller would then write a project descriptor
+// into the same directory the registry and the canonical state database live
+// in. Configurations are project-local: running in an unrelated directory
+// must say there is no project here, not silently adopt the machine-wide one.
 //
 // A cron entry should pass --config with an absolute path, which needs no
 // discovery at all.
@@ -79,13 +85,23 @@ func FindDir(startDir string) (string, error) {
 			ErrNoDir, env)
 	}
 
+	// homeErr is deliberately not fatal: a machine on which the home
+	// directory cannot be resolved still deserves an ordinary walk-up, and
+	// there is nothing to skip if there is nothing to compare against.
+	machineWide, homeErr := home.Dir()
+	if homeErr == nil {
+		if abs, err := filepath.Abs(machineWide); err == nil {
+			machineWide = abs
+		}
+	}
+
 	dir, err := filepath.Abs(startDir)
 	if err != nil {
 		return "", fmt.Errorf("resolve %q: %w", startDir, err)
 	}
 	for {
 		candidate := filepath.Join(dir, DirName)
-		if isDir(candidate) {
+		if isDir(candidate) && (homeErr != nil || candidate != machineWide) {
 			return candidate, nil
 		}
 		parent := filepath.Dir(dir)
@@ -96,7 +112,8 @@ func FindDir(startDir string) (string, error) {
 	}
 
 	return "", fmt.Errorf(
-		"%w in %s or any parent directory", ErrNoDir, startDir)
+		"%w in %s or any parent directory; run `agent-utils project init` to create one",
+		ErrNoDir, startDir)
 }
 
 // ConfigsDir returns the configurations directory inside a .agent-utils dir.
