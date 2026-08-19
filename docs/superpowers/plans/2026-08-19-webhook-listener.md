@@ -322,6 +322,44 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
 - `internal/runner/runner.go:242` `MarkNeedsRetry`, `:245` `MarkSucceeded`
 - `internal/loopcmd/tick.go:162` `MarkNeedsRetry`, `:225` `ClearNeedsRetry`
 
+## Execution plan
+
+22 tasks, dispatched as **16 units in 8 sequential steps**. Combining removes six
+dispatch-and-review cycles; the first two steps run their units concurrently.
+
+**Concurrency rule.** Units in one step share a working tree, so each one builds and tests
+**only its own package** — `go build ./internal/settings/...`, never `go build ./...`. A
+sibling's half-written package would otherwise break a whole-tree build and send an agent
+chasing a failure that is not its own. The full suite runs once, at commit review.
+
+| Step | Units | Concurrent | Files each owns |
+|---|---|---|---|
+| 1 | B1 · D1 · E5 · F1 · F2+F3 | 5 | `internal/settings` · `internal/ghub` · `internal/service` · `internal/config/discover.go` · `internal/wizard` |
+| 2 | A1+A2 · C2+C4 | 2 | `loopcmd/open.go`+`main.go` · `internal/config/config.go`+`examples`+`docs` |
+| 3 | C1+C3 · E1 | 2 | `store`+`engine`+`tick.go`+`runner` · `internal/listener/{listener,handler}.go` |
+| 4 | E2+E3 · B2+D2 | 2 | `listener/{route,env}.go`+`home.go` · `cmd/agent-utils/{config,project}.go` |
+| 5 | E4 · F4 | 2 | `internal/listener/work.go` · `cmd/agent-utils/project.go` |
+| 6 | E6 | 1 | `cmd/agent-utils/listener.go`+`main.go` |
+| 7 | F5 | 1 | `loopcmd/resolve.go`+`main.go` |
+| 8 | G1 | 1 | `README.md`+`docs/configuration.md`+`VERSION` |
+
+Steps 6 and 7 are sequential rather than concurrent: E6 and F5 both edit
+`cmd/agent-utils/main.go`.
+
+**Why each combination:**
+
+- **A1+A2** — one new file and one set of call sites. A2 alone re-reads all of A1's work.
+- **C2+C4** — `internal/config/docs_test.go` reflects over every yaml tag and fails between
+  them, so C2 alone leaves `make test` red.
+- **C1+C3** — one mechanism. Both edit `tick.go` and `engine.go`, and they must agree on which
+  function writes `retry_after`. Splitting them re-opens the two-writer defect that plan review
+  found. This is the largest and riskiest single diff in the plan, deliberately: the bug the
+  combination prevents costs more than the review burden it adds. Dispatch it on the most
+  capable model.
+- **E2+E3** — two small, independent new files in one new package.
+- **F2+F3** — F3 builds directly on F2's `Question` and `Prompter` types.
+- **B2+D2** — two thin command groups that only wire up B1 and D1.
+
 ## Tasks
 
 ### Phase A — the shared tick path
