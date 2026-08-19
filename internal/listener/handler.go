@@ -70,13 +70,16 @@ func safeDeliveryID(id string) string {
 // stranger choose how much this process writes.
 const rejectionLogInterval = time.Minute
 
-// rejectionLog rate-limits rejection logging, keyed by stage.
+// throttledLog rate-limits a repeating log line, keyed by whatever the caller
+// considers one kind of event: the HTTP rejection stage here, one loop of one
+// project in work.go. Both write into the same unrotated file for the same
+// reason, so they share the mechanism rather than each growing their own.
 //
-// Keyed by STAGE, not by delivery id or source address: the stage is the only
-// part of a rejection an operator reads a pattern out of, and both of the
-// others are attacker-chosen, so keying on either would let one caller mint
-// unbounded keys and defeat the limit it is subject to.
-type rejectionLog struct {
+// The KEY has to be something bounded and operator-meaningful. For rejections
+// that is the stage, never the delivery id or the source address: both of those
+// are attacker-chosen, so keying on either would let one caller mint unbounded
+// keys and defeat the limit it is subject to.
+type throttledLog struct {
 	mu       sync.Mutex
 	now      func() time.Time // seam: a test must not wait a real interval
 	interval time.Duration
@@ -84,8 +87,8 @@ type rejectionLog struct {
 	dropped  map[string]int
 }
 
-func newRejectionLog(interval time.Duration) *rejectionLog {
-	return &rejectionLog{
+func newThrottledLog(interval time.Duration) *throttledLog {
+	return &throttledLog{
 		now:      time.Now,
 		interval: interval,
 		next:     map[string]time.Time{},
@@ -93,23 +96,36 @@ func newRejectionLog(interval time.Duration) *rejectionLog {
 	}
 }
 
-// allow reports whether this rejection may be logged, and how many rejections
-// of the same stage went unlogged since the last one that was. The count is
-// returned rather than logged separately so the surviving line still says how
-// much it stands for -- a silently sampled log would understate an attack.
-func (l *rejectionLog) allow(stage string) (bool, int) {
+// allow reports whether this event may be logged, and how many events of the
+// same key went unlogged since the last one that was. The count is returned
+// rather than logged separately so the surviving line still says how much it
+// stands for -- a silently sampled log would understate an attack, and would
+// understate how long a stuck loop has been stuck.
+func (l *throttledLog) allow(key string) (bool, int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	now := l.now()
-	if next, ok := l.next[stage]; ok && now.Before(next) {
-		l.dropped[stage]++
+	if next, ok := l.next[key]; ok && now.Before(next) {
+		l.dropped[key]++
 		return false, 0
 	}
-	l.next[stage] = now.Add(l.interval)
-	suppressed := l.dropped[stage]
-	delete(l.dropped, stage)
+	l.next[key] = now.Add(l.interval)
+	suppressed := l.dropped[key]
+	delete(l.dropped, key)
 	return true, suppressed
+}
+
+// forget drops a key's throttle state, so the condition it stood for logs its
+// first line again if it ever returns. It is what keeps the maps bounded by the
+// events happening NOW rather than by every event this process ever saw, which
+// matters for the work.go caller: its keys are loops, and a loop that recovers
+// would otherwise hold an entry for the life of the daemon.
+func (l *throttledLog) forget(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.next, key)
+	delete(l.dropped, key)
 }
 
 // rejected writes a fixed, generic body for status and logs the stage that

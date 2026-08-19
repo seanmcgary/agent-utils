@@ -84,8 +84,8 @@ type Server struct {
 	seen *deliveryCache
 
 	// rejects bounds how often a rejection reaches the log. Built by New;
-	// see rejectionLog, and rejectionLogInterval for what it defends.
-	rejects *rejectionLog
+	// see throttledLog, and rejectionLogInterval for what it defends.
+	rejects *throttledLog
 }
 
 // New validates s and returns it ready to serve.
@@ -129,7 +129,7 @@ func New(s *Server) (*Server, error) {
 	}
 	s.sem = make(chan struct{}, s.MaxInFlight)
 	s.seen = newDeliveryCache(deliveryCacheSize)
-	s.rejects = newRejectionLog(rejectionLogInterval)
+	s.rejects = newThrottledLog(rejectionLogInterval)
 	return s, nil
 }
 

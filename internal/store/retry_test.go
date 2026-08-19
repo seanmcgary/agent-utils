@@ -199,7 +199,7 @@ func seedRetryRow(t *testing.T, s *Store, number int, at time.Time, needsRetry, 
 
 func TestEarliestRetryAfterOnAnEmptyTable(t *testing.T) {
 	db := openDB(t)
-	_, ok, err := db.EarliestRetryAfterAt(time.Now().UTC())
+	_, ok, err := db.EarliestRetryAfterAt(time.Now().UTC(), nil)
 	if err != nil {
 		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestEarliestRetryAfterSkipsRowsNoRetryCanActOn(t *testing.T) {
 	seedRetryRow(t, s, 4, retryNow.Add(time.Hour), true, false)   // live, later
 	seedRetryRow(t, s, 5, retryNow.Add(time.Minute), true, false) // live, sooner
 
-	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC())
+	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC(), nil)
 	if err != nil {
 		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestEarliestRetryAfterSkipsALoopInCooldown(t *testing.T) {
 	if err := s.SetCooldown("planning", time.Now().UTC().Add(time.Hour)); err != nil {
 		t.Fatalf("SetCooldown: %v", err)
 	}
-	if _, ok, err := db.EarliestRetryAfterAt(time.Now().UTC()); err != nil || ok {
+	if _, ok, err := db.EarliestRetryAfterAt(time.Now().UTC(), nil); err != nil || ok {
 		t.Fatalf("ok = %v (err %v), want false while the loop is in cooldown", ok, err)
 	}
 
@@ -258,7 +258,7 @@ func TestEarliestRetryAfterSkipsALoopInCooldown(t *testing.T) {
 	if err := s.SetCooldown("planning", time.Now().UTC().Add(-time.Hour)); err != nil {
 		t.Fatalf("SetCooldown: %v", err)
 	}
-	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC())
+	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC(), nil)
 	if err != nil {
 		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestEarliestRetryAfterIsReportedPerProject(t *testing.T) {
 	seedRetryRow(t, a, 1, retryNow, true, false)
 	seedRetryRow(t, b, 1, retryNow.Add(time.Hour), true, false)
 
-	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC())
+	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC(), nil)
 	if err != nil {
 		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
@@ -302,15 +302,77 @@ func TestEarliestRetryAfterAtUsesTheSuppliedClock(t *testing.T) {
 		t.Fatalf("SetCooldown: %v", err)
 	}
 
-	if _, ok, err := db.EarliestRetryAfterAt(retryNow); err != nil || ok {
+	if _, ok, err := db.EarliestRetryAfterAt(retryNow, nil); err != nil || ok {
 		t.Fatalf("ok = %v (err %v), want false inside the cooldown", ok, err)
 	}
-	due, ok, err := db.EarliestRetryAfterAt(retryNow.Add(2 * time.Hour))
+	due, ok, err := db.EarliestRetryAfterAt(retryNow.Add(2*time.Hour), nil)
 	if err != nil {
 		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
 	if !ok || due.Number != 1 {
 		t.Errorf("due = %+v, ok = %v, want issue 1 once the clock is past the cooldown", due, ok)
+	}
+}
+
+// One row is returned per call, so a caller that cannot act on the earliest one
+// has to be able to ask for the next. Without this the daemon, which cannot
+// tick a loop it is unable to route, would be handed the same unservable row on
+// every wake and would never reach any other loop's due deadline.
+func TestEarliestRetryAfterAtStepsOverTheSkippedLoops(t *testing.T) {
+	db := openDB(t)
+	s := db.Project(testProject)
+	put := func(loop string, number int, at time.Time) {
+		t.Helper()
+		if err := s.PutIssueState(IssueState{
+			Loop: loop, Repo: "o/r", Number: number,
+			NeedsRetry: true, RetryAfter: at, UpdatedAt: retryNow,
+		}); err != nil {
+			t.Fatalf("PutIssueState: %v", err)
+		}
+	}
+	// Two rows of the earliest loop: the skip is by LOOP, not by row, so one
+	// stuck loop with a thousand pending issues still costs one skip.
+	put("planning", 1, retryNow)
+	put("planning", 2, retryNow.Add(time.Minute))
+	put("review", 3, retryNow.Add(time.Hour))
+
+	skip := []LoopKey{{ProjectID: testProject, Loop: "planning"}}
+	due, ok, err := db.EarliestRetryAfterAt(retryNow.Add(2*time.Hour), skip)
+	if err != nil {
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
+	}
+	if !ok || due.Loop != "review" || due.Number != 3 {
+		t.Errorf("due = %+v, ok = %v, want review's deadline past both planning rows", due, ok)
+	}
+
+	// The skipped rows are stepped over, not deleted: with no skip the
+	// earliest is still planning.
+	if due, ok, err = db.EarliestRetryAfterAt(retryNow.Add(2*time.Hour), nil); err != nil || !ok || due.Loop != "planning" {
+		t.Errorf("due = %+v, ok = %v (err %v), want planning still pending", due, ok, err)
+	}
+
+	// A skip that covers every loop is "nothing to serve", not an error.
+	skip = append(skip, LoopKey{ProjectID: testProject, Loop: "review"})
+	if _, ok, err = db.EarliestRetryAfterAt(retryNow.Add(2*time.Hour), skip); err != nil || ok {
+		t.Errorf("ok = %v (err %v), want false when every pending loop is skipped", ok, err)
+	}
+
+	// The skip is keyed by project as well as loop. Two projects may run
+	// loops of the same name, and one project's stuck loop must not hide the
+	// other's.
+	other := db.Project(otherProject)
+	if err = other.PutIssueState(IssueState{
+		Loop: "planning", Repo: "o/r", Number: 4,
+		NeedsRetry: true, RetryAfter: retryNow, UpdatedAt: retryNow,
+	}); err != nil {
+		t.Fatalf("PutIssueState: %v", err)
+	}
+	due, ok, err = db.EarliestRetryAfterAt(retryNow.Add(2*time.Hour), skip)
+	if err != nil {
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
+	}
+	if !ok || due.ProjectID != otherProject {
+		t.Errorf("due = %+v, ok = %v, want the other project's loop of the same name", due, ok)
 	}
 }
 

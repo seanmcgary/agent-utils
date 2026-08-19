@@ -371,7 +371,7 @@ func TestSecretIsReReadPerRequest(t *testing.T) {
 // against a full disk.
 func TestRejectionLoggingIsRateLimitedPerStage(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	l := newRejectionLog(time.Minute)
+	l := newThrottledLog(time.Minute)
 	l.now = func() time.Time { return now }
 
 	ok, suppressed := l.allow("method")

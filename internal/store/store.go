@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/home"
@@ -1144,20 +1145,38 @@ func (d *DB) LoopStates() ([]LoopState, error) {
 // written through time.Time.UTC(), which the driver stores as text with a fixed
 // "+0000 UTC" suffix, so a text comparison orders them correctly. A writer that
 // omitted .UTC() would break this and legacy.go's refresh comparison together.
-func (d *DB) EarliestRetryAfterAt(now time.Time) (RetryDue, bool, error) {
+//
+// skip names loops whose rows this call must step over, and it exists because
+// exactly one row is returned. A caller that cannot act on the earliest row --
+// the daemon, when the loop it names cannot be routed right now -- would
+// otherwise be handed that same row on every call and would never see any other
+// loop's due deadline: one stuck loop starves the whole machine. The set is the
+// CALLER's, and deliberately not a column here: nothing about being unservable
+// belongs in the durable state, and the caller re-establishes it every pass.
+func (d *DB) EarliestRetryAfterAt(now time.Time, skip []LoopKey) (RetryDue, bool, error) {
 	var (
 		due        RetryDue
 		retryAfter int64
 	)
+	// Placeholders, never the loop names interpolated into the SQL: a project
+	// id and a loop name both come from files on disk, and one apostrophe in a
+	// loop name would otherwise be a syntax error at best.
+	args := make([]any, 0, 1+2*len(skip))
+	args = append(args, now.UTC())
+	var excluded strings.Builder
+	for _, k := range skip {
+		excluded.WriteString(" AND NOT (i.project_id = ? AND i.loop = ?)")
+		args = append(args, k.ProjectID, k.Loop)
+	}
 	err := d.db.QueryRow(`
 		SELECT i.project_id, i.loop, i.repo, i.number, i.retry_after
 		FROM issues i
 		LEFT JOIN cooldowns c
 		  ON c.project_id = i.project_id AND c.loop = i.loop
 		WHERE i.retry_after > 0 AND i.needs_retry = 1 AND i.parked = 0
-		  AND (c.until IS NULL OR c.until <= ?)
+		  AND (c.until IS NULL OR c.until <= ?)`+excluded.String()+`
 		ORDER BY i.retry_after ASC
-		LIMIT 1`, now.UTC()).
+		LIMIT 1`, args...).
 		Scan(&due.ProjectID, &due.Loop, &due.Repo, &due.Number, &retryAfter)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RetryDue{}, false, nil

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -639,7 +640,7 @@ func TestWakeWithNoDeadlineReturnsFalse(t *testing.T) {
 // query, i.e. whether its failure flag survived.
 func (h *harness) stillPending(t *testing.T, db *store.DB) bool {
 	t.Helper()
-	_, ok, err := db.EarliestRetryAfterAt(workNow)
+	_, ok, err := db.EarliestRetryAfterAt(workNow, nil)
 	if err != nil {
 		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
@@ -962,5 +963,107 @@ func TestAnUnresolvableWakeResetsTheGoneCount(t *testing.T) {
 		if !h.stillPending(t, db) {
 			t.Fatalf("gone wake %d after the gap cleared the deadline; the count did not reset", i)
 		}
+	}
+}
+
+// The wake query serves ONE row: the single earliest deadline on the machine.
+// A deadline whose loop cannot be resolved is never cleared and never skipped
+// by the query, so without the skip set it is returned again on every wake for
+// as long as the condition lasts -- and no other loop's durable retry ever runs
+// again. It would fire only if a webhook delivery happened to tick that loop.
+// One project with a single unparsable yaml, or one registered project whose
+// directory was deleted, is enough to reach that state.
+func TestAnUnresolvableDeadlineDoesNotStarveOtherLoops(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	h.targetFor = func(projectID, loop string) (Target, Routing, error) {
+		if loop == "planning" {
+			return Target{}, RouteUnknown, nil
+		}
+		return h.target(loop), RouteFound, nil
+	}
+	// planning holds the EARLIER deadline, so it is the row the wake query
+	// returns first and the one that does the starving.
+	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Hour))
+	seedDeadline(t, db, "review", 8, workNow.Add(-time.Minute))
+
+	if _, ok := h.w.Wake(context.Background()); !ok {
+		t.Fatal("ok = false, want the past deadline")
+	}
+
+	if got := h.ranLoops(); len(got) != 1 || got[0] != "review" {
+		t.Errorf("ran %v, want the later deadline's loop to be served past the unresolvable one", got)
+	}
+	// The unresolvable deadline is stepped over, not resolved: it must still
+	// be the earliest pending row, ready to run the moment the loop routes.
+	due, pending, err := db.EarliestRetryAfterAt(workNow, nil)
+	if err != nil {
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
+	}
+	if !pending || due.Loop != "planning" || due.Number != 7 {
+		t.Errorf("earliest pending = %+v (pending=%v), want the unresolvable deadline untouched", due, pending)
+	}
+}
+
+// A loop that becomes routable again must be served, not left in a skip set
+// that outlived the condition. Nothing about being unresolvable is durable:
+// the yaml gets saved, the volume gets mounted.
+func TestALoopThatRoutesAgainIsServedAfterBeingSkipped(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	routable := false
+	h.targetFor = func(projectID, loop string) (Target, Routing, error) {
+		if loop == "planning" && !routable {
+			return Target{}, RouteUnknown, nil
+		}
+		return h.target(loop), RouteFound, nil
+	}
+	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Hour))
+	seedDeadline(t, db, "review", 8, workNow.Add(-time.Minute))
+
+	h.w.Wake(context.Background())
+	routable = true
+	h.w.Wake(context.Background())
+
+	got := h.ranLoops()
+	if len(got) != 2 || got[0] != "review" || got[1] != "planning" {
+		t.Errorf("ran %v, want review while planning was unresolvable and planning once it routed again", got)
+	}
+}
+
+// An unresolvable deadline is waited on for as long as the condition lasts,
+// which is unbounded: an unparsable config left over a weekend would write one
+// warning per loop per wake -- about 2,880 lines a day -- into the same
+// unrotated launchd stdout log the HTTP rejections are throttled for.
+func TestTheUnroutableWarningIsThrottledPerLoop(t *testing.T) {
+	buf := captureLogs(t)
+	db := openWorkDB(t)
+	h := newHarness(db)
+	clock := workNow
+	h.w.Now = func() time.Time { return clock }
+	h.targetFor = func(projectID, loop string) (Target, Routing, error) {
+		return Target{}, RouteUnknown, nil
+	}
+	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Hour))
+
+	const wakes = 20
+	for i := 0; i < wakes; i++ {
+		h.w.Wake(context.Background())
+	}
+	if got := strings.Count(buf.String(), "cannot route a retry deadline"); got != 1 {
+		t.Errorf("logged %d warnings across %d wakes, want only the transition", got, wakes)
+	}
+
+	// Once the interval passes, one line gets through and says how many
+	// probes it stands for: a silently sampled log would understate how long
+	// the loop has been stuck.
+	buf.Reset()
+	clock = clock.Add(unroutableLogInterval)
+	h.w.Wake(context.Background())
+	if got := strings.Count(buf.String(), "cannot route a retry deadline"); got != 1 {
+		t.Fatalf("logged %d warnings after the interval, want the periodic summary", got)
+	}
+	if !strings.Contains(buf.String(), "suppressed_since_last="+fmt.Sprint(wakes-1)) {
+		t.Errorf("summary does not carry the suppressed count: %s", buf.String())
 	}
 }

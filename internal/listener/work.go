@@ -56,6 +56,17 @@ const openRetryMax = 3
 // MinWakeInterval) and cannot all land inside a single rename.
 const orphanClearAfter = 3
 
+// unroutableLogInterval is how often ONE loop's "cannot route this deadline"
+// warning may reach the log.
+//
+// The condition it reports has no bound: Wake waits on an unresolvable
+// deadline for as long as it lasts, so at the default wake interval an
+// unparsable config left over a weekend writes about 2,880 identical lines a
+// day per loop, into the unrotated file rejectionLogInterval describes. Ten
+// minutes keeps the transition and a periodic reminder carrying the count it
+// stands for, which is everything an operator reads out of it.
+const unroutableLogInterval = 10 * time.Minute
+
 // loopKey identifies one loop of one project. Two projects may run loops of
 // the same name, so the project is part of the key: without it, one
 // project's failure would cancel the other's pending retry.
@@ -137,6 +148,9 @@ type Worker struct {
 	// entry is dropped as soon as the loop routes again OR as soon as a wake
 	// cannot tell, so only agreeing observations accumulate.
 	orphans map[loopKey]int // guarded by mu
+	// unroutable throttles the "cannot route this deadline" warning per
+	// loop; it carries its own lock. See warnUnroutable.
+	unroutable *throttledLog
 }
 
 // NewWorker returns a Worker with production seams and defaults.
@@ -146,7 +160,7 @@ type Worker struct {
 // composite literal, and the first failing tick would write to a nil map and
 // panic the daemon. Worker also holds a mutex, so it must never be copied.
 func NewWorker(db *store.DB) *Worker {
-	return &Worker{
+	w := &Worker{
 		DB:              db,
 		Targets:         Targets,
 		TargetFor:       TargetFor,
@@ -160,7 +174,13 @@ func NewWorker(db *store.DB) *Worker {
 		MinWakeInterval: defaultMinWakeInterval,
 		pending:         make(map[loopKey]*attempt),
 		orphans:         make(map[loopKey]int),
+		unroutable:      newThrottledLog(unroutableLogInterval),
 	}
+	// The throttle reads the Worker's OWN clock, and reads it late: a test
+	// replaces Now after NewWorker returns, and a value captured here would
+	// leave it waiting a real ten minutes.
+	w.unroutable.now = func() time.Time { return w.Now() }
+	return w
 }
 
 // Deliver ticks every loop that watches repo.
@@ -387,74 +407,153 @@ func (w *Worker) stopAll() {
 func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 	now := w.Now()
 
-	// EarliestRetryAfterAt, not EarliestRetryAfter: the cooldown boundary is
-	// judged against this worker's own clock, so a test can freeze both the
-	// deadline comparison below and the one inside the query at the same
-	// instant.
-	due, ok, err := w.DB.EarliestRetryAfterAt(now)
-	if err != nil {
-		// Reported and treated as "nothing pending". The caller waits its
-		// wake interval and asks again, which is the right response to a
-		// database that is momentarily unreadable.
-		slog.Error("cannot read the earliest retry deadline", "err", err)
-		return time.Time{}, false
-	}
-	if !ok {
-		return time.Time{}, false
-	}
-	if due.At.After(now) {
-		// The caller sets its timer for this and does not tick.
-		return due.At, true
+	// skip collects the loops this pass has found it cannot serve, so the
+	// next query steps PAST them instead of being handed the same row again.
+	//
+	// Without it one unservable deadline starves every other loop on the
+	// machine. EarliestRetryAfterAt returns the single earliest row; a loop
+	// that cannot be routed is deliberately neither cleared nor advanced, so
+	// that row stays the earliest forever and no other project's durable
+	// retry ever runs again -- they fire only if a webhook delivery happens
+	// to tick them. One registered project whose directory was deleted, or
+	// one permanently unparsable yaml in a project's configs (which makes
+	// EVERY loop of that project unroutable), is enough to reach it. This is
+	// not a micro-optimisation to fold back into a single query.
+	//
+	// It is rebuilt on every wake rather than held on the Worker: nothing
+	// about being unservable is durable, so a set that outlived the pass
+	// would have to be expired, and an entry expired wrongly is a loop whose
+	// retries stop. Rebuilding bounds it by the loops that are unservable
+	// right now, cannot keep an entry for a loop that has since been fixed,
+	// and re-probes everything after a restart. The cost is one TargetFor
+	// per unservable loop per wake interval, which is the same probe the
+	// single-row version already paid for the first of them.
+	var skip []store.LoopKey
+
+	// skipped is the first past-due deadline this pass stepped over, and it
+	// is what the caller is told to wake for. Every skipped deadline is past
+	// due, so it is earlier than anything the pass goes on to find:
+	// returning it holds Serve at its MinWakeInterval floor and re-probes
+	// the skipped loops a wake later. Returning the later deadline instead
+	// would let a loop whose config was fixed a minute ago sit unserved
+	// until some unrelated deadline hours away.
+	var skipped time.Time
+	answer := func(at time.Time, ok bool) (time.Time, bool) {
+		if !skipped.IsZero() {
+			return skipped, true
+		}
+		return at, ok
 	}
 
-	slog.Info("waking a loop for a retry deadline", "loop", due.Loop,
-		"issue", due.Number, "due", due.At)
+	// Each pass adds one loop to skip and the query excludes it, so this
+	// ends after at most one iteration per loop that has a pending row.
+	for {
+		// EarliestRetryAfterAt, not EarliestRetryAfter: the cooldown
+		// boundary is judged against this worker's own clock, so a test can
+		// freeze both the deadline comparison below and the one inside the
+		// query at the same instant.
+		due, found, err := w.DB.EarliestRetryAfterAt(now, skip)
+		if err != nil {
+			// Reported and treated as "nothing pending". The caller waits
+			// its wake interval and asks again, which is the right response
+			// to a database that is momentarily unreadable.
+			slog.Error("cannot read the earliest retry deadline", "err", err)
+			return answer(time.Time{}, false)
+		}
+		if !found {
+			return answer(time.Time{}, false)
+		}
+		if due.At.After(now) {
+			// Nothing else is due. The caller sets its timer for this and
+			// does not tick.
+			return answer(due.At, true)
+		}
 
-	// TargetFor, never Targets(due.Repo): the deadline belongs to one
-	// project's issue, and repository routing would dispatch agents in every
-	// other project that watches the same repository, on that project's own
-	// token budget.
-	t, routing, err := w.TargetFor(due.ProjectID, due.Loop)
-	if err != nil {
-		slog.Error("cannot route retry deadline", "loop", due.Loop,
-			"project", due.ProjectID, "issue", due.Number, "err", err)
-		return due.At, true
+		slog.Info("waking a loop for a retry deadline", "loop", due.Loop,
+			"issue", due.Number, "due", due.At)
+
+		// TargetFor, never Targets(due.Repo): the deadline belongs to one
+		// project's issue, and repository routing would dispatch agents in
+		// every other project that watches the same repository, on that
+		// project's own token budget.
+		t, routing, err := w.TargetFor(due.ProjectID, due.Loop)
+		if err != nil {
+			// Returned, not skipped: TargetFor fails only when the registry
+			// itself cannot be read, which is machine-wide, so every other
+			// loop this pass tried would fail the same way.
+			slog.Error("cannot route retry deadline", "loop", due.Loop,
+				"project", due.ProjectID, "issue", due.Number, "err", err)
+			return answer(due.At, true)
+		}
+		key := loopKey{ProjectID: due.ProjectID, LoopName: due.Loop}
+
+		if routing == RouteFound {
+			// The loop routed, so whatever made it unroutable before is
+			// over. The count starts again from zero, which is what keeps a
+			// loop that is briefly unreadable every so often from ever
+			// reaching the threshold, and the throttle is dropped so the
+			// next occurrence logs its first line rather than being
+			// suppressed by an interval opened hours ago.
+			w.forgetUnroutable(key)
+			w.unroutable.forget(unroutableKey(key))
+
+			w.tickOne(ctx, t)
+
+			// The handled deadline is returned, not a fresh query for the
+			// next one. The tick may legitimately have decided nothing (its
+			// own backoff, a tripped breaker), which leaves this row past
+			// due, and Serve's MinWakeInterval floor is what keeps that
+			// from spinning.
+			return answer(due.At, true)
+		}
+
+		if routing == RouteGone {
+			w.noteUnroutable(key, due)
+		} else {
+			// RouteUnknown is waited on indefinitely, never cleared. This is
+			// the operator mid-edit, the volume not mounted yet, the
+			// permission changed during a restore -- all conditions that end
+			// when someone fixes them, none of them a reason to destroy a
+			// pending retry. The cost of waiting is now one throttled
+			// warning; the cost of acting would be an issue left holding an
+			// in-flight label with no agent and nothing to re-derive its
+			// flag.
+			//
+			// The count is forgotten, not merely left alone: orphanClearAfter
+			// counts CONSECUTIVE gone observations, and an observation that
+			// could not tell is not one of them.
+			w.forgetUnroutable(key)
+			w.warnUnroutable(key, due)
+		}
+
+		if skipped.IsZero() {
+			skipped = due.At
+		}
+		skip = append(skip, store.LoopKey{ProjectID: due.ProjectID, Loop: due.Loop})
 	}
-	key := loopKey{ProjectID: due.ProjectID, LoopName: due.Loop}
-	switch routing {
-	case RouteGone:
-		w.noteUnroutable(key, due)
-		return due.At, true
-	case RouteUnknown:
-		// Waited on indefinitely, never cleared. This is the operator
-		// mid-edit, the volume not mounted yet, the permission changed
-		// during a restore -- all conditions that end when someone fixes
-		// them, none of them a reason to destroy a pending retry. The cost
-		// of waiting is one warning per MinWakeInterval; the cost of acting
-		// would be an issue left holding an in-flight label with no agent
-		// and nothing to re-derive its flag.
-		//
-		// The count is forgotten, not merely left alone: orphanClearAfter
-		// counts CONSECUTIVE gone observations, and an observation that
-		// could not tell is not one of them.
-		w.forgetUnroutable(key)
+}
+
+// unroutableKey is one loop's throttle key. It is not loopKey itself only
+// because throttledLog is shared with the HTTP side, which keys by string.
+func unroutableKey(key loopKey) string {
+	return key.ProjectID + "/" + key.LoopName
+}
+
+// warnUnroutable reports a deadline whose loop cannot be resolved right now,
+// at most once per unroutableLogInterval for that loop.
+//
+// Throttled because the condition is unbounded in time by design: Wake never
+// clears such a deadline, so an unparsable config left over a weekend would
+// otherwise write one line per loop per wake -- thousands a day into the same
+// unrotated launchd stdout log the HTTP rejections are throttled for. The
+// operator needs to know it started and that it is still going, not a line per
+// probe.
+func (w *Worker) warnUnroutable(key loopKey, due store.RetryDue) {
+	if ok, suppressed := w.unroutable.allow(unroutableKey(key)); ok {
 		slog.Warn("cannot route a retry deadline right now; leaving it pending",
-			"loop", due.Loop, "project", due.ProjectID, "issue", due.Number)
-		return due.At, true
+			"loop", due.Loop, "project", due.ProjectID, "issue", due.Number,
+			"suppressed_since_last", suppressed)
 	}
-
-	// The loop routed, so whatever made it unroutable before is over. The
-	// count starts again from zero, which is what keeps a loop that is
-	// briefly unreadable every so often from ever reaching the threshold.
-	w.forgetUnroutable(key)
-
-	w.tickOne(ctx, t)
-
-	// The handled deadline is returned, not a fresh query for the next one.
-	// The tick may legitimately have decided nothing (its own backoff, a
-	// tripped breaker), which leaves this row past due, and Serve's
-	// MinWakeInterval floor is what keeps that from spinning.
-	return due.At, true
 }
 
 // noteUnroutable records that a past-due deadline's loop is definitely gone,
@@ -481,6 +580,9 @@ func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 // A failed clear leaves the count in place, so the next wake retries it at
 // once: a write that fails means the database itself is unwritable, and there
 // is no state a daemon could keep that would fix that.
+//
+// While the count runs, the wake pass steps over this loop as it does over an
+// unresolvable one, so the three observations cost the OTHER loops nothing.
 func (w *Worker) noteUnroutable(key loopKey, due store.RetryDue) {
 	w.mu.Lock()
 	w.orphans[key]++
