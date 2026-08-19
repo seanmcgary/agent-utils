@@ -29,11 +29,32 @@ const maxBodyBytes = 5 << 20
 const deliveryCacheSize = 1024
 
 // repoFullName matches "owner/name" the way GitHub spells a repository's
-// full_name. It is the one attacker-controlled value this package logs, so
-// it is bounded and character-restricted before it ever reaches a log line:
-// an unbounded string with embedded control characters would otherwise land
-// in the operator's log file verbatim.
+// full_name. It is one of two attacker-controlled values this package logs
+// (the other is the delivery id; see safeDeliveryID), so it is bounded and
+// character-restricted before it ever reaches a log line: an unbounded
+// string with embedded control characters would otherwise land in the
+// operator's log file verbatim.
 var repoFullName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$`)
+
+// deliveryIDShape matches what GitHub actually sends in X-Github-Delivery: a
+// UUID. It exists only to bound what safeDeliveryID will pass through to a
+// log line; the dedup cache itself (deliveryCache) accepts any non-empty
+// string as its key.
+var deliveryIDShape = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
+
+// safeDeliveryID returns id if it looks like a delivery id and "<invalid>"
+// otherwise. X-Github-Delivery is read and logged before anything else about
+// the request has been validated, so an anonymous, unauthenticated caller
+// controls its raw value completely -- net/http rejects control bytes in a
+// header value, but that still leaves room for a header approaching net/http's
+// line-length limit to land in the operator's log file. Every log call in
+// this file that carries a delivery id must route it through here first.
+func safeDeliveryID(id string) string {
+	if deliveryIDShape.MatchString(id) {
+		return id
+	}
+	return "<invalid>"
+}
 
 // rejected writes a fixed, generic body for status and logs the stage that
 // failed keyed only by delivery id.
@@ -44,7 +65,7 @@ var repoFullName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,1
 // this endpoint should not get for free. http.Error's fixed text for the
 // status code is all a caller ever sees.
 func rejected(w http.ResponseWriter, deliveryID, stage string, status int) {
-	slog.Warn("rejected webhook delivery", "delivery", deliveryID, "stage", stage, "status", status)
+	slog.Warn("rejected webhook delivery", "delivery", safeDeliveryID(deliveryID), "stage", stage, "status", status)
 	http.Error(w, http.StatusText(status), status)
 }
 
@@ -98,7 +119,8 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// The delivery id is read before anything can fail, purely so every
 		// rejection below can be keyed to it in the log without ever logging
-		// the signature or the secret.
+		// the signature or the secret. It is attacker-controlled and unread
+		// (see safeDeliveryID) until it is logged.
 		deliveryID := github.DeliveryID(r)
 
 		// 1. A method other than POST gives 405.
@@ -150,6 +172,11 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// the SHA-256 signature we already validated the shape of, is the
 		// only entry point used here. ValidateSignature compares with
 		// hmac.Equal, so this comparison is constant time.
+		//
+		// Any failure here -- including "error parsing signature" and
+		// "error decoding signature", which interpolate the raw signature
+		// string -- is folded into the single generic 401 below. rejected
+		// never receives err.Error(), only the fixed stage label.
 		payload, err := github.ValidatePayloadFromBody(mediaType, r.Body, sig, []byte(s.Secret))
 		if err != nil {
 			var tooLarge *http.MaxBytesError
@@ -175,9 +202,11 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		}
 
 		// 8. Decode and validate the one attacker-controlled value this
-		// daemon logs or passes onward. An unmatched full_name (empty, the
-		// wrong shape, or absurdly long) is rejected before it is ever
-		// logged, so the raw value never appears in the operator's log file.
+		// daemon passes onward as data (rather than only ever logging a
+		// bounded, shape-checked form of it, as with the delivery id). An
+		// unmatched full_name (empty, the wrong shape, or absurdly long) is
+		// rejected before it is ever logged, so the raw value never appears
+		// in the operator's log file.
 		var body struct {
 			Repository struct {
 				FullName string `json:"full_name"`
@@ -192,8 +221,19 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// 9. GitHub redelivers on timeout and on manual "Redeliver," and the
 		// plaintext hop behind a reverse proxy makes a captured delivery
 		// replayable forever. A repeat is answered 200 without a second Tick.
-		if s.seen.seen(deliveryID) {
-			slog.Info("duplicate delivery, skipping tick", "delivery", deliveryID, "repo", repo)
+		//
+		// A request that reaches here has already passed step 6, so it is
+		// signed with the real secret; an empty delivery id at this point is
+		// not an attacker probing the endpoint, only a malformed or unusual
+		// delivery. It is still not safe to cache: seen("") would remember
+		// the empty string, and every LATER signed delivery that also lacks
+		// the header would then be answered 200 with no tick, silently
+		// dropping real work. Skip the cache for it instead and let it
+		// through to step 10.
+		if deliveryID == "" {
+			slog.Warn("delivery has no id, skipping dedup", "repo", repo)
+		} else if s.seen.seen(deliveryID) {
+			slog.Info("duplicate delivery, skipping tick", "delivery", safeDeliveryID(deliveryID), "repo", repo)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -213,7 +253,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				s.Tick(ctx, repo)
 			}()
 		default:
-			slog.Warn("dropping delivery: worker pool full", "delivery", deliveryID, "repo", repo)
+			slog.Warn("dropping delivery: worker pool full", "delivery", safeDeliveryID(deliveryID), "repo", repo)
 		}
 		w.WriteHeader(http.StatusAccepted)
 	}
@@ -222,11 +262,18 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 // deliveryCache remembers the most recently seen X-Github-Delivery ids, so a
 // GitHub redelivery is answered without a second Tick.
 //
-// Eviction is oldest-in-first-out, not access-order LRU: dedup only cares
-// about the most recent N ids RECEIVED, and a hit never needs to renew an
-// id's position for that to stay correct. That keeps this a plain map plus a
-// queue instead of a second data structure to track access order, and avoids
-// adding a new module dependency for what a few dozen lines cover.
+// Eviction is oldest-in-first-out by insertion, not access-order LRU. This
+// is a real trade, not a free simplification: under FIFO, an id being
+// actively replayed still ages out once 1024 OTHER legitimate deliveries
+// have arrived after it, and the replay would then dispatch a second Tick.
+// Access-order LRU would instead keep an actively-replayed id pinned at the
+// front forever, since every replay attempt would touch it. FIFO is still
+// the right call here: the threat this defends against is GitHub's own
+// ordinary redelivery (retried close together, well within the window), not
+// an adversary who can already forge a valid signature and is choosing to
+// spend that capability on replaying a stale one instead of just signing a
+// fresh request. Given that, a plain map plus a queue is enough, and it
+// avoids a new module dependency for what amounts to a few dozen lines.
 type deliveryCache struct {
 	mu    sync.Mutex
 	limit int

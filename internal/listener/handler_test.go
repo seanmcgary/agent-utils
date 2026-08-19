@@ -57,6 +57,7 @@ func newServer(t *testing.T, tickCh chan<- string) *Server {
 	t.Helper()
 	s, err := New(&Server{
 		Secret: testSecret,
+		Port:   freePort(t),
 		Tick: func(_ context.Context, repo string) {
 			tickCh <- repo
 		},
@@ -142,6 +143,14 @@ func TestValidSignatureAccepts(t *testing.T) {
 	}
 }
 
+// TestWrongSignatureRejects is the control for the no-leak requirement on
+// the path that actually carries the attacker's signature into go-github's
+// error text. ValidatePayloadFromBody's ValidateSignature returns errors
+// like "signature is invalid" here, built from the caller's own signature
+// argument; TestSHA256HeaderCarryingSHA1SignatureRejects never reaches the
+// library at all, so it proves nothing about whether rejected() leaks a
+// real library error. This test would fail if rejected ever changed to
+// http.Error(w, err.Error(), status).
 func TestWrongSignatureRejects(t *testing.T) {
 	tickCh := make(chan string, 1)
 	s := newServer(t, tickCh)
@@ -149,13 +158,52 @@ func TestWrongSignatureRejects(t *testing.T) {
 	defer ts.Close()
 
 	body := repoPayload(t, "octo/hello")
+	sig := sha256Sig("not-the-secret", body)
 	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
-		github.SHA256SignatureHeader: sha256Sig("not-the-secret", body),
+		github.SHA256SignatureHeader: sig,
 	})
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
 	assertNoTick(t, tickCh)
+
+	respBody := readBody(t, resp)
+	if strings.Contains(respBody, sig) {
+		t.Errorf("rejection body leaks the signature: %q", respBody)
+	}
+	if strings.Contains(strings.ToLower(respBody), "sha1") {
+		t.Errorf("rejection body leaks the algorithm name: %q", respBody)
+	}
+}
+
+// TestInvalidHexSignatureRejects sends a signature with a correct "sha256="
+// prefix but a payload that is not valid hex. go-github's messageMAC
+// returns "error decoding signature %q", which interpolates the exact raw
+// signature string given to it -- a second, distinct place a leak could
+// enter besides ValidateSignature's own error text.
+func TestInvalidHexSignatureRejects(t *testing.T) {
+	tickCh := make(chan string, 1)
+	s := newServer(t, tickCh)
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body := repoPayload(t, "octo/hello")
+	sig := "sha256=not-valid-hex"
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sig,
+	})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	assertNoTick(t, tickCh)
+
+	respBody := readBody(t, resp)
+	if strings.Contains(respBody, sig) {
+		t.Errorf("rejection body leaks the signature: %q", respBody)
+	}
+	if strings.Contains(strings.ToLower(respBody), "sha1") {
+		t.Errorf("rejection body leaks the algorithm name: %q", respBody)
+	}
 }
 
 func TestMissingSignatureHeaderRejects(t *testing.T) {
@@ -427,4 +475,119 @@ func TestGetMethodRejectedAndHealthzOK(t *testing.T) {
 	if body := readBody(t, healthResp); body != "ok" {
 		t.Fatalf("GET /healthz body = %q, want %q", body, "ok")
 	}
+}
+
+// TestTickReceivesDaemonContextNotRequestContext proves Handler's ctx
+// parameter, not r.Context(), is what reaches Tick. net/http cancels
+// r.Context() the instant ServeHTTP returns, which happens right after step
+// 10 writes the 202 -- well before this test's fake Tick is even allowed to
+// run. If Handler used r.Context() instead of the daemon-scoped one, ctx.Err()
+// below would come back non-nil.
+func TestTickReceivesDaemonContextNotRequestContext(t *testing.T) {
+	release := make(chan struct{})
+	ctxErrCh := make(chan error, 1)
+	s, err := New(&Server{
+		Secret: testSecret,
+		Port:   freePort(t),
+		Tick: func(ctx context.Context, _ string) {
+			<-release
+			ctxErrCh <- ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body := repoPayload(t, "octo/hello")
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	// Drain and close the body so the client has the complete response,
+	// which happens only after ServeHTTP has returned on the server side --
+	// and r.Context() is therefore already cancelled -- before Tick is
+	// allowed to proceed past <-release.
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("drain response body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close response body: %v", err)
+	}
+
+	close(release)
+
+	select {
+	case err := <-ctxErrCh:
+		if err != nil {
+			t.Fatalf("Tick's ctx.Err() = %v, want nil (Handler must not pass r.Context() to Tick)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Tick")
+	}
+}
+
+// TestFullPoolDropsWithoutSecondTick is the DoS-bound control: with
+// MaxInFlight 1, a second delivery arriving while the one slot is held must
+// be dropped with 202 rather than blocking or, worse, spawning a second
+// unbounded goroutine. A regression to a blocking `s.sem <- struct{}{}`
+// would hang this test out to its deadline instead of passing quickly.
+func TestFullPoolDropsWithoutSecondTick(t *testing.T) {
+	tickStarted := make(chan struct{}, 2)
+	release := make(chan struct{})
+	s, err := New(&Server{
+		Secret:      testSecret,
+		Port:        freePort(t),
+		MaxInFlight: 1,
+		Tick: func(context.Context, string) {
+			tickStarted <- struct{}{}
+			<-release
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body1 := repoPayload(t, "octo/one")
+	resp1 := doRequest(t, ts.URL+"/webhook", body1, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body1),
+	})
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first delivery status = %d, want 202", resp1.StatusCode)
+	}
+
+	// Wait for the first Tick to actually be RUNNING, holding the one
+	// semaphore slot, before sending the second delivery. Without this the
+	// second request could race an empty pool and prove nothing.
+	select {
+	case <-tickStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first Tick to start")
+	}
+
+	body2 := repoPayload(t, "octo/two")
+	resp2 := doRequest(t, ts.URL+"/webhook", body2, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body2),
+	})
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("second delivery status = %d, want 202 (dropped, not blocked)", resp2.StatusCode)
+	}
+
+	// The second request's handling is entirely synchronous -- the pool-full
+	// branch never spawns a goroutine -- so by the time resp2 was received,
+	// no second Tick call could still be in flight. This check is therefore
+	// conclusive, not a race against a pending send.
+	select {
+	case <-tickStarted:
+		t.Fatal("second delivery must not have called Tick")
+	default:
+	}
+
+	close(release)
 }

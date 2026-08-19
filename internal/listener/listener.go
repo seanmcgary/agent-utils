@@ -24,13 +24,27 @@ import (
 // lock contention would.
 const defaultMaxInFlight = 8
 
+// loopbackAddr is the default bind address. net.JoinHostPort("", port)
+// produces ":port", which http.Server binds on every interface -- exactly
+// the "stranger on the internet can reach it" case the /healthz comment
+// says the OPERATOR, not this code, decides. Defaulting to loopback here is
+// what keeps a caller who simply omits Addr from publishing this endpoint,
+// which starts an agent with permission prompts disabled, to the whole
+// network.
+const loopbackAddr = "127.0.0.1"
+
 // Server serves the webhook endpoint. Construct it with New, which is the
 // only path that can produce one: it is where the fail-closed secret check
 // lives.
 type Server struct {
-	// Addr is the interface to bind. The operator, not this package, decides
-	// reachability by choosing it; see the /healthz comment in handler.go.
+	// Addr is the interface to bind. Empty defaults to loopback in New; see
+	// loopbackAddr. The operator, not this package, decides wider
+	// reachability by setting this explicitly; see the /healthz comment in
+	// handler.go.
 	Addr string
+	// Port must be positive. New refuses zero or negative values: an unset
+	// port would otherwise bind whatever ephemeral port the kernel picks,
+	// which the operator cannot predict or point a reverse proxy at.
 	Port int
 	// Secret is the GitHub webhook secret. New refuses to construct a Server
 	// when this is empty.
@@ -58,6 +72,11 @@ type Server struct {
 // is absent, so an empty secret is a state this program can reach in
 // practice, and the refusal has to live here rather than only in the command
 // that calls New, or a caller that forgets the check would serve wide open.
+//
+// It also defaults Addr to loopback and refuses a non-positive Port, for the
+// same reason: a caller who simply omits Addr must not publish this
+// endpoint to the whole network by accident, and a caller who omits Port
+// must not silently get an unpredictable ephemeral one.
 func New(s *Server) (*Server, error) {
 	if s == nil {
 		return nil, errors.New("listener: nil Server")
@@ -68,6 +87,12 @@ func New(s *Server) (*Server, error) {
 	if s.Tick == nil {
 		return nil, errors.New("listener: Tick must not be nil")
 	}
+	if s.Addr == "" {
+		s.Addr = loopbackAddr
+	}
+	if s.Port <= 0 {
+		return nil, errors.New("listener: Port must be a positive, specific port")
+	}
 	if s.MaxInFlight <= 0 {
 		s.MaxInFlight = defaultMaxInFlight
 	}
@@ -76,26 +101,41 @@ func New(s *Server) (*Server, error) {
 	return s, nil
 }
 
-// ListenAndServe binds Addr:Port and serves until ctx is cancelled, then
-// shuts down gracefully.
-//
-// The timeouts below all exist because http.MaxBytesReader bounds the size
-// of a request body but not the time it takes to send one: a client that
-// dribbles a few bytes at a time toward the 5 MiB cap would otherwise hold a
-// connection, and the goroutine serving it, open indefinitely.
-func (s *Server) ListenAndServe(ctx context.Context) error {
-	srv := &http.Server{
-		Addr:              net.JoinHostPort(s.Addr, strconv.Itoa(s.Port)),
+// httpServer builds the *http.Server ListenAndServe runs, without binding or
+// starting it. Split out so a test can assert the timeout fields directly,
+// without a real listener: MaxBytesReader bounds body SIZE but not read
+// TIME, so a client that dribbles a few bytes at a time toward the 5 MiB cap
+// would otherwise hold a connection, and the goroutine serving it, open
+// indefinitely, and that guarantee is worth asserting on its own.
+func (s *Server) httpServer(ctx context.Context) *http.Server {
+	return &http.Server{
 		Handler:           s.Handler(ctx),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+}
+
+// ListenAndServe binds Addr:Port and serves until ctx is cancelled, then
+// shuts down gracefully.
+//
+// The bind happens here, synchronously, via net.Listen rather than inside
+// the spawned goroutine: by the time this call returns without error, the
+// address is already bound and the kernel is queuing connections for it,
+// which is what lets a caller (or a test) treat a successful return as
+// "reachable" without polling.
+func (s *Server) ListenAndServe(ctx context.Context) error {
+	ln, err := net.Listen("tcp", net.JoinHostPort(s.Addr, strconv.Itoa(s.Port)))
+	if err != nil {
+		return err
+	}
+
+	srv := s.httpServer(ctx)
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
