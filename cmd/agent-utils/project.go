@@ -7,13 +7,320 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/home"
+	"github.com/seanmcgary/agent-utils/internal/project"
+	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/settings"
+	"github.com/seanmcgary/agent-utils/internal/wizard"
 	"github.com/urfave/cli/v3"
 )
+
+// projectInitCommand creates a project explicitly and, unless --no-loop,
+// walks through writing its first loop configuration.
+//
+// The project name is a POSITIONAL argument, following forget's precedent
+// (cli.StringArg, read with c.StringArg("name")), and MUST NOT be a --name
+// flag: `project` already declares --name as the PROJECT SELECTOR
+// (projectSelectorFlag), and urfave/cli lets a child flag of the same name
+// shadow a parent's — the exact hazard selectedProject's doc comment warns
+// about. A --name here would silently mean two different things depending on
+// where in the command line it appeared.
+func projectInitCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "init",
+		Usage:     "create a project explicitly and, unless --no-loop, set up its first loop",
+		Arguments: []cli.Argument{&cli.StringArg{Name: "name"}},
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "dir", Usage: "project directory; omit to use the working directory"},
+			&cli.BoolFlag{Name: "no-loop", Usage: "create the project only; skip the loop configuration wizard"},
+		},
+		Action: func(_ context.Context, c *cli.Command) error {
+			dir := c.String("dir")
+			if dir == "" {
+				wd, err := os.Getwd()
+				if err != nil {
+					return err
+				}
+				dir = wd
+			}
+			return projectInitRun(projectInitDeps{
+				Dir:         dir,
+				Name:        c.StringArg("name"),
+				NoLoop:      c.Bool("no-loop"),
+				Interactive: isInteractive(),
+				RunWizard:   runLoopWizard,
+				Out:         os.Stdout,
+			})
+		},
+	}
+}
+
+// projectInitDeps bundles project init's already-resolved inputs, the way
+// registerWebhookDeps does for register-webhook: the resolution, minting,
+// registration and reporting sequence in projectInitRun can then be driven by
+// a test against a temporary $AGENT_UTILS_HOME and a scripted RunWizard
+// function, none of which needs a real terminal. Only the Action above wires
+// the real ones in.
+type projectInitDeps struct {
+	// Dir is the project's root directory: --dir, or the working directory.
+	Dir string
+	// Name is the positional project name. Empty lets mintProjectDescriptor
+	// (via project.Ensure) name the project after Dir's base name instead.
+	Name        string
+	NoLoop      bool
+	Interactive bool
+	// RunWizard runs the loop-configuration wizard and writes the result. It
+	// is called only when NoLoop is false and Interactive is true, and takes
+	// (agentUtilsDir, rootDir): Write needs the former, Detect needs the
+	// latter.
+	RunWizard func(agentUtilsDir, rootDir string) (string, error)
+	Out       io.Writer
+}
+
+// projectInitRun resolves the target directory, mints or loads the project's
+// descriptor, registers it, and — unless told not to — runs the loop wizard.
+//
+// Re-running it on an already-initialised project is deliberately NOT an
+// error: it reports the existing identity, re-registers (a no-op update; see
+// registry.Register), and still offers the wizard, so `project init` doubles
+// as the entry point for adding a second loop to a project someone forgot
+// already existed.
+func projectInitRun(deps projectInitDeps) error {
+	rootDir, err := filepath.Abs(deps.Dir)
+	if err != nil {
+		return err
+	}
+
+	// The machine-wide directory (internal/home.Dir()) is an ordinary-looking
+	// directory under $HOME with nothing marking it as special. This refusal
+	// is the entire reason `project init` exists as an explicit step: without
+	// it, `project init` run from ~ (or from $AGENT_UTILS_HOME in a test)
+	// would happily write a project descriptor into the same directory the
+	// registry and the canonical state database live in, and register it as
+	// a "project". Symlinks are resolved on both sides (home.Resolve), the
+	// same way internal/config's FindDir guards its walk-up, because macOS
+	// resolves /var to /private/var and a raw string compare would fail
+	// open. An unresolvable machine-wide directory (home.Dir erroring)
+	// degrades to skipping the guard: there is nothing to protect against.
+	if machineWide, homeErr := home.Dir(); homeErr == nil &&
+		home.Resolve(rootDir) == home.Resolve(machineWide) {
+		return fmt.Errorf(
+			"refusing to initialise a project in %s: that is agent-utils' machine-wide "+
+				"directory (it holds the registry and the canonical state database); "+
+				"run `project init` from the directory you want to turn into a project instead",
+			rootDir)
+	}
+
+	agentUtilsDir := filepath.Join(rootDir, config.DirName)
+	configsDir := config.ConfigsDir(agentUtilsDir)
+	// 0700 on both: .agent-utils/ is the project's entire local state and
+	// configs/ holds its loop files, matching internal/home.EnsureDir's mode
+	// for the same reason — these directories are project-private. Created
+	// before minting the descriptor so an interrupted run leaves an empty
+	// configs/ rather than a descriptor with nowhere to put a loop file.
+	if err := os.MkdirAll(configsDir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", configsDir, err)
+	}
+
+	cfg, created, renamedFrom, err := mintProjectDescriptor(agentUtilsDir, deps.Name)
+	if err != nil {
+		return err
+	}
+
+	if err := registry.Register(agentUtilsDir, cfg.ID, cfg.Name); err != nil {
+		// Best effort, matching ResolveProject's own comment: the registry is
+		// an index, and losing this update costs the project a line in
+		// `agent-utils list`, never its descriptor.
+		fmt.Fprintf(os.Stderr, "warning: could not update the registry: %v\n", err)
+	}
+
+	// This reporting used to live in openProject, reached the first time any
+	// project command ran in an un-onboarded directory. It moves here because
+	// `project init` is now the explicit place a project is created or
+	// re-identified; a sibling unit (F5) removes the old implicit branch.
+	if created {
+		if err := reportf(deps.Out, "Created project %q (%s)\n", cfg.Name, agentUtilsDir); err != nil {
+			return err
+		}
+		if renamedFrom != "" {
+			if err := reportf(deps.Out,
+				"The name %q was already taken by another project, so this one is %q.\n"+
+					"Change it by editing %s\n",
+				renamedFrom, cfg.Name, project.Path(agentUtilsDir)); err != nil {
+				return err
+			}
+		}
+	} else if err := reportf(deps.Out, "Project %q already exists (%s)\n", cfg.Name, agentUtilsDir); err != nil {
+		return err
+	}
+
+	if deps.NoLoop {
+		return reportf(deps.Out,
+			"Skipped the loop configuration wizard (--no-loop). "+
+				"Run `agent-utils project loop new` to add one.\n")
+	}
+	if !deps.Interactive {
+		// A prompt in a cron job would hang forever — the same rule
+		// resolveLoopConfig already documents. init still does the
+		// non-prompting half of its job (steps 1-4) and only skips the part
+		// that needs a human.
+		return reportf(deps.Out,
+			"Skipped the loop configuration wizard: stdin is not a terminal. "+
+				"Run `agent-utils project loop new` from a terminal to add one.\n")
+	}
+
+	loopPath, err := deps.RunWizard(agentUtilsDir, rootDir)
+	if err != nil {
+		return err
+	}
+	loopName := strings.TrimSuffix(filepath.Base(loopPath), filepath.Ext(loopPath))
+	if err := reportf(deps.Out, "Wrote loop configuration %s\n", loopPath); err != nil {
+		return err
+	}
+	return reportf(deps.Out, "Next: agent-utils project --name %s loop tick --name %s\n", cfg.Name, loopName)
+}
+
+// reportf writes one status line to out and wraps a write failure with
+// enough context to say what could not be reported. Matches the treatment
+// registerWebhooks already gives its own out writes: a caller that cannot
+// see this line cannot tell what init or loop new actually did, so a failed
+// write here is not swallowed the way the direct os.Stderr warnings
+// elsewhere in this file are.
+func reportf(out io.Writer, format string, args ...any) error {
+	if _, err := fmt.Fprintf(out, format, args...); err != nil {
+		return fmt.Errorf("write status: %w", err)
+	}
+	return nil
+}
+
+// mintProjectDescriptor creates the project's descriptor if it does not
+// already exist, using name as the base identity when it is non-empty and
+// falling back to project.Ensure's own directory-derived default otherwise.
+//
+// name cannot be threaded through project.Ensure itself: Ensure always
+// derives its base name from the directory basename
+// (filepath.Base(filepath.Dir(agentUtilsDir))), with no parameter for an
+// explicit override. When name is given, this mints by hand instead —
+// slugging it the same way Ensure slugs a directory name, then uniquifying
+// against the SAME registry.NameTaken predicate Ensure itself uses — so
+// `project init foo` and `project init` (which lets Ensure name the project
+// after the directory) uniquify a taken name identically.
+//
+// Loading first, before any of that, is what keeps a second `project init`
+// on an already-initialised project from minting a second id: an existing
+// descriptor is returned as-is, and name (whatever was passed this time) is
+// ignored — the project already has an identity.
+func mintProjectDescriptor(agentUtilsDir, name string) (cfg *project.Config, created bool, renamedFrom string, err error) {
+	if name == "" {
+		cfg, created, err = project.Ensure(agentUtilsDir, registry.NameTaken)
+		return cfg, created, "", err
+	}
+
+	cfg, err = project.Load(agentUtilsDir)
+	if err == nil {
+		return cfg, false, "", nil
+	}
+	if !errors.Is(err, project.ErrNoConfig) {
+		return nil, false, "", err
+	}
+
+	base := project.Slug(name)
+	if base == "" {
+		base = "project"
+	}
+	chosen := base
+	for i := 2; registry.NameTaken(chosen); i++ {
+		chosen = fmt.Sprintf("%s-%d", base, i)
+	}
+
+	cfg = &project.Config{Name: chosen, ID: uuid.NewString()}
+	if err := project.Save(agentUtilsDir, cfg); err != nil {
+		return nil, false, "", err
+	}
+	if chosen != base {
+		renamedFrom = base
+	}
+	return cfg, true, renamedFrom, nil
+}
+
+// runLoopWizard runs the interactive setup wizard and writes the resulting
+// loop configuration.
+//
+// Detect is given rootDir (the project's own directory, for its git-derived
+// defaults) and Write is given agentUtilsDir (Write joins it with
+// config.ConfigsSubdir itself) — the two are not interchangeable.
+//
+// Prompts go to os.Stderr, matching promptForConfig and
+// confirmRegisterWebhook's existing convention in this file: a piped stdout
+// stays machine readable even during an interactive wizard session.
+func runLoopWizard(agentUtilsDir, rootDir string) (string, error) {
+	cfg, err := wizard.Run(wizard.NewTerminalPrompter(os.Stdin, os.Stderr), wizard.Detect(rootDir))
+	if err != nil {
+		return "", err
+	}
+	return wizard.Write(agentUtilsDir, cfg)
+}
+
+// projectLoopNewCommand adds another loop configuration to an already
+// initialised project via the setup wizard. It is the entry point for a
+// second (or third...) loop, once `project init` has already created the
+// project.
+func projectLoopNewCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "new",
+		Usage: "add another loop configuration to this project via the setup wizard",
+		Action: func(_ context.Context, c *cli.Command) error {
+			p, err := openProject(c)
+			if err != nil {
+				return err
+			}
+			return projectLoopNewRun(projectLoopNewDeps{
+				AgentUtilsDir: p.Dir,
+				RootDir:       p.Root,
+				Interactive:   isInteractive(),
+				RunWizard:     runLoopWizard,
+				Out:           os.Stdout,
+			})
+		},
+	}
+}
+
+// projectLoopNewDeps mirrors projectInitDeps' shape for the same reason:
+// projectLoopNewRun must be testable against a scripted RunWizard function
+// without a real terminal.
+type projectLoopNewDeps struct {
+	AgentUtilsDir string
+	RootDir       string
+	Interactive   bool
+	RunWizard     func(agentUtilsDir, rootDir string) (string, error)
+	Out           io.Writer
+}
+
+// projectLoopNewRun runs the wizard and reports what it wrote.
+//
+// Unlike project init, `loop new` has no non-wizard work to fall back to —
+// prompting is its entire job — so a non-interactive run is an outright
+// error rather than a skip-and-continue. The message names the same rule
+// resolveLoopConfig already documents: a prompt in a cron job would hang
+// forever.
+func projectLoopNewRun(deps projectLoopNewDeps) error {
+	if !deps.Interactive {
+		return errors.New(
+			"refusing to prompt for a loop configuration in a non-interactive run: " +
+				"run `agent-utils project loop new` from a terminal")
+	}
+	path, err := deps.RunWizard(deps.AgentUtilsDir, deps.RootDir)
+	if err != nil {
+		return err
+	}
+	return reportf(deps.Out, "Wrote loop configuration %s\n", path)
+}
 
 // registerWebhookCommand registers, with GitHub, the webhook endpoint that
 // lets the daemon dispatch an agent for this project's loops.

@@ -316,6 +316,7 @@ func projectCommand() *cli.Command {
 		Usage: "act on one project: its loops, configurations and logs",
 		Flags: []cli.Flag{projectSelectorFlag()},
 		Commands: []*cli.Command{
+			projectInitCommand(),
 			projectStatusCommand(),
 			projectListCommand(),
 			sessionsCommand(),
@@ -509,6 +510,7 @@ func loopCommand() *cli.Command {
 		Name:  "loop",
 		Usage: "run and inspect an issue-driven agent loop",
 		Commands: []*cli.Command{
+			projectLoopNewCommand(),
 			{
 				Name:  "tick",
 				Usage: "run one reconcile and dispatch pass, then exit",
