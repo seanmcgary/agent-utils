@@ -9,12 +9,12 @@ Design: [`docs/superpowers/specs/2026-08-19-webhook-listener-design.md`](../spec
 
 | Field   | Value                                                                 |
 |---------|-----------------------------------------------------------------------|
-| stage   | 2 (plan review complete, awaiting the human gate)                     |
+| stage   | 3 (implementation)                                                    |
 | class   | large (new subsystem, schema migration, remote-triggered code execution) |
 | profile | backend                                                               |
 | branch  | feat/webhook-listener                                                 |
 | pr      | #4                                                                    |
-| gate    | pending                                                               |
+| gate    | approved 2026-08-19                                                   |
 | round   | 0                                                                     |
 
 ## Architecture
@@ -484,13 +484,18 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
     what is really in the file.
 
   Field validation, in the `Set` functions:
-  - `webhook.url` must parse with `net/url`, must have a host, and must use scheme `http` or
-    `https`. Do **not** reject `http`. The daemon is expected to sit behind nginx, cloudflared,
-    or ngrok, which terminate TLS, so the public URL is normally `https` without this code
-    saying anything; and a plain-`http` endpoint is legitimate on a private network or a
-    tailnet. Print a warning when the scheme is `http` and the host is not loopback, naming
-    what it costs: the delivery and its signature cross the network in the clear, so an
-    observer can replay that one delivery. Do not print it for a loopback host.
+  - `webhook.url` must parse with `net/url`, must have a host, and must use scheme `https`.
+    Reject `http` for any non-loopback host.
+
+    This constrains the URL **GitHub posts to**, not the daemon. The daemon speaks plain HTTP
+    and never terminates TLS; nginx, cloudflared, or ngrok does that in front of it. The public
+    URL that terminating proxy publishes is `https`, and this rule is what keeps a
+    misconfiguration from handing GitHub a plaintext endpoint — over which the delivery and the
+    `X-Hub-Signature-256` that authorises agent execution would cross the internet in the
+    clear, replayable by anyone who observes one.
+
+    Allow `http` only when the host is a loopback name or address, so a local end-to-end test
+    needs no certificate. Say that exception is for local testing in the comment.
   - `webhook.listen_port` must be in 1..65535.
   - `webhook.secret` has no `Set`. Direct the operator to `config webhook --rotate-secret`, so
     a weak hand-typed secret cannot reach the file.
@@ -1457,8 +1462,8 @@ path, and the cause is implicit onboarding rather than the file name.
   - Add a "Webhooks" section after "Cron", giving the setup in order:
     `config webhook --enable --url ...`, `project register-webhook`,
     `listener start --daemon`. State that the daemon speaks plain HTTP and expects nginx,
-    cloudflared, or ngrok in front of it to terminate TLS, and that the default bind address is
-    `127.0.0.1`.
+    cloudflared, or ngrok in front of it to terminate TLS, that `webhook.url` is therefore the
+    proxy's `https` URL and must be `https`, and that the default bind address is `127.0.0.1`.
   - **The new section must carry the `install -m 600 /dev/null ~/.agent-utils/env` instruction**,
     or reference the Cron section that has it. That file is currently created only in the Cron
     section, and E3 makes it a hard daemon prerequisite.
