@@ -558,3 +558,60 @@ func TestRunNegativeRetryBreakerCooldownReasks(t *testing.T) {
 		t.Fatalf("Retry.Breaker.Cooldown = %v, want 45m", cfg.Retry.Breaker.Cooldown)
 	}
 }
+
+// A negative budget is not merely odd: internal/runner/args.go gates on
+// "> 0", so it silently means "no cap" -- the opposite of what someone who
+// typed a stray minus sign asked for. 0 is the deliberate way to say that,
+// and stays accepted.
+func TestRunNegativeAgentMaxBudgetReasksAndZeroIsAccepted(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		answers []string
+		want    float64
+	}{
+		{"negative is re-asked", []string{"-25", "25"}, 25},
+		{"zero means no cap", []string{"0"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setHome(t)
+			d := detected(t)
+
+			answers := []string{
+				"planning", // 24. prompt template
+				"",         // 1.  name
+				"",         // 2.  repo
+				"",         // 3.  checkout_base_dir
+				"",         // 4.  worktree_dir
+				"",         // 5.  state_dir
+				"",         // 6.  default_branch
+				"",         // 7.  labels.trigger
+				"",         // 8.  labels.in_flight
+				"",         // 9.  labels.blocked
+				"",         // 10. labels.review
+				"",         // 11. labels.terminal
+				"",         // 12. labels.veto
+				"",         // 13. agent.model
+				"",         // 14. agent.effort
+				"",         // 15. agent.permission_mode
+				"",         // 16. agent.worktree
+			}
+			answers = append(answers, tc.answers...) // 17. agent.max_budget_usd
+			answers = append(answers,
+				"", // 18. agent.timeout
+				"", // 20. retry.max
+				"", // 21. retry.backoff
+				"", // 22. retry.breaker.orphan_threshold
+				"", // 23. retry.breaker.cooldown
+			)
+			p := &scriptPrompter{t: t, answers: answers}
+
+			cfg, err := Run(p, d)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if cfg.Agent.MaxBudgetUSD != tc.want {
+				t.Fatalf("Agent.MaxBudgetUSD = %v, want %v", cfg.Agent.MaxBudgetUSD, tc.want)
+			}
+		})
+	}
+}

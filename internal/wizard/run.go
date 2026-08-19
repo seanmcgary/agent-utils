@@ -240,8 +240,8 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	// 17. agent.max_budget_usd
 	budgetAnswer, err := p.Ask(Question{
 		Key: "agent.max_budget_usd", Label: "Agent max budget (USD)",
-		Help: "Dispatch stops if the agent's session cost exceeds this.", Default: "25",
-		Validate: validateFloat,
+		Help: "Dispatch stops if the agent's session cost exceeds this; 0 means no limit.", Default: "25",
+		Validate: validateNonNegativeFloat,
 	})
 	if err != nil {
 		return nil, err
@@ -348,9 +348,20 @@ func validateRepo(s string) error {
 	return nil
 }
 
-func validateFloat(s string) error {
-	if _, err := strconv.ParseFloat(s, 64); err != nil {
+// validateNonNegativeFloat is used for agent.max_budget_usd. 0 is accepted
+// and means no cap -- internal/runner/args.go omits --max-budget-usd for it. A
+// negative value reaches that same "> 0" gate, so it would be silently
+// identical to 0: an operator who typed "-25" meaning "25" would have run
+// uncapped. config.validate rejects it too, for a hand-edited file; catching
+// it here means the wizard says so instead of failing at Write's reload,
+// after all 24 answers have been given.
+func validateNonNegativeFloat(s string) error {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
 		return fmt.Errorf("%q is not a number", s)
+	}
+	if f < 0 {
+		return fmt.Errorf("%q must not be negative; use 0 for no limit", s)
 	}
 	return nil
 }

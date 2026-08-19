@@ -200,6 +200,16 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf(
 			"agent.effort %q is not a valid effort level", c.Agent.Effort))
 	}
+	// 0 is legitimate and documented: it means no cost ceiling, and
+	// internal/runner/args.go omits --max-budget-usd for it. A NEGATIVE value
+	// hits that same "> 0" gate, so it is silently identical to no cap -- an
+	// operator who typed "-25" meaning "25" would have got an uncapped
+	// dispatch and no warning. Only the negative case is an error.
+	if c.Agent.MaxBudgetUSD < 0 {
+		errs = append(errs, fmt.Errorf(
+			"agent.max_budget_usd must not be negative, got %v; use 0 for no limit",
+			c.Agent.MaxBudgetUSD))
+	}
 	if c.Agent.Timeout.Std() <= 0 {
 		errs = append(errs, errors.New("agent.timeout must be greater than zero"))
 	}

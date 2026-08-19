@@ -222,3 +222,36 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+// max_budget_usd: 0 is how a loop runs with no cost ceiling:
+// internal/runner/args.go only appends --max-budget-usd when the value is greater
+// than zero, so 0 omits the flag entirely. Nothing in validate may start
+// requiring a positive number without deliberately taking that away, so the
+// behaviour is pinned here rather than left to be discovered by an operator
+// whose uncapped loop suddenly refuses to load.
+func TestLoadAcceptsZeroMaxBudget(t *testing.T) {
+	body := replaceOnce(validYAML, "  max_budget_usd: 25\n", "  max_budget_usd: 0\n")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("max_budget_usd: 0 must load, it means no cap: %v", err)
+	}
+	if cfg.Agent.MaxBudgetUSD != 0 {
+		t.Errorf("MaxBudgetUSD = %v, want 0", cfg.Agent.MaxBudgetUSD)
+	}
+}
+
+// A negative budget is silently identical to no budget: args.go gates on
+// "> 0", so -25 omits --max-budget-usd and the dispatch runs uncapped. An
+// operator who typed a stray minus sign asked for a $25 ceiling and would
+// have got none, with nothing said. Reject it at load, so a hand-edited file
+// is caught and not only a wizard answer.
+func TestLoadRejectsNegativeMaxBudget(t *testing.T) {
+	body := replaceOnce(validYAML, "  max_budget_usd: 25\n", "  max_budget_usd: -25\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want error for a negative max_budget_usd, got nil")
+	}
+	if !strings.Contains(err.Error(), "max_budget_usd") {
+		t.Errorf("err = %v, want it to name max_budget_usd", err)
+	}
+}

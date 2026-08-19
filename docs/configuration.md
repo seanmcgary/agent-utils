@@ -457,13 +457,21 @@ worktree: per_issue
 
 ### `agent.max_budget_usd` — optional
 
-Passed as `--max-budget-usd`. Omit or set `0` for no limit.
+Passed to the agent as `--max-budget-usd`. The dispatch is stopped when the session's cost
+exceeds it.
+
+**`0`, or omitting the field, disables the cap.** The flag is then not passed at all and the
+dispatch runs with no cost ceiling — bounded only by `agent.timeout`. That is deliberate and
+supported; set it knowingly.
+
+A negative value is rejected at load. It would otherwise behave exactly like `0`, so `-25`
+typed for `25` would have run uncapped and said nothing.
 
 This is a per-dispatch ceiling, not a per-issue or per-day one. An issue that is retried
 three times can spend up to three times this amount.
 
 ```yaml
-max_budget_usd: 25
+max_budget_usd: 25   # or 0 for no cap
 ```
 
 ### `agent.timeout` — required
@@ -674,6 +682,7 @@ Beyond the required fields in the quick reference:
 | `agent.effort` ∈ {`low`,`medium`,`high`,`xhigh`,`max`} or empty | `… is not a valid effort level` |
 | `agent.permission_mode` is a real claude mode or empty | `… is not a valid claude permission mode` |
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
+| `agent.max_budget_usd` ≥ 0 (`0` means no cap) | `agent.max_budget_usd must not be negative` |
 | `agent.timeout` > 0 | `agent.timeout must be greater than zero` |
 | `retry.max` ≥ 0 | `retry.max must not be negative` |
 | `len(retry.backoff)` ≥ `retry.max` | `it needs one entry per retry` |
