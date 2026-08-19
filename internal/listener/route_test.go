@@ -183,27 +183,29 @@ func TestTargetsReturnsAnErrorWhenTheRegistryCannotBeRead(t *testing.T) {
 	}
 }
 
-func TestTargetForReturnsExactlyOneLoopAndOkFalseForUnknown(t *testing.T) {
+func TestTargetForReturnsExactlyOneLoopAndGoneForUnknown(t *testing.T) {
 	home := setHome(t)
 	idA, dirA := newProject(t, home, "alpha")
 	writeLoop(t, dirA, "planning.yaml", minimalConfig("planning", "acme/widgets"))
 
-	target, ok, err := TargetFor(idA, "planning")
+	target, routing, err := TargetFor(idA, "planning")
 	if err != nil {
 		t.Fatalf("TargetFor: %v", err)
 	}
-	if !ok {
-		t.Fatal("ok = false, want true for a known project/loop pair")
+	if routing != RouteFound {
+		t.Fatalf("routing = %v, want found for a known project/loop pair", routing)
 	}
 	if target.LoopName != "planning" || target.ProjectID != idA {
 		t.Errorf("target = %+v, want alpha's planning loop", target)
 	}
 
-	if _, ok, err := TargetFor(idA, "no-such-loop"); err != nil || ok {
-		t.Errorf("TargetFor(known project, unknown loop) = ok=%v err=%v, want ok=false, err=nil", ok, err)
+	// Both of these are definite: the registry answered and the configs
+	// directory listed cleanly. The caller is allowed to act on that.
+	if _, routing, err := TargetFor(idA, "no-such-loop"); err != nil || routing != RouteGone {
+		t.Errorf("TargetFor(known project, unknown loop) = %v (err %v), want gone", routing, err)
 	}
-	if _, ok, err := TargetFor("no-such-project", "planning"); err != nil || ok {
-		t.Errorf("TargetFor(unknown project, known loop) = ok=%v err=%v, want ok=false, err=nil", ok, err)
+	if _, routing, err := TargetFor("no-such-project", "planning"); err != nil || routing != RouteGone {
+		t.Errorf("TargetFor(unknown project, known loop) = %v (err %v), want gone", routing, err)
 	}
 }
 
@@ -218,14 +220,73 @@ func TestTargetForDoesNotReturnAnotherProjectsSameNamedLoop(t *testing.T) {
 	writeLoop(t, dirA, "planning.yaml", minimalConfig("planning", "acme/widgets"))
 	writeLoop(t, dirB, "planning.yaml", minimalConfig("planning", "acme/widgets"))
 
-	target, ok, err := TargetFor(idA, "planning")
+	target, routing, err := TargetFor(idA, "planning")
 	if err != nil {
 		t.Fatalf("TargetFor: %v", err)
 	}
-	if !ok {
-		t.Fatal("ok = false, want true")
+	if routing != RouteFound {
+		t.Fatalf("routing = %v, want found", routing)
 	}
 	if target.ProjectID != idA || target.Dir != dirA {
 		t.Errorf("target = %+v, want alpha's loop, not beta's same-named one", target)
+	}
+}
+
+// Everything below is about the difference between "this loop is gone" and "I
+// cannot tell right now". Only the first may be acted on: the caller's
+// response to it (internal/listener/work.go's noteUnroutable) clears a durable
+// failure flag that nothing re-derives.
+
+// An operator saving a half-finished yaml file is the case a timer cannot
+// cover -- the file stays broken for as long as they are editing. The file
+// that fails to load also declares no name, so it cannot be ruled out as the
+// loop being looked for.
+func TestTargetForCannotTellWhileAConfigDoesNotParse(t *testing.T) {
+	home := setHome(t)
+	id, dir := newProject(t, home, "alpha")
+	writeLoop(t, dir, "planning.yaml", "name: planning\nthis_key_does_not_exist: true\n")
+
+	if _, routing, err := TargetFor(id, "planning"); err != nil || routing != RouteUnknown {
+		t.Errorf("routing = %v (err %v), want unknown while the loop's file is broken", routing, err)
+	}
+}
+
+// The same holds for an unrelated broken file: config.Entry.Name falls back to
+// the FILE's base name when a file does not load, and that need not equal the
+// `name:` field inside it, so a broken "notes.yaml" may be the loop.
+func TestTargetForCannotTellWhileAnyConfigDoesNotParse(t *testing.T) {
+	home := setHome(t)
+	id, dir := newProject(t, home, "alpha")
+	writeLoop(t, dir, "good.yaml", minimalConfig("review", "acme/widgets"))
+	writeLoop(t, dir, "notes.yaml", "name: notes\nthis_key_does_not_exist: true\n")
+
+	if _, routing, err := TargetFor(id, "planning"); err != nil || routing != RouteUnknown {
+		t.Errorf("routing = %v (err %v), want unknown while any config in the project is broken", routing, err)
+	}
+}
+
+// A directory that is not present is a volume not mounted yet, or a restore in
+// progress, as readily as a deleted project.
+func TestTargetForCannotTellWhileTheProjectDirectoryIsAbsent(t *testing.T) {
+	home := setHome(t)
+	id, dir := newProject(t, home, "alpha")
+	writeLoop(t, dir, "planning.yaml", minimalConfig("planning", "acme/widgets"))
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, routing, err := TargetFor(id, "planning"); err != nil || routing != RouteUnknown {
+		t.Errorf("routing = %v (err %v), want unknown for a directory that is not present", routing, err)
+	}
+}
+
+// The project is here, its configs directory listed cleanly, and it holds no
+// loop at all. Nothing transient produces that, so it is definite.
+func TestTargetForIsGoneWhenTheProjectHasNoConfigsAtAll(t *testing.T) {
+	home := setHome(t)
+	id, _ := newProject(t, home, "alpha") // no writeLoop: no configs/ directory
+
+	if _, routing, err := TargetFor(id, "planning"); err != nil || routing != RouteGone {
+		t.Errorf("routing = %v (err %v), want gone for a project with no loops", routing, err)
 	}
 }

@@ -391,3 +391,99 @@ func TestRenderProjectsFlagsOrphans(t *testing.T) {
 		t.Errorf("orphans should be marked in the LIVE column:\n%s", out)
 	}
 }
+
+// A retry deadline is only reachable through engine.Decide, which iterates the
+// OPEN issues. Close the issue and the row is stranded: nothing clears it, and
+// the webhook daemon's wake query hands the same past deadline back every
+// MinWakeInterval, running a full tick -- GitHub reads included -- each time,
+// forever. The tick that can see the issue is gone must retire the deadline.
+func TestTickClearsTheDeadlineOfAnIssueTheLoopCanNoLongerSee(t *testing.T) {
+	cfg := tickConfig(t)
+	// Issue 7 is not in the snapshot: closed, or transferred away.
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"trigger"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	now := time.Now().UTC()
+	if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 7, now,
+		[]time.Duration{time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.RetryAfter.IsZero() {
+		t.Errorf("RetryAfter = %v, want zero: the daemon's wake query would spin on it forever", st.RetryAfter)
+	}
+	// The flag survives on purpose. Nothing re-derives it, so destroying it
+	// would strand the issue holding an in-flight label with no agent; keeping
+	// it means reopening the issue retries at once.
+	if !st.NeedsRetry {
+		t.Error("NeedsRetry = false; a closed issue's failure must survive so reopening it retries")
+	}
+}
+
+// The same strand, reached by the other ordinary operator action: a veto label
+// makes engine.Decide skip the issue before it ever reads NeedsRetry, so the
+// row is just as unreachable as a closed one.
+func TestTickClearsTheDeadlineOfAVetoedIssue(t *testing.T) {
+	cfg := tickConfig(t)
+	cfg.Labels.Veto = []string{"hold"}
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 7, Labels: []string{"in-flight", "hold"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 7, time.Now().UTC(),
+		[]time.Duration{time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.RetryAfter.IsZero() {
+		t.Errorf("RetryAfter = %v, want zero for a vetoed issue", st.RetryAfter)
+	}
+	if !st.NeedsRetry {
+		t.Error("NeedsRetry = false; removing the veto label must resume the retry")
+	}
+}
+
+// The sweep must not touch a row the engine CAN reach. An issue inside its
+// backoff window is the case that would break loudest: clearing its deadline
+// would run the retry immediately and spend the whole escalating list as fast
+// as the GitHub API answers.
+func TestTickKeepsTheDeadlineOfAnIssueStillInTheSnapshot(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 7, Labels: []string{"in-flight"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 7, time.Now().UTC(),
+		[]time.Duration{time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.RetryAfter.IsZero() {
+		t.Error("RetryAfter was cleared for an issue the engine can still reach; its backoff window is gone")
+	}
+}

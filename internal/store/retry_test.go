@@ -199,9 +199,9 @@ func seedRetryRow(t *testing.T, s *Store, number int, at time.Time, needsRetry, 
 
 func TestEarliestRetryAfterOnAnEmptyTable(t *testing.T) {
 	db := openDB(t)
-	_, ok, err := db.EarliestRetryAfter()
+	_, ok, err := db.EarliestRetryAfterAt(time.Now().UTC())
 	if err != nil {
-		t.Fatalf("EarliestRetryAfter: %v", err)
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
 	if ok {
 		t.Error("ok = true on an empty table, want false")
@@ -220,9 +220,9 @@ func TestEarliestRetryAfterSkipsRowsNoRetryCanActOn(t *testing.T) {
 	seedRetryRow(t, s, 4, retryNow.Add(time.Hour), true, false)   // live, later
 	seedRetryRow(t, s, 5, retryNow.Add(time.Minute), true, false) // live, sooner
 
-	due, ok, err := db.EarliestRetryAfter()
+	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC())
 	if err != nil {
-		t.Fatalf("EarliestRetryAfter: %v", err)
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
 	if !ok {
 		t.Fatal("ok = false, want the live row")
@@ -250,7 +250,7 @@ func TestEarliestRetryAfterSkipsALoopInCooldown(t *testing.T) {
 	if err := s.SetCooldown("planning", time.Now().UTC().Add(time.Hour)); err != nil {
 		t.Fatalf("SetCooldown: %v", err)
 	}
-	if _, ok, err := db.EarliestRetryAfter(); err != nil || ok {
+	if _, ok, err := db.EarliestRetryAfterAt(time.Now().UTC()); err != nil || ok {
 		t.Fatalf("ok = %v (err %v), want false while the loop is in cooldown", ok, err)
 	}
 
@@ -258,9 +258,9 @@ func TestEarliestRetryAfterSkipsALoopInCooldown(t *testing.T) {
 	if err := s.SetCooldown("planning", time.Now().UTC().Add(-time.Hour)); err != nil {
 		t.Fatalf("SetCooldown: %v", err)
 	}
-	due, ok, err := db.EarliestRetryAfter()
+	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC())
 	if err != nil {
-		t.Fatalf("EarliestRetryAfter: %v", err)
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
 	if !ok || due.Number != 1 {
 		t.Errorf("due = %+v, ok = %v, want issue 1 once the cooldown has passed", due, ok)
@@ -277,9 +277,9 @@ func TestEarliestRetryAfterIsReportedPerProject(t *testing.T) {
 	seedRetryRow(t, a, 1, retryNow, true, false)
 	seedRetryRow(t, b, 1, retryNow.Add(time.Hour), true, false)
 
-	due, ok, err := db.EarliestRetryAfter()
+	due, ok, err := db.EarliestRetryAfterAt(time.Now().UTC())
 	if err != nil {
-		t.Fatalf("EarliestRetryAfter: %v", err)
+		t.Fatalf("EarliestRetryAfterAt: %v", err)
 	}
 	if !ok {
 		t.Fatal("ok = false, want project A's deadline")
@@ -362,5 +362,133 @@ func TestConcurrentMarkNeedsRetryNeverLosesAFailureFlag(t *testing.T) {
 			t.Errorf("issue %d = %+v, want needs_retry with a deadline of %v",
 				number, st, retryNow)
 		}
+	}
+}
+
+// The dispatch path writes this row from a tick that holds the loop's flock; a
+// detached runner process finishing a failed dispatch writes it through
+// MarkNeedsRetry and holds nothing. So the columns the failure path owns must
+// not be re-written from a value the dispatch read earlier.
+//
+// A retry spends the budget recorded on the ROW, not one carried across that
+// gap, and it leaves the deadline alone -- MarkNeedsRetry is the only writer of
+// a real one, and a deadline stamped before the agent runs would be overwritten
+// by the failure that follows, collapsing the escalating list to one entry.
+func TestBeginDispatchSpendsTheBudgetRecordedOnTheRow(t *testing.T) {
+	s := openTemp(t)
+
+	// Two failures: retry_count is still 0 (MarkNeedsRetry does not spend it),
+	// so drive it up the way a real retry does, then have the "other process"
+	// record one more failure before this dispatch writes.
+	if err := s.BeginDispatch("planning", "o/r", 1, "s1", true, retryNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkNeedsRetry("planning", "o/r", 1, retryNow, retryBackoff()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.BeginDispatch("planning", "o/r", 1, "s2", true, retryNow); err != nil {
+		t.Fatalf("BeginDispatch: %v", err)
+	}
+
+	got, err := s.IssueState("planning", "o/r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RetryCount != 2 {
+		t.Errorf("RetryCount = %d, want 2: the budget must be spent from the row", got.RetryCount)
+	}
+	if got.RetryAfter.IsZero() {
+		t.Error("RetryAfter = 0; a retry must leave MarkNeedsRetry's deadline alone")
+	}
+	if got.NeedsRetry {
+		t.Error("NeedsRetry = true; the dispatch it belongs to is now running")
+	}
+	if got.SessionID != "s2" {
+		t.Errorf("SessionID = %q, want the session this dispatch runs under", got.SessionID)
+	}
+}
+
+// A human trigger begins a new episode, so this one branch does reset the
+// budget and drop the deadline left from the previous one.
+func TestBeginDispatchOnAHumanTriggerResetsTheBudget(t *testing.T) {
+	s := openTemp(t)
+	if err := s.BeginDispatch("planning", "o/r", 1, "s1", true, retryNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkNeedsRetry("planning", "o/r", 1, retryNow, retryBackoff()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.BeginDispatch("planning", "o/r", 1, "s2", false, retryNow); err != nil {
+		t.Fatalf("BeginDispatch: %v", err)
+	}
+
+	got, err := s.IssueState("planning", "o/r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RetryCount != 0 || !got.RetryAfter.IsZero() || got.NeedsRetry {
+		t.Errorf("state = %+v, want the budget, the deadline and the flag all reset", got)
+	}
+}
+
+// The worktree is created between the dispatch's two writes -- git, so seconds,
+// not microseconds -- and that is the widest window a concurrent failure can
+// land in. This write must therefore touch nothing but the path.
+func TestSetWorktreePathLeavesTheFailureColumnsAlone(t *testing.T) {
+	s := openTemp(t)
+	if err := s.BeginDispatch("planning", "o/r", 1, "s1", true, retryNow); err != nil {
+		t.Fatal(err)
+	}
+	// The runner process records its failure while git is still working.
+	if err := s.MarkNeedsRetry("planning", "o/r", 1, retryNow, retryBackoff()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetWorktreePath("planning", "o/r", 1, "/wt/1", retryNow); err != nil {
+		t.Fatalf("SetWorktreePath: %v", err)
+	}
+
+	got, err := s.IssueState("planning", "o/r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorktreePath != "/wt/1" {
+		t.Errorf("WorktreePath = %q, want /wt/1", got.WorktreePath)
+	}
+	if !got.NeedsRetry {
+		t.Error("NeedsRetry = false; the failure recorded during the worktree step was clobbered")
+	}
+	if got.RetryAfter.IsZero() {
+		t.Error("RetryAfter = 0; the failure's deadline was clobbered")
+	}
+	if got.RetryCount != 1 {
+		t.Errorf("RetryCount = %d, want the 1 the dispatch spent", got.RetryCount)
+	}
+}
+
+// ClearRetryAfter retires a deadline the engine can never reach without
+// destroying the failure it belongs to: nothing re-derives that flag, and the
+// issue would be stranded holding an in-flight label with no agent.
+func TestClearRetryAfterKeepsTheFlag(t *testing.T) {
+	s := openTemp(t)
+	if err := s.MarkNeedsRetry("planning", "o/r", 1, retryNow, retryBackoff()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ClearRetryAfter("planning", "o/r", 1); err != nil {
+		t.Fatalf("ClearRetryAfter: %v", err)
+	}
+
+	got, err := s.IssueState("planning", "o/r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.RetryAfter.IsZero() {
+		t.Errorf("RetryAfter = %v, want zero", got.RetryAfter)
+	}
+	if !got.NeedsRetry {
+		t.Error("NeedsRetry = false; the failure must survive so reopening the issue retries")
 	}
 }

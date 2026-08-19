@@ -40,23 +40,20 @@ const (
 // delivery, exactly as an exhausted ordinary retry does.
 const openRetryMax = 3
 
-// orphanClearAfter is how many consecutive wakes must find a deadline
-// unroutable before its failure flag is cleared. At the default wake
-// interval that is about 90 seconds.
+// orphanClearAfter is how many consecutive wakes must report RouteGone
+// before a deadline's failure flag is cleared. At the default wake interval
+// that is about 90 seconds.
 //
-// It is not 1. listener.TargetFor reports ok=false for five different
-// conditions and cannot tell them apart -- an unregistered project, a
-// directory that is not currently present, a configs directory it could not
-// list, a loop whose yaml does not currently parse, and a loop that really
-// is gone. Three of those are transient: an operator saving a half-finished
-// yaml file, a volume that is not mounted yet, a permission changed mid
-// restore. Clearing needs_retry is irreversible -- store.IssueState says
-// only a retry, a park, or a success clears it, and nothing re-derives it --
-// so clearing on the first observation would let a config file that is
-// broken for an hour silently destroy every pending retry that loop had,
-// one issue per wake. Requiring the condition to outlive several wake
-// intervals keeps the spin bounded without attaching a permanent delete to
-// a signal that cannot distinguish "gone" from "cannot tell right now".
+// It is NOT a way to tell "gone" from "cannot tell right now": TargetFor
+// answers that question itself now (see Routing), and a wake that cannot
+// tell resets this count instead of adding to it. What is left for a counter
+// to defend against is narrow and mechanical -- a configs directory being
+// rewritten non-atomically, where a listing lands in the instant between the
+// old file being removed and the new one appearing. Clearing needs_retry is
+// irreversible: store.IssueState says only a retry, a park, or a success
+// clears it, and nothing re-derives it. Three agreeing observations across
+// three wake intervals cost nothing (the wake loop is already bounded by
+// MinWakeInterval) and cannot all land inside a single rename.
 const orphanClearAfter = 3
 
 // loopKey identifies one loop of one project. Two projects may run loops of
@@ -118,7 +115,7 @@ type Worker struct {
 	// Targets, TargetFor, Open, and Run are seams. Production wires them to
 	// listener.Targets, listener.TargetFor, loopcmd.Open, and loopcmd.RunTick.
 	Targets   func(repo string) ([]Target, error)
-	TargetFor func(projectID, loop string) (Target, bool, error)
+	TargetFor func(projectID, loop string) (Target, Routing, error)
 	Token     func() (string, error)
 	Open      func(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error)
 	Run       func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps) (loopcmd.Summary, error)
@@ -135,11 +132,10 @@ type Worker struct {
 
 	mu      sync.Mutex
 	pending map[loopKey]*attempt // guarded by mu
-	// orphans counts consecutive wakes that could not route a loop's
-	// deadline, guarded by mu. See orphanClearAfter: a loop is unroutable
-	// for transient reasons too, and clearing needs_retry is irreversible,
-	// so the flag is only cleared once the condition has outlived several
-	// wake intervals. An entry is dropped as soon as the loop routes again.
+	// orphans counts consecutive wakes that found a loop's deadline
+	// definitely gone (RouteGone), guarded by mu. See orphanClearAfter. An
+	// entry is dropped as soon as the loop routes again OR as soon as a wake
+	// cannot tell, so only agreeing observations accumulate.
 	orphans map[loopKey]int // guarded by mu
 }
 
@@ -398,17 +394,35 @@ func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 	// project's issue, and repository routing would dispatch agents in every
 	// other project that watches the same repository, on that project's own
 	// token budget.
-	t, found, err := w.TargetFor(due.ProjectID, due.Loop)
+	t, routing, err := w.TargetFor(due.ProjectID, due.Loop)
 	if err != nil {
 		slog.Error("cannot route retry deadline", "loop", due.Loop,
 			"project", due.ProjectID, "issue", due.Number, "err", err)
 		return due.At, true
 	}
 	key := loopKey{ProjectID: due.ProjectID, LoopName: due.Loop}
-	if !found {
+	switch routing {
+	case RouteGone:
 		w.noteUnroutable(key, due)
 		return due.At, true
+	case RouteUnknown:
+		// Waited on indefinitely, never cleared. This is the operator
+		// mid-edit, the volume not mounted yet, the permission changed
+		// during a restore -- all conditions that end when someone fixes
+		// them, none of them a reason to destroy a pending retry. The cost
+		// of waiting is one warning per MinWakeInterval; the cost of acting
+		// would be an issue left holding an in-flight label with no agent
+		// and nothing to re-derive its flag.
+		//
+		// The count is forgotten, not merely left alone: orphanClearAfter
+		// counts CONSECUTIVE gone observations, and an observation that
+		// could not tell is not one of them.
+		w.forgetUnroutable(key)
+		slog.Warn("cannot route a retry deadline right now; leaving it pending",
+			"loop", due.Loop, "project", due.ProjectID, "issue", due.Number)
+		return due.At, true
 	}
+
 	// The loop routed, so whatever made it unroutable before is over. The
 	// count starts again from zero, which is what keeps a loop that is
 	// briefly unreadable every so often from ever reaching the threshold.
@@ -423,24 +437,26 @@ func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 	return due.At, true
 }
 
-// noteUnroutable records that a past-due deadline could not be routed, and
-// clears its failure flag once the condition has persisted.
+// noteUnroutable records that a past-due deadline's loop is definitely gone,
+// and clears its failure flag once that has been observed enough times.
 //
-// A project can be deleted, or a loop's configuration file removed, while an
-// issue row carrying needs_retry survives in the canonical database. That row
-// is permanently past due and permanently unroutable, so leaving it alone
-// would make the wake loop re-enter Wake every MinWakeInterval for the life
-// of the daemon, re-logging the same warning and re-reading the same row --
-// the very hot loop EarliestRetryAfter's own predicate exists to prevent.
-// Clearing the flag removes the row from that predicate, which is exactly
-// what a tick does for a failure no retry can act on (loopcmd.act,
-// KindClearRetry), and it is durable: an in-memory skip list would lose the
-// fix on the next restart and spin again.
+// It is called for RouteGone only. A project can be deleted, or a loop's
+// configuration file removed, while an issue row carrying needs_retry
+// survives in the canonical database. That row is permanently past due and
+// permanently unroutable, so leaving it alone would make the wake loop
+// re-enter Wake every MinWakeInterval for the life of the daemon, re-logging
+// the same warning and re-reading the same row -- the very hot loop
+// EarliestRetryAfterAt's own predicate exists to prevent. Clearing the flag
+// removes the row from that predicate, which is exactly what a tick does for
+// a failure no retry can act on (loopcmd.act, KindClearRetry), and it is
+// durable: an in-memory skip list would lose the fix on the next restart and
+// spin again.
 //
-// The clear waits for orphanClearAfter consecutive observations because it is
-// irreversible and the signal it acts on is ambiguous; see orphanClearAfter.
-// Until then the wake loop is already bounded by its own MinWakeInterval, so
-// the delay costs nothing but a repeated warning.
+// The clear still waits for orphanClearAfter consecutive observations,
+// because it is irreversible; see orphanClearAfter for what a counter still
+// buys once the signal itself is no longer ambiguous. Until then the wake
+// loop is already bounded by its own MinWakeInterval, so the delay costs
+// nothing but a repeated warning.
 //
 // A failed clear leaves the count in place, so the next wake retries it at
 // once: a write that fails means the database itself is unwritable, and there
@@ -452,13 +468,13 @@ func (w *Worker) noteUnroutable(key loopKey, due store.RetryDue) {
 	w.mu.Unlock()
 
 	if seen < orphanClearAfter {
-		slog.Warn("cannot route a retry deadline; the loop is not resolvable right now",
+		slog.Warn("a retry deadline names a loop that no longer exists",
 			"loop", due.Loop, "project", due.ProjectID, "issue", due.Number,
 			"observations", seen)
 		return
 	}
 
-	slog.Warn("clearing a retry deadline whose loop has stayed unresolvable",
+	slog.Warn("clearing a retry deadline whose loop has stayed gone",
 		"loop", due.Loop, "project", due.ProjectID, "issue", due.Number,
 		"observations", seen)
 	if err := w.DB.Project(due.ProjectID).ClearNeedsRetry(due.Loop, due.Repo, due.Number); err != nil {

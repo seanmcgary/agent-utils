@@ -186,6 +186,10 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	plan := engine.Decide(cfg, snap, st, now)
 	sum.BreakerTripped = plan.BreakerTripped
 
+	// Run against the same snapshot Decide just read, so "the engine cannot
+	// reach this row" is judged from exactly the issue set the engine saw.
+	clearUnreachableDeadlines(cfg, deps, snap, states)
+
 	if plan.BreakerTripped {
 		if err := deps.Store.SetCooldown(cfg.Name, plan.CooldownUntil); err != nil {
 			return sum, err
@@ -208,6 +212,58 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	}
 	slog.Info("tick complete", "loop", cfg.Name, "summary", string(body))
 	return sum, nil
+}
+
+// clearUnreachableDeadlines drops the retry DEADLINE from every stamped row
+// whose issue this tick's snapshot did not offer to engine.Decide.
+//
+// Decide iterates snap.Issues and skips a vetoed one before it ever looks at
+// NeedsRetry, so two ordinary operator actions put a row permanently outside
+// its reach: closing (or transferring) the issue, which drops it from
+// ListOpenIssues, and adding a veto label. KindClearRetry is the only thing
+// that retires such a flag and it requires the issue to be in that list, so
+// before the webhook daemon existed the row simply sat there, inert. It is no
+// longer inert: store.EarliestRetryAfterAt selects on retry_after alone, hands
+// the daemon the same past deadline every MinWakeInterval, and each one costs a
+// FULL tick -- token read, database open, git fetch, ListOpenIssues,
+// ListOpenPullRequests, a BehindBy per review issue -- forever, per stranded
+// issue, with a repository-write token. Nothing about that tick changes the
+// row, so the next wake finds it again.
+//
+// Only the deadline is cleared; see store.ClearRetryAfter for why the flag
+// stays. A row the engine cannot reach is exactly the case where destroying
+// the failure would be unrecoverable, and exactly the case where reopening the
+// issue or removing the label must resume the retry at once.
+//
+// A failed clear is logged and the sweep continues: one unwritable row must not
+// abandon the rest of the tick, and the next tick tries again.
+func clearUnreachableDeadlines(
+	cfg *config.Config,
+	deps Deps,
+	snap engine.Snapshot,
+	states map[int]store.IssueState,
+) {
+	reachable := make(map[int]bool, len(snap.Issues))
+	for _, iss := range snap.Issues {
+		if iss.HasAnyLabel(cfg.Labels.Veto) {
+			continue
+		}
+		reachable[iss.Number] = true
+	}
+
+	for number, state := range states {
+		if state.RetryAfter.IsZero() || !state.NeedsRetry || state.Parked || reachable[number] {
+			continue
+		}
+		if err := deps.Store.ClearRetryAfter(cfg.Name, cfg.Repo, number); err != nil {
+			slog.Error("clear a retry deadline the loop can no longer reach",
+				"loop", cfg.Name, "issue", number, "err", err)
+			continue
+		}
+		slog.Info("cleared a retry deadline for an issue this loop can no longer see",
+			"loop", cfg.Name, "issue", number,
+			"reason", "closed, transferred, or carrying a veto label")
+	}
 }
 
 func act(
@@ -253,13 +309,6 @@ func dispatch(
 	now time.Time,
 	kind string,
 ) error {
-	state, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Issue)
-	if err != nil {
-		// Persisting a zero value read from a failed query would wipe the
-		// session identifier and the retry counter of a live issue.
-		return fmt.Errorf("read issue state for #%d: %w", d.Issue, err)
-	}
-
 	sessionID := d.SessionID
 	if sessionID == "" {
 		sessionID = uuid.NewString()
@@ -274,31 +323,23 @@ func dispatch(
 	// Persist the issue state BEFORE spawning. If the process dies between the
 	// spawn and this write, the next tick would otherwise see "no session" and
 	// start a second agent with a fresh session against a live worktree.
+	//
+	// BeginDispatch, not a read-modify-write through PutIssueState: this tick
+	// holds the loop's flock, but a detached runner process finishing a failed
+	// dispatch does not, and it writes this same row through MarkNeedsRetry.
+	// State read here and written back after the worktree and the spawn would
+	// silently drop a failure recorded in that gap -- flag, deadline and retry
+	// budget together. See store.BeginDispatch.
+	//
+	// RetryCount is load-bearing: MarkNeedsRetry indexes the backoff list with
+	// it on the NEXT failure, which is why it is spent in SQL rather than
+	// incremented from a value read before the gap. LastRetryTick is no longer
+	// stamped: the wait is wall-clock now, so a tick number names nothing a
+	// decision can use. The column stays in the table because dropping one
+	// costs a rebuild and buys nothing.
+	isRetry := d.Kind == engine.KindRetryStart || d.Kind == engine.KindRetryResume
 	if kind != store.KindTend {
-		state.SessionID = sessionID
-		state.UpdatedAt = now
-		state.NeedsRetry = false
-		state.Parked = false
-		switch d.Kind {
-		case engine.KindRetryStart, engine.KindRetryResume:
-			// RetryCount is load-bearing: MarkNeedsRetry indexes the backoff
-			// list with it on the NEXT failure. RetryAfter is deliberately left
-			// alone here. MarkNeedsRetry is its only writer, and a deadline
-			// stamped before the agent runs would be overwritten by the failure
-			// that follows, collapsing the escalating list to one entry.
-			//
-			// LastRetryTick is no longer stamped. The wait is wall-clock now, so
-			// a tick number names nothing a decision can use. The column stays
-			// in the table because dropping one costs a rebuild and buys
-			// nothing.
-			state.RetryCount++
-		default:
-			// A human trigger begins a new episode, so the budget starts over
-			// and any deadline left from the previous one goes with it.
-			state.RetryCount = 0
-			state.RetryAfter = time.Time{}
-		}
-		if err := deps.Store.PutIssueState(state); err != nil {
+		if err := deps.Store.BeginDispatch(cfg.Name, cfg.Repo, d.Issue, sessionID, isRetry, now); err != nil {
 			return err
 		}
 	}
@@ -337,8 +378,7 @@ func dispatch(
 	// Recording it only in one left the path empty in "none" mode, so status
 	// reported no working directory for a live agent.
 	if kind != store.KindTend {
-		state.WorktreePath = workDir
-		if err := deps.Store.PutIssueState(state); err != nil {
+		if err := deps.Store.SetWorktreePath(cfg.Name, cfg.Repo, d.Issue, workDir, now); err != nil {
 			return err
 		}
 	}

@@ -99,7 +99,7 @@ type harness struct {
 
 	// targetFor is what the TargetFor seam returns. Default: the single
 	// target named by the arguments.
-	targetFor func(projectID, loop string) (Target, bool, error)
+	targetFor func(projectID, loop string) (Target, Routing, error)
 
 	// runFn decides what the Run seam returns. Nil means every tick
 	// succeeds.
@@ -131,11 +131,11 @@ func newHarness(db *store.DB) *harness {
 	w.Open = h.open
 	w.Run = h.run
 	w.Targets = h.targetsSeam
-	w.TargetFor = func(projectID, loop string) (Target, bool, error) {
+	w.TargetFor = func(projectID, loop string) (Target, Routing, error) {
 		if h.targetFor != nil {
 			return h.targetFor(projectID, loop)
 		}
-		return h.target(loop), true, nil
+		return h.target(loop), RouteFound, nil
 	}
 	// MinWakeInterval is an hour so a Serve test parks in its select until
 	// the test cancels, rather than racing a real 30s tick.
@@ -579,9 +579,9 @@ func TestWakeTicksOnlyTheLoopNamedByTheDeadline(t *testing.T) {
 	h.targets = []Target{h.target("planning"), h.target("review")}
 
 	var forProject, forLoop string
-	h.targetFor = func(projectID, loop string) (Target, bool, error) {
+	h.targetFor = func(projectID, loop string) (Target, Routing, error) {
 		forProject, forLoop = projectID, loop
-		return h.target(loop), true, nil
+		return h.target(loop), RouteFound, nil
 	}
 	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Minute))
 
@@ -660,8 +660,8 @@ func (h *harness) stillPending(t *testing.T, db *store.DB) bool {
 func TestAnOrphanedDeadlineIsClearedOnlyAfterRepeatedObservations(t *testing.T) {
 	db := openWorkDB(t)
 	h := newHarness(db)
-	h.targetFor = func(projectID, loop string) (Target, bool, error) {
-		return Target{}, false, nil
+	h.targetFor = func(projectID, loop string) (Target, Routing, error) {
+		return Target{}, RouteGone, nil
 	}
 	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Minute))
 
@@ -701,11 +701,11 @@ func TestRoutingAgainResetsTheOrphanCount(t *testing.T) {
 	db := openWorkDB(t)
 	h := newHarness(db)
 	routable := false
-	h.targetFor = func(projectID, loop string) (Target, bool, error) {
+	h.targetFor = func(projectID, loop string) (Target, Routing, error) {
 		if !routable {
-			return Target{}, false, nil
+			return Target{}, RouteGone, nil
 		}
-		return h.target(loop), true, nil
+		return h.target(loop), RouteFound, nil
 	}
 	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Minute))
 
@@ -895,5 +895,72 @@ func TestOpenFailuresDoNotSpendTheTickRetryBudget(t *testing.T) {
 	}
 	if got := h.timers.at(t, 2).d; got != 45*time.Minute {
 		t.Errorf("tick retry delay = %v, want the loop's own first backoff entry 45m", got)
+	}
+}
+
+// The finding this exists for: an operator saves a loop's yaml mid-edit and
+// three wakes later -- about ninety seconds -- the earliest pending retry for
+// that loop is destroyed, then the next one, then the next. A condition
+// TargetFor cannot resolve is waited on indefinitely instead, because clearing
+// needs_retry is irreversible and nothing re-derives it.
+func TestADeadlineIsNeverClearedWhileTheLoopCannotBeResolved(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	h.targetFor = func(projectID, loop string) (Target, Routing, error) {
+		return Target{}, RouteUnknown, nil
+	}
+	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Minute))
+
+	// Far past orphanClearAfter: no number of wakes may clear it.
+	for i := 1; i <= orphanClearAfter*4; i++ {
+		if _, ok := h.w.Wake(context.Background()); !ok {
+			t.Fatalf("wake %d: ok = false, want the past deadline", i)
+		}
+		if !h.stillPending(t, db) {
+			t.Fatalf("wake %d destroyed a pending retry for a loop that is merely unreadable", i)
+		}
+	}
+	if got := h.ranLoops(); len(got) != 0 {
+		t.Errorf("ran %v, want nothing for a loop that cannot be routed", got)
+	}
+}
+
+// The count is of CONSECUTIVE "definitely gone" observations. A wake that
+// cannot tell is not one, so it resets the count rather than adding to it:
+// without that, a loop deleted while its project's volume flaps would still be
+// cleared by three observations that never agreed with each other.
+func TestAnUnresolvableWakeResetsTheGoneCount(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	routing := RouteGone
+	h.targetFor = func(projectID, loop string) (Target, Routing, error) {
+		return Target{}, routing, nil
+	}
+	seedDeadline(t, db, "planning", 7, workNow.Add(-time.Minute))
+
+	if orphanClearAfter != 3 {
+		t.Fatalf("orphanClearAfter = %d; this test is written against 3 wakes and must be updated with it",
+			orphanClearAfter)
+	}
+
+	// Two gone observations: one short of the threshold.
+	for i := 1; i <= 2; i++ {
+		h.w.Wake(context.Background())
+	}
+	// One wake that cannot tell.
+	routing = RouteUnknown
+	h.w.Wake(context.Background())
+	if !h.stillPending(t, db) {
+		t.Fatal("the unresolvable wake itself cleared the deadline")
+	}
+
+	// Two more gone observations. Under a count that survived the gap this
+	// would be the fourth and would clear.
+	routing = RouteGone
+	for i := 1; i <= 2; i++ {
+		h.w.Wake(context.Background())
+		if !h.stillPending(t, db) {
+			t.Fatalf("gone wake %d after the gap cleared the deadline; the count did not reset", i)
+		}
 	}
 }
