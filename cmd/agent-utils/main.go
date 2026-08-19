@@ -15,8 +15,10 @@ import (
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
+	"github.com/seanmcgary/agent-utils/internal/migrate"
 	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
@@ -104,6 +106,11 @@ func openProject(c *cli.Command) (*loopcmd.Project, error) {
 		}
 	}
 	return p, nil
+}
+
+// refOf names the project a command acts for.
+func refOf(p *loopcmd.Project) projectRef {
+	return projectRef{ID: p.Config.ID, Name: p.Config.Name, Dir: p.Dir}
 }
 
 func configFlag() *cli.StringFlag {
@@ -383,7 +390,7 @@ func logsCommand() *cli.Command {
 				return err
 			}
 			// Reading logs needs no GitHub access.
-			cfg, deps, cleanup, err := setup(path, false)
+			cfg, deps, cleanup, err := setup(refOf(p), path, false)
 			if err != nil {
 				return err
 			}
@@ -469,7 +476,7 @@ func loopCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					cfg, deps, cleanup, err := setup(path, true)
+					cfg, deps, cleanup, err := setup(refOf(p), path, true)
 					if err != nil {
 						return err
 					}
@@ -502,7 +509,7 @@ func loopCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					cfg, deps, cleanup, err := setup(path, true)
+					cfg, deps, cleanup, err := setup(refOf(p), path, true)
 					if err != nil {
 						return err
 					}
@@ -533,7 +540,7 @@ func loopCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					cfg, deps, cleanup, err := setup(path, false)
+					cfg, deps, cleanup, err := setup(refOf(p), path, false)
 					if err != nil {
 						return err
 					}
@@ -571,9 +578,20 @@ func internalCommand() *cli.Command {
 					// prompt or scan, so this one stays required.
 					&cli.StringFlag{Name: "config", Required: true},
 					&cli.IntFlag{Name: "dispatch", Usage: "dispatch id", Required: true},
+					// The runner resolves no project, so it is told which one owns
+					// the rows it writes.
+					&cli.StringFlag{Name: "project", Usage: "project id", Required: true},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					cfg, deps, cleanup, err := setup(c.String("config"), false)
+					configPath := c.String("config")
+					ref := projectRef{
+						ID: c.String("project"),
+						// Derived, not passed: the runner must not depend on a
+						// lookup it cannot perform. An empty result simply means
+						// the loop's own state directory is the only source.
+						Dir: config.DirFromPath(configPath),
+					}
+					cfg, deps, cleanup, err := setup(ref, configPath, false)
 					if err != nil {
 						return err
 					}
@@ -585,23 +603,33 @@ func internalCommand() *cli.Command {
 	}
 }
 
-func setup(configPath string, needsGitHub bool) (*config.Config, loopcmd.Deps, func(), error) {
+// projectRef is the project a command acts for. The runner is given one
+// explicitly, because it resolves no project of its own.
+type projectRef struct {
+	ID   string
+	Name string
+	// Dir is the project's .agent-utils directory. It is empty when the runner
+	// was pointed at a configuration outside any such directory.
+	Dir string
+}
+
+func setup(ref projectRef, configPath string, needsGitHub bool) (*config.Config, loopcmd.Deps, func(), error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, loopcmd.Deps{}, nil, err
 	}
 
-	// Resolve the state directory before anything uses it. When state_dir is
-	// not set this derives <project>/.agent-utils/state/<name>, which is what
-	// keeps two projects from sharing one database.
+	// Resolve the state directory before anything uses it. When state_dir is not
+	// set this derives <project>/.agent-utils/state/<name>. The database no
+	// longer lives there; the tick lock and the logs still do.
 	stateDir, err := cfg.ResolveStateDir(configPath)
 	if err != nil {
 		return nil, loopcmd.Deps{}, nil, err
 	}
 	cfg.StateDir = stateDir
 
-	// 0700: the state directory holds the sqlite database, which carries
-	// session identifiers and transcript logs.
+	// 0700: the state directory holds agent transcripts, which quote everything
+	// the agent read and ran.
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return nil, loopcmd.Deps{}, nil, fmt.Errorf("create state directory: %w", err)
 	}
@@ -616,26 +644,56 @@ func setup(configPath string, needsGitHub bool) (*config.Config, loopcmd.Deps, f
 		return nil, loopcmd.Deps{}, nil, fmt.Errorf("GITHUB_TOKEN is not set")
 	}
 
-	s, err := store.Open(filepath.Join(cfg.StateDir, "state.db"))
+	if _, err := home.EnsureDir(); err != nil {
+		return nil, loopcmd.Deps{}, nil, err
+	}
+	dbPath, err := home.StateDBPath()
 	if err != nil {
+		return nil, loopcmd.Deps{}, nil, err
+	}
+	db, err := store.Open(dbPath)
+	if err != nil {
+		return nil, loopcmd.Deps{}, nil, err
+	}
+
+	// This is the WRITE path, so an unimported source is fatal. A tick against a
+	// database missing this loop's rows would re-dispatch every open issue and
+	// start a second agent in a worktree that already holds one.
+	//
+	// The loop's own state directory is always included. --config takes an
+	// arbitrary path, so this loop is not always inside the directory Discover
+	// scans.
+	var (
+		sources  []migrate.Source
+		problems []migrate.Result
+	)
+	if ref.Dir != "" {
+		sources, problems = migrate.Discover(ref.Dir, ref.ID, ref.Name)
+	}
+	if own, ok := migrate.SourceFor(cfg.StateDir, ref.ID, ref.Name, cfg.Name, cfg.Repo); ok {
+		sources = append(sources, own)
+	}
+	if err := migrate.EnsureProject(db, sources, problems); err != nil {
+		db.Close()
 		return nil, loopcmd.Deps{}, nil, err
 	}
 
 	self, err := os.Executable()
 	if err != nil {
-		s.Close()
+		db.Close()
 		return nil, loopcmd.Deps{}, nil, fmt.Errorf("locate this executable: %w", err)
 	}
 	abs, err := filepath.Abs(configPath)
 	if err != nil {
-		s.Close()
+		db.Close()
 		return nil, loopcmd.Deps{}, nil, fmt.Errorf("resolve config path: %w", err)
 	}
 
 	wt := worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch)
 
 	deps := loopcmd.Deps{
-		Store:      s,
+		Store:      db.Project(ref.ID),
+		ProjectID:  ref.ID,
 		GH:         ghub.New(token),
 		WT:         wt,
 		SelfPath:   self,
@@ -645,5 +703,5 @@ func setup(configPath string, needsGitHub bool) (*config.Config, loopcmd.Deps, f
 		IsAlive:    proc.IsAlive,
 		Fetch:      wt.Fetch,
 	}
-	return cfg, deps, func() { s.Close() }, nil
+	return cfg, deps, func() { db.Close() }, nil
 }

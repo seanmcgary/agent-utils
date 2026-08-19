@@ -59,7 +59,7 @@ func TestSpawnFailureDoesNotStrandIssue(t *testing.T) {
 	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"trigger"}}}}
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
-	deps.Spawn = func(string, int64, string, string) (int, error) {
+	deps.Spawn = func(string, int64, string, string, string) (int, error) {
 		return 0, context.DeadlineExceeded
 	}
 	_, _ = Tick(context.Background(), cfg, deps)
@@ -70,7 +70,7 @@ func TestSpawnFailureDoesNotStrandIssue(t *testing.T) {
 	}
 
 	// Spawn recovers; the issue must dispatch again.
-	deps.Spawn = func(string, int64, string, string) (int, error) { spawned++; return 4242, nil }
+	deps.Spawn = func(string, int64, string, string, string) (int, error) { spawned++; return 4242, nil }
 	if _, err := Tick(context.Background(), cfg, deps); err != nil {
 		t.Fatal(err)
 	}

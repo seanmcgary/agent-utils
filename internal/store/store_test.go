@@ -7,14 +7,24 @@ import (
 	"time"
 )
 
+// testProject is a stand-in for a real project UUID. Every scoped read and
+// write carries one, and an empty string is reserved for rows that predate the
+// project key.
+const testProject = "11111111-1111-1111-1111-111111111111"
+
 func openTemp(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	return openTempAt(t, filepath.Join(t.TempDir(), "state.db"))
+}
+
+func openTempAt(t *testing.T, path string) *Store {
+	t.Helper()
+	db, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
-	return s
+	t.Cleanup(func() { db.Close() })
+	return db.Project(testProject)
 }
 
 func TestIssueStateRoundTrip(t *testing.T) {
@@ -160,23 +170,24 @@ func TestReopenPersists(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.db")
 
-	s1, err := Open(path)
+	db1, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	s1 := db1.Project(testProject)
 	if err := s1.PutIssueState(IssueState{
 		Loop: "planning", Repo: "o/r", Number: 1, SessionID: "keep", UpdatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	s1.Close()
+	db1.Close()
 
-	s2, err := Open(path)
+	db2, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s2.Close()
-	got, _ := s2.IssueStates("planning", "o/r")
+	defer db2.Close()
+	got, _ := db2.Project(testProject).IssueStates("planning", "o/r")
 	if got[1].SessionID != "keep" {
 		t.Errorf("session did not persist across reopen: %+v", got)
 	}
@@ -218,24 +229,35 @@ func TestOpenMigratesAnOlderDatabase(t *testing.T) {
 	}
 	old.Close()
 
-	s, err := Open(path)
+	db, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open must migrate an older database: %v", err)
 	}
-	defer s.Close()
+	defer db.Close()
 
-	// Every query naming a new column must work, and old rows must survive.
-	states, err := s.IssueStates("planning", "o/r")
+	// A row that predates the project key is carried over with an empty
+	// project_id. The importer stamps it later; nothing is dropped here.
+	unclaimed := db.Project("")
+	states, err := unclaimed.IssueStates("planning", "o/r")
 	if err != nil {
 		t.Fatalf("IssueStates after migration: %v", err)
 	}
 	if states[1].SessionID != "keep-me" {
 		t.Errorf("existing row lost: %+v", states[1])
 	}
+
+	// Every query naming a new column must work for a real project too.
+	s := db.Project(testProject)
 	if _, err := s.RunningDispatches("planning", "o/r"); err != nil {
 		t.Errorf("RunningDispatches after migration: %v", err)
 	}
 	if _, err := s.PRLinks("planning", "o/r"); err != nil {
 		t.Errorf("PRLinks after migration: %v", err)
+	}
+	if _, err := s.CooldownUntil("planning"); err != nil {
+		t.Errorf("CooldownUntil after migration: %v", err)
+	}
+	if got, err := s.IssueStates("planning", "o/r"); err != nil || len(got) != 0 {
+		t.Errorf("a project must not see unclaimed rows: %v, %v", got, err)
 	}
 }

@@ -21,13 +21,16 @@ import (
 
 // Deps holds everything a tick needs. Each field is replaceable in a test.
 type Deps struct {
-	Store      *store.Store
+	Store *store.Store
+	// ProjectID owns every row this loop writes. The detached runner is given it
+	// explicitly, because it resolves no project of its own.
+	ProjectID  string
 	GH         ghub.Client
 	WT         *worktree.Manager
 	SelfPath   string
 	ConfigPath string
 	Now        func() time.Time
-	Spawn      func(selfPath string, dispatchID int64, configPath, runnerLog string) (int, error)
+	Spawn      func(selfPath string, dispatchID int64, projectID, configPath, runnerLog string) (int, error)
 	// IsAlive reports whether a dispatch's runner process is still running.
 	// It is a seam so a test can control liveness; production passes proc.IsAlive.
 	IsAlive func(pid int, dispatchID int64) bool
@@ -142,7 +145,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 			st.Running = append(st.Running, d)
 			continue
 		}
-		if deps.IsAlive(d.PID, d.ID) {
+		if deps.IsAlive(d.PID, d.RunnerID()) {
 			st.Running = append(st.Running, d)
 			continue
 		}
@@ -329,7 +332,7 @@ func dispatch(
 	}
 
 	runnerLog := runner.RunnerLogPath(cfg.StateDir, cfg.Name, dispatchID)
-	pid, err := deps.Spawn(deps.SelfPath, dispatchID, deps.ConfigPath, runnerLog)
+	pid, err := deps.Spawn(deps.SelfPath, dispatchID, deps.ProjectID, deps.ConfigPath, runnerLog)
 	if err != nil {
 		// As above: no agent ran, so no retry flag. Setting one here would strand
 		// the issue, because nothing can act on a retry flag without in-flight.
@@ -489,7 +492,7 @@ func Reset(cfg *config.Config, s *store.Store, wt *worktree.Manager, number int,
 		if d.Number != number {
 			continue
 		}
-		if isAlive(d.PID, d.ID) {
+		if isAlive(d.PID, d.RunnerID()) {
 			// Removing the worktree now would delete files an agent is editing.
 			return fmt.Errorf(
 				"issue #%d has a live dispatch (pid %d); stop it before resetting",

@@ -89,7 +89,7 @@ func LogPathFor(cfg *config.Config, d store.Dispatch, stream LogStream) string {
 	case StreamStderr:
 		return d.LogPath + ".stderr"
 	case StreamRunner:
-		return runner.RunnerLogPath(cfg.StateDir, cfg.Name, d.ID)
+		return runner.RunnerLogPath(cfg.StateDir, cfg.Name, d.RunnerID())
 	default:
 		return d.LogPath
 	}
@@ -106,7 +106,7 @@ func RenderDispatchList(ds []store.Dispatch) string {
 	for _, d := range ds {
 		status := d.Status
 		if d.Status == store.StatusRunning {
-			if proc.IsAlive(d.PID, d.ID) {
+			if proc.IsAlive(d.PID, d.RunnerID()) {
 				status = "running"
 			} else {
 				status = "DEAD"
@@ -164,7 +164,7 @@ func Tail(ctx context.Context, out io.Writer, path string, d store.Dispatch, opt
 		}
 
 		// At end of file. Keep waiting only while the writer is alive.
-		if !proc.IsAlive(d.PID, d.ID) {
+		if !proc.IsAlive(d.PID, d.RunnerID()) {
 			// Drain whatever landed between the last read and the process
 			// exiting, then stop.
 			rest, _ := io.ReadAll(r)

@@ -2,14 +2,11 @@ package loopcmd
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
-	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
@@ -43,10 +40,21 @@ type ProjectSummary struct {
 // Projects reads every registered project and summarises its loops.
 //
 // It reads only local state: the registry, each project's configuration files,
-// and each loop's database. It makes no GitHub call, so it is fast, works
+// and the one state database. It makes no GitHub call, so it is fast, works
 // offline, and needs no token.
 func Projects() ([]ProjectSummary, error) {
 	entries, err := registry.List()
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := openCanonical()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	snap, err := readSnapshot(db)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +77,7 @@ func Projects() ([]ProjectSummary, error) {
 			continue
 		}
 		for _, c := range configs {
-			summary.Loops = append(summary.Loops, summariseLoop(c))
+			summary.Loops = append(summary.Loops, summariseLoop(c, p.ID, snap))
 		}
 		sort.Slice(summary.Loops, func(i, j int) bool {
 			return summary.Loops[i].Name < summary.Loops[j].Name
@@ -79,7 +87,12 @@ func Projects() ([]ProjectSummary, error) {
 	return out, nil
 }
 
-func summariseLoop(entry config.Entry) LoopSummary {
+// summariseLoop describes one loop from the snapshot the caller already read.
+//
+// It takes the project identifier because that is half of every key in the
+// database: a loop called "planning" exists in more than one project, and the
+// name alone would sum them together.
+func summariseLoop(entry config.Entry, projectID string, snap *snapshot) LoopSummary {
 	sum := LoopSummary{Name: entry.Name, Repo: entry.Repo}
 	if entry.Err != nil {
 		sum.Err = entry.Err
@@ -91,6 +104,8 @@ func summariseLoop(entry config.Entry) LoopSummary {
 		sum.Err = err
 		return sum
 	}
+	// The state directory no longer holds the database. It still holds the tick
+	// lock and the logs, and `project status` prints it for both.
 	stateDir, err := cfg.ResolveStateDir(entry.Path)
 	if err != nil {
 		sum.Err = err
@@ -98,47 +113,13 @@ func summariseLoop(entry config.Entry) LoopSummary {
 	}
 	sum.StateDir = stateDir
 
-	dbPath := filepath.Join(stateDir, "state.db")
-	if !fileExists(dbPath) {
-		// Configured but never run. That is a normal state, not an error.
-		return sum
-	}
-
-	s, err := store.Open(dbPath)
-	if err != nil {
-		sum.Err = err
-		return sum
-	}
-	defer s.Close()
-
-	if sum.Ticks, err = s.TickCount(cfg.Name); err != nil {
-		sum.Err = err
-		return sum
-	}
-	if sum.LastTick, err = s.LastTick(cfg.Name); err != nil {
-		sum.Err = err
-		return sum
-	}
-	running, err := s.RunningDispatches(cfg.Name, cfg.Repo)
-	if err != nil {
-		sum.Err = err
-		return sum
-	}
-	for _, d := range running {
-		if proc.IsAlive(d.PID, d.ID) {
-			sum.Live++
-		} else {
-			sum.Orphans++
-		}
-	}
-	costs, err := s.CostByIssue(cfg.Name, cfg.Repo)
-	if err != nil {
-		sum.Err = err
-		return sum
-	}
-	for _, c := range costs {
-		sum.Cost += c
-	}
+	k := store.LoopKey{ProjectID: projectID, Loop: cfg.Name}
+	st := snap.loops[k]
+	sum.Ticks = st.Ticks
+	sum.LastTick = st.LastTick
+	sum.Cost = st.Cost
+	sum.Live = snap.live[k]
+	sum.Orphans = snap.orphans[k]
 	return sum
 }
 
@@ -203,9 +184,4 @@ func RenderProjects(projects []ProjectSummary) string {
 		}
 	}
 	return b.String()
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }

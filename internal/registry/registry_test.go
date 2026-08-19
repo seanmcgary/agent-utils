@@ -17,6 +17,7 @@ func mkProject(t *testing.T, root string) string {
 }
 
 func TestRegisterIsIdempotentAndRecordsTheRoot(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", "")
 	t.Setenv("HOME", t.TempDir())
 	dir := mkProject(t, t.TempDir())
 
@@ -45,6 +46,7 @@ func TestRegisterIsIdempotentAndRecordsTheRoot(t *testing.T) {
 }
 
 func TestListIsEmptyBeforeAnythingIsRegistered(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", "")
 	t.Setenv("HOME", t.TempDir())
 	got, err := List()
 	if err != nil {
@@ -56,6 +58,7 @@ func TestListIsEmptyBeforeAnythingIsRegistered(t *testing.T) {
 }
 
 func TestListOrdersMostRecentFirst(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", "")
 	t.Setenv("HOME", t.TempDir())
 	a := mkProject(t, t.TempDir())
 	b := mkProject(t, t.TempDir())
@@ -81,6 +84,7 @@ func TestListOrdersMostRecentFirst(t *testing.T) {
 }
 
 func TestForgetRemovesOnlyTheNamedProject(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", "")
 	t.Setenv("HOME", t.TempDir())
 	a := mkProject(t, t.TempDir())
 	b := mkProject(t, t.TempDir())
@@ -108,6 +112,7 @@ func TestForgetRemovesOnlyTheNamedProject(t *testing.T) {
 }
 
 func TestExistsReportsAMovedProject(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", "")
 	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 	dir := mkProject(t, root)
@@ -133,6 +138,7 @@ func TestExistsReportsAMovedProject(t *testing.T) {
 // Several loops tick at once, each in its own process. The read-modify-write
 // has to be exclusive or a registration is lost.
 func TestConcurrentRegistrationsAllSurvive(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", "")
 	t.Setenv("HOME", t.TempDir())
 
 	const n = 8
@@ -164,6 +170,7 @@ func TestConcurrentRegistrationsAllSurvive(t *testing.T) {
 
 func TestReadToleratesAnEmptyFile(t *testing.T) {
 	home := t.TempDir()
+	t.Setenv("AGENT_UTILS_HOME", "")
 	t.Setenv("HOME", home)
 	path, err := Path()
 	if err != nil {

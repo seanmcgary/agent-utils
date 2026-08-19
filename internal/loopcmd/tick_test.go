@@ -74,22 +74,27 @@ func tickConfig(t *testing.T) *config.Config {
 	}
 }
 
+// testProject stands in for a real project UUID. Every row is keyed by one, and
+// the detached runner is told which.
+const testProject = "11111111-1111-1111-1111-111111111111"
+
 func newDeps(t *testing.T, cfg *config.Config, gh ghub.Client, spawned *int) Deps {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+	db, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { db.Close() })
 
 	return Deps{
-		Store:      s,
+		Store:      db.Project(testProject),
+		ProjectID:  testProject,
 		GH:         gh,
 		WT:         worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch),
 		SelfPath:   "/bin/true",
 		ConfigPath: "/tmp/loop.yaml",
 		Now:        time.Now,
-		Spawn: func(string, int64, string, string) (int, error) {
+		Spawn: func(string, int64, string, string, string) (int, error) {
 			*spawned++
 			return 4242, nil
 		},

@@ -16,8 +16,20 @@ const (
 	StatusFailed    = "failed"
 )
 
+// Legacy source states.
+const (
+	// SourceOpen means a runner from the old binary may still write this file,
+	// so it must be read again before it can be trusted as final.
+	SourceOpen = "open"
+	// SourceSealed means nothing will write the file again. It is never reopened.
+	SourceSealed = "sealed"
+)
+
 // IssueState is the durable per-issue record.
 type IssueState struct {
+	// ProjectID is the owning project's UUID. It is the first part of every key
+	// in this database, and it is what keeps two projects apart in one file.
+	ProjectID    string
 	Loop         string
 	Repo         string
 	Number       int
@@ -43,6 +55,7 @@ type IssueState struct {
 // Dispatch is one agent run.
 type Dispatch struct {
 	ID         int64
+	ProjectID  string
 	Loop       string
 	Repo       string
 	Number     int
@@ -63,6 +76,26 @@ type Dispatch struct {
 	// the tick's GitHub snapshot, so a prompt using {{.Issue.Title}} would
 	// otherwise render an empty string.
 	Title string
+	// LegacySource is the per-loop database this row was imported from, empty
+	// for a row created here.
+	LegacySource string
+	// LegacyID is the identifier this row had in that file.
+	LegacyID int64
+}
+
+// RunnerID is the dispatch identifier the runner process actually carries.
+//
+// An imported dispatch was renumbered by this database, but its live runner
+// still carries the identifier from the file it was started with, both on its
+// command line and in its log file name. Liveness checks and runner log paths
+// must use this, never ID: matching on ID would report every imported in-flight
+// dispatch as dead, and the tick would start a second agent in a worktree that
+// already holds one.
+func (d Dispatch) RunnerID() int64 {
+	if d.LegacyID != 0 {
+		return d.LegacyID
+	}
+	return d.ID
 }
 
 // DispatchResult is the outcome recorded when a dispatch ends.
@@ -79,14 +112,47 @@ type DispatchResult struct {
 
 // PRLink maps an issue to the pull request that closes it.
 type PRLink struct {
-	Loop     string
-	Repo     string
-	Number   int
-	PRNumber int
-	HeadRef  string
-	BaseRef  string
+	ProjectID string
+	Loop      string
+	Repo      string
+	Number    int
+	PRNumber  int
+	HeadRef   string
+	BaseRef   string
 	// BehindBy is how many commits the head lacks from the base. The tend prompt
 	// renders it, so it must survive into the detached runner, which never sees
 	// the tick's snapshot.
 	BehindBy int
+}
+
+// Tick is one recorded reconcile pass. The importer carries these across, so
+// a migrated loop keeps its history and its tick counter.
+type Tick struct {
+	ProjectID      string
+	Loop           string
+	StartedAt      time.Time
+	BreakerTripped bool
+	SummaryJSON    string
+}
+
+// Cooldown is the time before which a loop must not dispatch.
+type Cooldown struct {
+	ProjectID string
+	Loop      string
+	Until     time.Time
+}
+
+// LoopKey identifies one loop of one project.
+type LoopKey struct {
+	ProjectID string
+	Loop      string
+}
+
+// LoopState is one loop's totals, read machine-wide in a single query.
+type LoopState struct {
+	ProjectID string
+	Loop      string
+	Ticks     int64
+	LastTick  time.Time
+	Cost      float64
 }

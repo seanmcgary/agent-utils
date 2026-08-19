@@ -28,8 +28,19 @@ func Describe(p *Project) (*ProjectDetail, error) {
 		return d, nil
 	}
 	d.Entries = entries
+
+	db, err := openCanonical()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	snap, err := readSnapshot(db)
+	if err != nil {
+		return nil, err
+	}
 	for _, e := range entries {
-		d.Loops = append(d.Loops, summariseLoop(e))
+		d.Loops = append(d.Loops, summariseLoop(e, p.Config.ID, snap))
 	}
 	return d, nil
 }

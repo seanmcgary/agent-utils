@@ -25,14 +25,18 @@ func stubClaude(t *testing.T, exitCode int, body string) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+// testProject stands in for a real project UUID. Every row the store writes is
+// keyed by one.
+const testProject = "11111111-1111-1111-1111-111111111111"
+
 func newStore(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+	db, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
-	return s
+	t.Cleanup(func() { db.Close() })
+	return db.Project(testProject)
 }
 
 func TestSuperviseRecordsSuccess(t *testing.T) {
