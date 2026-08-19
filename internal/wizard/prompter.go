@@ -24,9 +24,10 @@ type Question struct {
 //
 // It is a seam. The terminal implementation is the only one that reads stdin;
 // every test drives the script with a scripted Prompter and never opens a
-// terminal. Ask must never return an answer that fails q.Validate: on a
-// failure it re-asks internally, printing the error, so the caller (Run) can
-// trust every answer it receives without repeating the validation loop
+// terminal. Ask must never return an answer that fails q.Validate, and must
+// never return an empty answer for a question that is not q.Optional: on
+// either failure it re-asks internally, printing the error, so the caller
+// (Run) can trust every answer it receives without repeating either check
 // itself.
 type Prompter interface {
 	Ask(q Question) (string, error)
@@ -70,14 +71,26 @@ func (t *terminalPrompter) Ask(q Question) (string, error) {
 		case len(q.Choices) > 0:
 			if n, convErr := strconv.Atoi(answer); convErr == nil {
 				if n < 1 || n > len(q.Choices) {
-					fmt.Fprintf(t.out, "  error: %d is not one of the listed choices\n\n", n)
+					t.printf("  error: %d is not one of the listed choices\n\n", n)
 					continue
 				}
 				answer = q.Choices[n-1]
 			} else if !containsString(q.Choices, answer) {
-				fmt.Fprintf(t.out, "  error: %q is not one of the listed choices\n\n", answer)
+				t.printf("  error: %q is not one of the listed choices\n\n", answer)
 				continue
 			}
+		}
+
+		// A required question left empty — either the operator typed nothing
+		// with no default to fall back on, or Detect could not fill one in
+		// (e.g. checkout_base_dir outside a git work tree) — must re-ask
+		// rather than hand Run an empty string for a field config.validate
+		// requires. Silently accepting it here would only surface as a
+		// reload failure in Write, by which point the earlier 23 answers
+		// would already be spent and the target filename already claimed.
+		if !q.Optional && strings.TrimSpace(answer) == "" {
+			t.printf("  error: %s is required\n\n", q.Key)
+			continue
 		}
 
 		if q.Validate != nil {
@@ -86,7 +99,7 @@ func (t *terminalPrompter) Ask(q Question) (string, error) {
 			// given, which is why this loops here instead of returning the
 			// error to Run.
 			if err := q.Validate(answer); err != nil {
-				fmt.Fprintf(t.out, "  error: %v\n\n", err)
+				t.printf("  error: %v\n\n", err)
 				continue
 			}
 		}
@@ -101,11 +114,11 @@ func (t *terminalPrompter) Confirm(label, help string, def bool) (bool, error) {
 		hint = "Y/n"
 	}
 	for {
-		fmt.Fprintln(t.out, label)
+		t.println(label)
 		if help != "" {
-			fmt.Fprintf(t.out, "  %s\n", help)
+			t.printf("  %s\n", help)
 		}
-		fmt.Fprintf(t.out, "[%s]: ", hint)
+		t.printf("[%s]: ", hint)
 
 		line, err := t.readLine()
 		if err != nil {
@@ -119,8 +132,8 @@ func (t *terminalPrompter) Confirm(label, help string, def bool) (bool, error) {
 		case "n", "no":
 			return false, nil
 		default:
-			fmt.Fprintln(t.out, "  error: enter y or n")
-			fmt.Fprintln(t.out)
+			t.println("  error: enter y or n")
+			t.println()
 		}
 	}
 }
@@ -129,20 +142,20 @@ func (t *terminalPrompter) Confirm(label, help string, def bool) (bool, error) {
 // default in brackets, so the operator sees what a field is for before being
 // asked to answer it.
 func (t *terminalPrompter) render(q Question) {
-	fmt.Fprintln(t.out, q.Label)
+	t.println(q.Label)
 	if q.Help != "" {
-		fmt.Fprintf(t.out, "  %s\n", q.Help)
+		t.printf("  %s\n", q.Help)
 	}
 	for i, c := range q.Choices {
-		fmt.Fprintf(t.out, "  %d) %s\n", i+1, c)
+		t.printf("  %d) %s\n", i+1, c)
 	}
 	switch {
 	case q.Default != "":
-		fmt.Fprintf(t.out, "[%s]: ", q.Default)
+		t.printf("[%s]: ", q.Default)
 	case q.Optional:
-		fmt.Fprint(t.out, "[optional]: ")
+		t.printf("[optional]: ")
 	default:
-		fmt.Fprint(t.out, "> ")
+		t.printf("> ")
 	}
 }
 
@@ -158,6 +171,19 @@ func (t *terminalPrompter) readLine() (string, error) {
 		return "", io.EOF
 	}
 	return t.scanner.Text(), nil
+}
+
+// printf and println funnel every prompt write through one place that
+// deliberately drops the write error. If out cannot be written to — a closed
+// pipe, say — the very next readLine call is about to fail anyway, and a
+// second error for the same broken stream would tell the operator nothing
+// the read failure doesn't already say.
+func (t *terminalPrompter) printf(format string, args ...any) {
+	_, _ = fmt.Fprintf(t.out, format, args...)
+}
+
+func (t *terminalPrompter) println(args ...any) {
+	_, _ = fmt.Fprintln(t.out, args...)
 }
 
 func containsString(list []string, s string) bool {

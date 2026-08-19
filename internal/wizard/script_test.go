@@ -2,15 +2,17 @@ package wizard
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 )
 
 // scriptPrompter is the Prompter every Run and Write test in this package
 // drives. It never touches a terminal or os.Stdin: it consumes canned
 // answers from a queue, and — matching the contract terminalPrompter
-// implements — loops on a failed Validate instead of ever returning an
-// answer that fails it, so a test can exercise the "invalid answer re-asks"
-// path without a human typing twice.
+// implements — loops on a failed Validate, and on an empty answer to a
+// required (non-Optional) question, instead of ever returning either to
+// Run, so a test can exercise both re-ask paths without a human typing
+// twice.
 type scriptPrompter struct {
 	t        *testing.T
 	answers  []string
@@ -33,6 +35,10 @@ func (s *scriptPrompter) Ask(q Question) (string, error) {
 			if n, err := strconv.Atoi(answer); err == nil && n >= 1 && n <= len(q.Choices) {
 				answer = q.Choices[n-1]
 			}
+		}
+
+		if !q.Optional && strings.TrimSpace(answer) == "" {
+			continue // re-ask: a required question with no default and no answer
 		}
 
 		if q.Validate != nil {

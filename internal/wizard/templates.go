@@ -18,8 +18,8 @@ var templateFS embed.FS
 
 // templateNames lists the embedded templates, in the order Templates and the
 // wizard's own template question offer them. It is kept in sync with the
-// go:embed directive above by templates_test.go, which loads every one of
-// them through config.Load.
+// file list embedded into templateFS above by templates_test.go, which loads
+// every one of them through config.Load.
 var templateNames = []string{"planning", "execution"}
 
 // Template supplies the prompt bodies and the label and tend defaults that go
@@ -97,7 +97,9 @@ func loadEmbeddedTemplate(name string) (*config.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stage embedded template %s: %w", name, err)
 	}
-	defer os.Remove(tmp.Name())
+	defer func() {
+		_ = os.Remove(tmp.Name()) // best-effort cleanup; a stray temp file costs nothing this function's caller cares about
+	}()
 
 	if _, err := tmp.Write(raw); err != nil {
 		tmp.Close()

@@ -153,7 +153,7 @@ func Write(dir string, cfg *config.Config) (path string, err error) {
 		return "", fmt.Errorf("write %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, target); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp) // best-effort cleanup; the rename error above is what matters
 		return "", fmt.Errorf("replace %s: %w", target, err)
 	}
 

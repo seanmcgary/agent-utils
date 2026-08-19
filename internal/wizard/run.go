@@ -3,6 +3,7 @@ package wizard
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -44,10 +45,11 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 
 	// 1. name
 	cfg.Name, err = p.Ask(Question{
-		Key:     "name",
-		Label:   "Loop name",
-		Help:    "Unique in this project. Keys the loop's state, its lock file, and its state directory.",
-		Default: "planning",
+		Key:      "name",
+		Label:    "Loop name",
+		Help:     "Unique in this project. Keys the loop's state, its lock file, and its state directory.",
+		Default:  "planning",
+		Validate: validateName,
 	})
 	if err != nil {
 		return nil, err
@@ -254,7 +256,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	timeoutAnswer, err := p.Ask(Question{
 		Key: "agent.timeout", Label: "Agent timeout",
 		Help: "Maximum wall time for one dispatch, e.g. 3h.", Default: "3h",
-		Validate: validateDuration,
+		Validate: validatePositiveDuration,
 	})
 	if err != nil {
 		return nil, err
@@ -325,7 +327,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	cooldownAnswer, err := p.Ask(Question{
 		Key: "retry.breaker.cooldown", Label: "Retry breaker cooldown",
 		Help: "How long the breaker stays tripped once it trips.", Default: "30m",
-		Validate: validateDuration,
+		Validate: validatePositiveDuration,
 	})
 	if err != nil {
 		return nil, err
@@ -353,9 +355,32 @@ func validateFloat(s string) error {
 	return nil
 }
 
-func validateDuration(s string) error {
-	if _, err := time.ParseDuration(s); err != nil {
+// validName matches internal/project.Slug's own constraint on a project name:
+// the value becomes part of a file name (<dir>/configs/<name>.yaml, per
+// Write) and a lock file name, so it stays to characters that need no
+// quoting and cannot walk the path outside configs/ via "/" or "..".
+var validName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+func validateName(s string) error {
+	if !validName.MatchString(s) {
+		return fmt.Errorf(
+			"%q is not a valid loop name; it becomes part of a file path, so use only letters, digits, '.', '_', and '-'", s)
+	}
+	return nil
+}
+
+// validatePositiveDuration is used for agent.timeout and
+// retry.breaker.cooldown, which config.validate requires to be greater than
+// zero. Rejecting "0s" and a negative value here means the wizard's own
+// Write reload catches the same defect config.Load would, before the
+// operator has spent all 24 answers.
+func validatePositiveDuration(s string) error {
+	d, err := time.ParseDuration(s)
+	if err != nil {
 		return fmt.Errorf("%q is not a valid duration such as \"30m\"", s)
+	}
+	if d <= 0 {
+		return fmt.Errorf("%q must be greater than zero", s)
 	}
 	return nil
 }
