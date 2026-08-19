@@ -138,7 +138,7 @@ func listenerStartCommand() *cli.Command {
 			}
 
 			def := st.WithDefaults()
-			return runListener(ctx, def.Webhook.ListenAddr, def.Webhook.ListenPort, def.Webhook.Secret)
+			return runListener(ctx, def.Webhook.ListenAddr, def.Webhook.ListenPort, currentSecret)
 		},
 	}
 }
@@ -218,6 +218,24 @@ func containsWritableRefusal(err error) bool {
 	return strings.Contains(err.Error(), "writable by group or other")
 }
 
+// currentSecret reads the webhook secret from the settings file, fresh.
+//
+// It is the Secret seam listener.Server calls on EVERY delivery, not a value
+// captured at start. `config webhook --rotate-secret` writes a new secret and
+// tells the operator to re-run register-webhook so GitHub signs with it; a
+// daemon still holding the old value would then reject every delivery with a
+// 401, and the log would fill with signature failures indistinguishable from
+// an attack. listener.Token does the same for the GitHub token and documents
+// the same reason, and the README promises that behaviour a paragraph before
+// it describes rotation.
+func currentSecret() (string, error) {
+	st, err := settings.Load()
+	if err != nil {
+		return "", err
+	}
+	return st.Webhook.Secret, nil
+}
+
 // runListener runs the listener in the foreground until it receives SIGINT
 // or SIGTERM, then shuts down in the order drainAndClose documents.
 //
@@ -226,7 +244,7 @@ func containsWritableRefusal(err error) bool {
 // `listener start` must keep serving after its own CLI Action would
 // otherwise be considered "done", which is exactly what a long-running
 // daemon is.
-func runListener(_ context.Context, addr string, port int, secret string) error {
+func runListener(_ context.Context, addr string, port int, secret func() (string, error)) error {
 	dir, err := home.EnsureDir()
 	if err != nil {
 		return err
@@ -697,6 +715,20 @@ func listenerStopCommand() *cli.Command {
 				if err != nil {
 					return fmt.Errorf(
 						"a listener is running (its lock is held) but its pidfile is unreadable: %w", err)
+				}
+				// The pid comes out of a JSON file on disk, and it is
+				// handed straight to kill(2), which reads non-positive
+				// values as broadcasts: 0 signals the CALLER's whole
+				// process group, -1 every process this user owns, and any
+				// other negative value a process group of its own. Nothing
+				// upstream guarantees the number is a pid at all -- a
+				// truncated write, a hand-edited file, or another local
+				// account that got write access to it (the file is 0600 for
+				// this reason, see writePidfile) is enough.
+				if pf.PID <= 0 {
+					return fmt.Errorf(
+						"the listener pidfile at %s records pid %d, which is not a process; "+
+							"delete it and stop the listener by hand", pidPath, pf.PID)
 				}
 				if err := syscall.Kill(pf.PID, syscall.SIGTERM); err != nil {
 					return fmt.Errorf("signal listener pid %d: %w", pf.PID, err)

@@ -9,6 +9,7 @@ package listener
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -47,9 +48,18 @@ type Server struct {
 	// port would otherwise bind whatever ephemeral port the kernel picks,
 	// which the operator cannot predict or point a reverse proxy at.
 	Port int
-	// Secret is the GitHub webhook secret. New refuses to construct a Server
-	// when this is empty.
-	Secret string
+	// Secret returns the GitHub webhook secret to verify a delivery against.
+	// It is called on EVERY request, not once at construction: rotating the
+	// secret (`config webhook --rotate-secret`) must not require restarting
+	// the daemon, or every delivery GitHub signs with the new value 401s
+	// against the old one and the log fills with signature failures
+	// indistinguishable from an attack. internal/listener/env.go's Token
+	// re-reads the token file per tick for exactly this reason.
+	//
+	// New calls it once and refuses a Server whose secret is empty or
+	// unreadable at start, so a misconfigured daemon fails at start rather
+	// than at the first delivery.
+	Secret func() (string, error)
 	// Tick runs one loop for a repository. It is a seam so a test can drive
 	// the handler without opening a database or starting an agent.
 	Tick func(ctx context.Context, repo string)
@@ -72,11 +82,15 @@ type Server struct {
 	// seen remembers recent delivery ids so a GitHub redelivery does not
 	// dispatch a second tick. Built by New.
 	seen *deliveryCache
+
+	// rejects bounds how often a rejection reaches the log. Built by New;
+	// see rejectionLog, and rejectionLogInterval for what it defends.
+	rejects *rejectionLog
 }
 
 // New validates s and returns it ready to serve.
 //
-// It refuses an empty Secret. This is fail-closed, not a convenience:
+// It refuses a nil or empty Secret. This is fail-closed, not a convenience:
 // github.ValidatePayloadFromBody only runs signature verification when the
 // secret or the signature is non-empty (messages.go:230-236), and with an
 // empty secret it would compute the HMAC with a key the attacker also knows,
@@ -93,7 +107,12 @@ func New(s *Server) (*Server, error) {
 	if s == nil {
 		return nil, errors.New("listener: nil Server")
 	}
-	if s.Secret == "" {
+	if s.Secret == nil {
+		return nil, errors.New("listener: Secret must not be nil")
+	}
+	if secret, err := s.Secret(); err != nil {
+		return nil, fmt.Errorf("listener: cannot read the webhook secret: %w", err)
+	} else if secret == "" {
 		return nil, errors.New("listener: refusing to serve with an empty webhook secret")
 	}
 	if s.Tick == nil {
@@ -110,6 +129,7 @@ func New(s *Server) (*Server, error) {
 	}
 	s.sem = make(chan struct{}, s.MaxInFlight)
 	s.seen = newDeliveryCache(deliveryCacheSize)
+	s.rejects = newRejectionLog(rejectionLogInterval)
 	return s, nil
 }
 

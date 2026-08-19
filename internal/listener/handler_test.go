@@ -8,10 +8,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +22,13 @@ import (
 )
 
 const testSecret = "test-webhook-secret"
+
+// fixedSecret is the Secret seam for a test that does not care about
+// rotation: it hands back the same value on every call, the way a settings
+// file nobody is editing does.
+func fixedSecret(secret string) func() (string, error) {
+	return func() (string, error) { return secret, nil }
+}
 
 // sha256Sig returns the header value GitHub would send for body signed with
 // secret: "sha256=" followed by the lowercase hex HMAC-SHA256 digest.
@@ -56,7 +65,7 @@ func repoPayload(t *testing.T, fullName string) []byte {
 func newServer(t *testing.T, tickCh chan<- string) *Server {
 	t.Helper()
 	s, err := New(&Server{
-		Secret: testSecret,
+		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
 		Tick: func(_ context.Context, repo string) {
 			tickCh <- repo
@@ -270,13 +279,125 @@ func TestSHA1HeaderAloneRejects(t *testing.T) {
 	assertNoTick(t, tickCh)
 }
 
+// The one invariant this package's doc is written around: with an empty
+// secret, github.ValidatePayloadFromBody computes the HMAC with a key the
+// attacker also knows, so the endpoint accepts anything and starts a coding
+// agent for it. settings.Load returns a zero value when its file is absent, so
+// an empty secret is a state this program can reach.
+//
+// Port is set deliberately. Left at zero, New fails on the Port check first
+// and this test passes with the secret refusal deleted -- which is exactly how
+// it used to pass. The error text is asserted for the same reason.
 func TestNewRefusesEmptySecret(t *testing.T) {
 	_, err := New(&Server{
-		Secret: "",
+		Secret: fixedSecret(""),
+		Port:   8080,
 		Tick:   func(context.Context, string) {},
 	})
 	if err == nil {
 		t.Fatal("New with an empty secret must return an error")
+	}
+	if !strings.Contains(err.Error(), "empty webhook secret") {
+		t.Fatalf("err = %v, want the refusal to name the empty webhook secret", err)
+	}
+}
+
+// A Secret seam that cannot answer is not an excuse to serve unauthenticated:
+// New refuses at start rather than letting every delivery discover it.
+func TestNewRefusesAnUnreadableSecret(t *testing.T) {
+	_, err := New(&Server{
+		Secret: func() (string, error) { return "", errors.New("settings unreadable") },
+		Port:   8080,
+		Tick:   func(context.Context, string) {},
+	})
+	if err == nil {
+		t.Fatal("New with an unreadable secret must return an error")
+	}
+}
+
+// Rotating the secret (`config webhook --rotate-secret`) must not require
+// restarting the daemon. A secret read once at start would make GitHub sign
+// with the new value while the daemon verified with the old, 401ing every
+// delivery and filling the log with signature failures indistinguishable from
+// an attack.
+func TestSecretIsReReadPerRequest(t *testing.T) {
+	tickCh := make(chan string, 1)
+	var mu sync.Mutex
+	secret := testSecret
+	s, err := New(&Server{
+		Secret: func() (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return secret, nil
+		},
+		Port: freePort(t),
+		Tick: func(_ context.Context, repo string) { tickCh <- repo },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	// The operator rotates it, and GitHub starts signing with the new value.
+	mu.Lock()
+	secret = "rotated-webhook-secret"
+	mu.Unlock()
+
+	body := repoPayload(t, "octo/hello")
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig("rotated-webhook-secret", body),
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: the rotated secret must be picked up without a restart", resp.StatusCode)
+	}
+	if got := waitTick(t, tickCh); got != "octo/hello" {
+		t.Fatalf("Tick repo = %q", got)
+	}
+
+	// And the old secret is genuinely no longer accepted.
+	old := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	if old.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d for the superseded secret, want 401", old.StatusCode)
+	}
+}
+
+// Every rejection below step 6 is written by an anonymous caller: slog goes to
+// stdout as JSON and launchd appends that to an unrotated file in the
+// operator's home directory. A few hundred requests a second of garbage would
+// otherwise write gigabytes a day and KeepAlive would respawn the daemon
+// against a full disk.
+func TestRejectionLoggingIsRateLimitedPerStage(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	l := newRejectionLog(time.Minute)
+	l.now = func() time.Time { return now }
+
+	ok, suppressed := l.allow("method")
+	if !ok || suppressed != 0 {
+		t.Fatalf("first rejection: ok=%v suppressed=%d, want true/0", ok, suppressed)
+	}
+	for i := 0; i < 500; i++ {
+		if ok, _ := l.allow("method"); ok {
+			t.Fatalf("rejection %d was logged inside the interval", i)
+		}
+	}
+	// A different stage is a different key: an operator must still see the
+	// first of each kind.
+	if ok, _ := l.allow("content type"); !ok {
+		t.Fatal("a different stage was suppressed by another stage's interval")
+	}
+
+	// Once the interval passes, one line gets through and carries the count it
+	// stands for -- a silently sampled log would understate an attack.
+	now = now.Add(time.Minute)
+	ok, suppressed = l.allow("method")
+	if !ok {
+		t.Fatal("nothing was logged after the interval passed")
+	}
+	if suppressed != 500 {
+		t.Fatalf("suppressed = %d, want 500", suppressed)
 	}
 }
 
@@ -487,7 +608,7 @@ func TestTickReceivesDaemonContextNotRequestContext(t *testing.T) {
 	release := make(chan struct{})
 	ctxErrCh := make(chan error, 1)
 	s, err := New(&Server{
-		Secret: testSecret,
+		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
 		Tick: func(ctx context.Context, _ string) {
 			<-release
@@ -540,7 +661,7 @@ func TestFullPoolDropsWithoutSecondTick(t *testing.T) {
 	tickStarted := make(chan struct{}, 2)
 	release := make(chan struct{})
 	s, err := New(&Server{
-		Secret:      testSecret,
+		Secret:      fixedSecret(testSecret),
 		Port:        freePort(t),
 		MaxInFlight: 1,
 		Tick: func(context.Context, string) {
@@ -592,6 +713,71 @@ func TestFullPoolDropsWithoutSecondTick(t *testing.T) {
 	close(release)
 }
 
+// A delivery the pool drops must stay recoverable. GitHub's "Redeliver" sends
+// the SAME guid, so an id cached for work that never ran answers every future
+// attempt with "duplicate, skipping tick" and the work is lost outright: Wake
+// fires only on retry deadlines, and the next delivery may be days away.
+func TestAPoolDroppedDeliveryIsRecoverableByRedelivery(t *testing.T) {
+	tickStarted := make(chan string, 2)
+	release := make(chan struct{})
+	s, err := New(&Server{
+		Secret:      fixedSecret(testSecret),
+		Port:        freePort(t),
+		MaxInFlight: 1,
+		Tick: func(_ context.Context, repo string) {
+			tickStarted <- repo
+			<-release
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	first := repoPayload(t, "octo/one")
+	if resp := doRequest(t, ts.URL+"/webhook", first, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, first),
+	}); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("first delivery status = %d, want 202", resp.StatusCode)
+	}
+	select {
+	case <-tickStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first Tick to start")
+	}
+
+	// The pool is full, so this one is dropped. Its guid is fixed, because
+	// that is what "Redeliver" reuses.
+	body := repoPayload(t, "octo/two")
+	guid := uuid.NewString()
+	headers := map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+		github.DeliveryIDHeader:      guid,
+	}
+	if resp := doRequest(t, ts.URL+"/webhook", body, headers); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("dropped delivery status = %d, want 202", resp.StatusCode)
+	}
+
+	// The slot frees up and the operator hits Redeliver. Drain is what proves
+	// the pool goroutine has finished and given the slot back, so the second
+	// delivery is not racing it.
+	close(release)
+	s.Drain()
+
+	if resp := doRequest(t, ts.URL+"/webhook", body, headers); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("redelivery status = %d, want 202: a dropped delivery must not be cached as seen", resp.StatusCode)
+	}
+	select {
+	case repo := <-tickStarted:
+		if repo != "octo/two" {
+			t.Fatalf("redelivery ticked %q, want octo/two", repo)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the redelivery of a dropped delivery did not tick; the work is unrecoverable")
+	}
+}
+
 // TestDrainWaitsForInFlightTickStartedByThePool proves Server.Drain gives a
 // real happens-before guarantee, not just an eventual one: it must not
 // return while a Tick the pool goroutine started is still running, and it
@@ -604,7 +790,7 @@ func TestDrainWaitsForInFlightTickStartedByThePool(t *testing.T) {
 	tickStarted := make(chan struct{})
 	release := make(chan struct{})
 	s, err := New(&Server{
-		Secret: testSecret,
+		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
 		Tick: func(context.Context, string) {
 			close(tickStarted)
@@ -657,7 +843,7 @@ func TestDrainWaitsForInFlightTickStartedByThePool(t *testing.T) {
 // block at all.
 func TestDrainReturnsImmediatelyWithNothingInFlight(t *testing.T) {
 	s, err := New(&Server{
-		Secret: testSecret,
+		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
 		Tick:   func(context.Context, string) {},
 	})

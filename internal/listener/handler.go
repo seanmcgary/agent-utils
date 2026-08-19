@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/go-github/v77/github"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
@@ -56,16 +57,78 @@ func safeDeliveryID(id string) string {
 	return "<invalid>"
 }
 
+// rejectionLogInterval is how often one rejection stage may reach the log.
+//
+// Every rejection below step 6 is written by an anonymous, unauthenticated
+// caller: no signature has been verified yet. slog goes to stdout as JSON
+// (cmd/agent-utils/main.go), and launchd appends that to
+// ~/.agent-utils/listener.stdout.log with no rotation
+// (internal/service/service_darwin.go). A few hundred requests a second of
+// garbage would write gigabytes a day to the home volume, and KeepAlive then
+// respawns the daemon against a full disk. One line per stage per interval,
+// carrying the count it stands for, keeps the diagnostic without letting a
+// stranger choose how much this process writes.
+const rejectionLogInterval = time.Minute
+
+// rejectionLog rate-limits rejection logging, keyed by stage.
+//
+// Keyed by STAGE, not by delivery id or source address: the stage is the only
+// part of a rejection an operator reads a pattern out of, and both of the
+// others are attacker-chosen, so keying on either would let one caller mint
+// unbounded keys and defeat the limit it is subject to.
+type rejectionLog struct {
+	mu       sync.Mutex
+	now      func() time.Time // seam: a test must not wait a real interval
+	interval time.Duration
+	next     map[string]time.Time
+	dropped  map[string]int
+}
+
+func newRejectionLog(interval time.Duration) *rejectionLog {
+	return &rejectionLog{
+		now:      time.Now,
+		interval: interval,
+		next:     map[string]time.Time{},
+		dropped:  map[string]int{},
+	}
+}
+
+// allow reports whether this rejection may be logged, and how many rejections
+// of the same stage went unlogged since the last one that was. The count is
+// returned rather than logged separately so the surviving line still says how
+// much it stands for -- a silently sampled log would understate an attack.
+func (l *rejectionLog) allow(stage string) (bool, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	if next, ok := l.next[stage]; ok && now.Before(next) {
+		l.dropped[stage]++
+		return false, 0
+	}
+	l.next[stage] = now.Add(l.interval)
+	suppressed := l.dropped[stage]
+	delete(l.dropped, stage)
+	return true, suppressed
+}
+
 // rejected writes a fixed, generic body for status and logs the stage that
-// failed keyed only by delivery id.
+// failed keyed only by delivery id, at most once per rejectionLogInterval per
+// stage.
 //
 // The body is never err.Error() and never the reason string alone: go-github
 // error text interpolates the attacker's own signature (messages.go's
 // messageMAC), and even which stage failed is information an attacker probing
 // this endpoint should not get for free. http.Error's fixed text for the
 // status code is all a caller ever sees.
-func rejected(w http.ResponseWriter, deliveryID, stage string, status int) {
-	slog.Warn("rejected webhook delivery", "delivery", safeDeliveryID(deliveryID), "stage", stage, "status", status)
+//
+// The RESPONSE is never rate-limited, only the log line: a caller always gets
+// its status code, so nothing about a legitimate delivery changes.
+func (s *Server) rejected(w http.ResponseWriter, deliveryID, stage string, status int) {
+	if ok, suppressed := s.rejects.allow(stage); ok {
+		slog.Warn("rejected webhook delivery", "delivery", safeDeliveryID(deliveryID),
+			"stage", stage, "status", status, "suppressed_since_last", suppressed)
+	}
 	http.Error(w, http.StatusText(status), status)
 }
 
@@ -125,7 +188,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 
 		// 1. A method other than POST gives 405.
 		if r.Method != http.MethodPost {
-			rejected(w, deliveryID, "method", http.StatusMethodNotAllowed)
+			s.rejected(w, deliveryID, "method", http.StatusMethodNotAllowed)
 			return
 		}
 
@@ -136,7 +199,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// 3. No SHA-256 header at all gives 400.
 		sig := r.Header.Get(github.SHA256SignatureHeader)
 		if sig == "" {
-			rejected(w, deliveryID, "missing signature", http.StatusBadRequest)
+			s.rejected(w, deliveryID, "missing signature", http.StatusBadRequest)
 			return
 		}
 
@@ -148,7 +211,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// the prefix inside its value must be pinned here, before the
 		// signature ever reaches ValidatePayloadFromBody.
 		if !strings.HasPrefix(sig, "sha256=") {
-			rejected(w, deliveryID, "signature not sha256", http.StatusBadRequest)
+			s.rejected(w, deliveryID, "signature not sha256", http.StatusBadRequest)
 			return
 		}
 
@@ -162,7 +225,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// than what gets parsed.
 		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		if err != nil || mediaType != "application/json" {
-			rejected(w, deliveryID, "content type", http.StatusUnsupportedMediaType)
+			s.rejected(w, deliveryID, "content type", http.StatusUnsupportedMediaType)
 			return
 		}
 
@@ -177,7 +240,26 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// "error decoding signature", which interpolate the raw signature
 		// string -- is folded into the single generic 401 below. rejected
 		// never receives err.Error(), only the fixed stage label.
-		payload, err := github.ValidatePayloadFromBody(mediaType, r.Body, sig, []byte(s.Secret))
+		// The secret is read HERE, per request, not once at process start.
+		// `config webhook --rotate-secret` writes a new one and tells the
+		// operator to re-run register-webhook; a daemon holding the old value
+		// would then 401 every delivery GitHub signed with the new one, and
+		// the log would fill with signature failures indistinguishable from an
+		// attack. internal/listener/env.go's Token re-reads for the same
+		// reason and says so.
+		secret, err := s.Secret()
+		if err != nil || secret == "" {
+			// Not an authentication failure -- this end is broken, not the
+			// caller -- so it is not folded into the 401 below. It is still
+			// routed through rejected: a settings file that has gone
+			// unreadable makes EVERY delivery take this path, so it needs the
+			// same bound on how much it can write.
+			slog.Error("cannot read the webhook secret; refusing the delivery", "err", err)
+			s.rejected(w, deliveryID, "secret unavailable", http.StatusInternalServerError)
+			return
+		}
+
+		payload, err := github.ValidatePayloadFromBody(mediaType, r.Body, sig, []byte(secret))
 		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
@@ -185,10 +267,10 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				// distinction matters when reading logs during an attack:
 				// 413 says "someone sent too much," 401 says "the HMAC did
 				// not match."
-				rejected(w, deliveryID, "body too large", http.StatusRequestEntityTooLarge)
+				s.rejected(w, deliveryID, "body too large", http.StatusRequestEntityTooLarge)
 				return
 			}
-			rejected(w, deliveryID, "signature verification failed", http.StatusUnauthorized)
+			s.rejected(w, deliveryID, "signature verification failed", http.StatusUnauthorized)
 			return
 		}
 
@@ -213,7 +295,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			} `json:"repository"`
 		}
 		if err := json.Unmarshal(payload, &body); err != nil || !repoFullName.MatchString(body.Repository.FullName) {
-			rejected(w, deliveryID, "repository", http.StatusBadRequest)
+			s.rejected(w, deliveryID, "repository", http.StatusBadRequest)
 			return
 		}
 		repo := body.Repository.FullName
@@ -225,14 +307,21 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// A request that reaches here has already passed step 6, so it is
 		// signed with the real secret; an empty delivery id at this point is
 		// not an attacker probing the endpoint, only a malformed or unusual
-		// delivery. It is still not safe to cache: seen("") would remember
+		// delivery. It is still not safe to cache: claim("") would remember
 		// the empty string, and every LATER signed delivery that also lacks
 		// the header would then be answered 200 with no tick, silently
 		// dropping real work. Skip the cache for it instead and let it
 		// through to step 10.
+		//
+		// Membership only. The id is NOT recorded here: step 10 may drop this
+		// delivery when the pool is full, and an id cached for work that never
+		// ran makes GitHub's "Redeliver" -- which sends the SAME guid -- answer
+		// "duplicate, skipping tick" forever. That work would be unrecoverable:
+		// Wake fires only on retry deadlines, and the next delivery for this
+		// repository may be days away.
 		if deliveryID == "" {
 			slog.Warn("delivery has no id, skipping dedup", "repo", repo)
-		} else if s.seen.seen(deliveryID) {
+		} else if s.seen.has(deliveryID) {
 			slog.Info("duplicate delivery, skipping tick", "delivery", safeDeliveryID(deliveryID), "repo", repo)
 			w.WriteHeader(http.StatusOK)
 			return
@@ -244,10 +333,25 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// handle through loopcmd.Open -- real work, not a cheap check -- so
 		// concurrency is bounded by a semaphore rather than a bare goroutine
 		// per delivery. When the pool is full this drops the delivery with
-		// 202 rather than blocking: the next delivery, or Wake, re-derives
-		// the same state, so nothing is lost by not queuing it here.
+		// 202 rather than blocking, and leaves its id UNCLAIMED so GitHub's
+		// "Redeliver" on that same guid can recover the work. Relying on the
+		// next delivery, or on Wake, would not: Wake fires only on retry
+		// deadlines, and the next delivery may be days away.
 		select {
 		case s.sem <- struct{}{}:
+			// The id is claimed once the work is certainly going to run, and
+			// claimed atomically: the check at step 9 and this point are two
+			// separate acquisitions of the cache's lock, so two concurrent
+			// deliveries carrying one id can both pass that check. Exactly one
+			// of them wins the claim here; the loser gives its slot back and
+			// answers 200, the same as any other duplicate.
+			if deliveryID != "" && s.seen.claim(deliveryID) {
+				<-s.sem
+				slog.Info("duplicate delivery, skipping tick",
+					"delivery", safeDeliveryID(deliveryID), "repo", repo)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			// Add happens here, synchronously, before the goroutine is
 			// spawned -- not inside it. A caller of Drain (see listener.go)
 			// waits on this same WaitGroup; Add inside the goroutine would
@@ -296,11 +400,22 @@ func newDeliveryCache(limit int) *deliveryCache {
 	}
 }
 
-// seen records id and reports whether it was already present. The
+// has reports whether id is already remembered, without recording it. It is
+// the cheap check the handler makes before it decides to do any work; the
+// recording is claim's job, and the two are deliberately separate so an id is
+// never remembered for work that was then dropped.
+func (c *deliveryCache) has(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.ids[id]
+	return ok
+}
+
+// claim records id and reports whether it was already present. The
 // check-and-insert has to happen atomically under one lock: two concurrent
 // deliveries carrying the same id must not both observe "not seen yet" and
 // both dispatch a tick.
-func (c *deliveryCache) seen(id string) bool {
+func (c *deliveryCache) claim(id string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

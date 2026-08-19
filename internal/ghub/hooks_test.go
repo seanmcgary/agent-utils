@@ -170,6 +170,32 @@ func TestEditHook(t *testing.T) {
 	}
 }
 
+// An EditHook whose Config carries an empty secret REMOVES the secret from a
+// live hook, after which GitHub sends unsigned deliveries and the listener
+// answers 400 to every one of them. The refusal must happen before the request
+// is built, so no such call can reach GitHub at all.
+func TestHookWritesRefuseAnEmptySecret(t *testing.T) {
+	mux := http.NewServeMux()
+	called := false
+	mux.HandleFunc("/repos/o/r/hooks", func(http.ResponseWriter, *http.Request) { called = true })
+	mux.HandleFunc("/repos/o/r/hooks/7", func(http.ResponseWriter, *http.Request) { called = true })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	g := newTestClient(t, srv)
+	spec := HookSpec{URL: "https://example.com/hook", Events: []string{"issues"}}
+
+	if _, err := g.CreateHook(context.Background(), "o", "r", spec); err == nil {
+		t.Error("CreateHook with an empty secret returned no error")
+	}
+	if err := g.EditHook(context.Background(), "o", "r", 7, spec); err == nil {
+		t.Error("EditHook with an empty secret returned no error")
+	}
+	if called {
+		t.Error("a hook write with an empty secret reached GitHub")
+	}
+}
+
 func TestIsHookEvent(t *testing.T) {
 	for _, e := range HookEvents {
 		if !IsHookEvent(e) {

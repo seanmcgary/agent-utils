@@ -176,7 +176,8 @@ func TestRunListenerRefusesWhenAlreadyRunning(t *testing.T) {
 	}
 	defer held.Release()
 
-	err = runListener(context.Background(), "127.0.0.1", 18080, "supersecretvalue")
+	err = runListener(context.Background(), "127.0.0.1", 18080,
+		func() (string, error) { return "supersecretvalue", nil })
 	if err == nil {
 		t.Fatal("runListener while the lock is held: want an error, got nil")
 	}
@@ -504,7 +505,7 @@ func listenerServerForTest(t *testing.T) (*listener.Server, error) {
 		return nil, err
 	}
 	return listener.New(&listener.Server{
-		Secret: "test-secret",
+		Secret: func() (string, error) { return "test-secret", nil },
 		Port:   port,
 		Tick:   func(context.Context, string) {},
 	})

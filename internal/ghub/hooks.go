@@ -45,7 +45,11 @@ func (g *GitHubClient) ListHooks(ctx context.Context, owner, repo string) ([]Hoo
 
 // CreateHook registers a new webhook and returns its ID.
 func (g *GitHubClient) CreateHook(ctx context.Context, owner, repo string, h HookSpec) (int64, error) {
-	created, _, err := g.c.Repositories.CreateHook(ctx, owner, repo, hookRequest(h))
+	req, err := hookRequest(h)
+	if err != nil {
+		return 0, err
+	}
+	created, _, err := g.c.Repositories.CreateHook(ctx, owner, repo, req)
 	if err != nil {
 		return 0, missingScopeErr(owner, repo, err)
 	}
@@ -54,7 +58,11 @@ func (g *GitHubClient) CreateHook(ctx context.Context, owner, repo string, h Hoo
 
 // EditHook updates an existing webhook's delivery URL, secret, and events.
 func (g *GitHubClient) EditHook(ctx context.Context, owner, repo string, id int64, h HookSpec) error {
-	_, _, err := g.c.Repositories.EditHook(ctx, owner, repo, id, hookRequest(h))
+	req, err := hookRequest(h)
+	if err != nil {
+		return err
+	}
+	_, _, err = g.c.Repositories.EditHook(ctx, owner, repo, id, req)
 	if err != nil {
 		return missingScopeErr(owner, repo, err)
 	}
@@ -62,7 +70,18 @@ func (g *GitHubClient) EditHook(ctx context.Context, owner, repo string, id int6
 }
 
 // hookRequest builds the go-github Hook the API expects from a HookSpec.
-func hookRequest(h HookSpec) *github.Hook {
+//
+// It refuses an empty secret rather than sending one. The Config below is a
+// full replacement, so EditHook with an empty HookSpec.Secret would REMOVE the
+// secret from a live hook -- after which GitHub sends deliveries with no
+// signature at all and the listener answers 400 to every one of them, which
+// reads as a broken daemon rather than a stripped hook. Today's only caller
+// validates before it gets here; this package is shared, and a fail-open
+// default in it is the kind that is discovered in production.
+func hookRequest(h HookSpec) (*github.Hook, error) {
+	if h.Secret == "" {
+		return nil, errors.New("hooks: refusing to write a webhook with an empty secret")
+	}
 	return &github.Hook{
 		Name:   github.Ptr("web"),
 		Active: github.Ptr(true),
@@ -73,7 +92,7 @@ func hookRequest(h HookSpec) *github.Hook {
 			URL:         github.Ptr(h.URL),
 			Secret:      github.Ptr(h.Secret),
 		},
-	}
+	}, nil
 }
 
 // missingScopeErr turns a 404 from a hooks endpoint into an error that names

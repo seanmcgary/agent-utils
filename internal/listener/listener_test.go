@@ -28,7 +28,7 @@ func freePort(t *testing.T) int {
 
 func TestNewDefaultsAddrToLoopback(t *testing.T) {
 	s, err := New(&Server{
-		Secret: testSecret,
+		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
 		Tick:   func(context.Context, string) {},
 	})
@@ -46,7 +46,7 @@ func TestNewDefaultsAddrToLoopback(t *testing.T) {
 func TestNewRejectsNonPositivePort(t *testing.T) {
 	for _, port := range []int{0, -1} {
 		if _, err := New(&Server{
-			Secret: testSecret,
+			Secret: fixedSecret(testSecret),
 			Port:   port,
 			Tick:   func(context.Context, string) {},
 		}); err == nil {
@@ -62,7 +62,7 @@ func TestNewRejectsNonPositivePort(t *testing.T) {
 // goroutine open indefinitely without these.
 func TestHTTPServerTimeoutsAreSet(t *testing.T) {
 	s, err := New(&Server{
-		Secret: testSecret,
+		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
 		Tick:   func(context.Context, string) {},
 	})
@@ -93,7 +93,7 @@ func TestHTTPServerTimeoutsAreSet(t *testing.T) {
 // propagating Shutdown's own "already closed" bookkeeping as an error.
 func TestListenAndServeShutsDownOnContextCancel(t *testing.T) {
 	s, err := New(&Server{
-		Secret: testSecret,
+		Secret: fixedSecret(testSecret),
 		Addr:   loopbackAddr,
 		Port:   freePort(t),
 		Tick:   func(context.Context, string) {},

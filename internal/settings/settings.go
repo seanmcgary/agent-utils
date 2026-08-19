@@ -25,6 +25,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -112,28 +113,18 @@ func Load() (*Settings, error) {
 		return nil, err
 	}
 
-	raw, err := os.ReadFile(path)
+	raw, err := readSecretFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return &Settings{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read settings: %w", err)
+		return nil, err
 	}
+	// After the checks, not before. An empty file used to short-circuit here,
+	// which skipped the mode check entirely and left a 0644 config.yaml
+	// unreported until something wrote a secret into it.
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return &Settings{}, nil
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("stat settings: %w", err)
-	}
-	// This file holds the sole authenticator for an HTTP endpoint that starts
-	// an agent. A mode that allows group or other access means any other
-	// account on the machine, or a 0644 copy restored from a backup, can read
-	// the HMAC secret and forge a signed webhook delivery. Refuse to use the
-	// file rather than trust it silently.
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return nil, fmt.Errorf("%s has mode %#o, which allows group or other access; chmod 0600 it before agent-utils will read it", path, perm)
 	}
 
 	if err := checkNotProjectDescriptor(raw, path); err != nil {
@@ -150,6 +141,87 @@ func Load() (*Settings, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return &s, nil
+}
+
+// maxSettingsFileSize caps how much of the settings file Load will read. It
+// holds a handful of scalars, never a document, so a file that has grown
+// unboundedly -- by mistake, or by anything that gained write access to the
+// path -- is rejected rather than read into memory whole.
+const maxSettingsFileSize = 64 * 1024
+
+// readSecretFile opens path, proves it is safe to trust, and returns its
+// contents. A missing file reports os.ErrNotExist through errors.Is, which is
+// what lets Load treat "this machine has never run `config`" as the zero
+// value rather than a failure.
+//
+// This is internal/listener/env.go's readTokenFile shape, deliberately: that
+// function defends the GitHub token against exactly this threat and documents
+// each check, and this file now holds the HMAC secret that is the SOLE
+// authenticator for an endpoint which starts a coding agent. The previous
+// version here read the file first and stat-ed the PATH afterwards, so the
+// content was already in memory before its mode was judged, the stat could
+// observe a different file than the read did, and a symlink was followed
+// without comment.
+func readSecretFile(path string) ([]byte, error) {
+	// O_NOFOLLOW closes the time-of-check-to-time-of-use gap: every check
+	// below is about the exact file this process now holds open, not about
+	// however the path happens to resolve at some other moment. O_NONBLOCK so
+	// a FIFO planted at this path cannot wedge the open before the IsRegular
+	// check runs.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("%s is a symlink, refusing to follow it", path)
+		}
+		// Passed through unwrapped enough for errors.Is: Load distinguishes
+		// "no settings file" from "unreadable settings file".
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("open settings %s: %w", path, err)
+	}
+	defer f.Close()
+
+	// Stat the DESCRIPTOR, not the path: os.Stat(path) would reopen by name
+	// and could observe a different file than O_NOFOLLOW just verified.
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat settings %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (mode %s)", path, info.Mode())
+	}
+
+	// A mode check alone is not enough: a file's owner can chmod it back at
+	// any time, so 0600 does not prove this process's own operator is who
+	// wrote the content. Requiring the uid to match means only the account
+	// this program runs as could have put the secret there.
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("cannot determine the owner of %s", path)
+	}
+	if int(stat.Uid) != os.Getuid() {
+		return nil, fmt.Errorf("%s is not owned by the current user", path)
+	}
+
+	// Any group or other access means another local account on the machine,
+	// or a 0644 copy restored from a backup, can read the HMAC secret and
+	// forge a signed webhook delivery that starts an agent.
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf("%s has mode %#o, which allows group or other access; chmod 0600 it before agent-utils will read it", path, perm)
+	}
+
+	// One byte past the cap, so a file exactly at the limit is not mistaken
+	// for one that overflowed it while anything larger is still rejected
+	// rather than silently truncated.
+	data, err := io.ReadAll(io.LimitReader(f, maxSettingsFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read settings %s: %w", path, err)
+	}
+	if len(data) > maxSettingsFileSize {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxSettingsFileSize)
+	}
+	return data, nil
 }
 
 // checkNotProjectDescriptor reports ErrProjectDescriptor when raw looks like
@@ -319,6 +391,7 @@ func Fields() []Field {
 				if strings.TrimSpace(v) == "" {
 					return fmt.Errorf("webhook.listen_addr must not be empty")
 				}
+				warnIfNotLoopback(v)
 				s.Webhook.ListenAddr = v
 				return nil
 			},
@@ -352,6 +425,33 @@ func Fields() []Field {
 			Unset: func(s *Settings) { s.Webhook.Secret = "" },
 		},
 	}
+}
+
+// warnIfNotLoopback prints to stderr when listen_addr is being widened past
+// loopback.
+//
+// Every other step in this program that grants something reach is gated: a
+// typed confirmation, an acknowledgement flag in the loop file, or a refusal.
+// Widening the bind address is the one that is not, and it is the largest of
+// them -- the endpoint behind it starts a claude agent with permission
+// prompts disabled, in a git worktree, on text written by other people. It
+// stays ungated because a reverse proxy on another host is a legitimate
+// deployment and this package cannot tell that from a mistake, so the operator
+// is told plainly instead of being stopped.
+//
+// Stderr, not slog: the only callers of Set are the `config` command and
+// `listener start`'s flag validation, both of which talk to a person at a
+// terminal, and stdout is reserved for the value those commands print.
+func warnIfNotLoopback(addr string) {
+	if isLoopbackHost(addr) {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"warning: webhook.listen_addr is %s, not a loopback address.\n"+
+			"The webhook endpoint starts a coding agent with permission prompts\n"+
+			"disabled, and its only authenticator is the HMAC secret in this file.\n"+
+			"Bind it to 127.0.0.1 and put a reverse proxy in front unless you mean\n"+
+			"to accept deliveries from the network directly.\n", addr)
 }
 
 // FieldFor returns the field for key, and whether it exists.

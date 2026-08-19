@@ -2,9 +2,11 @@ package settings
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -296,5 +298,123 @@ func TestRenderRedactsTheSecretUnlessRevealed(t *testing.T) {
 	}
 	if !strings.Contains(revealed, "topsecretvalue") {
 		t.Errorf("revealed render is missing the secret:\n%s", revealed)
+	}
+}
+
+// An empty file used to return the zero value before the mode was ever
+// checked, so a 0644 config.yaml stayed unreported until something wrote a
+// secret into it -- at which point it was already world-readable.
+func TestLoadOnAnEmpty0644FileStillGivesTheModeError(t *testing.T) {
+	home := withHome(t)
+	if err := os.WriteFile(filepath.Join(home, FileName), []byte("   \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load on an empty 0644 file must return an error")
+	}
+}
+
+// This file holds the sole authenticator for an endpoint that starts a coding
+// agent. A symlink at its path would have Load read, and later Save replace,
+// a file this process does not own; the token file is defended the same way
+// (internal/listener/env.go).
+func TestLoadRefusesToFollowASymlink(t *testing.T) {
+	home := withHome(t)
+
+	target := filepath.Join(t.TempDir(), "elsewhere.yaml")
+	if err := os.WriteFile(target, []byte("webhook:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(home, FileName)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load followed a symlink at the settings path")
+	}
+}
+
+// A FIFO is not a settings file. Without the regular-file check an open of one
+// reads EOF and Load would report an empty configuration -- silently, and with
+// an unauthenticated listener as the consequence.
+func TestLoadRefusesANonRegularFile(t *testing.T) {
+	home := withHome(t)
+	path := filepath.Join(home, FileName)
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("mkfifo is unavailable here: %v", err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted a FIFO at the settings path")
+	}
+}
+
+// captureStderr swaps os.Stderr for a pipe, runs fn, and returns what fn
+// wrote. The warning under test is written to the real os.Stderr at call time,
+// which is the only thing an operator at a terminal sees.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var buf strings.Builder
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	fn()
+
+	os.Stderr = orig
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out := <-done
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// Widening the bind address is the one reach-granting step in this program
+// that is not gated by a confirmation, an acknowledgement or a refusal, and it
+// is the largest: the endpoint behind it starts a coding agent with permission
+// prompts disabled. It is ungated on purpose -- a reverse proxy on another
+// host is legitimate -- so the operator must at least be told.
+func TestSettingANonLoopbackListenAddrWarns(t *testing.T) {
+	f, ok := FieldFor("webhook.listen_addr")
+	if !ok {
+		t.Fatal("webhook.listen_addr is not a settable field")
+	}
+
+	var s Settings
+	out := captureStderr(t, func() {
+		if err := f.Set(&s, "0.0.0.0"); err != nil {
+			t.Errorf("Set: %v", err)
+		}
+	})
+	if !strings.Contains(out, "0.0.0.0") || !strings.Contains(strings.ToLower(out), "warning") {
+		t.Errorf("stderr = %q, want a warning naming the address", out)
+	}
+	if s.Webhook.ListenAddr != "0.0.0.0" {
+		t.Errorf("ListenAddr = %q; the warning must not block the change", s.Webhook.ListenAddr)
+	}
+
+	// Loopback is the default and must stay silent, or the warning becomes
+	// noise an operator learns to skip past.
+	for _, addr := range []string{"127.0.0.1", "localhost", "::1"} {
+		out := captureStderr(t, func() {
+			if err := f.Set(&s, addr); err != nil {
+				t.Errorf("Set(%q): %v", addr, err)
+			}
+		})
+		if out != "" {
+			t.Errorf("Set(%q) wrote %q to stderr, want nothing", addr, out)
+		}
 	}
 }
