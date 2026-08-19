@@ -19,6 +19,9 @@ import (
 
 // LogOptions selects which log to show and how.
 type LogOptions struct {
+	// Session selects the dispatches that used one claude session. A session
+	// survives resumes, so it identifies an issue's whole conversation.
+	Session string
 	// Issue restricts selection to one issue. Zero means any.
 	Issue int
 	// Dispatch selects one dispatch by identifier. Zero means the most recent.
@@ -55,6 +58,16 @@ var ErrNoDispatch = errors.New("no dispatch found")
 func SelectDispatch(s *store.Store, cfg *config.Config, opts LogOptions) (store.Dispatch, error) {
 	if opts.Dispatch > 0 {
 		return s.GetDispatch(opts.Dispatch)
+	}
+	if opts.Session != "" {
+		ds, err := s.DispatchesBySession(opts.Session)
+		if err != nil {
+			return store.Dispatch{}, err
+		}
+		if len(ds) == 0 {
+			return store.Dispatch{}, fmt.Errorf("%w for session %q", ErrNoDispatch, opts.Session)
+		}
+		return ds[0], nil
 	}
 	recent, err := s.RecentDispatches(cfg.Name, cfg.Repo, opts.Issue, 1)
 	if err != nil {

@@ -31,6 +31,8 @@ type LoopSummary struct {
 
 // ProjectSummary is one registered project and every loop it defines.
 type ProjectSummary struct {
+	Name    string
+	ID      string
 	Root    string
 	Dir     string
 	Missing bool
@@ -51,7 +53,7 @@ func Projects() ([]ProjectSummary, error) {
 
 	out := make([]ProjectSummary, 0, len(entries))
 	for _, p := range entries {
-		summary := ProjectSummary{Root: p.Root, Dir: p.AgentUtilsDir}
+		summary := ProjectSummary{Name: p.Name, ID: p.ID, Root: p.Root, Dir: p.AgentUtilsDir}
 		if !p.Exists() {
 			// Keep it in the report. A project whose directory has moved is
 			// something the operator should see, not something to hide.
@@ -145,12 +147,11 @@ func RenderProjects(projects []ProjectSummary) string {
 	var b strings.Builder
 
 	if len(projects) == 0 {
-		fmt.Fprintf(&b, "No projects have been used yet.\n\n")
-		fmt.Fprintf(&b, "A project is recorded the first time a command runs against its\n")
-		fmt.Fprintf(&b, "%s directory. To onboard one:\n\n", config.DirName)
+		fmt.Fprintf(&b, "No projects are registered yet.\n\n")
+		fmt.Fprintf(&b, "A project is registered the first time a project command runs in it:\n\n")
 		fmt.Fprintf(&b, "  mkdir -p %s/%s\n", config.DirName, config.ConfigsSubdir)
 		fmt.Fprintf(&b, "  cp <a loop config>.yaml %s/%s/\n", config.DirName, config.ConfigsSubdir)
-		fmt.Fprintf(&b, "  agent-utils list\n")
+		fmt.Fprintf(&b, "  agent-utils project list\n")
 		return b.String()
 	}
 
@@ -158,12 +159,21 @@ func RenderProjects(projects []ProjectSummary) string {
 		if i > 0 {
 			fmt.Fprintln(&b)
 		}
-		fmt.Fprintf(&b, "%s\n", p.Root)
+		// A project registered before it had a descriptor has no name. Fall back
+		// to the path so the forget hint below is still something that resolves.
+		name, selector := p.Name, p.Name
+		if name == "" {
+			name, selector = "(unnamed)", p.Root
+		}
+		fmt.Fprintf(&b, "%s  %s\n", name, p.Root)
+		if p.ID != "" {
+			fmt.Fprintf(&b, "  id %s\n", p.ID)
+		}
 
 		switch {
 		case p.Missing:
 			fmt.Fprintf(&b, "  MISSING: %s no longer exists\n", p.Dir)
-			fmt.Fprintf(&b, "  Remove it with: agent-utils forget %s\n", p.Root)
+			fmt.Fprintf(&b, "  Remove it with: agent-utils forget %s\n", selector)
 			continue
 		case p.Err != nil:
 			fmt.Fprintf(&b, "  ERROR: %v\n", p.Err)

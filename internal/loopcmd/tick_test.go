@@ -353,7 +353,7 @@ func TestTruncateIsRuneSafe(t *testing.T) {
 
 func TestRenderProjectsExplainsAnEmptyRegistry(t *testing.T) {
 	out := RenderProjects(nil)
-	for _, want := range []string{"No projects", ".agent-utils/configs", "agent-utils list"} {
+	for _, want := range []string{"No projects", ".agent-utils/configs", "agent-utils project list"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output should mention %q:\n%s", want, out)
 		}
@@ -365,7 +365,7 @@ func TestRenderProjectsSurfacesAMissingProject(t *testing.T) {
 		{Root: "/gone", Dir: "/gone/.agent-utils", Missing: true},
 	})
 	if !strings.Contains(out, "MISSING") || !strings.Contains(out, "forget /gone") {
-		t.Errorf("a moved project must be reported with its fix:\n%s", out)
+		t.Errorf("a moved project must be reported with a fix that resolves:\n%s", out)
 	}
 }
 

@@ -3,12 +3,15 @@ package loopcmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -152,3 +155,59 @@ func TestRenderDispatchListFlagsADeadRunner(t *testing.T) {
 func timeAfterSeconds(n int) <-chan time.Time {
 	return time.After(time.Duration(n) * time.Second)
 }
+
+func TestRenderSessionsAggregatesAndFlags(t *testing.T) {
+	p := &Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}
+	out := RenderSessions(p, []Session{
+		{ID: "sess-a", Loop: "planning", Issue: 42, Title: "Add zone lookup",
+			Dispatches: 3, Cost: 5.05, LastStatus: store.StatusSucceeded},
+		{ID: "sess-b", Loop: "planning", Issue: 57, Title: "Timezone bug",
+			Dispatches: 1, Cost: 2.40, LastStatus: store.StatusRunning, Orphaned: true},
+		{ID: "sess-c", Loop: "execution", Issue: 58, Dispatches: 1,
+			LastStatus: store.StatusRunning, Live: true},
+	})
+
+	for _, want := range []string{"sess-a", "Add zone lookup", "$5.05", "ORPHANED", "running", "--session"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output should contain %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderSessionsExplainsAnEmptyList(t *testing.T) {
+	p := &Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}
+	if out := RenderSessions(p, nil); !strings.Contains(out, "No sessions yet") {
+		t.Errorf("an empty list must explain itself:\n%s", out)
+	}
+}
+
+func TestRenderProjectDetailShowsIdentityAndKeepsTheTableOnOneLine(t *testing.T) {
+	p := &Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}
+	out := RenderProjectDetail(&ProjectDetail{
+		Project: p,
+		Entries: []config.Entry{{Name: "planning"}, {Name: "broken", Err: errMultiLine}},
+		Loops: []LoopSummary{
+			{Name: "planning", Repo: "o/r", Ticks: 9, Live: 1, Cost: 7.75},
+			{Name: "broken", Err: errMultiLine},
+		},
+	})
+
+	for _, want := range []string{"proj-stub", "id ", "configs", "planning", "o/r"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output should contain %q:\n%s", want, out)
+		}
+	}
+	// A multi-line config error must not break the table; it belongs below it.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "broken ") && strings.Contains(line, "second line") {
+			t.Errorf("a multi-line error leaked into the table row: %q", line)
+		}
+	}
+	if !strings.Contains(out, "second line") {
+		t.Error("the full error must still be printed under the table")
+	}
+}
+
+var projectConfigStub = project.Config{Name: "proj-stub", ID: "id-1234"}
+
+var errMultiLine = errors.New("parse failed:\n  second line of the error")
