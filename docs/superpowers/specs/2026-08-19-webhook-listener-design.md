@@ -20,6 +20,7 @@ In scope:
 - A top-level `config` command that reads and writes that file.
 - A `project register-webhook` command that creates the webhook at GitHub.
 - A `listener` command that runs the daemon, with a `--daemon` flag for launchd.
+- A `project init` command, and the end of implicit project onboarding.
 - A refactor that lets the daemon and the command share one tick path.
 - A change from tick-counted retry backoff to wall-clock retry backoff.
 
@@ -153,8 +154,20 @@ machine-wide `.agent-utils` directory. Only the directory tells them apart.
 If an operator sets `$AGENT_UTILS_HOME` to a project's `.agent-utils` directory, one file is
 read by two strict parsers. Each parser rejects the other's keys.
 
-The design keeps the name the user asked for and adds a guard. `settings.Load` reports a clear
-error when the file it reads carries the `id` and `name` keys of a project descriptor.
+The two files collide because onboarding is implicit, not because the name is shared.
+`config.FindDir` walks from the working directory to the filesystem root and does not stop at
+the home directory, so `~/.agent-utils` — which exists on any machine that has run this tool —
+is a parent of everything under `~`. A `project` command run from a directory that is not
+inside a project therefore adopts the machine-wide directory as a project directory, and
+`ResolveProject` writes a descriptor into it. This happens today, without this feature.
+
+The design fixes the cause and keeps a guard for the symptom:
+
+- `FindDir` skips a candidate equal to the machine-wide directory.
+- A new `agent-utils project init` command creates a project's directory, mints its descriptor,
+  and registers it. `ResolveProject` stops minting a descriptor on its own.
+- `settings.Load` and `settings.Save` both refuse a file that carries the `id` and `name` keys
+  of a project descriptor, which still covers an `$AGENT_UTILS_HOME` pointed at a project.
 
 ## Design
 

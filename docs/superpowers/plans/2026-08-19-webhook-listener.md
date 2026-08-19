@@ -484,10 +484,13 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
     what is really in the file.
 
   Field validation, in the `Set` functions:
-  - `webhook.url` must parse with `net/url`, must have a host, and must use scheme `https`.
-    Allow `http` only when the host is a loopback name or address. The design puts a plaintext
-    hop behind a TLS-terminating proxy; the URL **GitHub** is given must still be `https`, or
-    the signature that authorises agent execution crosses the internet in the clear.
+  - `webhook.url` must parse with `net/url`, must have a host, and must use scheme `http` or
+    `https`. Do **not** reject `http`. The daemon is expected to sit behind nginx, cloudflared,
+    or ngrok, which terminate TLS, so the public URL is normally `https` without this code
+    saying anything; and a plain-`http` endpoint is legitimate on a private network or a
+    tailnet. Print a warning when the scheme is `http` and the host is not loopback, naming
+    what it costs: the delivery and its signature cross the network in the clear, so an
+    observer can replay that one delivery. Do not print it for a loopback host.
   - `webhook.listen_port` must be in 1..65535.
   - `webhook.secret` has no `Set`. Direct the operator to `config webhook --rotate-secret`, so
     a weak hand-typed secret cannot reach the file.
@@ -1355,18 +1358,107 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
   - `status` reports a live foreground listener through the pidfile.
   - A test proves shutdown drains an in-flight tick before the database is closed.
 
-### Phase F — documentation and version
+### Phase F — explicit project onboarding
 
-- [ ] **F1. README, configuration reference, and VERSION.**  `review: no`
+This phase is **independent of the webhook feature** and can be reverted or shipped on its own.
+It exists because `~/.agent-utils/config.yaml` (machine-wide settings, B1) and
+`<project>/.agent-utils/config.yaml` (a project descriptor) can currently land on the same
+path, and the cause is implicit onboarding rather than the file name.
+
+- [ ] **F1. `FindDir` must never return the machine-wide directory.**  `review: yes`
+
+  `internal/config/discover.go:85-96` walks from the working directory to the **filesystem
+  root**. `~/.agent-utils` is a parent of everything under `~` and exists on any machine that
+  has run this tool, so a command run from a directory that is not inside a project resolves
+  the machine-wide directory as the project directory.
+
+  The doc comment at `discover.go:64-70` says the function "deliberately does NOT fall back to
+  `$HOME/.agent-utils`". That is true of an explicit fallback only; the walk-up reaches it as
+  an ordinary parent. Correct the code, then correct the comment.
+
+  Skip a candidate equal to `home.Dir()` and keep walking. Return `ErrNoDir` naming
+  `agent-utils project init` when nothing else matches. `home` must not import `config`; check
+  the import direction before wiring this, and invert it if needed.
+
+  **Acceptance:** a test with a temporary tree proves `FindDir` called from
+  `<home>/Downloads/scratch`, where `<home>/.agent-utils` exists and no nearer directory does,
+  returns `ErrNoDir` rather than the machine-wide directory. A test proves a real project
+  nested under the machine-wide directory's parent still resolves. `$AGENT_UTILS_DIR` still
+  wins and is still allowed to name any directory, because it is the documented escape hatch.
+
+- [ ] **F2. `agent-utils project init`.**  `review: yes`
+
+  ```
+  agent-utils project init [<name>] [--dir <path>]
+  ```
+
+  The name is a **positional argument**, following `forget <project>`. It must not be `--name`:
+  `project` already declares `--name` as the project selector, and a child flag of the same
+  name shadows it — the hazard `selectedProject` documents.
+
+  Steps:
+  1. Resolve the target directory: `--dir`, else the working directory. Refuse when it
+     resolves to `home.Dir()`, naming why.
+  2. Create `<dir>/.agent-utils/` at 0700 and `<dir>/.agent-utils/configs/` at 0700.
+  3. Mint the descriptor with `project.Ensure`, which already uniquifies a taken name against
+     `registry.NameTaken`. Use the positional name when given.
+  4. Register with `registry.Register`.
+  5. Print the name, the directory, and the next step: drop a loop configuration into
+     `configs/`. Report a rename the way `openProject` already does.
+
+  Re-running on an initialised project is **not** an error: report the existing identity and
+  re-register, so a moved project is found again. Never mint a second id.
+
+  **Acceptance:** tests with a temporary `$AGENT_UTILS_HOME`:
+  - `init` in an empty directory creates `.agent-utils/configs/`, writes a descriptor with a
+    uuid, and registers exactly one project.
+  - The descriptor is mode 0600 and both directories are 0700.
+  - Running `init` twice keeps the same id and registers once.
+  - `init` with a positional name uses it; a taken name gets a suffix and says so.
+  - `init` in the machine-wide directory exits non-zero and writes nothing.
+
+- [ ] **F3. `ResolveProject` stops onboarding implicitly.**  `review: yes`
+
+  `internal/loopcmd/resolve.go` currently calls `project.Ensure`, so the first `project` command
+  in any directory mints a descriptor and registers it. That is what turns an accidental
+  directory into a project.
+
+  Change it to `project.Load`. On `project.ErrNoConfig`, and on `config.ErrNoDir`, return an
+  error naming `agent-utils project init`, in the shape the existing `ErrNoDir` message uses.
+  Keep `registry.Register` for a project that already has a descriptor, so a moved project is
+  re-found.
+
+  This is backward compatible: every already-onboarded project has a descriptor and keeps
+  working. Only a directory that was never a project now needs one command.
+
+  Delete `Project.Created` and `Project.RenamedFrom` if `init` is their only remaining writer,
+  and move the reporting into F2 rather than leaving dead fields.
+
+  **Acceptance:**
+  - A directory with `.agent-utils/` but no descriptor gives an error naming `project init`,
+    and writes nothing.
+  - A directory with no `.agent-utils/` anywhere in its parents gives an error naming
+    `project init`.
+  - An initialised project resolves and is re-registered.
+  - Existing tests that relied on implicit onboarding are updated to call `init` first; list
+    them in the commit message.
+
+### Phase G — documentation and version
+
+- [ ] **G1. README, configuration reference, and VERSION.**  `review: no`
 
   `README.md`:
-  - Add `config` and `listener` rows to the "Global" command table, and a
-    `project register-webhook` row to the "Project" table.
+  - Add `config` and `listener` rows to the "Global" command table, and
+    `project init` and `project register-webhook` rows to the "Project" table.
+  - **Rewrite "Quick start".** It currently says "There is no init step" and describes
+    `mkdir -p .agent-utils/configs` followed by any project command. After F2 the first step is
+    `agent-utils project init`. The paragraph describing the automatic registration and the
+    rename message moves to `project init`.
   - Add a "Webhooks" section after "Cron", giving the setup in order:
     `config webhook --enable --url ...`, `project register-webhook`,
-    `listener start --daemon`. State that the daemon speaks plain HTTP and needs a proxy or
-    tunnel that terminates TLS, that `webhook.url` must be `https`, and that the default bind
-    address is `127.0.0.1`.
+    `listener start --daemon`. State that the daemon speaks plain HTTP and expects nginx,
+    cloudflared, or ngrok in front of it to terminate TLS, and that the default bind address is
+    `127.0.0.1`.
   - **The new section must carry the `install -m 600 /dev/null ~/.agent-utils/env` instruction**,
     or reference the Cron section that has it. That file is currently created only in the Cron
     section, and E3 makes it a hard daemon prerequisite.
@@ -1424,6 +1516,12 @@ Callers of the retry-flag writers, confirmed by grep — C1 must update every on
    `listener start --daemon`, `stop`, and `status` by hand once on this machine before the PR
    is marked ready, and record the result in the PR body.
 
-6. **`MarkNeedsRetry` changes signature**, touching `internal/runner`. That package spawns real
+6. **Phase F changes how a project is onboarded.** `agent-utils project init` becomes required
+   for a directory that is not yet a project; every existing project keeps working, because it
+   already has a descriptor. The phase is separable and can be reverted, or shipped as its own
+   pull request ahead of this one. It is in scope because implicit onboarding is what lets the
+   machine-wide `config.yaml` and a project descriptor land on the same path.
+
+7. **`MarkNeedsRetry` changes signature**, touching `internal/runner`. That package spawns real
    processes in its tests, which is why the suite runs `-p 1`. Run
    `go test ./internal/runner/...` explicitly after C1.
