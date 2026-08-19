@@ -42,6 +42,7 @@ func main() {
 			listCommand(),
 			logsCommand(),
 			forgetCommand(),
+			migrateCommand(),
 			versionCommand(),
 			// Everything project-scoped lives under `project`.
 			projectCommand(),
@@ -456,6 +457,108 @@ func listCommand() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// migrateCommand imports the state of the old per-loop layout, for the whole
+// machine, and prints what it did.
+//
+// It sweeps every registered project, so it belongs at the top level rather than
+// under `project`. It exists for an operator who wants the report, not because
+// anything waits on it: every command migrates the project it touches, so the
+// import happens whether or not this is ever run.
+func migrateCommand() *cli.Command {
+	return &cli.Command{
+		Name: "migrate",
+		Usage: "import state left by the old per-loop databases; not required, " +
+			"a project is migrated the first time a command touches it",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run",
+				Usage: "report what would be imported and write nothing"},
+		},
+		Action: func(_ context.Context, c *cli.Command) error {
+			if _, err := home.EnsureDir(); err != nil {
+				return err
+			}
+			dbPath, err := home.StateDBPath()
+			if err != nil {
+				return err
+			}
+			db, err := store.Open(dbPath)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+
+			dryRun := c.Bool("dry-run")
+			report, err := migrate.Sweep(db, migrate.Options{DryRun: dryRun})
+			if err != nil {
+				return fmt.Errorf("sweep the machine for unimported state: %w", err)
+			}
+			fmt.Print(renderMigrateReport(report, dryRun))
+
+			// Err names every failure already. Rebuilding that message here would
+			// let the two drift apart, and the write path prints the same one.
+			return report.Err()
+		},
+	}
+}
+
+// renderMigrateReport formats a migration report for a terminal.
+//
+// It is separate from the command so the wording can be checked without a home
+// directory, a registry or a legacy file on disk.
+func renderMigrateReport(report migrate.Report, dryRun bool) string {
+	var b strings.Builder
+
+	if dryRun {
+		// Opening the canonical database applies the schema upgrade, and the
+		// report cannot be produced without opening it. Say so rather than let
+		// an operator believe --dry-run touched nothing at all.
+		fmt.Fprintf(&b, "Dry run: no state was imported and no legacy file was touched.\n")
+		fmt.Fprintf(&b, "Opening the canonical database still brought its schema up to date;\n")
+		fmt.Fprintf(&b, "that part cannot be avoided.\n\n")
+	}
+
+	if len(report.Results) == 0 {
+		fmt.Fprintf(&b, "Nothing left to import. Every registered project's state is already\n")
+		fmt.Fprintf(&b, "in the canonical database.\n")
+		return b.String()
+	}
+
+	fmt.Fprintf(&b, "%-20s %-16s %-10s %-7s %s\n",
+		"PROJECT", "LOOP", "STATE", "ROWS", "SOURCE")
+	for _, res := range report.Results {
+		fmt.Fprintf(&b, "%-20s %-16s %-10s %-7d %s\n",
+			orDash(res.Source.ProjectName), orDash(res.Source.Loop),
+			res.State, res.Rows, orDash(res.Source.Path))
+	}
+
+	verb := "imported"
+	if dryRun {
+		verb = "would be imported"
+	}
+	fmt.Fprintf(&b, "\n%d source(s); %d row(s) %s.\n",
+		len(report.Results), report.Rows(), verb)
+
+	// A reason does not fit the table, so it goes under it, one paragraph per
+	// source, the way a loop's error does in `project status`.
+	for _, res := range report.Results {
+		if res.Reason == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "\n%s (loop %s): %s\n",
+			orDash(res.Source.Path), orDash(res.Source.Loop), res.Reason)
+	}
+	return b.String()
+}
+
+// orDash keeps a column filled. A discovery failure has no path and no loop, and
+// an empty cell in the middle of a table reads as a rendering bug.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func loopCommand() *cli.Command {

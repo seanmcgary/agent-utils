@@ -26,9 +26,8 @@ const StateDBFile = "state.db"
 //     This is the only way to find the state of a loop whose configuration was
 //     deleted or renamed, which would otherwise sit unimported forever.
 //
-// A configuration file that does not load is reported as a failure, not skipped.
-// A broken file still has state behind it, and a tick that ran without that
-// state would re-dispatch every open issue.
+// A configuration file that does not load is reported and skipped. The reason
+// travels with the report, so `agent-utils migrate` can show it.
 func Discover(agentUtilsDir, projectID, projectName string) ([]Source, []Result) {
 	var (
 		sources []Source
@@ -45,43 +44,32 @@ func Discover(agentUtilsDir, projectID, projectName string) ([]Source, []Result)
 
 	entries, err := config.List(agentUtilsDir)
 	if err != nil && !errors.Is(err, config.ErrNoConfigs) {
-		results = append(results, Result{
-			Source: Source{ProjectID: projectID, ProjectName: projectName},
-			State:  StateFailed,
-			Reason: fmt.Sprintf("list the loop configurations: %v", err),
-			Err:    err,
-		})
+		results = append(results, skipped(projectID, projectName, "",
+			fmt.Sprintf("the loop configurations cannot be listed: %v", err)))
 		return sources, results
 	}
 
+	// A configuration that does not load is reported and skipped, not failed.
+	// State is per loop, so a broken sibling hides nothing this command needs,
+	// and that loop cannot run until the file is fixed anyway. The loop a command
+	// actually acts on is always added by the caller through SourceFor, so it is
+	// never discovery that decides whether the write path can see its own rows.
 	for _, e := range entries {
 		if e.Err != nil {
-			results = append(results, Result{
-				Source: Source{ProjectID: projectID, ProjectName: projectName, Loop: e.Name},
-				State:  StateFailed,
-				Reason: fmt.Sprintf("%s does not load: %v", e.Path, e.Err),
-				Err:    e.Err,
-			})
+			results = append(results, skipped(projectID, projectName, e.Name,
+				fmt.Sprintf("%s does not load: %v", e.Path, e.Err)))
 			continue
 		}
 		cfg, err := config.Load(e.Path)
 		if err != nil {
-			results = append(results, Result{
-				Source: Source{ProjectID: projectID, ProjectName: projectName, Loop: e.Name},
-				State:  StateFailed,
-				Reason: fmt.Sprintf("%s does not load: %v", e.Path, err),
-				Err:    err,
-			})
+			results = append(results, skipped(projectID, projectName, e.Name,
+				fmt.Sprintf("%s does not load: %v", e.Path, err)))
 			continue
 		}
 		stateDir, err := cfg.ResolveStateDir(e.Path)
 		if err != nil {
-			results = append(results, Result{
-				Source: Source{ProjectID: projectID, ProjectName: projectName, Loop: cfg.Name},
-				State:  StateFailed,
-				Reason: fmt.Sprintf("resolve the state directory: %v", err),
-				Err:    err,
-			})
+			results = append(results, skipped(projectID, projectName, cfg.Name,
+				fmt.Sprintf("the state directory cannot be resolved: %v", err)))
 			continue
 		}
 		path, ok := legacyPath(stateDir)
@@ -160,6 +148,14 @@ func DiscoverAll() ([]Source, []Result, error) {
 		results = append(results, problems...)
 	}
 	return sources, results, nil
+}
+
+func skipped(projectID, projectName, loop, reason string) Result {
+	return Result{
+		Source: Source{ProjectID: projectID, ProjectName: projectName, Loop: loop},
+		State:  StateSkipped,
+		Reason: reason,
+	}
 }
 
 // SourceFor returns the source for one already-resolved loop.

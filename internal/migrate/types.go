@@ -98,6 +98,6 @@ func (r Report) Err() error {
 	}
 	sort.Strings(lines)
 	return fmt.Errorf("state from an earlier layout could not be imported:\n%s\n\n"+
-		"Run `agent-utils migrate` to see the whole picture. Nothing was deleted.",
+		"nothing was deleted; run `agent-utils migrate` to see the whole picture",
 		strings.Join(lines, "\n"))
 }
