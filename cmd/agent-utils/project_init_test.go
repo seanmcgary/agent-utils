@@ -343,6 +343,7 @@ func TestProjectInitCLIPositionalNameNotFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
+	defer outR.Close()
 	old := os.Stdout
 	os.Stdout = outW
 	runErr := root.Run(context.Background(),
@@ -363,5 +364,120 @@ func TestProjectInitCLIPositionalNameNotFlag(t *testing.T) {
 	}
 	if cfg.Name != "myname" {
 		t.Errorf("Name = %q, want the positional argument %q", cfg.Name, "myname")
+	}
+}
+
+// TestProjectInitMachineWideAgentUtilsDirRefusesAndWritesNothing covers the
+// CRITICAL review finding directly: the actual dangerous invocation is `cd ~
+// && agent-utils project init`, where Dir is the machine-wide directory's
+// PARENT and the descriptor would land at <machine-wide>/.agent-utils,
+// beside registry.json and state.db. The guard must compare the COMPUTED
+// .agent-utils path against home.Dir(), not the root directory against it —
+// those are never equal for this exact invocation, which is why the sibling
+// TestProjectInitMachineWideDirRefusesAndWritesNothing (Dir set EQUAL to
+// AGENT_UTILS_HOME) alone did not catch this: that is the one arrangement a
+// root-only comparison happens to get right.
+func TestProjectInitMachineWideAgentUtilsDirRefusesAndWritesNothing(t *testing.T) {
+	parent := t.TempDir()
+	machineWide := filepath.Join(parent, ".agent-utils")
+	t.Setenv("AGENT_UTILS_HOME", machineWide)
+	var out bytes.Buffer
+
+	err := projectInitRun(projectInitDeps{
+		Dir: parent, NoLoop: true, Interactive: true, RunWizard: failWizard(t), Out: &out,
+	})
+	if err == nil {
+		t.Fatal("init whose computed .agent-utils dir IS the machine-wide directory: want an error, got nil")
+	}
+	if _, statErr := os.Stat(filepath.Join(machineWide, project.FileName)); !os.IsNotExist(statErr) {
+		t.Errorf("%s exists after a refused init, want no descriptor written into the machine-wide directory", filepath.Join(machineWide, project.FileName))
+	}
+}
+
+// TestProjectInitDefaultNameTakenReportsRename covers IMPORTANT 2: the
+// rename report openProject used to print (internal/loopcmd/resolve.go's
+// RenamedFrom, derived from the directory basename) must still fire when NO
+// positional name is given and project.Ensure has to uniquify the
+// directory-derived name. Before the internal/project.EnsureNamed refactor,
+// mintProjectDescriptor's name == "" branch hard-returned "" for
+// renamedFrom, so this path silently produced "web-2" with no explanation.
+func TestProjectInitDefaultNameTakenReportsRename(t *testing.T) {
+	withHome(t)
+
+	// Two directories cannot share one basename on a real filesystem, so the
+	// collision project.Ensure actually sees -- two projects whose directory
+	// basename slugs to the same name -- is built with two distinct parents
+	// both containing a directory named "web".
+	rootA := filepath.Join(t.TempDir(), "web")
+	rootB := filepath.Join(t.TempDir(), "web")
+	if err := os.MkdirAll(rootA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rootB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var outA, outB bytes.Buffer
+	if err := projectInitRun(projectInitDeps{
+		Dir: rootA, NoLoop: true, Interactive: true, RunWizard: failWizard(t), Out: &outA,
+	}); err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+	cfgA, err := project.Load(agentUtilsDirFor(rootA))
+	if err != nil {
+		t.Fatalf("project.Load: %v", err)
+	}
+	if cfgA.Name != "web" {
+		t.Fatalf("Name = %q, want %q", cfgA.Name, "web")
+	}
+
+	if err := projectInitRun(projectInitDeps{
+		Dir: rootB, NoLoop: true, Interactive: true, RunWizard: failWizard(t), Out: &outB,
+	}); err != nil {
+		t.Fatalf("second init: %v", err)
+	}
+	cfgB, err := project.Load(agentUtilsDirFor(rootB))
+	if err != nil {
+		t.Fatalf("project.Load: %v", err)
+	}
+	if cfgB.Name != "web-2" {
+		t.Fatalf("Name = %q, want web-2 when the directory-derived name web is taken", cfgB.Name)
+	}
+	if !strings.Contains(outB.String(), "already taken") {
+		t.Errorf("output = %q, want it to say the directory-derived name was already taken, "+
+			"the way openProject's RenamedFrom reporting used to", outB.String())
+	}
+}
+
+// TestProjectInitIgnoredPositionalNameIsReported covers MINOR 5: a
+// positional name passed to an already-initialised project is silently
+// dropped by mintProjectDescriptor (the project already has an identity),
+// but the operator typed it and deserves to be told it did nothing.
+func TestProjectInitIgnoredPositionalNameIsReported(t *testing.T) {
+	withHome(t)
+	dir := t.TempDir()
+	var first, second bytes.Buffer
+
+	if err := projectInitRun(projectInitDeps{
+		Dir: dir, Name: "original", NoLoop: true, Interactive: true, RunWizard: failWizard(t), Out: &first,
+	}); err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+
+	if err := projectInitRun(projectInitDeps{
+		Dir: dir, Name: "newname", NoLoop: true, Interactive: true, RunWizard: failWizard(t), Out: &second,
+	}); err != nil {
+		t.Fatalf("second init: %v", err)
+	}
+	if !strings.Contains(second.String(), "newname") || !strings.Contains(second.String(), "ignored") {
+		t.Errorf("output = %q, want it to say the requested name %q was ignored", second.String(), "newname")
+	}
+
+	cfg, err := project.Load(agentUtilsDirFor(dir))
+	if err != nil {
+		t.Fatalf("project.Load: %v", err)
+	}
+	if cfg.Name != "original" {
+		t.Errorf("Name = %q, want the original identity to be kept", cfg.Name)
 	}
 }

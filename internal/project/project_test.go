@@ -104,3 +104,74 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// TestEnsureNamedUsesAnExplicitBaseAndReportsARename covers the entry point
+// `project init <name>` needs (EnsureNamed cannot be reached through Ensure,
+// which always derives its base from the directory): an explicit base name
+// is used verbatim when free, and a taken one is suffixed with renamedFrom
+// naming what was actually asked for.
+func TestEnsureNamedUsesAnExplicitBaseAndReportsARename(t *testing.T) {
+	dir := mkDir(t, t.TempDir(), "irrelevant-directory-name")
+
+	c, created, renamedFrom, err := EnsureNamed(dir, "web", func(string) bool { return false })
+	if err != nil {
+		t.Fatalf("EnsureNamed: %v", err)
+	}
+	if !created {
+		t.Error("created = false on a fresh project")
+	}
+	if c.Name != "web" {
+		t.Errorf("Name = %q, want the explicit base %q, not the directory name", c.Name, "web")
+	}
+	if renamedFrom != "" {
+		t.Errorf("renamedFrom = %q, want empty: the base name was free", renamedFrom)
+	}
+}
+
+func TestEnsureNamedUniquifiesATakenExplicitBase(t *testing.T) {
+	dir := mkDir(t, t.TempDir(), "irrelevant-directory-name")
+
+	c, created, renamedFrom, err := EnsureNamed(dir, "web",
+		func(n string) bool { return n == "web" })
+	if err != nil {
+		t.Fatalf("EnsureNamed: %v", err)
+	}
+	if !created {
+		t.Error("created = false on a fresh project")
+	}
+	if c.Name != "web-2" {
+		t.Errorf("Name = %q, want web-2 when web is taken", c.Name)
+	}
+	if renamedFrom != "web" {
+		t.Errorf("renamedFrom = %q, want %q", renamedFrom, "web")
+	}
+}
+
+// TestEnsureNamedOnAnExistingProjectIgnoresBaseAndReportsNoRename covers the
+// idempotent re-run `project init` relies on: base is not even consulted
+// once a descriptor already exists, and no id is minted twice.
+func TestEnsureNamedOnAnExistingProjectIgnoresBaseAndReportsNoRename(t *testing.T) {
+	dir := mkDir(t, t.TempDir(), "x")
+
+	first, _, _, err := EnsureNamed(dir, "original", func(string) bool { return false })
+	if err != nil {
+		t.Fatalf("EnsureNamed: %v", err)
+	}
+
+	again, created, renamedFrom, err := EnsureNamed(dir, "different-name", func(string) bool { return false })
+	if err != nil {
+		t.Fatalf("EnsureNamed: %v", err)
+	}
+	if created {
+		t.Error("created = true on an existing project")
+	}
+	if renamedFrom != "" {
+		t.Errorf("renamedFrom = %q, want empty on an existing project", renamedFrom)
+	}
+	if again.ID != first.ID {
+		t.Errorf("id changed across calls: %q -> %q", first.ID, again.ID)
+	}
+	if again.Name != "original" {
+		t.Errorf("Name = %q, want the existing identity kept", again.Name)
+	}
+}

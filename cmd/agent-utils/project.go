@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/home"
@@ -96,28 +95,40 @@ func projectInitRun(deps projectInitDeps) error {
 	if err != nil {
 		return err
 	}
+	agentUtilsDir := filepath.Join(rootDir, config.DirName)
 
 	// The machine-wide directory (internal/home.Dir()) is an ordinary-looking
 	// directory under $HOME with nothing marking it as special. This refusal
 	// is the entire reason `project init` exists as an explicit step: without
-	// it, `project init` run from ~ (or from $AGENT_UTILS_HOME in a test)
-	// would happily write a project descriptor into the same directory the
-	// registry and the canonical state database live in, and register it as
-	// a "project". Symlinks are resolved on both sides (home.Resolve), the
-	// same way internal/config's FindDir guards its walk-up, because macOS
-	// resolves /var to /private/var and a raw string compare would fail
-	// open. An unresolvable machine-wide directory (home.Dir erroring)
-	// degrades to skipping the guard: there is nothing to protect against.
-	if machineWide, homeErr := home.Dir(); homeErr == nil &&
-		home.Resolve(rootDir) == home.Resolve(machineWide) {
-		return fmt.Errorf(
-			"refusing to initialise a project in %s: that is agent-utils' machine-wide "+
-				"directory (it holds the registry and the canonical state database); "+
-				"run `project init` from the directory you want to turn into a project instead",
-			rootDir)
+	// it, `cd ~ && agent-utils project init` would happily write a project
+	// descriptor into <machine-wide>/.agent-utils, beside registry.json and
+	// state.db, and register it as a "project".
+	//
+	// Both agentUtilsDir AND rootDir are checked against machineWide.
+	// agentUtilsDir is the one that matters for the invocation above --
+	// there rootDir is home.Dir()'s PARENT, never equal to it, so a
+	// comparison against rootDir alone passes it straight through; the
+	// sibling internal/config.FindDir guard makes the identical choice, by
+	// comparing its walk CANDIDATE rather than the walk directory
+	// (discover.go's isDir(candidate) check). rootDir is still checked too,
+	// for the direct-hit case ($AGENT_UTILS_HOME itself, or --dir pointed at
+	// it), which agentUtilsDir's comparison alone would miss. Symlinks are
+	// resolved on both sides (home.Resolve) for the same reason FindDir
+	// does: macOS resolves /var to /private/var, and a raw string compare
+	// would fail open. An unresolvable machine-wide directory (home.Dir
+	// erroring) degrades to skipping the guard: there is nothing to protect
+	// against.
+	if machineWide, homeErr := home.Dir(); homeErr == nil {
+		mw := home.Resolve(machineWide)
+		if home.Resolve(agentUtilsDir) == mw || home.Resolve(rootDir) == mw {
+			return fmt.Errorf(
+				"refusing to initialise a project in %s: that is agent-utils' machine-wide "+
+					"directory (it holds the registry and the canonical state database); "+
+					"run `project init` from the directory you want to turn into a project instead",
+				rootDir)
+		}
 	}
 
-	agentUtilsDir := filepath.Join(rootDir, config.DirName)
 	configsDir := config.ConfigsDir(agentUtilsDir)
 	// 0700 on both: .agent-utils/ is the project's entire local state and
 	// configs/ holds its loop files, matching internal/home.EnsureDir's mode
@@ -128,7 +139,7 @@ func projectInitRun(deps projectInitDeps) error {
 		return fmt.Errorf("create %s: %w", configsDir, err)
 	}
 
-	cfg, created, renamedFrom, err := mintProjectDescriptor(agentUtilsDir, deps.Name)
+	cfg, created, renamedFrom, err := mintProjectDescriptor(agentUtilsDir, rootDir, deps.Name)
 	if err != nil {
 		return err
 	}
@@ -140,10 +151,16 @@ func projectInitRun(deps projectInitDeps) error {
 		fmt.Fprintf(os.Stderr, "warning: could not update the registry: %v\n", err)
 	}
 
-	// This reporting used to live in openProject, reached the first time any
-	// project command ran in an un-onboarded directory. It moves here because
-	// `project init` is now the explicit place a project is created or
-	// re-identified; a sibling unit (F5) removes the old implicit branch.
+	// This reporting used to live in openProject (which printed to STDERR,
+	// alongside its other unsolicited-but-informational messages), reached
+	// the first time any project command ran in an un-onboarded directory.
+	// It moves here because `project init` is now the explicit place a
+	// project is created or re-identified; a sibling unit (F5) removes the
+	// old implicit branch. It prints to STDOUT here instead: unlike
+	// openProject's callers, whose real output is something else (a status
+	// table, a log stream) that this must not interleave with, `project
+	// init`'s entire job IS reporting what it did -- there is no other
+	// output for this to compete with.
 	if created {
 		if err := reportf(deps.Out, "Created project %q (%s)\n", cfg.Name, agentUtilsDir); err != nil {
 			return err
@@ -156,8 +173,22 @@ func projectInitRun(deps projectInitDeps) error {
 				return err
 			}
 		}
-	} else if err := reportf(deps.Out, "Project %q already exists (%s)\n", cfg.Name, agentUtilsDir); err != nil {
-		return err
+	} else {
+		if err := reportf(deps.Out, "Project %q already exists (%s)\n", cfg.Name, agentUtilsDir); err != nil {
+			return err
+		}
+		if deps.Name != "" && deps.Name != cfg.Name {
+			// The project already has an identity, so mintProjectDescriptor
+			// never even looked at deps.Name -- but the operator typed it,
+			// and `Project "original" already exists` alone gives no hint
+			// that the name they asked for did nothing.
+			if err := reportf(deps.Out,
+				"The name %q was ignored: this project already has an identity; "+
+					"rename it by editing %s\n",
+				deps.Name, project.Path(agentUtilsDir)); err != nil {
+				return err
+			}
+		}
 	}
 
 	if deps.NoLoop {
@@ -201,52 +232,24 @@ func reportf(out io.Writer, format string, args ...any) error {
 
 // mintProjectDescriptor creates the project's descriptor if it does not
 // already exist, using name as the base identity when it is non-empty and
-// falling back to project.Ensure's own directory-derived default otherwise.
+// falling back to the directory's own (slugged) basename otherwise -- the
+// same fallback project.Ensure computes internally.
 //
-// name cannot be threaded through project.Ensure itself: Ensure always
-// derives its base name from the directory basename
-// (filepath.Base(filepath.Dir(agentUtilsDir))), with no parameter for an
-// explicit override. When name is given, this mints by hand instead —
-// slugging it the same way Ensure slugs a directory name, then uniquifying
-// against the SAME registry.NameTaken predicate Ensure itself uses — so
-// `project init foo` and `project init` (which lets Ensure name the project
-// after the directory) uniquify a taken name identically.
-//
-// Loading first, before any of that, is what keeps a second `project init`
-// on an already-initialised project from minting a second id: an existing
-// descriptor is returned as-is, and name (whatever was passed this time) is
-// ignored — the project already has an identity.
-func mintProjectDescriptor(agentUtilsDir, name string) (cfg *project.Config, created bool, renamedFrom string, err error) {
-	if name == "" {
-		cfg, created, err = project.Ensure(agentUtilsDir, registry.NameTaken)
-		return cfg, created, "", err
-	}
-
-	cfg, err = project.Load(agentUtilsDir)
-	if err == nil {
-		return cfg, false, "", nil
-	}
-	if !errors.Is(err, project.ErrNoConfig) {
-		return nil, false, "", err
-	}
-
-	base := project.Slug(name)
+// It calls project.EnsureNamed directly, rather than going through
+// project.Ensure for the empty-name case, so that BOTH paths can report a
+// rename. Ensure exists for callers (loopcmd.ResolveProject among them) that
+// compute their own "before" name separately and so have no use for
+// EnsureNamed's renamedFrom; `project init` is not one of those callers, and
+// discarding the report here would repeat exactly the gap this function used
+// to have when it hand-rolled its own uniquify loop only for the
+// explicit-name path: the directory-derived path could never say a name had
+// been taken.
+func mintProjectDescriptor(agentUtilsDir, rootDir, name string) (*project.Config, bool, string, error) {
+	base := name
 	if base == "" {
-		base = "project"
+		base = filepath.Base(rootDir)
 	}
-	chosen := base
-	for i := 2; registry.NameTaken(chosen); i++ {
-		chosen = fmt.Sprintf("%s-%d", base, i)
-	}
-
-	cfg = &project.Config{Name: chosen, ID: uuid.NewString()}
-	if err := project.Save(agentUtilsDir, cfg); err != nil {
-		return nil, false, "", err
-	}
-	if chosen != base {
-		renamedFrom = base
-	}
-	return cfg, true, renamedFrom, nil
+	return project.EnsureNamed(agentUtilsDir, project.Slug(base), registry.NameTaken)
 }
 
 // runLoopWizard runs the interactive setup wizard and writes the resulting
