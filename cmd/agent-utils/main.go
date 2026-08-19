@@ -39,6 +39,7 @@ func main() {
 			forgetCommand(),
 			migrateCommand(),
 			versionCommand(),
+			configCommand(),
 			// Everything project-scoped lives under `project`.
 			projectCommand(),
 			internalCommand(),
@@ -320,6 +321,7 @@ func projectCommand() *cli.Command {
 			sessionsCommand(),
 			logsCommand(),
 			loopCommand(),
+			registerWebhookCommand(),
 		},
 	}
 }
