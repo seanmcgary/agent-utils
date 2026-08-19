@@ -30,6 +30,12 @@ const DirName = ".agent-utils"
 // StateDBFile is the canonical database, holding every project's loop state.
 const StateDBFile = "state.db"
 
+// EnvFile is the machine-wide env file, holding GITHUB_TOKEN for the webhook
+// daemon. It lives beside StateDBFile and registry.FileName for the same
+// reason both of those do: so the registry and the canonical state database
+// can never disagree about where home is, and neither can the token file.
+const EnvFile = "env"
+
 // Dir returns the machine-wide agent-utils directory.
 //
 // An override that names something which exists and is not a directory is an
@@ -73,6 +79,15 @@ func StateDBPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, StateDBFile), nil
+}
+
+// EnvPath returns the machine-wide env file's path.
+func EnvPath() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, EnvFile), nil
 }
 
 // Resolve returns a path in the one spelling everything compares against:

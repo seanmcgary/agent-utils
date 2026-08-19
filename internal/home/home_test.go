@@ -81,3 +81,19 @@ func TestStateDBPathIsInsideTheDirectory(t *testing.T) {
 		t.Errorf("StateDBPath() = %q, want %q", got, want)
 	}
 }
+
+// EnvPath must resolve through Dir() exactly like StateDBPath does, so the
+// registry, the canonical database, and the token file can never disagree
+// about where home is.
+func TestEnvPathIsInsideTheDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvVar, dir)
+
+	got, err := EnvPath()
+	if err != nil {
+		t.Fatalf("EnvPath: %v", err)
+	}
+	if want := filepath.Join(dir, EnvFile); got != want {
+		t.Errorf("EnvPath() = %q, want %q", got, want)
+	}
+}
