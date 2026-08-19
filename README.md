@@ -197,8 +197,8 @@ keyed by the project's UUID, so no project ever reads another's issue state, dis
 sessions. `state_dir` still holds each loop's tick lock and its log tree, under
 `<project>/.agent-utils/state/<loop>/` by default. Only the database moved. `~/.agent-utils`
 also holds `config.yaml` (the machine-wide settings `agent-utils config` edits — see
-[Webhooks](#webhooks)), `env` (the `GITHUB_TOKEN` file the [Cron](#cron) and
-[Webhooks](#webhooks) sections have you create), `listener.pid` and `listener.lock` (the
+[Webhooks](#webhooks)), `env` (the `GITHUB_TOKEN` file `agent-utils config token` writes, read by
+[Cron](#cron) and [Webhooks](#webhooks)), `listener.pid` and `listener.lock` (the
 liveness source `listener stop` and `listener status` trust), and the webhook listener's own
 logs.
 
@@ -282,6 +282,15 @@ to every user on the machine.
 Put it in a file instead:
 
 ```bash
+agent-utils config token
+```
+
+That prompts for the token without echoing it, and writes `~/.agent-utils/env` at mode `0600`,
+creating the file if it is not there and leaving every other line in it alone. Scripting a
+machine build? Pipe it in — `echo "$TOKEN" | agent-utils config token` — or write the file by
+hand, which is all the command is doing:
+
+```bash
 install -m 600 /dev/null ~/.agent-utils/env
 echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
 ```
@@ -300,6 +309,7 @@ request updated — directly into a `loop tick`, instead of waiting for the next
 Set it up in this order:
 
 ```bash
+agent-utils config token                 # prompts, without echoing; writes ~/.agent-utils/env 0600
 agent-utils config webhook --enable --url https://hooks.example.com/webhook
 agent-utils project register-webhook
 agent-utils listener start --daemon
@@ -324,12 +334,18 @@ actually binds).
 The listener needs the same `~/.agent-utils/env` file the [Cron](#cron) section has you
 create, with `GITHUB_TOKEN` in it: `listener start` refuses to start without it, and once
 running, the daemon re-reads it on every delivery so a rotated token needs no restart. If you
-have not created it yet:
+have not stored one yet:
 
 ```bash
-install -m 600 /dev/null ~/.agent-utils/env
-echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
+agent-utils config token
 ```
+
+`listener start` also offers that prompt itself when the file does not exist and you are at a
+terminal, so the setup above works even if you skip this step. It only offers: with no terminal
+(launchd, cron, CI) it fails with instructions instead, because a prompt nobody can answer
+would hang the daemon forever. And it only offers for a MISSING file — a wrong mode, a symlink,
+or a file owned by another account still fails outright, since something put a credential file
+into that state and you should look at it rather than overwrite it.
 
 `agent-utils project register-webhook` reads the repositories your project's loops watch and
 registers (or updates) a GitHub webhook on each, pointed at `webhook.url` and signed with

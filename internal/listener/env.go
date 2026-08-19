@@ -22,6 +22,16 @@ const tokenKey = "GITHUB_TOKEN"
 // tick, forever.
 const maxEnvFileSize = 64 * 1024
 
+// ErrEnvFileMissing reports that the env file is not there at all.
+//
+// Its text is a fragment because it is only ever printed inside the sentence
+// readTokenFile builds ("<path> does not exist. ..."); it exists so a caller
+// can tell the ordinary first-run case apart from a wrong mode, a symlink or
+// a bad owner. `listener start` makes exactly that distinction: it offers to
+// write the file only when it is absent, because every other failure is a
+// condition the operator has to look at rather than answer a prompt about.
+var ErrEnvFileMissing = errors.New("does not exist")
+
 // Token reads GITHUB_TOKEN from ~/.agent-utils/env.
 //
 // It reads the file on every call, so a rotated token needs no restart: the
@@ -48,10 +58,39 @@ func Token() (string, error) {
 	return token, nil
 }
 
-// readTokenFile opens path, checks that it is safe to trust, and returns its
+// readTokenFile opens path for the daemon to read a token out of, and returns
+// its contents. It is readEnvFile with every check switched on, plus the
+// first-run diagnostic for an absent file.
+func readTokenFile(path string) ([]byte, error) {
+	data, err := readEnvFile(path, true)
+	// An absent file is the ordinary first-run case, not a fault, and the
+	// fix is one command. Saying so here is what keeps an operator from
+	// reading a bare ENOENT as a bug in the daemon.
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf(
+			"%s %w. The daemon reads %s from it on every tick, so a "+
+				"rotated token needs no restart. Create it with:\n\n"+
+				"  install -m 600 /dev/null %s\n"+
+				"  echo 'export %s=ghp_...' >> %s",
+			path, ErrEnvFileMissing, tokenKey, path, tokenKey, path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// readEnvFile opens path, checks that it is safe to trust, and returns its
 // contents. Every check exists to defend against this file being something
 // other than exactly what the operator created with `install -m 600`.
-func readTokenFile(path string) ([]byte, error) {
+//
+// requireOwnerOnlyMode is false for exactly one caller, SetToken: it is about
+// to rewrite the file atomically at 0600, so refusing to read a 0644 one
+// would send the operator away to chmod a file this program is already
+// replacing. Every other check still applies there -- a symlink, a FIFO or a
+// file owned by somebody else are all reasons to refuse to read content that
+// is then preserved into a credential file cron sources.
+func readEnvFile(path string, requireOwnerOnlyMode bool) ([]byte, error) {
 	// O_NOFOLLOW closes a time-of-check-to-time-of-use gap. A Stat(path)
 	// done BEFORE Open would follow a symlink and report the target's mode
 	// and owner while leaving the link itself unchecked; a later Open could
@@ -69,21 +108,11 @@ func readTokenFile(path string) ([]byte, error) {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("%s is a symlink, refusing to follow it", path)
 		}
-		// An absent file is the ordinary first-run case, not a fault, and the
-		// fix is one command. Saying so here is what keeps an operator from
-		// reading a bare ENOENT as a bug in the daemon.
-		//
-		// os.OpenFile's error is an *os.PathError, which already renders as
-		// "open <path>: ...", so wrapping it with another "open %s" prefix
-		// prints the path twice.
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf(
-				"%s does not exist. The daemon reads %s from it on every tick, so a "+
-					"rotated token needs no restart. Create it with:\n\n"+
-					"  install -m 600 /dev/null %s\n"+
-					"  echo 'export %s=ghp_...' >> %s",
-				path, tokenKey, path, tokenKey, path)
-		}
+		// Returned unwrapped, so errors.Is(err, os.ErrNotExist) still holds
+		// for the callers that distinguish an absent file from an unreadable
+		// one. os.OpenFile's error is an *os.PathError, which already renders
+		// as "open <path>: ...", so a second "open %s" prefix would print the
+		// path twice anyway.
 		return nil, err
 	}
 	defer f.Close()
@@ -125,7 +154,7 @@ func readTokenFile(path string) ([]byte, error) {
 	// this file. The README tells the operator to create it with
 	// `install -m 600`; a wider mode would let any other local account read
 	// a repository-write GitHub token.
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+	if perm := info.Mode().Perm(); requireOwnerOnlyMode && perm&0o077 != 0 {
 		return nil, fmt.Errorf(
 			"%s has mode %04o, which grants group or other access; recreate it with `install -m 600`",
 			path, perm)
@@ -149,10 +178,33 @@ func readTokenFile(path string) ([]byte, error) {
 // parseEnvValue returns the value last assigned to key in an env file's
 // contents, and whether it was set at all.
 //
-// The rules are pinned here, in one place, so two future call sites cannot
-// silently diverge on a case the tests do not happen to cover:
-//   - a blank line, or one whose first non-space character is '#', is
-//     skipped;
+// The LAST matching line wins, matching shell semantics for a file sourced
+// top to bottom.
+func parseEnvValue(data []byte, key string) (string, bool) {
+	value := ""
+	found := false
+
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := envAssignment(line)
+		if !ok || k != key {
+			continue
+		}
+		value = v
+		found = true
+	}
+
+	return value, found
+}
+
+// envAssignment splits one line of an env file into the key it assigns and
+// the value it assigns, reporting whether it assigns anything at all.
+//
+// The rules are pinned here, in one place, so the reader (parseEnvValue) and
+// the writer (upsertEnvAssignment) cannot silently diverge on a case the
+// tests do not happen to cover -- which would let SetToken append a second
+// assignment beside one it failed to recognise, leaving a stale token to win:
+//   - a blank line, or one whose first non-space character is '#', assigns
+//     nothing;
 //   - leading whitespace and an optional "export " prefix are allowed;
 //   - the line splits on the FIRST '=' only, so a value may itself contain
 //     '=';
@@ -162,32 +214,21 @@ func readTokenFile(path string) ([]byte, error) {
 //     token or a key;
 //   - a trailing "# comment" is NOT stripped from the value: '#' is a legal
 //     character inside a token, so only a line's OWN first character being
-//     '#' marks it a comment;
-//   - the LAST matching line wins, matching shell semantics for a file
-//     sourced top to bottom.
-func parseEnvValue(data []byte, key string) (string, bool) {
-	value := ""
-	found := false
+//     '#' marks it a comment.
+func envAssignment(rawLine string) (key, value string, ok bool) {
+	line := strings.TrimSuffix(rawLine, "\r")
 
-	for _, rawLine := range strings.Split(string(data), "\n") {
-		line := strings.TrimSuffix(rawLine, "\r")
-
-		trimmed := strings.TrimLeft(line, " \t")
-		if trimmed == "" || trimmed[0] == '#' {
-			continue
-		}
-		trimmed = strings.TrimPrefix(trimmed, "export ")
-
-		k, v, ok := strings.Cut(trimmed, "=")
-		if !ok || k != key {
-			continue
-		}
-
-		value = unquote(v)
-		found = true
+	trimmed := strings.TrimLeft(line, " \t")
+	if trimmed == "" || trimmed[0] == '#' {
+		return "", "", false
 	}
+	trimmed = strings.TrimPrefix(trimmed, "export ")
 
-	return value, found
+	k, v, ok := strings.Cut(trimmed, "=")
+	if !ok {
+		return "", "", false
+	}
+	return k, unquote(v), true
 }
 
 // unquote strips one layer of matching single or double quotes from v.

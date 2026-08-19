@@ -104,6 +104,7 @@ func configCommand() *cli.Command {
 				},
 			},
 			configWebhookCommand(),
+			configTokenCommand(),
 		},
 	}
 }

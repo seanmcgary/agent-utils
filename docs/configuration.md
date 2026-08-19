@@ -92,6 +92,27 @@ ask for, and the mistake would surface much later as missing state.
 Set it to run a test, or a second machine-wide installation, against its own state. Moving
 `$HOME` instead would also move the git and ssh configuration the agent still needs.
 
+It also holds `env`, the shell-sourceable file `GITHUB_TOKEN` is read from — by the webhook
+listener on every delivery, and by the cron entry in the README. Write it with:
+
+```bash
+agent-utils config token
+```
+
+The command prompts without echoing the token, creates `~/.agent-utils` if it does not exist,
+and writes the file atomically at mode `0600`; anything else already in the file is preserved,
+since cron sources it and it may hold unrelated exports. It never takes the token as a flag or
+an argument — a value on the command line shows up in `ps` output and in shell history — but it
+does read one piped to it (`echo "$TOKEN" | agent-utils config token`), for a scripted machine
+build. With neither a terminal nor a pipe it refuses rather than hanging. Writing the file by
+hand still works, as long as the mode is `0600` and the file is owned by the account the
+listener runs as, which is what the reader enforces:
+
+```bash
+install -m 600 /dev/null ~/.agent-utils/env
+echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
+```
+
 ### Two different `config.yaml` files
 
 `~/.agent-utils/config.yaml` (the machine-wide settings file, `AGENT_UTILS_HOME`) and
@@ -722,5 +743,6 @@ Both read only local state, so they need no token and work offline. A file that 
 is reported as `INVALID` with its error rather than being skipped.
 
 `agent-utils project loop status --name <loop>` validates too, but it also lists the
-repository's open issues, so it needs `GITHUB_TOKEN` and network access. A config error names
+repository's open issues, so it needs `GITHUB_TOKEN` (see [The machine-wide
+directory](#the-machine-wide-directory), or `agent-utils config token`) and network access. A config error names
 the offending field, so it is easy to tell from an authentication error.

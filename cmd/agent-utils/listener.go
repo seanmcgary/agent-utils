@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -129,8 +130,8 @@ func listenerStartCommand() *cli.Command {
 			// 0644 (or missing) env file comes up looking healthy and then
 			// fails every single tick, since Worker reads the token fresh
 			// on every delivery (see internal/listener/env.go's Token).
-			if _, err := listener.Token(); err != nil {
-				return fmt.Errorf("github token: %w", err)
+			if err := ensureToken(os.Stdin, os.Stderr, isInteractive()); err != nil {
+				return err
 			}
 
 			if c.Bool("daemon") {
@@ -141,6 +142,44 @@ func listenerStartCommand() *cli.Command {
 			return runListener(ctx, def.Webhook.ListenAddr, def.Webhook.ListenPort, currentSecret)
 		},
 	}
+}
+
+// ensureToken proves the GitHub token is readable before the listener starts,
+// and offers to write the env file when it is simply not there yet.
+//
+// The prompt is offered for an ABSENT file only. A wrong mode, a symlink, or
+// a file owned by somebody else all still fail with the error Token
+// produced: those are conditions an operator has to look at -- something put
+// a credential file into that state -- and silently overwriting the file
+// would destroy the evidence while answering nothing.
+//
+// interactive is a parameter rather than an isInteractive() call inside, so
+// this is testable without a pty. It must be false whenever stdin is not a
+// terminal: under launchd or cron stdin is /dev/null, and a prompt there
+// would hang the service forever on a question nobody will ever see -- the
+// same rule resolveLoopConfig documents.
+func ensureToken(in io.Reader, out io.Writer, interactive bool) error {
+	_, err := listener.Token()
+	if err == nil {
+		return nil
+	}
+	if !interactive || !errors.Is(err, listener.ErrEnvFileMissing) {
+		return fmt.Errorf("github token: %w", err)
+	}
+
+	_, _ = fmt.Fprintln(out, "No GitHub token is stored yet. The listener reads one from "+
+		"~/.agent-utils/env on every delivery.")
+	if err := storeToken(in, out); err != nil {
+		return err
+	}
+
+	// Read it back rather than trusting the write: the point of checking here
+	// at all is that the daemon fails now, at a terminal, instead of on every
+	// tick once it is detached.
+	if _, err := listener.Token(); err != nil {
+		return fmt.Errorf("github token: %w", err)
+	}
+	return nil
 }
 
 // installDaemon registers this program as a launchd user agent, invoked at
