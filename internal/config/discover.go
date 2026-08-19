@@ -74,6 +74,14 @@ type Entry struct {
 // in. Configurations are project-local: running in an unrelated directory
 // must say there is no project here, not silently adopt the machine-wide one.
 //
+// The comparison resolves symlinks on both sides (internal/home.Resolve).
+// FindDir's only caller feeds it os.Getwd(), and on Darwin os.Getwd returns
+// the fully resolved spelling (/private/var/...) whenever $PWD is unset --
+// which is exactly the case for a launchd-started process such as the
+// listener daemon. A raw string compare against home.Dir()'s unresolved
+// /var/... spelling would then never match, and the guard above would fail
+// open: it existed but silently let the machine-wide directory through.
+//
 // A cron entry should pass --config with an absolute path, which needs no
 // discovery at all.
 func FindDir(startDir string) (string, error) {
@@ -85,14 +93,15 @@ func FindDir(startDir string) (string, error) {
 			ErrNoDir, env)
 	}
 
-	// homeErr is deliberately not fatal: a machine on which the home
-	// directory cannot be resolved still deserves an ordinary walk-up, and
-	// there is nothing to skip if there is nothing to compare against.
-	machineWide, homeErr := home.Dir()
-	if homeErr == nil {
-		if abs, err := filepath.Abs(machineWide); err == nil {
-			machineWide = abs
-		}
+	// A raw string compare is not enough: home.Dir() and the walk candidate
+	// can name one directory in two spellings, and the guard would then
+	// silently pass the machine-wide directory through. An unresolvable
+	// machineWide (no machine-wide directory at all, or home.Dir() erroring)
+	// degrades to "", which cannot spuriously match an existing candidate,
+	// so the walk-up is simply unguarded -- there is nothing to protect.
+	machineWide := ""
+	if dir, err := home.Dir(); err == nil {
+		machineWide = home.Resolve(dir)
 	}
 
 	dir, err := filepath.Abs(startDir)
@@ -101,7 +110,9 @@ func FindDir(startDir string) (string, error) {
 	}
 	for {
 		candidate := filepath.Join(dir, DirName)
-		if isDir(candidate) && (homeErr != nil || candidate != machineWide) {
+		// home.Resolve(candidate) is safe here because isDir(candidate) has
+		// already established the path exists, so EvalSymlinks succeeds.
+		if isDir(candidate) && (machineWide == "" || home.Resolve(candidate) != machineWide) {
 			return candidate, nil
 		}
 		parent := filepath.Dir(dir)

@@ -88,8 +88,8 @@ func TestFindDirErrorsWhenNothingExists(t *testing.T) {
 func TestFindDirDoesNotAdoptTheMachineWideDirectory(t *testing.T) {
 	t.Setenv("AGENT_UTILS_DIR", "")
 
-	home := t.TempDir()
-	machineWide := filepath.Join(home, DirName)
+	homeDir := t.TempDir()
+	machineWide := filepath.Join(homeDir, DirName)
 	t.Setenv("AGENT_UTILS_HOME", machineWide)
 	// The machine-wide directory itself, exactly as the registry creates it.
 	if err := os.MkdirAll(filepath.Join(machineWide, ConfigsSubdir), 0o700); err != nil {
@@ -101,7 +101,7 @@ func TestFindDirDoesNotAdoptTheMachineWideDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scratch := filepath.Join(home, "Downloads", "scratch")
+	scratch := filepath.Join(homeDir, "Downloads", "scratch")
 	if err := os.MkdirAll(scratch, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -118,20 +118,66 @@ func TestFindDirDoesNotAdoptTheMachineWideDirectory(t *testing.T) {
 	}
 }
 
+// Regression. home.Dir() and a walk candidate can name the same directory in
+// two different spellings: macOS resolves /var to /private/var, and
+// FindDir's only caller (internal/loopcmd/resolve.go) feeds it os.Getwd(),
+// which returns the RESOLVED spelling whenever $PWD is unset -- exactly the
+// case for a launchd-started process such as the listener daemon this
+// feature adds. AGENT_UTILS_HOME is set here to the raw (unresolved)
+// spelling, as an operator or a plist would write it, while the walk starts
+// from the resolved spelling, as os.Getwd() would hand FindDir under
+// launchd. A guard that compares raw strings never fires in this case and
+// silently lets the machine-wide directory through.
+func TestFindDirDoesNotAdoptTheMachineWideDirectoryAcrossASymlink(t *testing.T) {
+	t.Setenv("AGENT_UTILS_DIR", "")
+
+	homeDir := t.TempDir()
+	resolvedHome, err := filepath.EvalSymlinks(homeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedHome == homeDir {
+		t.Skip("temp dir is not reached through a symlink on this platform; the spellings cannot diverge")
+	}
+
+	// AGENT_UTILS_HOME holds the raw spelling, the way an operator would
+	// write it or launchd's plist would name it.
+	machineWide := filepath.Join(homeDir, DirName)
+	t.Setenv("AGENT_UTILS_HOME", machineWide)
+	if err := os.MkdirAll(filepath.Join(machineWide, ConfigsSubdir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The walk starts from the RESOLVED spelling, the way os.Getwd() returns
+	// it when $PWD is unset.
+	scratch := filepath.Join(resolvedHome, "Downloads", "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindDir(scratch)
+	if err == nil {
+		t.Fatalf("FindDir = %q, want an error; the machine-wide directory must never be adopted, even spelled through a symlink", got)
+	}
+	if !errors.Is(err, ErrNoDir) {
+		t.Fatalf("err = %v, want ErrNoDir", err)
+	}
+}
+
 // A genuine project nested under the same tree as the machine-wide directory
 // (e.g. ~/Downloads/myproject) must still resolve. Skipping the machine-wide
 // directory must not turn into skipping every ancestor.
 func TestFindDirStillResolvesAProjectNearTheMachineWideDirectory(t *testing.T) {
 	t.Setenv("AGENT_UTILS_DIR", "")
 
-	home := t.TempDir()
-	machineWide := filepath.Join(home, DirName)
+	homeDir := t.TempDir()
+	machineWide := filepath.Join(homeDir, DirName)
 	t.Setenv("AGENT_UTILS_HOME", machineWide)
 	if err := os.MkdirAll(filepath.Join(machineWide, ConfigsSubdir), 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	project := filepath.Join(home, "Downloads", "myproject")
+	project := filepath.Join(homeDir, "Downloads", "myproject")
 	want := mkConfigs(t, project, nil)
 
 	deep := filepath.Join(project, "sub", "dir")
