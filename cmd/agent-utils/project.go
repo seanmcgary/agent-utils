@@ -86,10 +86,11 @@ type projectInitDeps struct {
 // descriptor, registers it, and — unless told not to — runs the loop wizard.
 //
 // Re-running it on an already-initialised project is deliberately NOT an
-// error: it reports the existing identity, re-registers (a no-op update; see
-// registry.Register), and still offers the wizard, so `project init` doubles
-// as the entry point for adding a second loop to a project someone forgot
-// already existed.
+// error: it reports the existing identity and re-registers (a no-op update;
+// see registry.Register). It offers the wizard only when the project has no
+// loop configuration yet, so `project init` doubles as the entry point for
+// finishing a half-set-up project someone forgot already existed, while a
+// repository cloned with its loops already committed just gets registered.
 func projectInitRun(deps projectInitDeps) error {
 	rootDir, err := filepath.Abs(deps.Dir)
 	if err != nil {
@@ -144,6 +145,25 @@ func projectInitRun(deps projectInitDeps) error {
 		return err
 	}
 
+	// project.EnsureNamed uniquifies a name only on the descriptor it MINTS,
+	// so a descriptor that arrived with the repository -- the clone-to-a-new-
+	// host case -- walks straight past that check. Registering it anyway put
+	// two projects with the same name in the registry, and from that moment
+	// every `agent-utils project --name <that name>` command silently acted on
+	// whichever of the two ticked last: a status read against the wrong
+	// repository, or a `loop reset` that threw away the wrong project's
+	// session. Refusing here happens BEFORE registry.Register, so a rejected
+	// clone leaves the registry exactly as it was. Comparing by id keeps
+	// re-running init on the SAME project the no-op success it has always been.
+	if !created {
+		if other, ok := conflictingProject(cfg.Name, cfg.ID); ok {
+			return fmt.Errorf(
+				"refusing to register %s: the name %q already belongs to a different project (%s, id %s)\n"+
+					"project names are unique across this machine; edit the name: field in %s and run init again",
+				agentUtilsDir, cfg.Name, other.AgentUtilsDir, other.ID, project.Path(agentUtilsDir))
+		}
+	}
+
 	if err := registry.Register(agentUtilsDir, cfg.ID, cfg.Name); err != nil {
 		// Best effort, matching ResolveProject's own comment: the registry is
 		// an index, and losing this update costs the project a line in
@@ -191,6 +211,23 @@ func projectInitRun(deps projectInitDeps) error {
 		}
 	}
 
+	// A repository cloned to a new host arrives with its loop configurations
+	// already committed, and its only missing piece is this host's registry
+	// entry -- which the Register call above has now written. Offering the
+	// wizard here was actively harmful: wizard.Write refuses to overwrite an
+	// existing loop file, so an operator answered all two dozen questions and
+	// only then watched the command fail with nothing to show for it.
+	//
+	// An entry whose Err is non-nil counts as an existing loop on purpose. A
+	// loop file that fails to load still proves the repository was set up; the
+	// fix is to repair that file, not to be walked through the wizard that
+	// cannot write over it anyway.
+	if loops := existingLoopCount(agentUtilsDir); loops > 0 {
+		return reportf(deps.Out,
+			"Registered %q (%s) at %s with %d existing loop configuration%s; nothing else to do.\n",
+			cfg.Name, cfg.ID, agentUtilsDir, loops, plural(loops))
+	}
+
 	if deps.NoLoop {
 		return reportf(deps.Out,
 			"Skipped the loop configuration wizard (--no-loop). "+
@@ -215,6 +252,56 @@ func projectInitRun(deps projectInitDeps) error {
 		return err
 	}
 	return reportf(deps.Out, "Next: agent-utils project --name %s loop tick --name %s\n", cfg.Name, loopName)
+}
+
+// conflictingProject returns a registered project that answers to name but is
+// a DIFFERENT project than id, which is the collision that makes a name
+// useless as a selector.
+//
+// A registry that cannot be read reports no conflict: the registry is an index
+// (see registry.Register's own contract), and failing init because the index
+// was unreadable would refuse a legitimate project over a check that is a
+// guard, not the operation.
+func conflictingProject(name, id string) (registry.Project, bool) {
+	projects, err := registry.List()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not check the registry for a name collision: %v\n", err)
+		return registry.Project{}, false
+	}
+	for _, p := range projects {
+		if p.ID != id && strings.EqualFold(p.Name, name) {
+			return p, true
+		}
+	}
+	return registry.Project{}, false
+}
+
+// existingLoopCount reports how many loop configurations the project already
+// has, treating config.ErrNoConfigs as none rather than as a failure: init
+// creates configs/ moments earlier, and an empty one is the normal state of a
+// project being set up for the first time.
+//
+// Any other read failure also counts as none. The alternative -- failing init
+// -- would refuse to record a project in the registry over a directory listing
+// this command never actually needed, and the wizard that follows reports a
+// real write problem far more clearly.
+func existingLoopCount(agentUtilsDir string) int {
+	entries, err := config.List(agentUtilsDir)
+	if err != nil {
+		if !errors.Is(err, config.ErrNoConfigs) {
+			fmt.Fprintf(os.Stderr, "warning: could not list loop configurations: %v\n", err)
+		}
+		return 0
+	}
+	return len(entries)
+}
+
+// plural returns the "s" that makes a count read naturally.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // reportf writes one status line to out and wraps a write failure with

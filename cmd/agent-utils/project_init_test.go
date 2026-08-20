@@ -481,3 +481,189 @@ func TestProjectInitIgnoredPositionalNameIsReported(t *testing.T) {
 		t.Errorf("Name = %q, want the original identity to be kept", cfg.Name)
 	}
 }
+
+// clonedRepo builds what a `git clone` of an already-onboarded repository
+// leaves on a new host: a COMMITTED project descriptor (name and id already
+// minted, on some other machine) and, when loopName is non-empty, a committed
+// loop configuration beside it. Nothing here touches the registry — that is
+// exactly what `project init` has to do on the new host.
+func clonedRepo(t *testing.T, name, id, loopName string) string {
+	t.Helper()
+	root := t.TempDir()
+	agentUtilsDir := agentUtilsDirFor(root)
+	if err := os.MkdirAll(config.ConfigsDir(agentUtilsDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := project.Save(agentUtilsDir, &project.Config{Name: name, ID: id}); err != nil {
+		t.Fatal(err)
+	}
+	if loopName != "" {
+		if _, err := wizard.Write(agentUtilsDir, validLoopConfig(loopName)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// TestProjectInitClonedRepoRegistersAndSkipsWizard covers the whole clone
+// case: a repo whose .agent-utils/config.yaml AND .agent-utils/configs/*.yaml
+// are already committed needs nothing minted and nothing asked — its only
+// missing piece is the entry in this host's registry. init used to offer the
+// wizard anyway, and wizard.Write refuses to overwrite, so the operator
+// answered every question and only then hit the failure.
+func TestProjectInitClonedRepoRegistersAndSkipsWizard(t *testing.T) {
+	withHome(t)
+	const id = "3f8c1d2e-0000-4000-8000-000000000001"
+	root := clonedRepo(t, "lawndominator", id, "planning")
+	var out bytes.Buffer
+
+	err := projectInitRun(projectInitDeps{
+		Dir: root, NoLoop: false, Interactive: true,
+		RunWizard: failWizard(t), Out: &out,
+	})
+	if err != nil {
+		t.Fatalf("projectInitRun on a cloned repo: %v", err)
+	}
+
+	projects, err := registry.List()
+	if err != nil {
+		t.Fatalf("registry.List: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("registered %d projects, want exactly 1", len(projects))
+	}
+	if projects[0].ID != id || projects[0].Name != "lawndominator" {
+		t.Errorf("registered %+v, want the committed identity %q/%q", projects[0], "lawndominator", id)
+	}
+
+	// The operator has to be able to see that init recognised the existing
+	// setup rather than silently doing nothing: name, id, path, loop count.
+	for _, want := range []string{"lawndominator", id, agentUtilsDirFor(root), "1"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output = %q, want it to report %q", out.String(), want)
+		}
+	}
+}
+
+// TestProjectInitClonedRepoTwiceStaysASuccess covers the ordinary re-run: the
+// same project, same id, initialised again on the same host is a no-op
+// success, not a name collision with itself.
+func TestProjectInitClonedRepoTwiceStaysASuccess(t *testing.T) {
+	withHome(t)
+	const id = "3f8c1d2e-0000-4000-8000-000000000002"
+	root := clonedRepo(t, "lawndominator", id, "planning")
+
+	for i := 0; i < 2; i++ {
+		var out bytes.Buffer
+		if err := projectInitRun(projectInitDeps{
+			Dir: root, NoLoop: false, Interactive: true,
+			RunWizard: failWizard(t), Out: &out,
+		}); err != nil {
+			t.Fatalf("init %d: %v", i+1, err)
+		}
+	}
+
+	projects, err := registry.List()
+	if err != nil {
+		t.Fatalf("registry.List: %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != id {
+		t.Fatalf("registry = %+v, want exactly one entry for %q", projects, id)
+	}
+}
+
+// TestProjectInitDescriptorWithoutLoopsStillOffersWizard guards the skip from
+// swallowing a half-finished setup: a descriptor with no loop configuration at
+// all is a project someone started and never finished, not a clone, and the
+// wizard is still what it needs.
+func TestProjectInitDescriptorWithoutLoopsStillOffersWizard(t *testing.T) {
+	withHome(t)
+	root := clonedRepo(t, "halfdone", "3f8c1d2e-0000-4000-8000-000000000003", "")
+	var out bytes.Buffer
+
+	called := false
+	err := projectInitRun(projectInitDeps{
+		Dir: root, NoLoop: false, Interactive: true,
+		RunWizard: func(agentUtilsDir, rootDir string) (string, error) {
+			called = true
+			return wizard.Write(agentUtilsDir, validLoopConfig("planning"))
+		},
+		Out: &out,
+	})
+	if err != nil {
+		t.Fatalf("projectInitRun: %v", err)
+	}
+	if !called {
+		t.Error("RunWizard was not called for a project with a descriptor but no loop configurations")
+	}
+}
+
+// TestProjectInitBrokenLoopFileStillSkipsWizard covers the deliberate choice
+// about config.Entry.Err: a loop file that fails to load still proves the repo
+// was set up. Walking the operator through 24 questions the wizard cannot even
+// write the answers to (wizard.Write refuses to overwrite) instead of telling
+// them to fix the file they already have would be the same failure this whole
+// change removes.
+func TestProjectInitBrokenLoopFileStillSkipsWizard(t *testing.T) {
+	withHome(t)
+	root := clonedRepo(t, "broken", "3f8c1d2e-0000-4000-8000-000000000004", "")
+	loopPath := filepath.Join(agentUtilsDirFor(root), config.ConfigsSubdir, "planning.yaml")
+	if err := os.WriteFile(loopPath, []byte("name: planning\nnot_a_field: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(loopPath); err == nil {
+		t.Fatal("the fixture loop file must fail to load, or this test proves nothing")
+	}
+
+	var out bytes.Buffer
+	if err := projectInitRun(projectInitDeps{
+		Dir: root, NoLoop: false, Interactive: true,
+		RunWizard: failWizard(t), Out: &out,
+	}); err != nil {
+		t.Fatalf("projectInitRun: %v", err)
+	}
+}
+
+// TestProjectInitRefusesNameTakenByADifferentProject covers the collision a
+// COMMITTED descriptor used to walk straight past: project.EnsureNamed only
+// uniquifies a name it mints, so cloning a repo whose committed name matches a
+// project already on this host wrote a second registry entry with the same
+// name — and from then on every `project --name <that name>` command silently
+// acted on whichever of the two ticked last.
+func TestProjectInitRefusesNameTakenByADifferentProject(t *testing.T) {
+	withHome(t)
+	existing := t.TempDir()
+	var first bytes.Buffer
+	if err := projectInitRun(projectInitDeps{
+		Dir: existing, Name: "lawndominator", NoLoop: true, Interactive: true,
+		RunWizard: failWizard(t), Out: &first,
+	}); err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+
+	clone := clonedRepo(t, "lawndominator", "3f8c1d2e-0000-4000-8000-000000000005", "planning")
+	var out bytes.Buffer
+	err := projectInitRun(projectInitDeps{
+		Dir: clone, NoLoop: false, Interactive: true,
+		RunWizard: failWizard(t), Out: &out,
+	})
+	if err == nil {
+		t.Fatal("init of a clone whose committed name is taken: want an error, got nil")
+	}
+	// Both paths, so the operator can tell the two projects apart, and the
+	// descriptor to edit.
+	for _, want := range []string{agentUtilsDirFor(existing), project.Path(agentUtilsDirFor(clone)), "name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q", err.Error(), want)
+		}
+	}
+
+	projects, listErr := registry.List()
+	if listErr != nil {
+		t.Fatalf("registry.List: %v", listErr)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("registry holds %d projects after a refused init, want the original 1 only: %+v",
+			len(projects), projects)
+	}
+}

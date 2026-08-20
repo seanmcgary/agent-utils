@@ -81,8 +81,24 @@ The name "lawndominator" was already taken by another project, so this one is "l
 Change it by editing /tmp/wsB/lawndominator/.agent-utils/config.yaml
 ```
 
-Unless you pass `--no-loop`, `project init` then walks an interactive wizard that asks for
-every field the first loop needs — labels, repository, agent model, retry policy — and takes
+Cloning a repository that was already set up somewhere else is the one case where `project
+init` does nothing but register it. The committed `.agent-utils/config.yaml` keeps its name and
+UUID, the committed `.agent-utils/configs/*.yaml` loops are left alone, and the wizard is
+skipped — there is nothing to ask:
+
+```
+Registered "my-repo" (0f5c...c31a) at /Users/you/Code/my-repo/.agent-utils with 2 existing loop configurations; nothing else to do.
+```
+
+If that committed name already belongs to a *different* project on this machine, init refuses
+rather than registering a second project under the same name — a name that matches two projects
+makes every later `--name` command act on whichever one ran most recently. Edit the `name:` in
+the clone's `.agent-utils/config.yaml` and run init again. (An already-duplicated registry is
+caught on the other side too: selecting by an ambiguous name is an error listing both
+candidates, and you can select by id or path instead.)
+
+Unless you pass `--no-loop`, and unless the project already has at least one loop
+configuration, `project init` then walks an interactive wizard that asks for every field the first loop needs — labels, repository, agent model, retry policy — and takes
 the three prompt bodies from the template, which you edit in the written file. It writes
 `.agent-utils/configs/<name>.yaml`. Run from a script or a cron job (any
 non-terminal stdin), it skips the wizard rather than hanging on a prompt that will never come;
@@ -109,7 +125,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 
 | Command | Does |
 |---|---|
-| `agent-utils project init [<name>] [--dir <path>] [--no-loop]` | Create a project explicitly and, unless `--no-loop`, walk the loop-configuration wizard for its first loop |
+| `agent-utils project init [<name>] [--dir <path>] [--no-loop]` | Create or re-register a project explicitly and, unless `--no-loop` or it already has a loop, walk the loop-configuration wizard for its first loop |
 | `agent-utils project loop new` | Add another loop configuration to this project, via the same wizard |
 | `agent-utils project status` | Identity, file locations, and every loop's state |
 | `agent-utils project list` | This project's loop configurations |
