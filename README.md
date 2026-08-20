@@ -288,9 +288,10 @@ and pull request population you trust.
 Cron is optional. `loop tick` is what any driver runs — a cron entry, or the webhook listener
 on a GitHub delivery — and the per-loop lock (`internal/lock`) makes it safe to run both at
 once: an overlapping tick simply finds the lock held and exits rather than double-dispatching.
-Keep the cron entry as a heartbeat even after the listener is running, if you want ticks to
-keep happening on schedule when no webhook fires — a quiet repository, or a proxy that is
-briefly down, otherwise waits for the next event with no fallback.
+Keep the cron entry after the listener is running. It is not only a heartbeat for a quiet
+repository or a proxy that is briefly down: the listener acts on the issue a delivery names,
+so the full sweep is the only thing that notices a pull request that fell behind on someone
+else's push, or a retry deadline on an issue nobody touched.
 
 Do NOT put the token inline in the crontab. cron runs the whole line through `/bin/sh -c`, so
 a `VAR=value command` prefix puts the token in the shell's argument list, where `ps` shows it
@@ -327,12 +328,21 @@ Passing `--config` with an absolute path works too and skips discovery entirely.
 
 The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
 request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
-A delivery is a wake-up, not an instruction: it triggers a full reconcile of every loop
-watching that repository, exactly as the cron tick does, and nothing in the payload beyond the
-repository name is acted on. So an unrelated issue that was already eligible can be dispatched
-by a delivery about some other issue — the same work cron would have done at the next interval,
-only sooner. The `accepted delivery` and `reconciling every loop...` lines in the log are what
-tie a delivery to the ticks it caused.
+A delivery acts on the issue it names, and on nothing else: it says "something about this
+issue changed, figure out what and dispatch the right executor." The daemon fetches that one
+issue, decides it, and stops — it does not read every open issue and every open pull request
+in the repository, which is what a full reconcile costs in tokens and rate limit on every
+delivery, per project watching that repository. Pull requests share the issue number space, so
+a `pull_request` event is resolved to the issue its pull request closes (`Closes #N` in the
+body); a pull request that closes no issue is a no-op. The `accepted delivery` line in the log
+names the issue, so a delivery can be matched against the dispatch it caused.
+
+The daemon is the fast path; cron remains the safety net. A `loop tick` is still a full sweep,
+and it is what catches the work no event names — a pull request that fell behind because
+someone pushed to the default branch (a `push` event, which this daemon does not subscribe to),
+or a retry deadline on an issue nobody touched. Both can run at once: the per-loop lock makes
+an overlapping tick harmless.
+
 Set it up in this order:
 
 ```bash
