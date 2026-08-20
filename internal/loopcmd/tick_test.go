@@ -21,13 +21,51 @@ type fakeGH struct {
 	comments []string
 	added    []string
 	removed  []string
+
+	// The counters and the fetch logs are what a scoped tick is judged by:
+	// the token burn this whole change exists to stop is invisible in the
+	// dispatch count and visible only in which endpoints were called.
+	listedIssues  int
+	listedPRs     int
+	fetchedIssues []int
+	fetchedPRs    []int
 }
 
 func (f *fakeGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
+	f.listedIssues++
 	return f.issues, nil
 }
 func (f *fakeGH) ListOpenPullRequests(context.Context, string, string) ([]ghub.PullRequest, error) {
+	f.listedPRs++
 	return f.prs, nil
+}
+
+// Issue answers from the same fixture the list does, so a scoped tick and a
+// full tick decide from identical data. A number the fixture holds as a pull
+// request answers ErrNotAnIssue, exactly as GitHub's issues endpoint does.
+func (f *fakeGH) Issue(_ context.Context, _, _ string, number int) (ghub.Issue, error) {
+	f.fetchedIssues = append(f.fetchedIssues, number)
+	for _, pr := range f.prs {
+		if pr.Number == number {
+			return ghub.Issue{}, fmt.Errorf("o/r#%d: %w", number, ghub.ErrNotAnIssue)
+		}
+	}
+	for _, iss := range f.issues {
+		if iss.Number == number {
+			return iss, nil
+		}
+	}
+	return ghub.Issue{}, fmt.Errorf("issue #%d not found", number)
+}
+
+func (f *fakeGH) PullRequest(_ context.Context, _, _ string, number int) (ghub.PullRequest, error) {
+	f.fetchedPRs = append(f.fetchedPRs, number)
+	for _, pr := range f.prs {
+		if pr.Number == number {
+			return pr, nil
+		}
+	}
+	return ghub.PullRequest{}, fmt.Errorf("pull request #%d not found", number)
 }
 func (f *fakeGH) BehindBy(_ context.Context, _, _, _, head string) (int, error) {
 	for _, pr := range f.prs {

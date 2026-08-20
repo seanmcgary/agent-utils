@@ -112,6 +112,16 @@ func (f *noCallGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue
 	return nil, nil
 }
 
+func (f *noCallGH) Issue(context.Context, string, string, int) (ghub.Issue, error) {
+	f.t.Fatal("Issue called; a held lock must return before any GitHub call")
+	return ghub.Issue{}, nil
+}
+
+func (f *noCallGH) PullRequest(context.Context, string, string, int) (ghub.PullRequest, error) {
+	f.t.Fatal("PullRequest called; a held lock must return before any GitHub call")
+	return ghub.PullRequest{}, nil
+}
+
 func (f *noCallGH) ListOpenPullRequests(context.Context, string, string) ([]ghub.PullRequest, error) {
 	f.t.Fatal("ListOpenPullRequests called; RunTick should have returned before Tick started")
 	return nil, nil

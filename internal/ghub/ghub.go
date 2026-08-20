@@ -14,6 +14,12 @@ import (
 // for the retry-cap park. Every method is safe to fake in a test.
 type Client interface {
 	ListOpenIssues(ctx context.Context, owner, repo string) ([]Issue, error)
+	// Issue and PullRequest fetch ONE number. A webhook delivery names one
+	// issue, and answering it with the two list calls plus a comparison per
+	// review issue is what burned a token budget on an unrelated issue; see
+	// loopcmd.TickIssue.
+	Issue(ctx context.Context, owner, repo string, number int) (Issue, error)
+	PullRequest(ctx context.Context, owner, repo string, number int) (PullRequest, error)
 	ListOpenPullRequests(ctx context.Context, owner, repo string) ([]PullRequest, error)
 	BehindBy(ctx context.Context, owner, repo, base, head string) (int, error)
 	PostComment(ctx context.Context, owner, repo string, number int, body string) error
@@ -53,6 +59,95 @@ func ConvertIssues(in []*github.Issue) []Issue {
 		})
 	}
 	return out
+}
+
+// convertPR maps one go-github pull request onto the engine type and decides
+// its trust.
+//
+// Trust is decided here, once, at the boundary. A pull request is trusted only
+// when its head branch lives in this repository and its author is a repository
+// insider. Tending checks the head branch out and runs an agent in it, so an
+// untrusted head is code execution.
+//
+// EqualFold: full_name comes back in GitHub's canonical casing while
+// owner/repo come from config unchecked. A casing mismatch would fail closed
+// and silently disable tending with no diagnostic.
+//
+// The list path and the single-fetch path share this function rather than each
+// computing trust for itself. Two copies could drift, and a single-fetch path
+// that drifted toward "trusted" would let one webhook delivery about a fork's
+// pull request run an agent inside that fork's branch.
+func convertPR(owner, repo string, pr *github.PullRequest) PullRequest {
+	head := pr.GetHead().GetRef()
+	base := pr.GetBase().GetRef()
+	assoc := pr.GetAuthorAssociation()
+	headRepo := pr.GetHead().GetRepo().GetFullName()
+
+	trusted := strings.EqualFold(headRepo, owner+"/"+repo) &&
+		(assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR") &&
+		SafeRef(head) && SafeRef(base)
+
+	return PullRequest{
+		Number:            pr.GetNumber(),
+		HeadRef:           head,
+		BaseRef:           base,
+		Body:              pr.GetBody(),
+		Draft:             pr.GetDraft(),
+		HeadRepo:          headRepo,
+		AuthorAssociation: assoc,
+		Trusted:           trusted,
+	}
+}
+
+// ErrNotAnIssue reports that a number names a pull request rather than an
+// issue.
+//
+// It is a distinct sentinel, not a "not found", because the caller acts on the
+// difference: a webhook delivery about a pull request is resolved to the issue
+// that pull request closes (engine.ClosesIssue), while a genuinely missing
+// issue is an error. GitHub's issues endpoint answers a pull request number
+// with a pull request, which is the same overlap ConvertIssues filters out of
+// a list.
+var ErrNotAnIssue = errors.New("this number names a pull request, not an issue")
+
+// Issue returns one open or closed issue.
+//
+// This exists so a webhook delivery costs one API call instead of the two list
+// calls plus a comparison per review issue that a full reconcile costs. That
+// difference is the whole point of the scoped tick: a delivery about a single
+// unlabelled issue used to read the entire repository.
+func (g *GitHubClient) Issue(ctx context.Context, owner, repo string, number int) (Issue, error) {
+	gi, _, err := g.c.Issues.Get(ctx, owner, repo, number)
+	if err != nil {
+		return Issue{}, fmt.Errorf("get issue %s/%s#%d: %w", owner, repo, number, err)
+	}
+	if gi == nil {
+		return Issue{}, fmt.Errorf("get issue %s/%s#%d: empty response", owner, repo, number)
+	}
+	if gi.IsPullRequest() {
+		return Issue{}, fmt.Errorf("%s/%s#%d: %w", owner, repo, number, ErrNotAnIssue)
+	}
+	// ConvertIssues, not a hand-written mapping: the label and timestamp
+	// handling must be identical to the list path, or a scoped tick would
+	// decide from a differently shaped issue than a cron tick.
+	out := ConvertIssues([]*github.Issue{gi})
+	if len(out) != 1 {
+		return Issue{}, fmt.Errorf("get issue %s/%s#%d: unusable response", owner, repo, number)
+	}
+	return out[0], nil
+}
+
+// PullRequest returns one pull request, carrying the same trust decision
+// ListOpenPullRequests makes; see convertPR.
+func (g *GitHubClient) PullRequest(ctx context.Context, owner, repo string, number int) (PullRequest, error) {
+	pr, _, err := g.c.PullRequests.Get(ctx, owner, repo, number)
+	if err != nil {
+		return PullRequest{}, fmt.Errorf("get pull request %s/%s#%d: %w", owner, repo, number, err)
+	}
+	if pr == nil {
+		return PullRequest{}, fmt.Errorf("get pull request %s/%s#%d: empty response", owner, repo, number)
+	}
+	return convertPR(owner, repo, pr), nil
 }
 
 // ListOpenIssues returns every open issue in the repository.
@@ -95,32 +190,7 @@ func (g *GitHubClient) ListOpenPullRequests(ctx context.Context, owner, repo str
 			return nil, fmt.Errorf("list pull requests %s/%s: %w", owner, repo, err)
 		}
 		for _, pr := range page {
-			head := pr.GetHead().GetRef()
-			base := pr.GetBase().GetRef()
-			assoc := pr.GetAuthorAssociation()
-			headRepo := pr.GetHead().GetRepo().GetFullName()
-
-			// Trust is decided here, once, at the boundary. A pull request is
-			// trusted only when its head branch lives in this repository and its
-			// author is a repository insider. Tending checks the head branch out
-			// and runs an agent in it, so an untrusted head is code execution.
-			// EqualFold: full_name comes back in GitHub's canonical casing while
-			// owner/repo come from config unchecked. A casing mismatch would fail
-			// closed and silently disable tending with no diagnostic.
-			trusted := strings.EqualFold(headRepo, owner+"/"+repo) &&
-				(assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR") &&
-				SafeRef(head) && SafeRef(base)
-
-			all = append(all, PullRequest{
-				Number:            pr.GetNumber(),
-				HeadRef:           head,
-				BaseRef:           base,
-				Body:              pr.GetBody(),
-				Draft:             pr.GetDraft(),
-				HeadRepo:          headRepo,
-				AuthorAssociation: assoc,
-				Trusted:           trusted,
-			})
+			all = append(all, convertPR(owner, repo, pr))
 		}
 		if resp.NextPage == 0 {
 			return all, nil
