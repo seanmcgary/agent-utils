@@ -142,7 +142,6 @@ func TestPiBuildArgsPutsPromptLast(t *testing.T) {
 	}
 }
 
-
 func TestRenderPrompt(t *testing.T) {
 	got, err := RenderPrompt("issue {{.Issue.Number}} in {{.Repo}}", PromptData{
 		Repo:  "o/r",

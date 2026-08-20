@@ -1,0 +1,58 @@
+# A pi-powered execution loop. This is the same loop as execution.yaml, but
+# the agent is pi and the model is a pi provider id, so it can reach a model
+# that claude does not offer.
+#
+# For a pi harness:
+#   - agent.model must be a provider/id or a pattern pi resolves
+#     (for example anthropic/claude-sonnet-4-5 or openrouter/...).
+#   - agent.permission_mode is claude-only and must be omitted.
+#   - agent.max_budget_usd is claude-only; for pi it is accepted but has no
+#     effect. It is omitted here.
+name: pi
+repo: mcgarylabs/lawndominator-monorepo
+
+checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+worktree_dir: .agent-utils/worktrees
+default_branch: master
+
+labels:
+  trigger:   status:ready-for-execution
+  in_flight: status:executing
+  blocked:   status:needs-execution-input
+  review:    status:ready-for-review
+  veto:
+    - "blocked:*"
+
+agent:
+  harness: pi
+  model: anthropic/claude-sonnet-4-5
+  effort: high
+  worktree: per_issue
+  timeout: 4h
+
+tend_pr: false
+
+retry:
+  max: 3
+  backoff: [0s, 15m, 30m]
+  breaker:
+    orphan_threshold: 2
+    cooldown: 30m
+
+prompt: |
+  Build GitHub issue #{{.Issue.Number}} in {{.Repo}} to completion as a live
+  agent. You own the labels: remove {{.Labels.Trigger}} and add
+  {{.Labels.InFlight}} first. Run in the isolated worktree given by
+  {{.Worktree}}. Self-contained; never ask the human through the CLI. On a
+  blocker, park: comment and add {{.Labels.Blocked}}. On success, remove
+  {{.Labels.InFlight}} and add {{.Labels.Review}}. Never merge.
+
+resume_prompt: |
+  Resume issue #{{.Issue.Number}} in {{.Repo}} in the SAME session. Remove
+  {{.Labels.Trigger}} and add {{.Labels.InFlight}}. Read any new comments and
+  continue from where you left off.
+
+tend_prompt: |
+  You are tending pull request #{{.PR.Number}} for issue #{{.Issue.Number}} in
+  {{.Repo}}, {{.PR.BehindBy}} commits behind {{.PR.BaseRef}}. Rebase onto
+  {{.PR.BaseRef}}, push with --force-with-lease, and never merge.

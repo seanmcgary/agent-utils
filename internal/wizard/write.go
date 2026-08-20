@@ -49,6 +49,7 @@ type yamlLabels struct {
 }
 
 type yamlAgent struct {
+	Harness        string  `yaml:"harness"`
 	Model          string  `yaml:"model"`
 	Effort         string  `yaml:"effort"`
 	PermissionMode string  `yaml:"permission_mode"`
@@ -89,6 +90,7 @@ func toYAMLDoc(cfg *config.Config) yamlDoc {
 			Veto:     cfg.Labels.Veto,
 		},
 		Agent: yamlAgent{
+			Harness:        cfg.Agent.Harness,
 			Model:          cfg.Agent.Model,
 			Effort:         cfg.Agent.Effort,
 			PermissionMode: cfg.Agent.PermissionMode,

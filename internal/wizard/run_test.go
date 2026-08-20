@@ -38,16 +38,17 @@ func TestRunAcceptsEveryDefault(t *testing.T) {
 				"",       // 10. labels.review
 				"",       // 11. labels.terminal
 				"",       // 12. labels.veto
-				"",       // 13. agent.model
-				"",       // 14. agent.effort
-				"",       // 15. agent.permission_mode
-				"",       // 16. agent.worktree
-				"",       // 17. agent.max_budget_usd
-				"",       // 18. agent.timeout
-				"",       // 20. retry.max
-				"",       // 21. retry.backoff
-				"",       // 22. retry.breaker.orphan_threshold
-				"",       // 23. retry.breaker.cooldown
+				"",       // 13. agent.harness
+				"",       // 14. agent.model
+				"",       // 15. agent.effort
+				"",       // 16. agent.permission_mode
+				"",       // 17. agent.worktree
+				"",       // 18. agent.max_budget_usd
+				"",       // 19. agent.timeout
+				"",       // 21. retry.max
+				"",       // 22. retry.backoff
+				"",       // 23. retry.breaker.orphan_threshold
+				"",       // 24. retry.breaker.cooldown
 			}
 			p := &scriptPrompter{t: t, answers: answers}
 
@@ -112,17 +113,18 @@ func TestRunBypassPermissionsDeclineThenAcceptEditsStaysUnacknowledged(t *testin
 		"",                  // 10. labels.review
 		"",                  // 11. labels.terminal
 		"",                  // 12. labels.veto
-		"",                  // 13. agent.model
-		"",                  // 14. agent.effort
-		"bypassPermissions", // 15. agent.permission_mode, attempt 1
-		"acceptEdits",       // 15. agent.permission_mode, re-asked after decline: pick a different mode
-		"",                  // 16. agent.worktree
-		"",                  // 17. agent.max_budget_usd
-		"",                  // 18. agent.timeout
-		"",                  // 20. retry.max
-		"",                  // 21. retry.backoff
-		"",                  // 22. retry.breaker.orphan_threshold
-		"",                  // 23. retry.breaker.cooldown
+		"",                  // 13. agent.harness
+		"",                  // 14. agent.model
+		"",                  // 15. agent.effort
+		"bypassPermissions", // 16. agent.permission_mode, attempt 1
+		"acceptEdits",       // 16. agent.permission_mode, re-asked after decline: pick a different mode
+		"",                  // 17. agent.worktree
+		"",                  // 18. agent.max_budget_usd
+		"",                  // 19. agent.timeout
+		"",                  // 21. retry.max
+		"",                  // 22. retry.backoff
+		"",                  // 23. retry.breaker.orphan_threshold
+		"",                  // 24. retry.breaker.cooldown
 	}
 	confirms := []bool{false} // decline the one bypassPermissions confirmation
 	p := &scriptPrompter{t: t, answers: answers, confirms: confirms}
@@ -156,17 +158,18 @@ func TestRunBypassPermissionsDeclineReasksThenAccepts(t *testing.T) {
 		"",                  // 10. labels.review
 		"",                  // 11. labels.terminal
 		"",                  // 12. labels.veto
-		"",                  // 13. agent.model
-		"",                  // 14. agent.effort
-		"bypassPermissions", // 15. agent.permission_mode, attempt 1
-		"bypassPermissions", // 15. agent.permission_mode, re-asked after decline
-		"",                  // 16. agent.worktree
-		"",                  // 17. agent.max_budget_usd
-		"",                  // 18. agent.timeout
-		"",                  // 20. retry.max
-		"",                  // 21. retry.backoff
-		"",                  // 22. retry.breaker.orphan_threshold
-		"",                  // 23. retry.breaker.cooldown
+		"",                  // 13. agent.harness
+		"",                  // 14. agent.model
+		"",                  // 15. agent.effort
+		"bypassPermissions", // 16. agent.permission_mode, attempt 1
+		"bypassPermissions", // 16. agent.permission_mode, re-asked after decline
+		"",                  // 17. agent.worktree
+		"",                  // 18. agent.max_budget_usd
+		"",                  // 19. agent.timeout
+		"",                  // 21. retry.max
+		"",                  // 22. retry.backoff
+		"",                  // 23. retry.breaker.orphan_threshold
+		"",                  // 24. retry.breaker.cooldown
 	}
 	// First bypassPermissions confirmation is declined, so question 15 must
 	// be re-asked rather than aborting the wizard; the second is accepted.
@@ -202,17 +205,18 @@ func TestRunRetryBackoffFewerEntriesThanMaxReasks(t *testing.T) {
 		"",             // 10. labels.review
 		"",             // 11. labels.terminal
 		"",             // 12. labels.veto
-		"",             // 13. agent.model
-		"",             // 14. agent.effort
-		"",             // 15. agent.permission_mode
-		"",             // 16. agent.worktree
-		"",             // 17. agent.max_budget_usd
-		"",             // 18. agent.timeout
-		"3",            // 20. retry.max
-		"0s, 15m",      // 21. retry.backoff, attempt 1: only 2 entries for max=3
-		"0s, 15m, 30m", // 21. retry.backoff, re-asked: 3 entries
-		"",             // 22. retry.breaker.orphan_threshold
-		"",             // 23. retry.breaker.cooldown
+		"",             // 13. agent.harness
+		"",             // 14. agent.model
+		"",             // 15. agent.effort
+		"",             // 16. agent.permission_mode
+		"",             // 17. agent.worktree
+		"",             // 18. agent.max_budget_usd
+		"",             // 19. agent.timeout
+		"3",            // 21. retry.max
+		"0s, 15m",      // 22. retry.backoff, attempt 1: only 2 entries for max=3
+		"0s, 15m, 30m", // 22. retry.backoff, re-asked: 3 entries
+		"",             // 23. retry.breaker.orphan_threshold
+		"",             // 24. retry.breaker.cooldown
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -243,16 +247,17 @@ func TestRunRepoNotOwnerSlashNameReasks(t *testing.T) {
 		"",             // 10. labels.review
 		"",             // 11. labels.terminal
 		"",             // 12. labels.veto
-		"",             // 13. agent.model
-		"",             // 14. agent.effort
-		"",             // 15. agent.permission_mode
-		"",             // 16. agent.worktree
-		"",             // 17. agent.max_budget_usd
-		"",             // 18. agent.timeout
-		"",             // 20. retry.max
-		"",             // 21. retry.backoff
-		"",             // 22. retry.breaker.orphan_threshold
-		"",             // 23. retry.breaker.cooldown
+		"",             // 13. agent.harness
+		"",             // 14. agent.model
+		"",             // 15. agent.effort
+		"",             // 16. agent.permission_mode
+		"",             // 17. agent.worktree
+		"",             // 18. agent.max_budget_usd
+		"",             // 19. agent.timeout
+		"",             // 21. retry.max
+		"",             // 22. retry.backoff
+		"",             // 23. retry.breaker.orphan_threshold
+		"",             // 24. retry.breaker.cooldown
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -282,17 +287,18 @@ func TestRunInvalidAgentTimeoutReasks(t *testing.T) {
 		"",             // 10. labels.review
 		"",             // 11. labels.terminal
 		"",             // 12. labels.veto
-		"",             // 13. agent.model
-		"",             // 14. agent.effort
-		"",             // 15. agent.permission_mode
-		"",             // 16. agent.worktree
-		"",             // 17. agent.max_budget_usd
-		"notaduration", // 18. agent.timeout, attempt 1: not a valid duration
-		"3h",           // 18. agent.timeout, re-asked: valid
-		"",             // 20. retry.max
-		"",             // 21. retry.backoff
-		"",             // 22. retry.breaker.orphan_threshold
-		"",             // 23. retry.breaker.cooldown
+		"",             // 13. agent.harness
+		"",             // 14. agent.model
+		"",             // 15. agent.effort
+		"",             // 16. agent.permission_mode
+		"",             // 17. agent.worktree
+		"",             // 18. agent.max_budget_usd
+		"notaduration", // 19. agent.timeout, attempt 1: not a valid duration
+		"3h",           // 19. agent.timeout, re-asked: valid
+		"",             // 21. retry.max
+		"",             // 22. retry.backoff
+		"",             // 23. retry.breaker.orphan_threshold
+		"",             // 24. retry.breaker.cooldown
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -327,16 +333,17 @@ func TestRunVetoListIsSplitFromTemplateDefault(t *testing.T) {
 		"",         // 10. labels.review
 		"",         // 11. labels.terminal
 		"",         // 12. labels.veto (take the template default)
-		"",         // 13. agent.model
-		"",         // 14. agent.effort
-		"",         // 15. agent.permission_mode
-		"",         // 16. agent.worktree
-		"",         // 17. agent.max_budget_usd
-		"",         // 18. agent.timeout
-		"",         // 20. retry.max
-		"",         // 21. retry.backoff
-		"",         // 22. retry.breaker.orphan_threshold
-		"",         // 23. retry.breaker.cooldown
+		"",         // 13. agent.harness
+		"",         // 14. agent.model
+		"",         // 15. agent.effort
+		"",         // 16. agent.permission_mode
+		"",         // 17. agent.worktree
+		"",         // 18. agent.max_budget_usd
+		"",         // 19. agent.timeout
+		"",         // 21. retry.max
+		"",         // 22. retry.backoff
+		"",         // 23. retry.breaker.orphan_threshold
+		"",         // 24. retry.breaker.cooldown
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -380,16 +387,17 @@ func TestRunRequiredFieldWithEmptyDefaultReasks(t *testing.T) {
 		"",             // 10. labels.review
 		"",             // 11. labels.terminal
 		"",             // 12. labels.veto
-		"",             // 13. agent.model
-		"",             // 14. agent.effort
-		"",             // 15. agent.permission_mode
-		"",             // 16. agent.worktree
-		"",             // 17. agent.max_budget_usd
-		"",             // 18. agent.timeout
-		"",             // 20. retry.max
-		"",             // 21. retry.backoff
-		"",             // 22. retry.breaker.orphan_threshold
-		"",             // 23. retry.breaker.cooldown
+		"",             // 13. agent.harness
+		"",             // 14. agent.model
+		"",             // 15. agent.effort
+		"",             // 16. agent.permission_mode
+		"",             // 17. agent.worktree
+		"",             // 18. agent.max_budget_usd
+		"",             // 19. agent.timeout
+		"",             // 21. retry.max
+		"",             // 22. retry.backoff
+		"",             // 23. retry.breaker.orphan_threshold
+		"",             // 24. retry.breaker.cooldown
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -433,16 +441,17 @@ func TestRunInvalidNameReasks(t *testing.T) {
 		"",          // 10. labels.review
 		"",          // 11. labels.terminal
 		"",          // 12. labels.veto
-		"",          // 13. agent.model
-		"",          // 14. agent.effort
-		"",          // 15. agent.permission_mode
-		"",          // 16. agent.worktree
-		"",          // 17. agent.max_budget_usd
-		"",          // 18. agent.timeout
-		"",          // 20. retry.max
-		"",          // 21. retry.backoff
-		"",          // 22. retry.breaker.orphan_threshold
-		"",          // 23. retry.breaker.cooldown
+		"",          // 13. agent.harness
+		"",          // 14. agent.model
+		"",          // 15. agent.effort
+		"",          // 16. agent.permission_mode
+		"",          // 17. agent.worktree
+		"",          // 18. agent.max_budget_usd
+		"",          // 19. agent.timeout
+		"",          // 21. retry.max
+		"",          // 22. retry.backoff
+		"",          // 23. retry.breaker.orphan_threshold
+		"",          // 24. retry.breaker.cooldown
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -472,17 +481,18 @@ func TestRunNonPositiveAgentTimeoutReasks(t *testing.T) {
 		"",         // 10. labels.review
 		"",         // 11. labels.terminal
 		"",         // 12. labels.veto
-		"",         // 13. agent.model
-		"",         // 14. agent.effort
-		"",         // 15. agent.permission_mode
-		"",         // 16. agent.worktree
-		"",         // 17. agent.max_budget_usd
-		"0s",       // 18. agent.timeout, attempt 1: config.validate requires > 0
-		"1h",       // 18. agent.timeout, re-asked: valid
-		"",         // 20. retry.max
-		"",         // 21. retry.backoff
-		"",         // 22. retry.breaker.orphan_threshold
-		"",         // 23. retry.breaker.cooldown
+		"",         // 13. agent.harness
+		"",         // 14. agent.model
+		"",         // 15. agent.effort
+		"",         // 16. agent.permission_mode
+		"",         // 17. agent.worktree
+		"",         // 18. agent.max_budget_usd
+		"0s",       // 19. agent.timeout, attempt 1: config.validate requires > 0
+		"1h",       // 19. agent.timeout, re-asked: valid
+		"",         // 21. retry.max
+		"",         // 22. retry.backoff
+		"",         // 23. retry.breaker.orphan_threshold
+		"",         // 24. retry.breaker.cooldown
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -512,17 +522,18 @@ func TestRunNegativeRetryBreakerCooldownReasks(t *testing.T) {
 		"",         // 10. labels.review
 		"",         // 11. labels.terminal
 		"",         // 12. labels.veto
-		"",         // 13. agent.model
-		"",         // 14. agent.effort
-		"",         // 15. agent.permission_mode
-		"",         // 16. agent.worktree
-		"",         // 17. agent.max_budget_usd
-		"",         // 18. agent.timeout
-		"",         // 20. retry.max
-		"",         // 21. retry.backoff
-		"",         // 22. retry.breaker.orphan_threshold
-		"-5m",      // 23. retry.breaker.cooldown, attempt 1: config.validate requires > 0
-		"45m",      // 23. retry.breaker.cooldown, re-asked: valid
+		"",         // 13. agent.harness
+		"",         // 14. agent.model
+		"",         // 15. agent.effort
+		"",         // 16. agent.permission_mode
+		"",         // 17. agent.worktree
+		"",         // 18. agent.max_budget_usd
+		"",         // 19. agent.timeout
+		"",         // 21. retry.max
+		"",         // 22. retry.backoff
+		"",         // 23. retry.breaker.orphan_threshold
+		"-5m",      // 24. retry.breaker.cooldown, attempt 1: config.validate requires > 0
+		"45m",      // 24. retry.breaker.cooldown, re-asked: valid
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -565,18 +576,19 @@ func TestRunNegativeAgentMaxBudgetReasksAndZeroIsAccepted(t *testing.T) {
 				"",         // 10. labels.review
 				"",         // 11. labels.terminal
 				"",         // 12. labels.veto
-				"",         // 13. agent.model
-				"",         // 14. agent.effort
-				"",         // 15. agent.permission_mode
-				"",         // 16. agent.worktree
+				"",         // 13. agent.harness
+				"",         // 14. agent.model
+				"",         // 15. agent.effort
+				"",         // 16. agent.permission_mode
+				"",         // 17. agent.worktree
 			}
-			answers = append(answers, tc.answers...) // 17. agent.max_budget_usd
+			answers = append(answers, tc.answers...) // 18. agent.max_budget_usd
 			answers = append(answers,
-				"", // 18. agent.timeout
-				"", // 20. retry.max
-				"", // 21. retry.backoff
-				"", // 22. retry.breaker.orphan_threshold
-				"", // 23. retry.breaker.cooldown
+				"", // 19. agent.timeout
+				"", // 21. retry.max
+				"", // 22. retry.backoff
+				"", // 23. retry.breaker.orphan_threshold
+				"", // 24. retry.breaker.cooldown
 			)
 			p := &scriptPrompter{t: t, answers: answers}
 

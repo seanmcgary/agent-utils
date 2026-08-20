@@ -125,6 +125,7 @@ func TestWriteRoundTripsEveryValue(t *testing.T) {
 	// Not "opus": the fixture's default is what a hardcoded mapping would
 	// most plausibly be hardcoded TO, and this test has to catch that.
 	cfg.Agent.Model = "sonnet"
+	cfg.Agent.Harness = config.HarnessClaude
 	cfg.Agent.PermissionMode = "bypassPermissions"
 	cfg.AcknowledgeBypassPermissions = true
 	cfg.TendPR = true
