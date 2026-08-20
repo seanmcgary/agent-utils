@@ -427,6 +427,7 @@ func logsCommand() *cli.Command {
 				Follow:   c.Bool("follow"),
 				Raw:      c.Bool("raw"),
 				Thinking: c.Bool("thinking"),
+				Harness:  cfg.Agent.Harness,
 			}
 
 			d, err := loopcmd.SelectDispatch(deps.Store, cfg, opts)
