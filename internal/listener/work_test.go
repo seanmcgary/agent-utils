@@ -1168,7 +1168,7 @@ func TestTheUnroutableWarningIsThrottledPerLoop(t *testing.T) {
 // across every project watching the repository -- separate state, separate
 // token budgets -- but each of those passes now acts on one issue, and a line
 // that omitted it would still read as a repository-wide reconcile.
-func TestDeliverLogsTheIssueAndTheLoopsItIsAboutToTick(t *testing.T) {
+func TestDeliverLogsTheIssueAndTheLoopsThatWillEvaluateIt(t *testing.T) {
 	buf := captureLogs(t)
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
@@ -1184,6 +1184,17 @@ func TestDeliverLogsTheIssueAndTheLoopsItIsAboutToTick(t *testing.T) {
 	}
 	if strings.Contains(out, "reconciling every loop") {
 		t.Errorf("the fan-out line still claims a repository-wide reconcile:\n%s", out)
+	}
+	// The line says the issue is EVALUATED in each loop, not acted on. Every
+	// watching loop does evaluate it, but most decide nothing -- usually only
+	// one has a matching trigger label -- so "acting on" oversold the fan-out
+	// and read as the full reconcile this branch removed. What each loop
+	// decided is the per-loop tick line's job; it carries a reason now.
+	if !strings.Contains(out, "evaluating this issue in every loop") {
+		t.Errorf("the fan-out line does not say the issue is evaluated in each loop:\n%s", out)
+	}
+	if strings.Contains(out, "acting on this issue") {
+		t.Errorf("the fan-out line still claims every loop acts on the issue:\n%s", out)
 	}
 	for _, loop := range []string{"planning", "execution"} {
 		if !strings.Contains(out, loop) {

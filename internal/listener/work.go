@@ -196,7 +196,8 @@ func NewWorker(db *store.DB) *Worker {
 	return w
 }
 
-// Deliver acts on ONE issue of repo, in every loop that watches it.
+// Deliver evaluates ONE issue of repo in every loop that watches it, and acts
+// wherever a loop decides there is something to do.
 //
 // A delivery says "something about this issue changed, figure out what and
 // dispatch the correct executor to handle it." It used to trigger a full
@@ -236,7 +237,15 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 	for _, t := range targets {
 		loops = append(loops, t.ProjectName+"/"+t.LoopName)
 	}
-	slog.Info("acting on this issue in every loop that watches the repository",
+	// EVALUATED, not "acted on". Every watching loop does evaluate the issue,
+	// and this line is what ties the ticks below back to the delivery that
+	// caused them -- but most of those loops decide nothing, because only the
+	// loop whose trigger label the issue carries usually has anything to do.
+	// "Acting on" read as the full repository reconcile this daemon no longer
+	// performs, so an operator reasonably read the line as stale or wrong.
+	// What each loop DECIDED belongs to the per-loop tick line, which carries
+	// a reason now.
+	slog.Info("evaluating this issue in every loop that watches the repository",
 		"repo", repo, "number", number, "loops", loops)
 
 	// One token read, one client, one memo, for the whole delivery -- created
