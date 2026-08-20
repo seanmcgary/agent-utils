@@ -211,3 +211,40 @@ func TestRenderProjectDetailShowsIdentityAndKeepsTheTableOnOneLine(t *testing.T)
 var projectConfigStub = project.Config{Name: "proj-stub", ID: "id-1234"}
 
 var errMultiLine = errors.New("parse failed:\n  second line of the error")
+
+// TestRenderProjectDetailReportsRecordedWebhooks covers surfacing the recorded
+// registration: an operator debugging a loop that stopped reacting to GitHub
+// needs to see whether a webhook is recorded for the repository at all, and
+// which hook id it is, without opening the state database by hand.
+func TestRenderProjectDetailReportsRecordedWebhooks(t *testing.T) {
+	p := &Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}
+	out := RenderProjectDetail(&ProjectDetail{
+		Project: p,
+		Entries: []config.Entry{{Name: "planning", Repo: "o/r"}, {Name: "other", Repo: "o/quiet"}},
+		Loops: []LoopSummary{
+			{Name: "planning", Repo: "o/r"},
+			{Name: "other", Repo: "o/quiet"},
+		},
+		Webhooks: []WebhookStatus{
+			{Repo: "o/r", Recorded: true, HookID: 123, URL: "https://hooks.example/webhook"},
+			{Repo: "o/quiet"},
+		},
+	})
+
+	for _, want := range []string{"o/r", "123", "https://hooks.example/webhook"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output should report the recorded hook %q:\n%s", want, out)
+		}
+	}
+	// A repository with no record must say so rather than be omitted: a silent
+	// gap reads as "fine", which is the state the operator is trying to rule out.
+	var quiet string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "o/quiet") {
+			quiet = line
+		}
+	}
+	if quiet == "" || !strings.Contains(quiet, "not recorded") {
+		t.Errorf("a repository with no recorded webhook must say so, got %q:\n%s", quiet, out)
+	}
+}

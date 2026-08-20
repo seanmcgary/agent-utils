@@ -312,11 +312,17 @@ It holds two things:
 | `{state_dir}/{name}.lock` | The per-loop tick lock |
 | `{state_dir}/logs/{name}/` | Agent transcripts and runner logs |
 
-**The database is not one of them.** Issue state, dispatches, pull request links and ticks
-live in one canonical database for the machine, at `$HOME/.agent-utils/state.db`. Every row
-carries the UUID of the project that owns it, so one file holds every project without any of
-them seeing another's state. That is why a `state_dir` shared between two projects no longer
-mixes their state — only their lock and their logs.
+**The database is not one of them.** Issue state, dispatches, pull request links, ticks and
+webhook registrations live in one canonical database for the machine, at
+`$HOME/.agent-utils/state.db`. Every row carries the UUID of the project that owns it, so one
+file holds every project without any of them seeing another's state. That is why a `state_dir`
+shared between two projects no longer mixes their state — only their lock and their logs.
+
+Webhook registrations are keyed by project and repository, and hold the hook id GitHub
+assigned. `agent-utils project register-webhook` writes the row once GitHub confirms, and
+`agent-utils project deregister-webhook` deletes the hook by that id and removes the row.
+The id is what makes a hook findable after `webhook.url` changes; see
+[Webhooks](../README.md#webhooks).
 
 The same directory holds `registry.json`, which records which projects have been used so
 `agent-utils list` can list them. It is an index only: deleting it loses the list and nothing

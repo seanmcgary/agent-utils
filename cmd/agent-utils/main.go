@@ -324,6 +324,7 @@ func projectCommand() *cli.Command {
 			logsCommand(),
 			loopCommand(),
 			registerWebhookCommand(),
+			deregisterWebhookCommand(),
 		},
 	}
 }

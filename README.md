@@ -134,7 +134,8 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils project loop tick --name <loop>` | One reconcile-and-dispatch pass, then exit. This is what cron (and the webhook daemon) runs |
 | `agent-utils project loop status --name <loop>` | The reconciled view of one loop: issues, titles, dispatch state, retries |
 | `agent-utils project loop reset --name <loop> --issue <n>` | Drop an issue's stored session and worktree so its next trigger starts fresh |
-| `agent-utils project register-webhook [--name <loop>] [--yes]` | Register this project's repositories with GitHub as webhook delivery targets |
+| `agent-utils project register-webhook [--name <loop>] [--yes]` | Register this project's repositories with GitHub as webhook delivery targets, and record each hook id |
+| `agent-utils project deregister-webhook [--name <loop>] [--yes] [--force]` | Delete those webhooks at GitHub, by recorded hook id, and forget the records |
 
 Every `project` command takes `--name <project>` to act from any directory, or uses the
 project in the current directory when you omit it:
@@ -417,6 +418,44 @@ trigger agent dispatch — unless you pass `--yes`, and it refuses to run unatte
 terminal, no `--yes`) for the same reason a config wizard does. Run it again after
 `config webhook --rotate-secret`: GitHub returns a hook's secret obfuscated, so there is no way
 to detect that a hook's secret is stale short of always re-pushing it.
+
+Each registration is recorded in the canonical state database, keyed by project and
+repository, with the hook id GitHub assigned and the URL it was registered with.
+`agent-utils project status` prints that under `WEBHOOKS`, one line per repository, so
+"is a webhook actually registered for this repo, and which one" is answerable without
+opening GitHub:
+
+```
+WEBHOOKS
+  acme/widgets                         hook 512334891 (https://hooks.example.com/webhook)
+  acme/quiet-repo                      not recorded
+```
+
+The id is what makes a changed `webhook.url` survivable. Registration matches the recorded
+hook first and only then falls back to matching a delivery URL, so changing `webhook.url` and
+re-running `register-webhook` MOVES the existing hook to the new endpoint instead of creating
+a second one beside it — which is what used to happen, leaving the first hook delivering to a
+dead address with nothing on this machine naming it.
+
+`agent-utils project deregister-webhook` is the other half: it deletes each repository's hook
+at GitHub **by the recorded id**, then forgets the record. It takes the same `--name <loop>`
+selector and the same `--yes` rule as registration, and it needs neither `webhook.url` nor
+`webhook.secret` — deleting addresses the hook by id and writes no secret — so it still works
+after you have unset the webhook configuration. Three cases are worth knowing:
+
+* **A hook you already deleted in GitHub's UI** answers 404. That is treated as success: the
+  record is removed and the command exits zero, because failing would leave a row nothing
+  could ever clear. (GitHub answers a token missing the `admin:repo_hook` scope with 404 too,
+  so the message says as much — if deliveries continue, check the scope.)
+* **A repository registered before ids were recorded** has no record, so the command falls
+  back to finding a hook whose URL matches the current `webhook.url`, and says that is what
+  it did. If neither exists, it reports "nothing to deregister" and exits zero.
+* **A hook two projects share** — both watching one repository through one `webhook.url`, so
+  the second registration found and edited the first's hook and recorded the same id — is
+  REFUSED. Deleting it would silently stop the other project's deliveries, so the command
+  names the other projects and their paths instead of guessing. `--force` overrides it and
+  says plainly which projects just lost delivery; run `deregister-webhook` in each of them
+  afterwards to clear their now-stale records.
 
 `agent-utils listener start --daemon` installs the listener as a launchd user agent (macOS
 only) instead of running it in your terminal — `RunAtLoad` and `KeepAlive`, so it starts at

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
@@ -16,6 +17,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/settings"
+	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/wizard"
 	"github.com/urfave/cli/v3"
 )
@@ -448,8 +450,15 @@ func registerWebhookCommand() *cli.Command {
 				return err
 			}
 
+			records, closeRecords, err := openWebhookRecords(p.Config.ID)
+			if err != nil {
+				return err
+			}
+			defer closeRecords()
+
 			token := os.Getenv("GITHUB_TOKEN")
 			return registerWebhookRun(ctx, repos, registerWebhookDeps{
+				Records: records,
 				// ghub.New never talks to the network by itself; the token check
 				// inside registerWebhookRun runs before any of ListHooks,
 				// CreateHook or EditHook is ever called on this client.
@@ -511,7 +520,11 @@ func collectRepos(entries []config.Entry, loopName string) []string {
 // real project, a real terminal or a real GITHUB_TOKEN. Only the Action above
 // wires the real ones in.
 type registerWebhookDeps struct {
-	Hooks       ghub.HookAdmin
+	Hooks ghub.HookAdmin
+	// Records is where the registration is written once GitHub confirms it.
+	// Before it existed, registration left NOTHING on this machine naming the
+	// hook it had just created.
+	Records     webhookRecords
 	Settings    *settings.Settings
 	Token       string
 	Yes         bool
@@ -594,7 +607,7 @@ func registerWebhookRun(ctx context.Context, repos []string, deps registerWebhoo
 				"until `agent-utils config webhook --enable` is run")
 	}
 
-	return registerWebhooks(ctx, deps.Hooks, repos, deps.Settings, deps.Out)
+	return registerWebhooks(ctx, deps.Hooks, deps.Records, repos, deps.Settings, deps.Out)
 }
 
 // registerWebhooks does the actual GitHub work: for each repository it edits
@@ -613,7 +626,7 @@ func registerWebhookRun(ctx context.Context, repos []string, deps registerWebhoo
 // ghub.HookEvents grows between releases, and repairs a hook GitHub flipped
 // Active=false on after a run of failed deliveries, but the secret is why
 // this is not optional.
-func registerWebhooks(ctx context.Context, hooks ghub.HookAdmin, repos []string, s *settings.Settings, out io.Writer) error {
+func registerWebhooks(ctx context.Context, hooks ghub.HookAdmin, records webhookRecords, repos []string, s *settings.Settings, out io.Writer) error {
 	spec := ghub.HookSpec{URL: s.Webhook.URL, Secret: s.Webhook.Secret, Events: ghub.HookEvents}
 	for _, repo := range repos {
 		owner, name, ok := strings.Cut(repo, "/")
@@ -629,16 +642,40 @@ func registerWebhooks(ctx context.Context, hooks ghub.HookAdmin, repos []string,
 		if err != nil {
 			return err
 		}
+		// The RECORDED id is matched first, and only then the URL.
+		//
+		// Matching on URL alone is what orphaned hooks: change webhook.url,
+		// re-run this command, and the hook already registered no longer
+		// matches, so a SECOND hook is created while the first keeps
+		// delivering to the dead endpoint -- with the record then overwritten
+		// to name the new one, leaving nothing on this machine able to find
+		// the old one again. Editing the recorded hook instead moves it to the
+		// new URL, so a URL change repoints one hook rather than growing a
+		// second. The URL match still runs for a repository registered before
+		// the record existed, and for one another project registered.
+		rec, hasRecord, err := records.Webhook(repo)
+		if err != nil {
+			return err
+		}
 		var found *ghub.Hook
 		for i := range existing {
-			if existing[i].URL == s.Webhook.URL {
+			if hasRecord && existing[i].ID == rec.HookID {
 				found = &existing[i]
 				break
+			}
+			if found == nil && existing[i].URL == s.Webhook.URL {
+				found = &existing[i]
+				// Keep looking rather than break: a recorded id later in the
+				// list wins over a URL match, because it is the hook THIS
+				// project registered.
 			}
 		}
 
 		if found != nil {
 			if err := hooks.EditHook(ctx, owner, name, found.ID, spec); err != nil {
+				return err
+			}
+			if err := recordWebhook(records, repo, found.ID, s.Webhook.URL); err != nil {
 				return err
 			}
 			// A failure writing this line means the operator cannot see which
@@ -655,9 +692,36 @@ func registerWebhooks(ctx context.Context, hooks ghub.HookAdmin, repos []string,
 		if err != nil {
 			return err
 		}
+		if err := recordWebhook(records, repo, id, s.Webhook.URL); err != nil {
+			return err
+		}
 		if _, err := fmt.Fprintf(out, "created %s (hook %d)\n", repo, id); err != nil {
 			return fmt.Errorf("report creation for %s: %w", repo, err)
 		}
+	}
+	return nil
+}
+
+// recordWebhook stores what was just registered, AFTER GitHub confirmed it.
+//
+// The order matters in both directions. Recording first would leave a row
+// naming a hook a failed create never made, and the next deregistration would
+// try to delete it. Not recording at all is what this whole feature fixes: a
+// hook nothing on this machine names is an orphan the moment webhook.url
+// changes.
+//
+// A failed write is returned rather than warned about, and the message says the
+// hook IS registered: the operator has granted GitHub dispatch rights and has
+// no local record of it, which is exactly the state they need to know about.
+func recordWebhook(records webhookRecords, repo string, id int64, url string) error {
+	err := records.PutWebhook(store.Webhook{
+		Repo: repo, HookID: id, URL: url, RegisteredAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return fmt.Errorf(
+			"hook %d is registered on %s at GitHub, but recording it here failed: %w\n"+
+				"re-run `agent-utils project register-webhook` once the state database is writable",
+			id, repo, err)
 	}
 	return nil
 }
@@ -674,6 +738,393 @@ func confirmRegisterWebhook(repos []string) (bool, error) {
 	for _, r := range repos {
 		fmt.Fprintf(os.Stderr, "  %s\n", r)
 	}
+	fmt.Fprint(os.Stderr, "Continue? [y/N] ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return false, fmt.Errorf("read confirmation: %w", err)
+	}
+	choice := strings.ToLower(strings.TrimSpace(line))
+	return choice == "y" || choice == "yes", nil
+}
+
+// webhookRecords is the slice of the canonical state database the webhook
+// commands need. It is an interface, not *store.Store, for the same reason
+// ghub.HookAdmin is one: registration and deregistration can then be driven by
+// a test with no $AGENT_UTILS_HOME, no sqlite file and no network.
+type webhookRecords interface {
+	// PutWebhook records a registration GitHub has already confirmed.
+	PutWebhook(w store.Webhook) error
+	// Webhook returns this project's record for a repository, if it has one.
+	Webhook(repo string) (store.Webhook, bool, error)
+	// DeleteWebhook forgets a registration, once GitHub confirms it is gone.
+	DeleteWebhook(repo string) error
+	// OtherHolders returns rows in OTHER projects that record the same hook.
+	// Deleting a hook two projects share stops deliveries for both, so this is
+	// what deregistration checks before it decides.
+	OtherHolders(repo string, hookID int64) ([]store.Webhook, error)
+}
+
+// projectWebhooks adapts the canonical database to webhookRecords.
+//
+// The embedded *store.Store answers everything scoped to this project. Only
+// OtherHolders crosses the project boundary, and it is written here rather than
+// on Store deliberately: Store's contract is that a scoped caller can neither
+// see nor touch another project's rows, so the machine-wide read lives on DB
+// and this adapter is the one place that filters this project back out of it.
+type projectWebhooks struct {
+	*store.Store
+	db        *store.DB
+	projectID string
+}
+
+func (p projectWebhooks) OtherHolders(repo string, hookID int64) ([]store.Webhook, error) {
+	all, err := p.db.WebhooksForHook(repo, hookID)
+	if err != nil {
+		return nil, err
+	}
+	var others []store.Webhook
+	for _, w := range all {
+		if w.ProjectID != p.projectID {
+			others = append(others, w)
+		}
+	}
+	return others, nil
+}
+
+// openWebhookRecords opens the canonical state database for one project and
+// returns a closer the caller must defer.
+//
+// It opens the database directly rather than through loopcmd's migrating
+// opener: the legacy per-loop files this program imports never held a webhook
+// table, so there is nothing here for a migration to carry across, and a
+// registration must not be blocked by an unrelated import failing.
+func openWebhookRecords(projectID string) (webhookRecords, func(), error) {
+	if _, err := home.EnsureDir(); err != nil {
+		return nil, nil, err
+	}
+	path, err := home.StateDBPath()
+	if err != nil {
+		return nil, nil, err
+	}
+	db, err := store.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	records := projectWebhooks{Store: db.Project(projectID), db: db, projectID: projectID}
+	return records, func() { _ = db.Close() }, nil
+}
+
+// deregisterWebhookCommand removes, at GitHub, the webhook this project
+// registered, and forgets the record of it.
+//
+// --name here selects a LOOP, and it shadows project's own --name (which
+// selects the PROJECT), exactly as registerWebhookCommand's doc comment
+// explains: urfave/cli lets a child command declare a flag with the same name
+// as its parent's, and the child's own value wins for c.String("name") read
+// from the child.
+func deregisterWebhookCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "deregister-webhook",
+		Usage: "delete this project's GitHub webhooks and forget the recorded registrations",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "name", Usage: "restrict to one loop; omit to deregister every loop's repository"},
+			&cli.BoolFlag{Name: "yes", Usage: "skip the confirmation prompt"},
+			&cli.BoolFlag{Name: "force", Usage: "delete a hook another project also records, stopping its deliveries too"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			p, err := openProject(c)
+			if err != nil {
+				return err
+			}
+			entries, err := config.List(p.Dir)
+			if err != nil {
+				return err
+			}
+			// c.String("name") is THIS command's own --name (the loop), not
+			// project's; see the doc comment above.
+			loopName := c.String("name")
+			repos := collectRepos(entries, loopName)
+			if len(repos) == 0 {
+				return noReposErr(loopName)
+			}
+
+			s, err := settings.Load()
+			if err != nil {
+				return err
+			}
+
+			records, closeRecords, err := openWebhookRecords(p.Config.ID)
+			if err != nil {
+				return err
+			}
+			defer closeRecords()
+
+			token := os.Getenv("GITHUB_TOKEN")
+			return deregisterWebhookRun(ctx, repos, deregisterWebhookDeps{
+				Records: records,
+				// ghub.New never talks to the network by itself; the token
+				// check inside deregisterWebhookRun runs before any of
+				// ListHooks or DeleteHook is called on this client.
+				Hooks:       ghub.New(token),
+				Settings:    s,
+				Token:       token,
+				Yes:         c.Bool("yes"),
+				Force:       c.Bool("force"),
+				Interactive: isInteractive(),
+				Confirm:     confirmDeregisterWebhook,
+				Out:         os.Stdout,
+			})
+		},
+	}
+}
+
+// deregisterWebhookDeps mirrors registerWebhookDeps for the same reason: the
+// validation, confirmation, GitHub-call and record-clearing sequence has to be
+// drivable by a test with no real project, terminal, token or network.
+type deregisterWebhookDeps struct {
+	Records  webhookRecords
+	Hooks    ghub.HookAdmin
+	Settings *settings.Settings
+	Token    string
+	Yes      bool
+	// Force deletes a hook another project also records. Without it that case
+	// is a refusal, because the delete would silently stop their deliveries.
+	Force       bool
+	Interactive bool
+	// Confirm asks the operator to approve, and is called only when Yes is
+	// false and Interactive is true.
+	Confirm func(repos []string) (bool, error)
+	Out     io.Writer
+}
+
+// deregisterWebhookRun validates, confirms, and then deletes repos' webhooks.
+//
+// It deliberately does NOT require webhook.url or webhook.secret the way
+// register-webhook does. Deleting needs neither: the hook is addressed by its
+// recorded id, and no secret is written. Demanding them would refuse to clean
+// up after an operator who has already unset the webhook configuration, which
+// is precisely when an orphaned hook is left delivering to a dead endpoint.
+func deregisterWebhookRun(ctx context.Context, repos []string, deps deregisterWebhookDeps) error {
+	if deps.Token == "" {
+		return errors.New("GITHUB_TOKEN is not set")
+	}
+
+	if !deps.Yes {
+		// The same rule register-webhook and resolveLoopConfig already state: a
+		// prompt in a cron job would hang forever. This command deletes state
+		// at GitHub, so the refusal has to come before any call.
+		if !deps.Interactive {
+			return fmt.Errorf(
+				"refusing to delete a webhook without confirmation in a non-interactive run: %s\n"+
+					"pass --yes to proceed", strings.Join(repos, ", "))
+		}
+		ok, err := deps.Confirm(repos)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("aborted")
+		}
+	}
+
+	for _, repo := range repos {
+		if err := deregisterOne(ctx, repo, deps); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deregisterOne removes one repository's webhook and forgets the record of it.
+func deregisterOne(ctx context.Context, repo string, deps deregisterWebhookDeps) error {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok {
+		// config.Load already validates repo is owner/name form; reaching this
+		// means Entry.Repo was built some other way. Fail loudly rather than
+		// calling GitHub with a nonsense owner. Mirrors registerWebhooks.
+		return fmt.Errorf("repo %q is not in owner/name form", repo)
+	}
+
+	hookID, recorded, found, err := resolveHookToDelete(ctx, owner, name, repo, deps)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return reportf(deps.Out,
+			"%s: nothing to deregister (no recorded registration, and no hook at GitHub delivering to %s)\n",
+			repo, deliveryTarget(deps.Settings))
+	}
+
+	if err := checkSharedHook(repo, hookID, deps); err != nil {
+		return err
+	}
+
+	err = deps.Hooks.DeleteHook(ctx, owner, name, hookID)
+	switch {
+	case err == nil:
+		// The record is cleared only now, after GitHub confirmed: clearing it
+		// on a failed delete would lose the id while the hook kept delivering,
+		// leaving nothing on this machine able to name it again.
+		if recorded {
+			if err := deps.Records.DeleteWebhook(repo); err != nil {
+				return err
+			}
+		}
+		if recorded {
+			return reportf(deps.Out, "deleted %s (hook %d)\n", repo, hookID)
+		}
+		return reportf(deps.Out,
+			"deleted %s (hook %d, found by matching webhook.url: no registration was recorded for it)\n",
+			repo, hookID)
+
+	case errors.Is(err, ghub.ErrHookNotFound):
+		// The operator deleted it in GitHub's UI and is now tidying up. Failing
+		// here would leave a recorded row that nothing on this machine can ever
+		// clear. The scope reading of a 404 is named in the message rather than
+		// acted on, because GitHub reports both causes identically and only the
+		// operator can tell them apart.
+		if recorded {
+			if err := deps.Records.DeleteWebhook(repo); err != nil {
+				return err
+			}
+		}
+		return reportf(deps.Out,
+			"%s: hook %d was already gone at GitHub; removed the local record\n"+
+				"  (if deliveries continue, the token may lack the admin:repo_hook scope rather than the hook being absent)\n",
+			repo, hookID)
+
+	default:
+		return err
+	}
+}
+
+// resolveHookToDelete finds which hook to delete, and reports whether the
+// answer came from this project's record.
+//
+// The recorded id is preferred and no listing happens at all when there is one:
+// that is the entire point of recording it. After `config set webhook.url`, the
+// live hook still points at the PREVIOUS endpoint, so a URL match would fail to
+// find exactly the orphan the operator came here to remove.
+//
+// The URL fallback exists only for a repository registered before the record
+// existed. It is reported as such by the caller so the operator can tell which
+// path ran.
+func resolveHookToDelete(ctx context.Context, owner, name, repo string, deps deregisterWebhookDeps) (int64, bool, bool, error) {
+	rec, ok, err := deps.Records.Webhook(repo)
+	if err != nil {
+		return 0, false, false, err
+	}
+	if ok {
+		return rec.HookID, true, true, nil
+	}
+
+	url := strings.TrimSpace(deps.Settings.Webhook.URL)
+	if url == "" {
+		// Nothing recorded and nothing to match against. Saying so is more use
+		// than an error: there is no action left that this command could take.
+		return 0, false, false, nil
+	}
+	existing, err := deps.Hooks.ListHooks(ctx, owner, name)
+	if err != nil {
+		return 0, false, false, err
+	}
+	for _, h := range existing {
+		if h.URL == url {
+			return h.ID, false, true, nil
+		}
+	}
+	return 0, false, false, nil
+}
+
+// deliveryTarget names webhook.url for a report, or says it is unset.
+func deliveryTarget(s *settings.Settings) string {
+	if url := strings.TrimSpace(s.Webhook.URL); url != "" {
+		return url
+	}
+	return "webhook.url, which is not set"
+}
+
+// checkSharedHook refuses to delete a hook another project also records.
+//
+// Two projects can watch one repository through one webhook.url: registering
+// from the first creates the hook, registering from the second FINDS it by URL
+// and edits it, and both then record the same id. Deleting it on behalf of one
+// silently stops deliveries for the other, and nothing in that project's own
+// state would say why it went quiet.
+//
+// Refusing and naming the candidates rather than guessing mirrors the ambiguity
+// rule registry.Find already follows. --force overrides, and says plainly who
+// just lost delivery.
+func checkSharedHook(repo string, hookID int64, deps deregisterWebhookDeps) error {
+	holders, err := deps.Records.OtherHolders(repo, hookID)
+	if err != nil {
+		return err
+	}
+	if len(holders) == 0 {
+		return nil
+	}
+	if !deps.Force {
+		return sharedHookErr(repo, hookID, holders)
+	}
+	// Their rows are deliberately left alone: this project's view cannot write
+	// another's, and a stale row is self-healing -- running deregister-webhook
+	// there gets a 404 from GitHub and clears it.
+	return reportf(deps.Out,
+		"warning: hook %d on %s is also recorded by %d other project(s); --force deletes it anyway, "+
+			"and they stop receiving deliveries:%s\n"+
+			"  run `agent-utils project --name <project> deregister-webhook` in each to clear their records\n",
+		hookID, repo, len(holders), describeHolders(holders))
+}
+
+// sharedHookErr names every other project that records the hook, with its path,
+// because the operator cannot decide what to do about a project they cannot
+// identify. It follows registry.ambiguousNameErr's shape for that reason.
+func sharedHookErr(repo string, hookID int64, holders []store.Webhook) error {
+	return fmt.Errorf(
+		"refusing to delete hook %d on %s: %d other project(s) record the same hook, "+
+			"and deleting it stops their webhook deliveries too:%s\n"+
+			"pass --force to delete it anyway",
+		hookID, repo, len(holders), describeHolders(holders))
+}
+
+// describeHolders renders one indented line per project that records a hook.
+//
+// A project missing from the registry is reported by its identifier alone. The
+// registry is an index, never a source of truth (see its package comment), so a
+// project absent from it must not silently disappear from a refusal whose whole
+// job is to list who is affected.
+func describeHolders(holders []store.Webhook) string {
+	known := map[string]registry.Project{}
+	if projects, err := registry.List(); err == nil {
+		for _, p := range projects {
+			known[p.ID] = p
+		}
+	}
+	var b strings.Builder
+	for _, h := range holders {
+		if p, ok := known[h.ProjectID]; ok {
+			fmt.Fprintf(&b, "\n  %s (%s) at %s", p.Name, h.ProjectID, p.Root)
+			continue
+		}
+		fmt.Fprintf(&b, "\n  %s (not in the registry)", h.ProjectID)
+	}
+	return b.String()
+}
+
+// confirmDeregisterWebhook asks the operator to approve deleting the webhooks
+// for repos. It is called only when isInteractive() is true; see
+// deregisterWebhookRun.
+//
+// The prompt goes to stderr, matching confirmRegisterWebhook, so a piped stdout
+// stays machine readable.
+func confirmDeregisterWebhook(repos []string) (bool, error) {
+	fmt.Fprintln(os.Stderr, "This deletes the GitHub webhook on:")
+	for _, r := range repos {
+		fmt.Fprintf(os.Stderr, "  %s\n", r)
+	}
+	fmt.Fprintln(os.Stderr, "Deliveries stop immediately; the loops keep running only under cron.")
 	fmt.Fprint(os.Stderr, "Continue? [y/N] ")
 
 	reader := bufio.NewReader(os.Stdin)

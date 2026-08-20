@@ -9,10 +9,13 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/settings"
+	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
 // captureStderr runs fn with os.Stderr redirected to a pipe and returns what
@@ -54,6 +57,10 @@ type fakeHookAdmin struct {
 	createCalls int
 	editCalls   int
 	deleteCalls int
+	// deletedIDs records what DeleteHook was asked to remove, which is the
+	// assertion that matters after webhook.url changes: the RECORDED id must
+	// be deleted, never one rediscovered by matching the new URL.
+	deletedIDs []int64
 }
 
 func newFakeHookAdmin() *fakeHookAdmin {
@@ -87,6 +94,7 @@ func (f *fakeHookAdmin) EditHook(_ context.Context, owner, repo string, id int64
 	for i := range f.hooks[key] {
 		if f.hooks[key][i].ID == id {
 			f.hooks[key][i].Events = h.Events
+			f.hooks[key][i].URL = h.URL
 			f.hooks[key][i].Active = true
 			return nil
 		}
@@ -96,6 +104,7 @@ func (f *fakeHookAdmin) EditHook(_ context.Context, owner, repo string, id int64
 
 func (f *fakeHookAdmin) DeleteHook(_ context.Context, owner, repo string, id int64) error {
 	f.deleteCalls++
+	f.deletedIDs = append(f.deletedIDs, id)
 	key := owner + "/" + repo
 	for i := range f.hooks[key] {
 		if f.hooks[key][i].ID == id {
@@ -103,9 +112,57 @@ func (f *fakeHookAdmin) DeleteHook(_ context.Context, owner, repo string, id int
 			return nil
 		}
 	}
-	// The real client reports GitHub's 404 this way, and a caller tidying up a
-	// hook that is already gone branches on it rather than on the message.
+	// The real client reports GitHub's 404 this way, and deregister-webhook
+	// branches on it: a hook an operator already deleted in the UI must read
+	// as "already done", not as a failure.
 	return fmt.Errorf("hooks %s/%s: 404: %w", owner, repo, ghub.ErrHookNotFound)
+}
+
+// fakeWebhookRecords stands in for the canonical state database. It is a map
+// rather than a real store so a cmd test needs no $AGENT_UTILS_HOME and no
+// sqlite file, matching how fakeHookAdmin stands in for GitHub.
+type fakeWebhookRecords struct {
+	rows map[string]store.Webhook
+	// others is what OtherHolders reports, keyed "repo#hookID". It models rows
+	// belonging to OTHER projects, which this project's scoped view can never
+	// hold itself.
+	others map[string][]store.Webhook
+	// putErr fails the recording write, so a test can prove a hook registered
+	// at GitHub but unrecorded here is reported rather than silently accepted.
+	putErr error
+
+	putCalls    int
+	deleteCalls int
+}
+
+func newFakeWebhookRecords() *fakeWebhookRecords {
+	return &fakeWebhookRecords{rows: map[string]store.Webhook{}, others: map[string][]store.Webhook{}}
+}
+
+var _ webhookRecords = (*fakeWebhookRecords)(nil)
+
+func (f *fakeWebhookRecords) PutWebhook(w store.Webhook) error {
+	f.putCalls++
+	if f.putErr != nil {
+		return f.putErr
+	}
+	f.rows[w.Repo] = w
+	return nil
+}
+
+func (f *fakeWebhookRecords) Webhook(repo string) (store.Webhook, bool, error) {
+	w, ok := f.rows[repo]
+	return w, ok, nil
+}
+
+func (f *fakeWebhookRecords) DeleteWebhook(repo string) error {
+	f.deleteCalls++
+	delete(f.rows, repo)
+	return nil
+}
+
+func (f *fakeWebhookRecords) OtherHolders(repo string, hookID int64) ([]store.Webhook, error) {
+	return f.others[fmt.Sprintf("%s#%d", repo, hookID)], nil
 }
 
 // TestCollectReposDedupsAcrossLoops covers: "Two loops naming one repository
@@ -159,7 +216,7 @@ func TestRegisterWebhookSecondRunEditsNotCreates(t *testing.T) {
 	s := &settings.Settings{Webhook: settings.Webhook{
 		Enabled: true, URL: "https://x/y", Secret: "sekrit",
 	}}
-	deps := registerWebhookDeps{Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
+	deps := registerWebhookDeps{Records: newFakeWebhookRecords(), Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
 
 	if err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps); err != nil {
 		t.Fatalf("first run: %v", err)
@@ -189,7 +246,7 @@ func TestRegisterWebhookTwoLoopsOneRepoProducesOneCall(t *testing.T) {
 		{Name: "execution", Repo: "acme/widgets"},
 	}
 	repos := collectRepos(entries, "")
-	deps := registerWebhookDeps{Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
+	deps := registerWebhookDeps{Records: newFakeWebhookRecords(), Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
 
 	if err := registerWebhookRun(context.Background(), repos, deps); err != nil {
 		t.Fatalf("run: %v", err)
@@ -204,7 +261,7 @@ func TestRegisterWebhookTwoLoopsOneRepoProducesOneCall(t *testing.T) {
 func TestRegisterWebhookMissingURLFailsBeforeGitHubCall(t *testing.T) {
 	fake := newFakeHookAdmin()
 	s := &settings.Settings{} // webhook.url and webhook.secret both empty
-	deps := registerWebhookDeps{Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
+	deps := registerWebhookDeps{Records: newFakeWebhookRecords(), Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
 
 	err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps)
 	if err == nil {
@@ -227,7 +284,8 @@ func TestRegisterWebhookNonInteractiveWithoutYesFails(t *testing.T) {
 	fake := newFakeHookAdmin()
 	s := &settings.Settings{Webhook: settings.Webhook{URL: "https://x/y", Secret: "sekrit"}}
 	deps := registerWebhookDeps{
-		Hooks: fake, Settings: s, Token: "tok",
+		Records: newFakeWebhookRecords(),
+		Hooks:   fake, Settings: s, Token: "tok",
 		Yes: false, Interactive: false,
 		Confirm: func([]string) (bool, error) {
 			t.Fatal("must not prompt when stdin is not a terminal")
@@ -258,7 +316,8 @@ func TestRegisterWebhookInteractiveDeclinedMakesNoGitHubCall(t *testing.T) {
 	fake := newFakeHookAdmin()
 	s := &settings.Settings{Webhook: settings.Webhook{URL: "https://x/y", Secret: "sekrit"}}
 	deps := registerWebhookDeps{
-		Hooks: fake, Settings: s, Token: "tok",
+		Records: newFakeWebhookRecords(),
+		Hooks:   fake, Settings: s, Token: "tok",
 		Yes: false, Interactive: true,
 		Confirm: func([]string) (bool, error) { return false, nil },
 		Out:     io.Discard,
@@ -277,7 +336,7 @@ func TestRegisterWebhookInteractiveDeclinedMakesNoGitHubCall(t *testing.T) {
 func TestRegisterWebhookMissingTokenFailsBeforeGitHubCall(t *testing.T) {
 	fake := newFakeHookAdmin()
 	s := &settings.Settings{Webhook: settings.Webhook{URL: "https://x/y", Secret: "sekrit"}}
-	deps := registerWebhookDeps{Hooks: fake, Settings: s, Token: "", Yes: true, Out: io.Discard}
+	deps := registerWebhookDeps{Records: newFakeWebhookRecords(), Hooks: fake, Settings: s, Token: "", Yes: true, Out: io.Discard}
 
 	if err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps); err == nil {
 		t.Fatal("expected an error")
@@ -295,7 +354,7 @@ func TestRegisterWebhookWarnsWhenDisabled(t *testing.T) {
 	s := &settings.Settings{Webhook: settings.Webhook{
 		Enabled: false, URL: "https://x/y", Secret: "sekrit",
 	}}
-	deps := registerWebhookDeps{Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
+	deps := registerWebhookDeps{Records: newFakeWebhookRecords(), Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
 
 	var runErr error
 	stderr := captureStderr(t, func() {
@@ -337,7 +396,7 @@ func TestNoReposErrNamesFlagOnlyWhenGiven(t *testing.T) {
 // webhook.secret in that case, not both fields.
 func TestMissingWebhookFieldsNamesOnlyWhatIsEmpty(t *testing.T) {
 	s := &settings.Settings{Webhook: settings.Webhook{URL: "https://x/y", Secret: ""}}
-	deps := registerWebhookDeps{Hooks: newFakeHookAdmin(), Settings: s, Token: "tok", Yes: true, Out: io.Discard}
+	deps := registerWebhookDeps{Records: newFakeWebhookRecords(), Hooks: newFakeHookAdmin(), Settings: s, Token: "tok", Yes: true, Out: io.Discard}
 
 	err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps)
 	if err == nil {
@@ -348,5 +407,325 @@ func TestMissingWebhookFieldsNamesOnlyWhatIsEmpty(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "webhook.url") {
 		t.Errorf("error = %q, want it NOT to name webhook.url, which was set", err.Error())
+	}
+}
+
+// TestRegisterWebhookRecordsTheHook covers the whole point of recording: before
+// this, registration left nothing on this machine naming the hook it created,
+// so a later webhook.url change orphaned it with no way to find it again.
+func TestRegisterWebhookRecordsTheHook(t *testing.T) {
+	fake := newFakeHookAdmin()
+	records := newFakeWebhookRecords()
+	s := &settings.Settings{Webhook: settings.Webhook{
+		Enabled: true, URL: "https://x/y", Secret: "sekrit",
+	}}
+	deps := registerWebhookDeps{Records: records, Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
+
+	if err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got, ok, _ := records.Webhook("acme/widgets")
+	if !ok {
+		t.Fatal("nothing was recorded for acme/widgets after a successful registration")
+	}
+	if got.HookID != 1 {
+		t.Errorf("HookID = %d, want the id GitHub returned (1)", got.HookID)
+	}
+	if got.URL != "https://x/y" {
+		t.Errorf("URL = %q, want the URL it was registered with", got.URL)
+	}
+	if got.RegisteredAt.IsZero() {
+		t.Error("RegisteredAt is zero; the row must record when registration happened")
+	}
+
+	// A second run edits rather than creates, and must still leave the row
+	// current: an EditHook that pushed a rotated secret but left a stale row
+	// would record a registration that no longer describes the live hook.
+	s.Webhook.URL = "https://moved/z"
+	deps.Settings = s
+	if err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	got, _, _ = records.Webhook("acme/widgets")
+	if got.HookID != 1 || got.URL != "https://moved/z" {
+		t.Errorf("after re-registering: %+v, want hook 1 recorded at the new URL", got)
+	}
+}
+
+// TestRegisterWebhookRecordsNothingWhenGitHubFails covers: "A failed GitHub
+// call must record nothing." A row written ahead of the API call would name a
+// hook that does not exist, and the next deregistration would try to delete it.
+func TestRegisterWebhookRecordsNothingWhenGitHubFails(t *testing.T) {
+	fake := &failingHookAdmin{fakeHookAdmin: newFakeHookAdmin()}
+	records := newFakeWebhookRecords()
+	s := &settings.Settings{Webhook: settings.Webhook{
+		Enabled: true, URL: "https://x/y", Secret: "sekrit",
+	}}
+	deps := registerWebhookDeps{Records: records, Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard}
+
+	if err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps); err == nil {
+		t.Fatal("expected the GitHub failure to surface")
+	}
+	if records.putCalls != 0 {
+		t.Errorf("putCalls = %d, want 0: a failed registration must record nothing", records.putCalls)
+	}
+	if _, ok, _ := records.Webhook("acme/widgets"); ok {
+		t.Error("a row was recorded for a registration GitHub refused")
+	}
+}
+
+// failingHookAdmin fails the create, leaving list and edit alone, so a test can
+// separate "GitHub refused" from "nothing was called".
+type failingHookAdmin struct {
+	*fakeHookAdmin
+}
+
+func (f *failingHookAdmin) CreateHook(_ context.Context, _, _ string, _ ghub.HookSpec) (int64, error) {
+	f.createCalls++
+	return 0, errors.New("github said no")
+}
+
+// TestDeregisterWebhookDeletesTheRecordedID is the acceptance test for the
+// failure this feature exists to fix: after webhook.url changed, the live hook
+// points at the OLD endpoint, so a URL match finds nothing and the orphan
+// survives. Deleting by the recorded id still removes it.
+func TestDeregisterWebhookDeletesTheRecordedID(t *testing.T) {
+	fake := newFakeHookAdmin()
+	fake.hooks["acme/widgets"] = []ghub.Hook{{ID: 77, URL: "https://old/hook", Active: true}}
+	records := newFakeWebhookRecords()
+	records.rows["acme/widgets"] = store.Webhook{
+		Repo: "acme/widgets", HookID: 77, URL: "https://old/hook", RegisteredAt: time.Now(),
+	}
+	s := &settings.Settings{Webhook: settings.Webhook{Enabled: true, URL: "https://new/hook", Secret: "sekrit"}}
+
+	var out bytes.Buffer
+	err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deregisterWebhookDeps{
+		Records: records, Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: &out,
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(fake.deletedIDs) != 1 || fake.deletedIDs[0] != 77 {
+		t.Fatalf("deletedIDs = %v, want [77]: the RECORDED id, not one matched by the new URL", fake.deletedIDs)
+	}
+	if fake.listCalls != 0 {
+		t.Errorf("listCalls = %d, want 0: a recorded hook needs no URL search", fake.listCalls)
+	}
+	if _, ok, _ := records.Webhook("acme/widgets"); ok {
+		t.Error("the row survived a confirmed delete")
+	}
+	if !strings.Contains(out.String(), "77") {
+		t.Errorf("output = %q, want it to name the hook it deleted", out.String())
+	}
+}
+
+// TestDeregisterWebhookRemovesTheRowOnlyAfterGitHubConfirms covers the ordering
+// rule: a delete GitHub refused for any reason other than "already gone" must
+// leave the record in place, or the operator loses the id and the hook keeps
+// delivering with nothing naming it.
+func TestDeregisterWebhookRemovesTheRowOnlyAfterGitHubConfirms(t *testing.T) {
+	fake := &refusingHookAdmin{fakeHookAdmin: newFakeHookAdmin()}
+	records := newFakeWebhookRecords()
+	records.rows["acme/widgets"] = store.Webhook{Repo: "acme/widgets", HookID: 77, URL: "https://x/y"}
+	s := &settings.Settings{Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "sekrit"}}
+
+	err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deregisterWebhookDeps{
+		Records: records, Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard,
+	})
+	if err == nil {
+		t.Fatal("expected the GitHub failure to surface")
+	}
+	if records.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0: the row must outlive a failed delete", records.deleteCalls)
+	}
+}
+
+// refusingHookAdmin fails DeleteHook with something that is NOT a 404, which
+// must never be read as "the hook is already gone".
+type refusingHookAdmin struct {
+	*fakeHookAdmin
+}
+
+func (f *refusingHookAdmin) DeleteHook(_ context.Context, _, _ string, id int64) error {
+	f.deleteCalls++
+	f.deletedIDs = append(f.deletedIDs, id)
+	return errors.New("500 from github")
+}
+
+// TestDeregisterWebhookTreatsAMissingHookAsDone covers: a recorded hook that is
+// already gone at GitHub is a success. The operator deleted it in the UI and is
+// tidying up; failing would leave a row nothing on this machine can clear.
+func TestDeregisterWebhookTreatsAMissingHookAsDone(t *testing.T) {
+	fake := newFakeHookAdmin() // holds no hooks at all, so DeleteHook 404s
+	records := newFakeWebhookRecords()
+	records.rows["acme/widgets"] = store.Webhook{Repo: "acme/widgets", HookID: 77, URL: "https://x/y"}
+	s := &settings.Settings{Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "sekrit"}}
+
+	var out bytes.Buffer
+	err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deregisterWebhookDeps{
+		Records: records, Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: &out,
+	})
+	if err != nil {
+		t.Fatalf("a hook already gone at GitHub must exit zero, got: %v", err)
+	}
+	if _, ok, _ := records.Webhook("acme/widgets"); ok {
+		t.Error("the stale row survived; nothing else can ever clear it")
+	}
+	if !strings.Contains(out.String(), "already") {
+		t.Errorf("output = %q, want it to say the hook was already gone", out.String())
+	}
+}
+
+// TestDeregisterWebhookFallsBackToTheURL covers a repository registered before
+// this table existed: with no row, the only handle left is the delivery URL.
+func TestDeregisterWebhookFallsBackToTheURL(t *testing.T) {
+	fake := newFakeHookAdmin()
+	fake.hooks["acme/widgets"] = []ghub.Hook{
+		{ID: 5, URL: "https://someone-else/hook", Active: true},
+		{ID: 9, URL: "https://x/y", Active: true},
+	}
+	records := newFakeWebhookRecords() // no rows at all
+	s := &settings.Settings{Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "sekrit"}}
+
+	var out bytes.Buffer
+	err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deregisterWebhookDeps{
+		Records: records, Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: &out,
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(fake.deletedIDs) != 1 || fake.deletedIDs[0] != 9 {
+		t.Fatalf("deletedIDs = %v, want [9]: the hook matching webhook.url", fake.deletedIDs)
+	}
+	if !strings.Contains(out.String(), "webhook.url") {
+		t.Errorf("output = %q, want it to say the hook was found by matching webhook.url", out.String())
+	}
+}
+
+// TestDeregisterWebhookWithNothingToDoExitsZero: no record and no hook at
+// GitHub is the tidy state this command is trying to reach, not a failure.
+func TestDeregisterWebhookWithNothingToDoExitsZero(t *testing.T) {
+	fake := newFakeHookAdmin()
+	s := &settings.Settings{Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "sekrit"}}
+
+	var out bytes.Buffer
+	err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deregisterWebhookDeps{
+		Records: newFakeWebhookRecords(), Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: &out,
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if fake.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0", fake.deleteCalls)
+	}
+	if !strings.Contains(out.String(), "nothing to deregister") {
+		t.Errorf("output = %q, want it to say there was nothing to deregister", out.String())
+	}
+}
+
+// TestDeregisterWebhookRefusesASharedHook covers the shared-hook hazard: two
+// projects watching one repository through one webhook.url end up recording the
+// SAME hook id, and deleting it on behalf of one silently stops deliveries for
+// the other. Refusing and naming them mirrors registry.Find's ambiguity rule.
+func TestDeregisterWebhookRefusesASharedHook(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", t.TempDir())
+	const otherID = "22222222-2222-2222-2222-222222222222"
+	if err := registry.Register("/work/other-project/.agent-utils", otherID, "other-project"); err != nil {
+		t.Fatalf("seed registry: %v", err)
+	}
+
+	fake := newFakeHookAdmin()
+	fake.hooks["acme/widgets"] = []ghub.Hook{{ID: 77, URL: "https://x/y", Active: true}}
+	records := newFakeWebhookRecords()
+	records.rows["acme/widgets"] = store.Webhook{Repo: "acme/widgets", HookID: 77, URL: "https://x/y"}
+	records.others["acme/widgets#77"] = []store.Webhook{
+		{ProjectID: otherID, Repo: "acme/widgets", HookID: 77, URL: "https://x/y"},
+	}
+	s := &settings.Settings{Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "sekrit"}}
+	deps := deregisterWebhookDeps{
+		Records: records, Hooks: fake, Settings: s, Token: "tok", Yes: true, Out: io.Discard,
+	}
+
+	err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deps)
+	if err == nil {
+		t.Fatal("expected a refusal: another project records the same hook")
+	}
+	for _, want := range []string{"other-project", "/work/other-project", "--force"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q", err.Error(), want)
+		}
+	}
+	if fake.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0: the refusal must come before the delete", fake.deleteCalls)
+	}
+	if records.deleteCalls != 0 {
+		t.Errorf("the row was cleared despite the refusal")
+	}
+
+	// --force overrides, and must say plainly who just lost delivery.
+	deps.Force = true
+	var out bytes.Buffer
+	deps.Out = &out
+	if err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deps); err != nil {
+		t.Fatalf("--force run: %v", err)
+	}
+	if len(fake.deletedIDs) != 1 || fake.deletedIDs[0] != 77 {
+		t.Fatalf("deletedIDs = %v, want [77] once --force is passed", fake.deletedIDs)
+	}
+	if !strings.Contains(out.String(), "other-project") {
+		t.Errorf("output = %q, want the forced delete to name the project that lost delivery", out.String())
+	}
+}
+
+// TestDeregisterWebhookNonInteractiveWithoutYesFails mirrors register-webhook's
+// own rule: a prompt in a cron job would hang forever, and this command deletes
+// state at GitHub, so nothing may be called before the operator has agreed.
+func TestDeregisterWebhookNonInteractiveWithoutYesFails(t *testing.T) {
+	fake := newFakeHookAdmin()
+	records := newFakeWebhookRecords()
+	records.rows["acme/widgets"] = store.Webhook{Repo: "acme/widgets", HookID: 77, URL: "https://x/y"}
+	s := &settings.Settings{Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "sekrit"}}
+
+	err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deregisterWebhookDeps{
+		Records: records, Hooks: fake, Settings: s, Token: "tok",
+		Yes: false, Interactive: false,
+		Confirm: func([]string) (bool, error) {
+			t.Fatal("must not prompt when stdin is not a terminal")
+			return false, nil
+		},
+		Out: io.Discard,
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "--yes") {
+		t.Errorf("error = %q, want it to name --yes", err.Error())
+	}
+	if !strings.Contains(err.Error(), "acme/widgets") {
+		t.Errorf("error = %q, want it to list the repositories", err.Error())
+	}
+	if fake.listCalls != 0 || fake.deleteCalls != 0 {
+		t.Fatalf("GitHub was called: list=%d delete=%d, want all zero", fake.listCalls, fake.deleteCalls)
+	}
+	if records.deleteCalls != 0 {
+		t.Fatalf("the record was cleared without confirmation")
+	}
+}
+
+// TestDeregisterWebhookMissingTokenFailsBeforeGitHubCall mirrors
+// register-webhook: without a token every call would fail anyway, and failing
+// first keeps a half-deregistered set of repositories out of the picture.
+func TestDeregisterWebhookMissingTokenFailsBeforeGitHubCall(t *testing.T) {
+	fake := newFakeHookAdmin()
+	s := &settings.Settings{Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "sekrit"}}
+
+	err := deregisterWebhookRun(context.Background(), []string{"acme/widgets"}, deregisterWebhookDeps{
+		Records: newFakeWebhookRecords(), Hooks: fake, Settings: s, Token: "", Yes: true, Out: io.Discard,
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if fake.listCalls != 0 || fake.deleteCalls != 0 {
+		t.Fatalf("GitHub was called without a token: list=%d delete=%d", fake.listCalls, fake.deleteCalls)
 	}
 }
