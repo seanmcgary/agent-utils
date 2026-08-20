@@ -98,7 +98,10 @@ func TestSingleFetchPullRequestCarriesTheSameTrustAsTheListPath(t *testing.T) {
 			pr.Head.Repo.FullName = github.Ptr("attacker/r")
 		}, false},
 		{"outside contributor", func(pr *github.PullRequest) {
-			pr.AuthorAssociation = github.Ptr("NONE")
+			// Deprecated only for Events API payloads. This is the pull
+			// requests endpoint, which is exactly where the deprecation notice
+			// says to read it, and it is the field trust is decided from.
+			pr.AuthorAssociation = github.Ptr("NONE") //nolint:staticcheck // SA1019: valid on the pulls endpoint
 		}, false},
 		{"head ref git would read as an option", func(pr *github.PullRequest) {
 			pr.Head.Ref = github.Ptr("--upload-pack=evil")

@@ -60,9 +60,16 @@ type Server struct {
 	// unreadable at start, so a misconfigured daemon fails at start rather
 	// than at the first delivery.
 	Secret func() (string, error)
-	// Tick runs one loop for a repository. It is a seam so a test can drive
-	// the handler without opening a database or starting an agent.
-	Tick func(ctx context.Context, repo string)
+	// Tick acts on ONE issue of a repository: the number the delivery named.
+	// It is a seam so a test can drive the handler without opening a database
+	// or starting an agent.
+	//
+	// The number is not decoration. A delivery says "something about this
+	// issue changed"; reconciling the whole repository instead spends a token
+	// budget on every open issue, per project watching that repository, on
+	// every delivery -- which is how creating one unlabelled test issue
+	// dispatched a tend agent for an unrelated one.
+	Tick func(ctx context.Context, repo string, number int)
 	// MaxInFlight bounds concurrent ticks. Zero means defaultMaxInFlight.
 	MaxInFlight int
 

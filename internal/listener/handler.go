@@ -215,7 +215,7 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 //  5. require an exact "application/json" media type
 //  6. verify the HMAC and read the payload
 //  7. drop any event this daemon does not act on
-//  8. decode and validate the repository full_name
+//  8. decode and validate the repository full_name and the issue number
 //  9. drop a repeated delivery id
 //  10. hand the work to the bounded pool and answer 202
 func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
@@ -323,9 +323,9 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			return
 		}
 
-		// 8. Decode and validate the one attacker-controlled value this
+		// 8. Decode and validate the two attacker-controlled values this
 		// daemon passes onward as data (rather than only ever logging a
-		// bounded, shape-checked form of it, as with the delivery id). An
+		// bounded, shape-checked form of them, as with the delivery id). An
 		// unmatched full_name (empty, the wrong shape, or absurdly long) is
 		// rejected before it is ever logged, so the raw value never appears
 		// in the operator's log file.
@@ -339,12 +339,42 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			Repository struct {
 				FullName string `json:"full_name"`
 			} `json:"repository"`
+			// The subject of the delivery. All five subscribed events carry a
+			// number: issues and issue_comment in issue.number, and
+			// pull_request, pull_request_review and pull_request_review_comment
+			// in pull_request.number. Both are decoded because issue_comment
+			// fires on pull requests too, and because a delivery this daemon
+			// cannot attribute to one number is one it cannot act on.
+			Issue struct {
+				Number int `json:"number"`
+			} `json:"issue"`
+			PullRequest struct {
+				Number int `json:"number"`
+			} `json:"pull_request"`
 		}
 		if err := json.Unmarshal(payload, &body); err != nil || !repoFullName.MatchString(body.Repository.FullName) {
 			s.rejected(w, deliveryID, "repository", http.StatusBadRequest)
 			return
 		}
 		repo := body.Repository.FullName
+
+		// The subject number is validated exactly as the full_name is: it is
+		// attacker-controlled, it is passed onward as data, and it is logged.
+		// A number that is absent, zero, negative or wider than an int (which
+		// fails the Unmarshal above) names no issue GitHub could have.
+		//
+		// A delivery with no usable number is a 400, never a silent accept. It
+		// names nothing this daemon can act on, and answering 202 would hide a
+		// malformed delivery -- or a subscription to an event that carries no
+		// number -- behind a success the operator never sees.
+		number := body.Issue.Number
+		if number == 0 {
+			number = body.PullRequest.Number
+		}
+		if number <= 0 {
+			s.rejected(w, deliveryID, "issue number", http.StatusBadRequest)
+			return
+		}
 
 		// 9. GitHub redelivers on timeout and on manual "Redeliver," and the
 		// plaintext hop behind a reverse proxy makes a captured delivery
@@ -413,17 +443,24 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// reaches this point carried a valid signature, so its rate is
 			// bounded by GitHub and by the projects registered on this
 			// machine, not by a stranger.
+			// The NUMBER is part of this line, because it is now the whole
+			// scope of the work: this delivery starts a tick for that issue and
+			// no other. The line an operator reads is "delivery X said issue
+			// #51 changed", which is exactly what they can match against what
+			// they just did in the browser.
 			slog.Info("accepted delivery", "delivery", safeDeliveryID(deliveryID),
-				"event", event, "action", safeAction(body.Action), "repo", repo)
+				"event", event, "action", safeAction(body.Action), "repo", repo,
+				"number", number)
 
 			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.sem }()
 				defer s.wg.Done()
-				s.Tick(ctx, repo)
+				s.Tick(ctx, repo, number)
 			}()
 		default:
-			slog.Warn("dropping delivery: worker pool full", "delivery", safeDeliveryID(deliveryID), "repo", repo)
+			slog.Warn("dropping delivery: worker pool full",
+				"delivery", safeDeliveryID(deliveryID), "repo", repo, "number", number)
 		}
 		w.WriteHeader(http.StatusAccepted)
 	}

@@ -30,7 +30,7 @@ func TestNewDefaultsAddrToLoopback(t *testing.T) {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick:   func(context.Context, string) {},
+		Tick:   func(context.Context, string, int) {},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -48,7 +48,7 @@ func TestNewRejectsNonPositivePort(t *testing.T) {
 		if _, err := New(&Server{
 			Secret: fixedSecret(testSecret),
 			Port:   port,
-			Tick:   func(context.Context, string) {},
+			Tick:   func(context.Context, string, int) {},
 		}); err == nil {
 			t.Errorf("New with Port %d must return an error", port)
 		}
@@ -64,7 +64,7 @@ func TestHTTPServerTimeoutsAreSet(t *testing.T) {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick:   func(context.Context, string) {},
+		Tick:   func(context.Context, string, int) {},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -96,7 +96,7 @@ func TestListenAndServeShutsDownOnContextCancel(t *testing.T) {
 		Secret: fixedSecret(testSecret),
 		Addr:   loopbackAddr,
 		Port:   freePort(t),
-		Tick:   func(context.Context, string) {},
+		Tick:   func(context.Context, string, int) {},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

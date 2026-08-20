@@ -123,14 +123,20 @@ func (a *attempt) counter(kind retryKind) *int {
 // storm creates, and it is checked by -race in CI.
 type Worker struct {
 	DB *store.DB
-	// Targets, TargetFor, Open, and Run are seams. Production wires them to
-	// listener.Targets, listener.TargetFor, loopcmd.Open, and loopcmd.RunTick.
+	// Targets, TargetFor, Open, and RunIssue are seams. Production wires them
+	// to listener.Targets, listener.TargetFor, loopcmd.Open, and
+	// loopcmd.TickIssue.
 	Targets   func(repo string) ([]Target, error)
 	TargetFor func(projectID, loop string) (Target, Routing, error)
 	Token     func() (string, error)
 	Open      func(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error)
-	Run       func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps) (loopcmd.Summary, error)
-	Now       func() time.Time
+	// RunIssue acts on ONE issue, taking the loop's lock first. It is
+	// loopcmd.TickIssue, never loopcmd.RunTick: the daemon answers events, and
+	// an event names an issue. The full reconcile is the cron sweep's job --
+	// see loopcmd.Tick -- and running it per delivery burned a token budget on
+	// every open issue of every project watching the repository.
+	RunIssue func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, number int) (loopcmd.Summary, error)
+	Now      func() time.Time
 	// After schedules f. It is a seam: production wires it to time.AfterFunc,
 	// and a test substitutes a controlled clock. Without it the retry tests
 	// would have to sleep for the real delays, which the acceptance forbids.
@@ -166,7 +172,7 @@ func NewWorker(db *store.DB) *Worker {
 		TargetFor:       TargetFor,
 		Token:           Token,
 		Open:            loopcmd.Open,
-		Run:             loopcmd.RunTick,
+		RunIssue:        loopcmd.TickIssue,
 		Now:             time.Now,
 		After:           time.AfterFunc,
 		OpenRetryDelay:  defaultOpenRetryDelay,
@@ -183,18 +189,26 @@ func NewWorker(db *store.DB) *Worker {
 	return w
 }
 
-// Deliver ticks every loop that watches repo.
+// Deliver acts on ONE issue of repo, in every loop that watches it.
 //
-// A delivery is a WAKE-UP, not an instruction. The tick it starts reconciles
-// the loop's whole issue set against GitHub; it does not act on the issue the
-// payload happened to name, and the payload is not even read past the
-// repository. So creating one unlabelled issue can dispatch an agent for a
-// completely different issue that was already eligible -- the same thing the
-// cron tick would have done within its interval, only sooner. That is by
-// design, and it looks like a bug from the outside, which is why the log lines
-// below and in handler.go exist: they are what makes the chain
-// delivery -> repository -> loops -> ticks readable after the fact.
-func (w *Worker) Deliver(ctx context.Context, repo string) {
+// A delivery says "something about this issue changed, figure out what and
+// dispatch the correct executor to handle it." It used to trigger a full
+// reconcile of every loop watching the repository instead, which is how
+// opening one unlabelled test issue dispatched a tend agent for an unrelated
+// issue whose pull request was 16 commits behind -- and how every delivery
+// spent a token budget proportional to the whole repository rather than to the
+// thing that changed.
+//
+// number may name a pull request rather than an issue; the two share a number
+// space and three of the five subscribed events carry a pull request. Resolving
+// that is loopcmd.TickIssue's job, because it is the layer with a GitHub
+// client.
+//
+// The fan-out is still per loop: several projects may watch one repository, and
+// each keeps its own state and spends its own budget. The log lines here and in
+// handler.go are what makes the chain delivery -> repository -> issue -> loops
+// readable after the fact.
+func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 	targets, err := w.Targets(repo)
 	if err != nil {
 		// Logged and dropped: the routing failure is machine-wide (the
@@ -215,20 +229,25 @@ func (w *Worker) Deliver(ctx context.Context, repo string) {
 	for _, t := range targets {
 		loops = append(loops, t.ProjectName+"/"+t.LoopName)
 	}
-	slog.Info("reconciling every loop that watches this repository",
-		"repo", repo, "loops", loops)
+	slog.Info("acting on this issue in every loop that watches the repository",
+		"repo", repo, "number", number, "loops", loops)
 
 	for _, t := range targets {
 		// Sequential, and one target's failure never returns early: the
 		// loops that share a repository are separate projects with separate
 		// state, and one broken project must not strand the others.
-		w.tickOne(ctx, t)
+		w.tickOne(ctx, t, number)
 	}
 }
 
-// tickOne runs one loop's tick and decides what its outcome means for the
-// retry schedule.
-func (w *Worker) tickOne(ctx context.Context, t Target) {
+// tickOne acts on one issue in one loop and decides what the outcome means
+// for the retry schedule.
+//
+// number is carried through every retry this schedules, so a retry re-runs the
+// SAME scoped pass rather than widening into a reconcile: a delivery that
+// failed and is retried a minute later must still be about the issue the
+// delivery named.
+func (w *Worker) tickOne(ctx context.Context, t Target, number int) {
 	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
 
 	tok, err := w.Token()
@@ -263,11 +282,11 @@ func (w *Worker) tickOne(ctx context.Context, t Target) {
 		// retry runs at OpenRetryDelay rather than at some undefined value.
 		slog.Error("cannot open loop", "loop", t.LoopName, "project", t.ProjectName,
 			"config", t.ConfigPath, "err", err)
-		w.schedule(ctx, t, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		w.schedule(ctx, t, number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
 		return
 	}
 
-	if _, err := w.Run(ctx, cfg, deps); err != nil {
+	if _, err := w.RunIssue(ctx, cfg, deps, number); err != nil {
 		if errors.Is(err, lock.ErrHeld) {
 			// No retry. The delivery carries no state of its own, so the
 			// tick already holding the lock reads the same GitHub state a
@@ -275,12 +294,13 @@ func (w *Worker) tickOne(ctx context.Context, t Target) {
 			// cleared too, or the next real failure would resume a backoff
 			// list part way through and give up early.
 			slog.Info("skipping tick: another tick holds the loop lock",
-				"loop", cfg.Name, "project", t.ProjectName)
+				"loop", cfg.Name, "project", t.ProjectName, "issue", number)
 			w.clear(key)
 			return
 		}
-		slog.Error("tick failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
-		w.schedule(ctx, t, kindTick, cfg.Retry.Max, func(n int) time.Duration {
+		slog.Error("tick failed", "loop", cfg.Name, "project", t.ProjectName,
+			"issue", number, "err", err)
+		w.schedule(ctx, t, number, kindTick, cfg.Retry.Max, func(n int) time.Duration {
 			return w.backoffFor(cfg, n)
 		})
 		return
@@ -327,7 +347,7 @@ func (w *Worker) backoffFor(cfg *config.Config, n int) time.Duration {
 // delay is a function rather than a value because the two callers know
 // different things: a failed tick has the loop's configuration and reads its
 // backoff list, and a failed Open has no configuration at all.
-func (w *Worker) schedule(ctx context.Context, t Target, kind retryKind, max int, delay func(n int) time.Duration) {
+func (w *Worker) schedule(ctx context.Context, t Target, number int, kind retryKind, max int, delay func(n int) time.Duration) {
 	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
 
 	w.mu.Lock()
@@ -385,8 +405,8 @@ func (w *Worker) schedule(ctx context.Context, t Target, kind retryKind, max int
 			return
 		}
 		slog.Info("retrying a failed tick", "loop", t.LoopName,
-			"project", t.ProjectName, "attempt", n)
-		w.tickOne(ctx, t)
+			"project", t.ProjectName, "issue", number, "attempt", n)
+		w.tickOne(ctx, t, number)
 	})
 	slog.Info("scheduled a retry", "loop", t.LoopName, "project", t.ProjectName,
 		"attempt", n, "in", d)
@@ -423,8 +443,8 @@ func (w *Worker) stopAll() {
 	}
 }
 
-// Wake ticks the one loop whose retry deadline has passed, and returns when the
-// next deadline is due. ok is false when no deadline is pending.
+// Wake acts on the one ISSUE whose retry deadline has passed, and returns when
+// the next deadline is due. ok is false when no deadline is pending.
 func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 	now := w.Now()
 
@@ -518,7 +538,11 @@ func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 			w.forgetUnroutable(key)
 			w.unroutable.forget(unroutableKey(key))
 
-			w.tickOne(ctx, t)
+			// The deadline names the ISSUE it belongs to, so the wake acts on
+			// that issue alone. A whole-loop reconcile here would decide every
+			// open issue of the loop because ONE of them came due, which is the
+			// same repository-wide cost a delivery used to pay.
+			w.tickOne(ctx, t, due.Number)
 
 			// The handled deadline is returned, not a fresh query for the
 			// next one. The tick may legitimately have decided nothing (its

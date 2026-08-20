@@ -102,7 +102,7 @@ type harness struct {
 	// target named by the arguments.
 	targetFor func(projectID, loop string) (Target, Routing, error)
 
-	// runFn decides what the Run seam returns. Nil means every tick
+	// runFn decides what the RunIssue seam returns. Nil means every tick
 	// succeeds.
 	runFn func(cfg *config.Config) error
 
@@ -113,9 +113,13 @@ type harness struct {
 	nowCalls     int
 	opens        []openCall
 	ran          []string
-	cleanups     int
-	backoff      []time.Duration
-	max          int
+	// ranIssues records the issue number each recorded run was scoped to, in
+	// the same order as ran. A delivery decides one issue, so "which loop ran"
+	// is only half of what a test has to be able to assert.
+	ranIssues []int
+	cleanups  int
+	backoff   []time.Duration
+	max       int
 }
 
 // newHarness returns a Worker whose seams are all fakes. db may be nil for a
@@ -130,7 +134,7 @@ func newHarness(db *store.DB) *harness {
 	w.After = h.timers.After
 	w.Token = h.token
 	w.Open = h.open
-	w.Run = h.run
+	w.RunIssue = h.runIssue
 	w.Targets = h.targetsSeam
 	w.TargetFor = func(projectID, loop string) (Target, Routing, error) {
 		if h.targetFor != nil {
@@ -210,9 +214,15 @@ func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (
 	return cfg, loopcmd.Deps{}, cleanup, nil
 }
 
-func (h *harness) run(ctx context.Context, cfg *config.Config, deps loopcmd.Deps) (loopcmd.Summary, error) {
+func (h *harness) runIssue(
+	ctx context.Context,
+	cfg *config.Config,
+	deps loopcmd.Deps,
+	number int,
+) (loopcmd.Summary, error) {
 	h.mu.Lock()
 	h.ran = append(h.ran, cfg.Name)
+	h.ranIssues = append(h.ranIssues, number)
 	fn := h.runFn
 	h.mu.Unlock()
 
@@ -240,6 +250,13 @@ func (h *harness) ranLoops() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]string(nil), h.ran...)
+}
+
+// ranNumbers reports the issue each recorded run was scoped to.
+func (h *harness) ranNumbers() []int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]int(nil), h.ranIssues...)
 }
 
 // pendingLen reports how many loops hold a scheduled retry.
@@ -282,7 +299,7 @@ func TestALockHeldTickSchedulesNoRetry(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.runFn = func(*config.Config) error { return fmt.Errorf("run tick: %w", lock.ErrHeld) }
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	if n := h.timers.len(); n != 0 {
 		t.Errorf("armed %d retry timers, want 0 for a held lock", n)
@@ -302,13 +319,13 @@ func TestALockHeldTickClearsAPendingAttempt(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 	if n := h.pendingLen(); n != 1 {
 		t.Fatalf("pending after a failed tick = %d, want 1", n)
 	}
 
 	h.runFn = func(*config.Config) error { return fmt.Errorf("run tick: %w", lock.ErrHeld) }
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	if n := h.pendingLen(); n != 0 {
 		t.Errorf("pending after a held lock = %d, want 0", n)
@@ -327,7 +344,7 @@ func TestATickErrorIsRetriedAfterTheConfiguredDelay(t *testing.T) {
 	h.backoff = []time.Duration{45 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	if n := h.timers.len(); n != 1 {
 		t.Fatalf("armed %d retry timers, want 1", n)
@@ -355,7 +372,7 @@ func TestTheRetryStopsAfterRetryMax(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 	h.timers.at(t, 0).f()
 	h.timers.at(t, 1).f()
 
@@ -383,7 +400,7 @@ func TestRetryMaxZeroSchedulesNothingAndDoesNotPanic(t *testing.T) {
 	h.backoff = nil
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	if n := h.timers.len(); n != 0 {
 		t.Errorf("armed %d retry timers, want 0 for retry.max = 0", n)
@@ -398,7 +415,7 @@ func TestATokenErrorSchedulesNoRetry(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.tokenErr = errors.New("mode 0644 grants group access")
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	opens, runs, cleanups := h.counts()
 	if opens != 0 || runs != 0 || cleanups != 0 {
@@ -417,7 +434,7 @@ func TestAnOpenErrorSchedulesARetryAtOpenRetryDelay(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.openErr = errors.New("unimported legacy database")
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	if n := h.timers.len(); n != 1 {
 		t.Fatalf("armed %d retry timers, want 1 after an Open error", n)
@@ -444,7 +461,7 @@ func TestAZeroBackoffEntryStillWaitsMinRetryDelay(t *testing.T) {
 	h.backoff = []time.Duration{0}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	if got := h.timers.at(t, 0).d; got != h.w.MinRetryDelay {
 		t.Errorf("retry delay = %v, want the MinRetryDelay floor %v", got, h.w.MinRetryDelay)
@@ -467,7 +484,7 @@ func TestCleanupRunsExactlyOncePerTick(t *testing.T) {
 			h.targets = []Target{h.target("planning")}
 			h.runFn = tc.run
 
-			h.w.Deliver(context.Background(), "o/r")
+			h.w.Deliver(context.Background(), "o/r", 7)
 
 			if _, _, cleanups := h.counts(); cleanups != 1 {
 				t.Errorf("called cleanup %d times, want exactly 1", cleanups)
@@ -488,7 +505,7 @@ func TestTwoTargetsBothRunWhenTheFirstFails(t *testing.T) {
 		return nil
 	}
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	got := h.ranLoops()
 	if len(got) != 2 || got[0] != "planning" || got[1] != "review" {
@@ -506,7 +523,7 @@ func TestOpenIsCalledWithTheDaemonsOptions(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning")}
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -535,8 +552,8 @@ func TestSchedulingAgainStopsTheOldTimer(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute, 10 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r")
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	if n := h.timers.len(); n != 2 {
 		t.Fatalf("armed %d timers, want 2", n)
@@ -559,7 +576,7 @@ func TestARetryDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
 	h.runFn = func(*config.Config) error { return errBoom }
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h.w.Deliver(ctx, "o/r")
+	h.w.Deliver(ctx, "o/r", 7)
 	cancel()
 	h.timers.at(t, 0).f()
 
@@ -743,7 +760,7 @@ func TestServeStopsEveryPendingTimerOnCancel(t *testing.T) {
 	h.runFn = func(*config.Config) error { return errBoom }
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h.w.Deliver(ctx, "o/r")
+	h.w.Deliver(ctx, "o/r", 7)
 	if n := h.pendingLen(); n != 1 {
 		t.Fatalf("pending = %d before Serve, want 1", n)
 	}
@@ -876,8 +893,8 @@ func TestOpenFailuresDoNotSpendTheTickRetryBudget(t *testing.T) {
 	h.backoff = []time.Duration{45 * time.Minute}
 	h.openErr = errors.New("unimported legacy database")
 
-	h.w.Deliver(context.Background(), "o/r")
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), "o/r", 7)
 	if n := h.timers.len(); n != 2 {
 		t.Fatalf("armed %d timers for two Open failures, want 2", n)
 	}
@@ -889,7 +906,7 @@ func TestOpenFailuresDoNotSpendTheTickRetryBudget(t *testing.T) {
 	h.mu.Unlock()
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 7)
 
 	if n := h.timers.len(); n != 3 {
 		t.Fatalf("armed %d timers, want a third for the tick failure", n)
@@ -1074,20 +1091,89 @@ func TestTheUnroutableWarningIsThrottledPerLoop(t *testing.T) {
 // loops produced ticks with nothing tying them back to it. Without this line
 // an operator cannot tell "my issue caused this" from "cron would have done it
 // anyway".
-func TestDeliverLogsTheLoopsItIsAboutToTick(t *testing.T) {
+//
+// The line names the ISSUE as well as the loops. One delivery still fans out
+// across every project watching the repository -- separate state, separate
+// token budgets -- but each of those passes now acts on one issue, and a line
+// that omitted it would still read as a repository-wide reconcile.
+func TestDeliverLogsTheIssueAndTheLoopsItIsAboutToTick(t *testing.T) {
 	buf := captureLogs(t)
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r")
+	h.w.Deliver(context.Background(), "o/r", 51)
 
 	out := buf.String()
 	if !strings.Contains(out, "repo=o/r") {
 		t.Errorf("the fan-out line does not name the repository:\n%s", out)
 	}
+	if !strings.Contains(out, "number=51") {
+		t.Errorf("the fan-out line does not name the issue:\n%s", out)
+	}
+	if strings.Contains(out, "reconciling every loop") {
+		t.Errorf("the fan-out line still claims a repository-wide reconcile:\n%s", out)
+	}
 	for _, loop := range []string{"planning", "execution"} {
 		if !strings.Contains(out, loop) {
 			t.Errorf("the fan-out line does not name loop %q:\n%s", loop, out)
 		}
+	}
+}
+
+// A delivery names one issue, and every loop watching the repository must be
+// told WHICH. Passing only the repository is what made a delivery about an
+// unlabelled issue dispatch an agent for an unrelated one, once per project.
+func TestDeliverScopesEveryTargetToTheDeliveredIssue(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning"), h.target("execution")}
+
+	h.w.Deliver(context.Background(), "o/r", 51)
+
+	if got := h.ranLoops(); len(got) != 2 {
+		t.Fatalf("ran %v, want both loops", got)
+	}
+	for i, n := range h.ranNumbers() {
+		if n != 51 {
+			t.Errorf("run %d was scoped to issue %d, want 51", i, n)
+		}
+	}
+}
+
+// A retry re-runs the SAME scoped pass. A retry that widened into a reconcile
+// would spend the whole repository's budget a minute after a delivery about
+// one issue failed -- and would dispatch agents the delivery never asked for.
+func TestARetryStaysScopedToTheDeliveredIssue(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.backoff = []time.Duration{time.Minute}
+	h.runFn = func(*config.Config) error { return errBoom }
+
+	h.w.Deliver(context.Background(), "o/r", 51)
+	if h.timers.len() != 1 {
+		t.Fatalf("armed %d timers, want 1", h.timers.len())
+	}
+	h.timers.at(t, 0).f()
+
+	got := h.ranNumbers()
+	if len(got) != 2 || got[0] != 51 || got[1] != 51 {
+		t.Fatalf("runs scoped to %v, want [51 51]", got)
+	}
+}
+
+// store.RetryDue carries the issue the deadline belongs to, and the wake must
+// act on that issue alone. Reconciling the whole loop because one of its
+// issues came due is the same repository-wide cost a delivery used to pay,
+// on a timer.
+func TestWakeActsOnTheIssueNamedByTheDeadline(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	seedDeadline(t, db, "planning", 51, workNow.Add(-time.Minute))
+
+	if _, ok := h.w.Wake(context.Background()); !ok {
+		t.Fatal("ok = false, want the past deadline")
+	}
+	got := h.ranNumbers()
+	if len(got) != 1 || got[0] != 51 {
+		t.Fatalf("wake ran for issues %v, want only [51]", got)
 	}
 }

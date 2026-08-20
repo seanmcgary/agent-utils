@@ -46,12 +46,28 @@ func sha1Hex(secret string, body []byte) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// repoPayload returns the JSON body of a minimal webhook delivery carrying
-// the given repository full_name.
+// testIssueNumber is the subject of every fixture below that does not care
+// which issue it names. It is not optional decoration: all five subscribed
+// events carry a number, and a delivery without one is rejected, so a fixture
+// that omitted it would exercise the rejection path instead of the case it was
+// written for.
+const testIssueNumber = 7
+
+// repoPayload returns the JSON body of a minimal webhook delivery: the
+// repository full_name and the issue number the event is about.
 func repoPayload(t *testing.T, fullName string) []byte {
+	t.Helper()
+	return subjectPayload(t, fullName, "issue", testIssueNumber)
+}
+
+// subjectPayload returns a delivery whose subject ("issue" or "pull_request")
+// carries number. number is any so a test can send what an attacker would: a
+// string, a negative, a float.
+func subjectPayload(t *testing.T, fullName, subject string, number any) []byte {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
 		"repository": map[string]any{"full_name": fullName},
+		subject:      map[string]any{"number": number},
 	})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
@@ -59,16 +75,23 @@ func repoPayload(t *testing.T, fullName string) []byte {
 	return body
 }
 
+// tickCall is one call to the Server's Tick seam: the repository and the issue
+// number the delivery named.
+type tickCall struct {
+	repo   string
+	number int
+}
+
 // newServer builds a Server wired to tickCh: the fake Tick sends the repo
 // name and returns. Tests synchronise on tickCh, never on a sleep or a
 // counter, so they stay correct under -race.
-func newServer(t *testing.T, tickCh chan<- string) *Server {
+func newServer(t *testing.T, tickCh chan<- tickCall) *Server {
 	t.Helper()
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick: func(_ context.Context, repo string) {
-			tickCh <- repo
+		Tick: func(_ context.Context, repo string, number int) {
+			tickCh <- tickCall{repo: repo, number: number}
 		},
 	})
 	if err != nil {
@@ -80,14 +103,14 @@ func newServer(t *testing.T, tickCh chan<- string) *Server {
 // waitTick blocks for one value on ch, bounded by a deadline so a test that
 // would otherwise hang forever fails instead. This is a safety bound, not a
 // synchronisation sleep: the send on ch is what proves Tick ran.
-func waitTick(t *testing.T, ch <-chan string) string {
+func waitTick(t *testing.T, ch <-chan tickCall) tickCall {
 	t.Helper()
 	select {
-	case repo := <-ch:
-		return repo
+	case call := <-ch:
+		return call
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for Tick")
-		return ""
+		return tickCall{}
 	}
 }
 
@@ -96,11 +119,11 @@ func waitTick(t *testing.T, ch <-chan string) string {
 // point being tested (no goroutine could still be in flight), which every
 // rejection path in Handler satisfies: Tick is dispatched only at step 10,
 // after every check this package makes.
-func assertNoTick(t *testing.T, ch <-chan string) {
+func assertNoTick(t *testing.T, ch <-chan tickCall) {
 	t.Helper()
 	select {
-	case repo := <-ch:
-		t.Fatalf("Tick called unexpectedly with repo %q", repo)
+	case call := <-ch:
+		t.Fatalf("Tick called unexpectedly with %+v", call)
 	default:
 	}
 }
@@ -135,7 +158,7 @@ func readBody(t *testing.T, resp *http.Response) string {
 }
 
 func TestValidSignatureAccepts(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -147,8 +170,8 @@ func TestValidSignatureAccepts(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", resp.StatusCode)
 	}
-	if repo := waitTick(t, tickCh); repo != "octo/hello" {
-		t.Errorf("Tick called with repo %q, want %q", repo, "octo/hello")
+	if got := waitTick(t, tickCh); got.repo != "octo/hello" {
+		t.Errorf("Tick called with repo %q, want %q", got.repo, "octo/hello")
 	}
 }
 
@@ -161,7 +184,7 @@ func TestValidSignatureAccepts(t *testing.T) {
 // real library error. This test would fail if rejected ever changed to
 // http.Error(w, err.Error(), status).
 func TestWrongSignatureRejects(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -191,7 +214,7 @@ func TestWrongSignatureRejects(t *testing.T) {
 // signature string given to it -- a second, distinct place a leak could
 // enter besides ValidateSignature's own error text.
 func TestInvalidHexSignatureRejects(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -216,7 +239,7 @@ func TestInvalidHexSignatureRejects(t *testing.T) {
 }
 
 func TestMissingSignatureHeaderRejects(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -239,7 +262,7 @@ func TestMissingSignatureHeaderRejects(t *testing.T) {
 // The header-name case alone (TestMissingSignatureHeaderRejects) would pass
 // against a still-vulnerable handler; this is the one that would not.
 func TestSHA256HeaderCarryingSHA1SignatureRejects(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -264,7 +287,7 @@ func TestSHA256HeaderCarryingSHA1SignatureRejects(t *testing.T) {
 }
 
 func TestSHA1HeaderAloneRejects(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -292,7 +315,7 @@ func TestNewRefusesEmptySecret(t *testing.T) {
 	_, err := New(&Server{
 		Secret: fixedSecret(""),
 		Port:   8080,
-		Tick:   func(context.Context, string) {},
+		Tick:   func(context.Context, string, int) {},
 	})
 	if err == nil {
 		t.Fatal("New with an empty secret must return an error")
@@ -308,7 +331,7 @@ func TestNewRefusesAnUnreadableSecret(t *testing.T) {
 	_, err := New(&Server{
 		Secret: func() (string, error) { return "", errors.New("settings unreadable") },
 		Port:   8080,
-		Tick:   func(context.Context, string) {},
+		Tick:   func(context.Context, string, int) {},
 	})
 	if err == nil {
 		t.Fatal("New with an unreadable secret must return an error")
@@ -321,7 +344,7 @@ func TestNewRefusesAnUnreadableSecret(t *testing.T) {
 // delivery and filling the log with signature failures indistinguishable from
 // an attack.
 func TestSecretIsReReadPerRequest(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	var mu sync.Mutex
 	secret := testSecret
 	s, err := New(&Server{
@@ -331,7 +354,7 @@ func TestSecretIsReReadPerRequest(t *testing.T) {
 			return secret, nil
 		},
 		Port: freePort(t),
-		Tick: func(_ context.Context, repo string) { tickCh <- repo },
+		Tick: func(_ context.Context, repo string, number int) { tickCh <- tickCall{repo: repo, number: number} },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -351,7 +374,7 @@ func TestSecretIsReReadPerRequest(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202: the rotated secret must be picked up without a restart", resp.StatusCode)
 	}
-	if got := waitTick(t, tickCh); got != "octo/hello" {
+	if got := waitTick(t, tickCh); got.repo != "octo/hello" {
 		t.Fatalf("Tick repo = %q", got)
 	}
 
@@ -402,7 +425,7 @@ func TestRejectionLoggingIsRateLimitedPerStage(t *testing.T) {
 }
 
 func TestContentTypeWithCharsetAccepted(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -427,7 +450,7 @@ func TestContentTypeWithCharsetAccepted(t *testing.T) {
 }
 
 func TestFormEncodedContentTypeRejected(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -452,7 +475,7 @@ func TestFormEncodedContentTypeRejected(t *testing.T) {
 }
 
 func TestOversizedBodyRejectedAsTooLarge(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -471,7 +494,7 @@ func TestOversizedBodyRejectedAsTooLarge(t *testing.T) {
 }
 
 func TestUnsubscribedEventGivesNoContent(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -496,7 +519,7 @@ func TestUnsubscribedEventGivesNoContent(t *testing.T) {
 }
 
 func TestRepeatedDeliveryIsDroppedOnSecondDelivery(t *testing.T) {
-	tickCh := make(chan string, 2)
+	tickCh := make(chan tickCall, 2)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -514,8 +537,8 @@ func TestRepeatedDeliveryIsDroppedOnSecondDelivery(t *testing.T) {
 	if first.StatusCode != http.StatusAccepted {
 		t.Fatalf("first delivery status = %d, want 202", first.StatusCode)
 	}
-	if repo := waitTick(t, tickCh); repo != "octo/hello" {
-		t.Errorf("Tick called with repo %q, want %q", repo, "octo/hello")
+	if got := waitTick(t, tickCh); got.repo != "octo/hello" {
+		t.Errorf("Tick called with repo %q, want %q", got.repo, "octo/hello")
 	}
 
 	second := doRequestRaw(t, ts.URL+"/webhook", body, headers)
@@ -555,7 +578,7 @@ func TestInvalidRepositoryFullNameRejects(t *testing.T) {
 	for _, fullName := range cases {
 		fullName := fullName
 		t.Run("", func(t *testing.T) {
-			tickCh := make(chan string, 1)
+			tickCh := make(chan tickCall, 1)
 			s := newServer(t, tickCh)
 			ts := httptest.NewServer(s.Handler(context.Background()))
 			defer ts.Close()
@@ -573,7 +596,7 @@ func TestInvalidRepositoryFullNameRejects(t *testing.T) {
 }
 
 func TestGetMethodRejectedAndHealthzOK(t *testing.T) {
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -610,7 +633,7 @@ func TestTickReceivesDaemonContextNotRequestContext(t *testing.T) {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick: func(ctx context.Context, _ string) {
+		Tick: func(ctx context.Context, _ string, _ int) {
 			<-release
 			ctxErrCh <- ctx.Err()
 		},
@@ -664,7 +687,7 @@ func TestFullPoolDropsWithoutSecondTick(t *testing.T) {
 		Secret:      fixedSecret(testSecret),
 		Port:        freePort(t),
 		MaxInFlight: 1,
-		Tick: func(context.Context, string) {
+		Tick: func(context.Context, string, int) {
 			tickStarted <- struct{}{}
 			<-release
 		},
@@ -724,7 +747,7 @@ func TestAPoolDroppedDeliveryIsRecoverableByRedelivery(t *testing.T) {
 		Secret:      fixedSecret(testSecret),
 		Port:        freePort(t),
 		MaxInFlight: 1,
-		Tick: func(_ context.Context, repo string) {
+		Tick: func(_ context.Context, repo string, _ int) {
 			tickStarted <- repo
 			<-release
 		},
@@ -792,7 +815,7 @@ func TestDrainWaitsForInFlightTickStartedByThePool(t *testing.T) {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick: func(context.Context, string) {
+		Tick: func(context.Context, string, int) {
 			close(tickStarted)
 			<-release
 		},
@@ -845,7 +868,7 @@ func TestDrainReturnsImmediatelyWithNothingInFlight(t *testing.T) {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick:   func(context.Context, string) {},
+		Tick:   func(context.Context, string, int) {},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -872,6 +895,7 @@ func repoActionPayload(t *testing.T, fullName, action string) []byte {
 	body, err := json.Marshal(map[string]any{
 		"action":     action,
 		"repository": map[string]any{"full_name": fullName},
+		"issue":      map[string]any{"number": testIssueNumber},
 	})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
@@ -883,12 +907,12 @@ func repoActionPayload(t *testing.T, fullName, action string) []byte {
 // already logs; success logged nothing, so the ticks a delivery causes
 // appeared in the operator's log with no line explaining why. The report that
 // prompted this: a fresh unlabelled issue was created, and seconds later a
-// tend was dispatched for a DIFFERENT issue -- correct behaviour (a delivery
-// reconciles the whole loop) that was indistinguishable from a bug because
-// nothing said a delivery had arrived at all.
+// tend was dispatched for a DIFFERENT issue. That turned out to be a real bug
+// -- a delivery now acts only on the issue it names -- and nothing in the log
+// said a delivery had arrived at all, which is what made it unreadable.
 func TestAnAcceptedDeliveryIsLogged(t *testing.T) {
 	logs := captureLogs(t)
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -921,7 +945,7 @@ func TestAnAcceptedDeliveryIsLogged(t *testing.T) {
 // would otherwise forge a whole log record in the operator's file.
 func TestAnOutOfShapeActionIsNotLoggedVerbatim(t *testing.T) {
 	logs := captureLogs(t)
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -950,7 +974,7 @@ func TestAnOutOfShapeActionIsNotLoggedVerbatim(t *testing.T) {
 // operator who sees "<invalid>" goes looking for an attack.
 func TestAnAcceptedDeliveryWithNoActionIsStillLogged(t *testing.T) {
 	logs := captureLogs(t)
-	tickCh := make(chan string, 1)
+	tickCh := make(chan tickCall, 1)
 	s := newServer(t, tickCh)
 	ts := httptest.NewServer(s.Handler(context.Background()))
 	defer ts.Close()
@@ -970,5 +994,132 @@ func TestAnAcceptedDeliveryWithNoActionIsStillLogged(t *testing.T) {
 	}
 	if strings.Contains(out, "action=<invalid>") {
 		t.Errorf("an absent action must not be reported as invalid:\n%s", out)
+	}
+}
+
+// A delivery says WHICH issue changed, and that number is the whole point of
+// the delivery: the tick it starts decides that issue and nothing else.
+// Passing only the repository is what made an unlabelled test issue dispatch
+// an agent for an unrelated one.
+func TestAnIssueEventPassesItsNumberToTick(t *testing.T) {
+	tickCh := make(chan tickCall, 1)
+	s := newServer(t, tickCh)
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body := subjectPayload(t, "octo/hello", "issue", 51)
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	if got := waitTick(t, tickCh); got.repo != "octo/hello" || got.number != 51 {
+		t.Fatalf("Tick called with %+v, want octo/hello #51", got)
+	}
+}
+
+// Pull requests are also technically issues: they share the number space, and
+// three of the five subscribed events carry pull_request.number rather than
+// issue.number. Reading only one of the two fields would silently drop those
+// deliveries.
+func TestAPullRequestEventPassesItsNumberToTick(t *testing.T) {
+	tickCh := make(chan tickCall, 1)
+	s := newServer(t, tickCh)
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body := subjectPayload(t, "octo/hello", "pull_request", 108)
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+		github.EventTypeHeader:       "pull_request",
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	if got := waitTick(t, tickCh); got.number != 108 {
+		t.Fatalf("Tick called with %+v, want #108", got)
+	}
+}
+
+// The number is decoded out of an attacker-controlled payload, like the
+// repository full_name, so it is validated before it is used or logged. A
+// delivery carrying no usable number names nothing to act on: answering it
+// 202 would accept work this daemon cannot do and hide the malformed delivery
+// from the operator.
+func TestADeliveryWithNoUsableNumberIsRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body func(t *testing.T) []byte
+	}{
+		{"no subject at all", func(t *testing.T) []byte {
+			t.Helper()
+			body, err := json.Marshal(map[string]any{
+				"repository": map[string]any{"full_name": "octo/hello"},
+			})
+			if err != nil {
+				t.Fatalf("marshal payload: %v", err)
+			}
+			return body
+		}},
+		{"zero", func(t *testing.T) []byte {
+			return subjectPayload(t, "octo/hello", "issue", 0)
+		}},
+		{"negative", func(t *testing.T) []byte {
+			return subjectPayload(t, "octo/hello", "issue", -1)
+		}},
+		{"not a number", func(t *testing.T) []byte {
+			return subjectPayload(t, "octo/hello", "issue", "51")
+		}},
+		{"wider than an int", func(t *testing.T) []byte {
+			return subjectPayload(t, "octo/hello", "issue", json.RawMessage("99999999999999999999"))
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tickCh := make(chan tickCall, 1)
+			s := newServer(t, tickCh)
+			ts := httptest.NewServer(s.Handler(context.Background()))
+			defer ts.Close()
+
+			body := c.body(t)
+			resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+				github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+			})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			assertNoTick(t, tickCh)
+		})
+	}
+}
+
+// The accepted line has to name the issue, not just the repository: it is the
+// only record tying a delivery to the one tick it caused, and "a delivery
+// arrived for octo/hello" cannot be matched against what the human just did.
+func TestAnAcceptedDeliveryLogsTheIssueItNames(t *testing.T) {
+	logs := captureLogs(t)
+	tickCh := make(chan tickCall, 1)
+	s := newServer(t, tickCh)
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body := subjectPayload(t, "octo/hello", "issue", 51)
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	waitTick(t, tickCh)
+
+	out := logs.String()
+	if !strings.Contains(out, "number=51") {
+		t.Errorf("the accepted delivery log does not name the issue:\n%s", out)
+	}
+	// The old line claimed a repository-wide reconcile, which is no longer
+	// what a delivery does.
+	if strings.Contains(out, "reconcil") {
+		t.Errorf("an accepted delivery still claims a reconcile:\n%s", out)
 	}
 }

@@ -670,15 +670,19 @@ func drainAndClose(
 // unrecovered panic in ANY Go goroutine kills the whole process -- there is
 // no per-goroutine isolation. This command is the process owner, so the
 // decision belongs here.
-func wrapTick(tickCtx context.Context, deliver func(ctx context.Context, repo string)) func(context.Context, string) {
-	return func(_ context.Context, repo string) {
+func wrapTick(
+	tickCtx context.Context,
+	deliver func(ctx context.Context, repo string, number int),
+) func(context.Context, string, int) {
+	return func(_ context.Context, repo string, number int) {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("webhook tick panicked; recovered to keep the listener alive",
-					"repo", repo, "panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+					"repo", repo, "number", number,
+					"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
 			}
 		}()
-		deliver(tickCtx, repo)
+		deliver(tickCtx, repo, number)
 	}
 }
 
