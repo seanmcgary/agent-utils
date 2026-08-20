@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/listener"
 	"github.com/seanmcgary/agent-utils/internal/lock"
@@ -139,7 +140,11 @@ func listenerStartCommand() *cli.Command {
 			}
 
 			def := st.WithDefaults()
-			return runListener(ctx, def.Webhook.ListenAddr, def.Webhook.ListenPort, currentSecret)
+			// os.Stdout, and only on this path: --daemon returned above
+			// without ever running a server, so it has no routing table to
+			// report and would be printing one for a process that is not
+			// the one serving.
+			return runListener(ctx, os.Stdout, def.Webhook.ListenAddr, def.Webhook.ListenPort, currentSecret)
 		},
 	}
 }
@@ -298,7 +303,7 @@ func currentSecret() (string, error) {
 // `listener start` must keep serving after its own CLI Action would
 // otherwise be considered "done", which is exactly what a long-running
 // daemon is.
-func runListener(_ context.Context, addr string, port int, secret func() (string, error)) error {
+func runListener(_ context.Context, out io.Writer, addr string, port int, secret func() (string, error)) error {
 	dir, err := home.EnsureDir()
 	if err != nil {
 		return err
@@ -422,6 +427,16 @@ func runListener(_ context.Context, addr string, port int, secret func() (string
 		close(workerDone)
 	}()
 
+	// The routing table goes to the operator's terminal, not to slog: it is
+	// a multi-line table, and the JSON handler a daemon runs under would
+	// turn it into one unreadable escaped string. The slog line below stays
+	// as the machine-readable record of the same event.
+	//
+	// Printed here, after ListenAndServe has been started and at the same
+	// moment "listener started" is recorded, so a daemon that cannot bind
+	// still reports that failure as its outcome rather than this table
+	// becoming the last thing an operator reads.
+	printRoutingTable(out)
 	slog.Info("listener started", "addr", addr, "port", port, "pid", os.Getpid())
 
 	// Whichever happens first -- an operator or launchd sending a signal, or
@@ -438,6 +453,104 @@ func runListener(_ context.Context, addr string, port int, secret func() (string
 	}
 
 	return drainAndClose(cancelShuttingDown, cancelServer, cancelWorker, serverDone, workerDone, srv, &tickWG, db, lk, pidPath)
+}
+
+// printRoutingTable writes what this daemon will actually route to out.
+//
+// A listener that routes NOTHING -- no project registered on this host, every
+// loop config broken -- verifies signatures and returns 200 exactly like a
+// healthy one, and then does nothing with the delivery. Before this, the only
+// evidence either way was a per-delivery log line nobody reads until they
+// already suspect something is wrong.
+//
+// A write failure is logged rather than returned: this runs after the socket
+// is bound and serving, and a closed stdout is no reason to take down a daemon
+// that is otherwise working.
+func printRoutingTable(out io.Writer) {
+	routes, err := listener.Scan()
+	if err != nil {
+		// Only registry.List failing gets here (see listener.Scan), and it
+		// fails the same way on every delivery: nothing will route at all
+		// until it is fixed. Not fatal, because the registry can be repaired
+		// under a running daemon and the next delivery will pick it up.
+		slog.Error("cannot enumerate the routing table", "err", err)
+		writeBanner(out, fmt.Sprintf(
+			"NOT LISTENING FOR ANYTHING: the project registry could not be read, so no\n"+
+				"delivery can be routed to any loop: %v\n", err))
+		return
+	}
+	writeBanner(out, routingTable(routes))
+}
+
+// writeBanner writes one already-formatted block, discarding a write error
+// for the reason printRoutingTable documents.
+func writeBanner(out io.Writer, s string) {
+	_, _ = io.WriteString(out, s)
+}
+
+// oneLine folds a multi-line reason onto one line.
+//
+// A config that does not parse produces exactly that: gopkg.in/yaml.v3
+// reports "yaml: unmarshal errors:\n  line 2: field ... not found". Printed
+// raw into the indented list below, its continuation lines land at their own
+// indentation and read as further skipped entries -- which is what the first
+// run of this banner against a real broken config looked like.
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// routingTable renders the repositories this daemon will accept deliveries
+// for, grouped by repository because that is the key GitHub delivers against,
+// and then whatever the scan had to skip.
+//
+// It reports only what is configured HERE. Whether GitHub actually has a
+// webhook registered for one of these repositories is a different question,
+// and answering it would need an API call per repository and a token on the
+// startup path; `agent-utils project register-webhook` is where that belongs.
+func routingTable(routes listener.Routes) string {
+	var b strings.Builder
+
+	groups := routes.ByRepo()
+	if len(groups) == 0 {
+		// Deliberately loud, and deliberately not phrased as "0
+		// repositories": this is the one startup state that looks identical
+		// to a healthy daemon from the outside, and both of its causes are
+		// things the operator can fix in a minute if they are told which one
+		// it is.
+		fmt.Fprintf(&b, "NOT LISTENING FOR ANYTHING: no loop on this machine watches any repository.\n")
+		fmt.Fprintf(&b, "This listener will still verify and accept GitHub deliveries, and then do\n")
+		fmt.Fprintf(&b, "nothing with them. Either:\n")
+		fmt.Fprintf(&b, "  * no project is registered on this host -- run `agent-utils project init`\n")
+		fmt.Fprintf(&b, "    in each project, and `agent-utils list` to see what is registered; or\n")
+		fmt.Fprintf(&b, "  * no loop configuration in %s/%s declares a `repo:`.\n",
+			config.DirName, config.ConfigsSubdir)
+	} else {
+		fmt.Fprintf(&b, "listening for deliveries on %d repositor%s (configured locally; GitHub is not asked):\n",
+			len(groups), map[bool]string{true: "y", false: "ies"}[len(groups) == 1])
+		for _, g := range groups {
+			fmt.Fprintf(&b, "  %s\n", g.Repo)
+			for _, t := range g.Targets {
+				// project/loop, the pair every other command names a loop
+				// by: a loop name alone is ambiguous across projects.
+				fmt.Fprintf(&b, "    %s/%s\n", t.ProjectName, t.LoopName)
+			}
+		}
+	}
+
+	if len(routes.Skips) > 0 {
+		// Printed even when the table above is empty: a skip is usually the
+		// REASON a repository an operator expected is missing, and the two
+		// only mean something together.
+		fmt.Fprintf(&b, "\nskipped, and therefore not routed:\n")
+		for _, s := range routes.Skips {
+			if s.File != "" {
+				fmt.Fprintf(&b, "  %s/%s: %s\n", s.Project, s.File, oneLine(s.Reason))
+				continue
+			}
+			fmt.Fprintf(&b, "  %s (%s): %s\n", s.Project, s.Dir, oneLine(s.Reason))
+		}
+	}
+	return b.String()
 }
 
 // drainAndClose runs the shutdown sequence, in this exact order, and why:

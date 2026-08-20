@@ -176,7 +176,7 @@ func TestRunListenerRefusesWhenAlreadyRunning(t *testing.T) {
 	}
 	defer held.Release()
 
-	err = runListener(context.Background(), "127.0.0.1", 18080,
+	err = runListener(context.Background(), io.Discard, "127.0.0.1", 18080,
 		func() (string, error) { return "supersecretvalue", nil })
 	if err == nil {
 		t.Fatal("runListener while the lock is held: want an error, got nil")
@@ -707,5 +707,157 @@ func TestInstrumentRetriesSkipsFiringDuringShutdown(t *testing.T) {
 
 	if ran {
 		t.Fatal("the wrapped callback ran the retry tick after shuttingDown was already cancelled")
+	}
+}
+
+// routingTableFor is the shape of the fixtures below: a routing table built
+// by hand, so these tests exercise the FORMAT without a registry, a project
+// directory or a terminal. What the scan itself finds is covered one layer
+// down, in internal/listener/route_test.go.
+func routingTableFor(targets []listener.Target, skips []listener.Skip) string {
+	return routingTable(listener.Routes{Targets: targets, Skips: skips})
+}
+
+// loopsUnder returns the indented loop lines that follow the line naming
+// repo, which is what "grouped by repository" has to mean to be worth
+// printing: a flat list that happens to contain the right strings would
+// satisfy a Contains assertion while telling an operator nothing.
+func loopsUnder(table, repo string) []string {
+	var out []string
+	found := false
+	for _, line := range strings.Split(table, "\n") {
+		if strings.TrimSpace(line) == repo && strings.HasPrefix(line, "  ") {
+			found = true
+			continue
+		}
+		if !found {
+			continue
+		}
+		if !strings.HasPrefix(line, "    ") {
+			break
+		}
+		out = append(out, strings.TrimSpace(line))
+	}
+	return out
+}
+
+func TestRoutingTableGroupsLoopsUnderTheirRepository(t *testing.T) {
+	table := routingTableFor([]listener.Target{
+		{ProjectName: "lawndominator", LoopName: "planning", Repo: "mcgarylabs/lawndominator-monorepo"},
+		{ProjectName: "lawndominator", LoopName: "execution", Repo: "mcgarylabs/lawndominator-monorepo"},
+		{ProjectName: "widgets", LoopName: "planning", Repo: "acme/widgets"},
+	}, nil)
+
+	if !strings.Contains(table, "2 repositories") {
+		t.Errorf("table does not count the repositories it will route:\n%s", table)
+	}
+	got := loopsUnder(table, "mcgarylabs/lawndominator-monorepo")
+	want := []string{"lawndominator/execution", "lawndominator/planning"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("loops under the monorepo = %q, want %q:\n%s", got, want, table)
+	}
+	if got := loopsUnder(table, "acme/widgets"); len(got) != 1 || got[0] != "widgets/planning" {
+		t.Errorf("loops under acme/widgets = %q, want [widgets/planning]:\n%s", got, table)
+	}
+}
+
+// One repository, singular. A daemon routing exactly one repository is the
+// common case, and "1 repositories" is the kind of thing an operator reads as
+// "this output is not being looked after".
+func TestRoutingTableCountsOneRepositoryInTheSingular(t *testing.T) {
+	table := routingTableFor([]listener.Target{
+		{ProjectName: "widgets", LoopName: "planning", Repo: "acme/widgets"},
+	}, nil)
+
+	if !strings.Contains(table, "1 repository") || strings.Contains(table, "1 repositories") {
+		t.Errorf("table = %q, want the count in the singular", table)
+	}
+}
+
+// The case this banner exists for. A daemon that routes nothing verifies
+// signatures and accepts deliveries exactly like a healthy one, so the
+// startup output is the only place the difference can show.
+func TestRoutingTableZeroCaseSaysWhyItIsAProblemAndNamesTheCauses(t *testing.T) {
+	table := routingTableFor(nil, nil)
+
+	for _, want := range []string{
+		"NOT LISTENING",            // hard to miss in a terminal
+		"accept",                   // what it will still do with a delivery
+		"agent-utils project init", // cause one: nothing registered here
+		"repo:",                    // cause two: no loop declares a repository
+	} {
+		if !strings.Contains(table, want) {
+			t.Errorf("the zero case does not mention %q:\n%s", want, table)
+		}
+	}
+}
+
+// A skip is why an operator's repository is missing from the table above, so
+// the two have to appear together -- an early return on "no targets" that
+// dropped the skips would hide the very thing that explains the zero case.
+func TestRoutingTableZeroCaseStillReportsWhatWasSkipped(t *testing.T) {
+	table := routingTableFor(nil, []listener.Skip{
+		{Project: "alpha", Dir: "/gone/.agent-utils", Reason: "the project directory no longer exists"},
+	})
+
+	if !strings.Contains(table, "NOT LISTENING") {
+		t.Errorf("the zero-case warning disappeared once there was a skip:\n%s", table)
+	}
+	if !strings.Contains(table, "alpha") || !strings.Contains(table, "/gone/.agent-utils") {
+		t.Errorf("the skip is not reported next to the zero case:\n%s", table)
+	}
+}
+
+func TestRoutingTableNamesTheFileAndErrorOfASkippedLoop(t *testing.T) {
+	table := routingTableFor([]listener.Target{
+		{ProjectName: "widgets", LoopName: "planning", Repo: "acme/widgets"},
+	}, []listener.Skip{
+		{Project: "alpha", Dir: "/gone/.agent-utils", Reason: "the project directory no longer exists"},
+		{Project: "beta", Dir: "/here/.agent-utils", File: "broken.yaml",
+			Reason: "cannot load config: field this_key_does_not_exist not found"},
+	})
+
+	for _, want := range []string{
+		"broken.yaml",
+		"this_key_does_not_exist",
+		"alpha",
+		"/gone/.agent-utils",
+		"beta",
+	} {
+		if !strings.Contains(table, want) {
+			t.Errorf("the skipped entries do not mention %q:\n%s", want, table)
+		}
+	}
+	// The skips must not be mistaken for routing: they come after the table
+	// of repositories, not inside it.
+	if strings.Index(table, "acme/widgets") > strings.Index(table, "broken.yaml") {
+		t.Errorf("the skips are printed before the routing table:\n%s", table)
+	}
+}
+
+// A config that does not parse yields a MULTI-line error: gopkg.in/yaml.v3
+// reports "yaml: unmarshal errors:\n  line 2: field ... not found". Printed
+// raw, its second line lands in the skip list at its own indentation and
+// reads as a separate skipped entry -- which is what this looked like the
+// first time the banner ran against a real broken config.
+func TestRoutingTableKeepsEachSkipOnOneLine(t *testing.T) {
+	table := routingTableFor([]listener.Target{
+		{ProjectName: "widgets", LoopName: "planning", Repo: "acme/widgets"},
+	}, []listener.Skip{
+		{Project: "beta", Dir: "/here/.agent-utils", File: "broken.yaml",
+			Reason: "cannot load config: yaml: unmarshal errors:\n  line 2: field this_key_does_not_exist not found"},
+	})
+
+	var skipLines []string
+	for _, line := range strings.Split(strings.TrimSpace(table), "\n") {
+		if strings.Contains(line, "broken.yaml") || strings.Contains(line, "this_key_does_not_exist") {
+			skipLines = append(skipLines, line)
+		}
+	}
+	if len(skipLines) != 1 {
+		t.Fatalf("the skip spans %d lines, want one:\n%s", len(skipLines), table)
+	}
+	if !strings.Contains(skipLines[0], "line 2: field this_key_does_not_exist not found") {
+		t.Errorf("flattening the skip lost the detail of the error: %q", skipLines[0])
 	}
 }

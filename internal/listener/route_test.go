@@ -326,3 +326,202 @@ func TestTargetForIsGoneWhenTheProjectHasNoConfigsAtAll(t *testing.T) {
 		t.Errorf("routing = %v (err %v), want gone for a project with no loops", routing, err)
 	}
 }
+
+// Everything below is about Scan: the same walk Targets does, minus the repo
+// filter, so `listener start` can print the routing table it will actually
+// use. The two must share the walk -- a project Targets skips but Scan shows
+// would make the startup banner promise routing that a delivery then does
+// not do.
+
+func TestScanGroupsTwoProjectsWatchingOneRepoUnderIt(t *testing.T) {
+	home := setHome(t)
+	_, dirA := newProject(t, home, "alpha")
+	_, dirB := newProject(t, home, "beta")
+	writeLoop(t, dirA, "planning.yaml", minimalConfig("planning", "acme/widgets"))
+	writeLoop(t, dirB, "planning.yaml", minimalConfig("planning", "Acme/Widgets"))
+
+	routes, err := Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	byRepo := routes.ByRepo()
+	// One group, not two: the repo is the key GitHub delivers against, and
+	// Targets matches it with EqualFold, so two spellings of one repository
+	// route to each other's loops and must be shown together.
+	if len(byRepo) != 1 {
+		t.Fatalf("ByRepo() = %+v, want one group for the one repository", byRepo)
+	}
+	if len(byRepo[0].Targets) != 2 {
+		t.Fatalf("group = %+v, want both projects' loops under it", byRepo[0])
+	}
+	seen := map[string]bool{}
+	for _, tg := range byRepo[0].Targets {
+		seen[tg.ProjectName] = true
+	}
+	if !seen["alpha"] || !seen["beta"] {
+		t.Errorf("group = %+v, want a loop from alpha and one from beta", byRepo[0])
+	}
+}
+
+func TestScanKeepsEveryLoopOfAProject(t *testing.T) {
+	home := setHome(t)
+	_, dir := newProject(t, home, "alpha")
+	// Named so config.List's own by-name order (build, planning, zdocs) puts
+	// acme/widgets before acme/docs. Without that, insertion order and sorted
+	// order agree and the ordering assertion below would hold whether or not
+	// ByRepo sorts anything.
+	writeLoop(t, dir, "build.yaml", minimalConfig("build", "acme/widgets"))
+	writeLoop(t, dir, "planning.yaml", minimalConfig("planning", "acme/widgets"))
+	writeLoop(t, dir, "zdocs.yaml", minimalConfig("zdocs", "acme/docs"))
+
+	routes, err := Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(routes.Targets) != 3 {
+		t.Fatalf("targets = %+v, want all three loops", routes.Targets)
+	}
+	byRepo := routes.ByRepo()
+	if len(byRepo) != 2 {
+		t.Fatalf("ByRepo() = %+v, want one group per repository", byRepo)
+	}
+	// Sorted, so an operator reading the banner twice sees the same order and
+	// a diff between two hosts means something.
+	if byRepo[0].Repo != "acme/docs" || byRepo[1].Repo != "acme/widgets" {
+		t.Errorf("groups = %q, %q, want them sorted by repository",
+			byRepo[0].Repo, byRepo[1].Repo)
+	}
+	if len(byRepo[1].Targets) != 2 {
+		t.Errorf("acme/widgets group = %+v, want both loops that watch it", byRepo[1])
+	}
+}
+
+// The zero case is what the banner exists for: a daemon routing nothing
+// verifies and accepts deliveries exactly like a healthy one. Scan must
+// report it as an ordinary empty result, not an error -- the registry
+// answered, there is simply nothing in it.
+func TestScanFindsNothingWhenNoProjectIsRegistered(t *testing.T) {
+	setHome(t)
+
+	routes, err := Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(routes.Targets) != 0 || len(routes.ByRepo()) != 0 {
+		t.Fatalf("routes = %+v, want nothing on a host with no projects", routes)
+	}
+}
+
+// A loop file that does not load is a silent misconfiguration: the loop is
+// skipped and the operator has no reason to expect it. Scan reports it so
+// the banner can name the file and the error.
+func TestScanReportsALoopFileThatDoesNotLoad(t *testing.T) {
+	home := setHome(t)
+	_, dir := newProject(t, home, "alpha")
+	writeLoop(t, dir, "broken.yaml", "name: broken\nthis_key_does_not_exist: true\n")
+	writeLoop(t, dir, "good.yaml", minimalConfig("planning", "acme/widgets"))
+
+	routes, err := Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(routes.Targets) != 1 || routes.Targets[0].LoopName != "planning" {
+		t.Fatalf("targets = %+v, want exactly the one loadable loop", routes.Targets)
+	}
+	if len(routes.Skips) != 1 {
+		t.Fatalf("skips = %+v, want the broken file reported", routes.Skips)
+	}
+	s := routes.Skips[0]
+	if s.File != "broken.yaml" || s.Project != "alpha" {
+		t.Errorf("skip = %+v, want alpha's broken.yaml named", s)
+	}
+	if !strings.Contains(s.Reason, "this_key_does_not_exist") {
+		t.Errorf("skip reason = %q, want it to carry the load error", s.Reason)
+	}
+}
+
+// A registered project whose directory is gone stays in the registry until
+// pruned (registry.Project.Exists), so every one of its loops silently stops
+// routing. The banner is where an operator finds that out.
+func TestScanReportsAProjectDirectoryThatIsGone(t *testing.T) {
+	home := setHome(t)
+	_, dirA := newProject(t, home, "alpha")
+	writeLoop(t, dirA, "planning.yaml", minimalConfig("planning", "acme/widgets"))
+	if err := os.RemoveAll(dirA); err != nil {
+		t.Fatal(err)
+	}
+
+	routes, err := Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(routes.Targets) != 0 {
+		t.Fatalf("targets = %+v, want nothing from a project that is not there", routes.Targets)
+	}
+	if len(routes.Skips) != 1 {
+		t.Fatalf("skips = %+v, want the vanished project reported", routes.Skips)
+	}
+	s := routes.Skips[0]
+	if s.Project != "alpha" || s.Dir != dirA {
+		t.Errorf("skip = %+v, want alpha and its directory %s named", s, dirA)
+	}
+	if !strings.Contains(s.Reason, "no longer exists") {
+		t.Errorf("skip reason = %q, want it to say the directory is gone", s.Reason)
+	}
+}
+
+func TestScanReportsAProjectWithNoConfigsDirectory(t *testing.T) {
+	home := setHome(t)
+	newProject(t, home, "empty") // never gets writeLoop, so no configs/ dir exists
+
+	routes, err := Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(routes.Skips) != 1 || routes.Skips[0].Project != "empty" {
+		t.Fatalf("skips = %+v, want the project with no loop configurations reported", routes.Skips)
+	}
+	if routes.Skips[0].File != "" {
+		t.Errorf("skip = %+v, want no file named: the whole project was skipped", routes.Skips[0])
+	}
+}
+
+// Same rule Targets follows, for the same reason: an unreadable registry
+// would otherwise render an empty table that looks exactly like a host with
+// no projects on it.
+func TestScanReturnsAnErrorWhenTheRegistryCannotBeRead(t *testing.T) {
+	home := setHome(t)
+	if err := os.WriteFile(filepath.Join(home, registry.FileName), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Scan(); err == nil {
+		t.Fatal("Scan returned a nil error for a corrupt registry file")
+	}
+}
+
+// ByRepo must label a repository the same way on every scan. registry.List
+// returns projects most-recently-used first, so the order two projects are
+// walked in changes as they tick -- and with it which spelling of a repo two
+// projects disagree about would be seen first. A banner whose repository
+// names shuffle between restarts cannot be diffed against the last one, which
+// is most of what an operator does with it.
+func TestByRepoLabelsARepositoryTheSameWayWhateverTheScanOrder(t *testing.T) {
+	shouty := Target{ProjectName: "beta", LoopName: "planning", Repo: "ACME/Widgets"}
+	quiet := Target{ProjectName: "alpha", LoopName: "planning", Repo: "acme/widgets"}
+
+	first := Routes{Targets: []Target{shouty, quiet}}.ByRepo()
+	second := Routes{Targets: []Target{quiet, shouty}}.ByRepo()
+
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("ByRepo() = %+v and %+v, want one group each", first, second)
+	}
+	if first[0].Repo != second[0].Repo {
+		t.Errorf("label = %q one way and %q the other; it must not depend on scan order",
+			first[0].Repo, second[0].Repo)
+	}
+	if first[0].Targets[0].ProjectName != second[0].Targets[0].ProjectName {
+		t.Errorf("loop order = %q vs %q; it must not depend on scan order",
+			first[0].Targets[0].ProjectName, second[0].Targets[0].ProjectName)
+	}
+}

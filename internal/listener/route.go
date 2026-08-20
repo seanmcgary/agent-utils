@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
@@ -30,6 +31,174 @@ func (t Target) Ref() loopcmd.ProjectRef {
 	return loopcmd.ProjectRef{ID: t.ProjectID, Name: t.ProjectName, Dir: t.Dir}
 }
 
+// Skip is one thing a scan could not route, and why.
+//
+// It exists because the walk below already logs every one of these and then
+// throws it away. A per-delivery log line is the wrong place for a
+// misconfiguration that is permanent: it scrolls past, and the loop it names
+// never routes again until somebody fixes it. Returning the skips lets
+// `listener start` show them at the moment an operator is watching -- see
+// routingTable in cmd/agent-utils/listener.go.
+type Skip struct {
+	// Project is the registered project's name.
+	Project string
+	// Dir is the project's .agent-utils directory.
+	Dir string
+	// File is the base name of the loop file that was skipped. It is empty
+	// when the whole project was skipped, which is the difference between
+	// "one loop of this project does not load" and "none of this project's
+	// loops route at all".
+	File string
+	// Reason says what stopped it, in the same words the log line uses.
+	Reason string
+}
+
+// Routes is one whole scan of this machine: every loop that can receive a
+// delivery, and everything skipped on the way to that list.
+type Routes struct {
+	Targets []Target
+	Skips   []Skip
+}
+
+// RepoRoute is every loop that watches one repository.
+type RepoRoute struct {
+	Repo    string
+	Targets []Target
+}
+
+// ByRepo groups the targets by the repository they watch, sorted, so a
+// routing table can be printed in the shape a delivery arrives in.
+//
+// Grouping folds case, exactly as Targets matches: two projects that spell
+// one repository differently in their yaml both receive its deliveries, so
+// showing them as two separate repositories would misreport what this daemon
+// does. When they disagree, the label is the spelling used by the first loop
+// listed under it, NOT the first one the scan happened to walk past:
+// registry.List returns projects most-recently-used first, so scan order
+// changes as loops tick, and a banner whose repository names shuffle between
+// restarts cannot be compared against the last one. Nothing here is used to
+// call GitHub, so no spelling is more correct than another.
+func (r Routes) ByRepo() []RepoRoute {
+	index := map[string]int{}
+	var out []RepoRoute
+	for _, t := range r.Targets {
+		key := strings.ToLower(t.Repo)
+		i, ok := index[key]
+		if !ok {
+			index[key] = len(out)
+			out = append(out, RepoRoute{Repo: t.Repo})
+			i = len(out) - 1
+		}
+		out[i].Targets = append(out[i].Targets, t)
+	}
+	for i := range out {
+		g := &out[i]
+		sort.Slice(g.Targets, func(a, b int) bool {
+			if g.Targets[a].ProjectName != g.Targets[b].ProjectName {
+				return g.Targets[a].ProjectName < g.Targets[b].ProjectName
+			}
+			return g.Targets[a].LoopName < g.Targets[b].LoopName
+		})
+		g.Repo = g.Targets[0].Repo
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].Repo) < strings.ToLower(out[j].Repo)
+	})
+	return out
+}
+
+// Scan walks every registered project and returns every loop on this machine,
+// plus what it had to skip.
+//
+// This is the whole of Targets' walk apart from the repo filter, and Targets
+// is written in terms of it rather than beside it. A second copy of the skip
+// rules would drift: a project this one showed and Targets dropped would make
+// `listener start`'s routing table promise deliveries that never happen, and
+// the divergence would only ever surface as "the webhook does nothing".
+//
+// Nothing here is cached, for the reason Targets documents.
+func Scan() (Routes, error) {
+	projects, err := registry.List()
+	if err != nil {
+		// Returned, not logged-and-skipped: an empty result here would look
+		// exactly like "no loop watches this repository," and the delivery
+		// would be dropped with no recorded outcome anywhere. The per-project
+		// failures below are different -- they still leave every OTHER
+		// project's loops routable.
+		return Routes{}, fmt.Errorf("list registered projects: %w", err)
+	}
+
+	var routes Routes
+	for _, p := range projects {
+		if !p.Exists() {
+			// registry.Project.Exists documents that a moved or deleted
+			// project stays in the registry until pruned. One vanished
+			// directory must not stop every other project's loop from
+			// ticking, so this is logged and skipped, not returned.
+			slog.Warn("skipping project: directory no longer exists",
+				"project", p.Name, "dir", p.AgentUtilsDir)
+			routes.Skips = append(routes.Skips, Skip{
+				Project: p.Name, Dir: p.AgentUtilsDir,
+				Reason: "the project directory no longer exists",
+			})
+			continue
+		}
+
+		entries, err := config.List(p.AgentUtilsDir)
+		if err != nil {
+			reason := "cannot list loop configurations: " + err.Error()
+			if errors.Is(err, config.ErrNoConfigs) {
+				// The normal state of a registered project that has not (or
+				// not yet) grown a configs/ directory. Logged at Info, not
+				// Warn, so it does not read as a problem when it is not one.
+				slog.Info("skipping project: no loop configurations",
+					"project", p.Name, "dir", p.AgentUtilsDir)
+				reason = "no loop configurations"
+			} else {
+				slog.Warn("skipping project: cannot list loop configurations",
+					"project", p.Name, "dir", p.AgentUtilsDir, "err", err)
+			}
+			routes.Skips = append(routes.Skips, Skip{
+				Project: p.Name, Dir: p.AgentUtilsDir, Reason: reason,
+			})
+			continue
+		}
+
+		for _, e := range entries {
+			if e.Err != nil {
+				// One unparsable loop file must not stop this project's
+				// other loops, or any other project's loops, from ticking.
+				slog.Warn("skipping loop: cannot load config",
+					"loop", e.Name, "project", p.Name, "file", e.File, "err", e.Err)
+				routes.Skips = append(routes.Skips, Skip{
+					Project: p.Name, Dir: p.AgentUtilsDir, File: e.File,
+					Reason: "cannot load config: " + e.Err.Error(),
+				})
+				continue
+			}
+			routes.Targets = append(routes.Targets, Target{
+				ProjectID:   p.ID,
+				ProjectName: p.Name,
+				Dir:         p.AgentUtilsDir,
+				ConfigPath:  e.Path,
+				LoopName:    e.Name,
+				Repo:        e.Repo,
+			})
+		}
+	}
+	// Sorted for the same reason ByRepo sorts: registry.List orders projects
+	// by how recently they were used, so an unsorted skip list reorders
+	// itself between restarts and two runs of the same banner cannot be
+	// compared.
+	sort.Slice(routes.Skips, func(i, j int) bool {
+		if routes.Skips[i].Project != routes.Skips[j].Project {
+			return routes.Skips[i].Project < routes.Skips[j].Project
+		}
+		return routes.Skips[i].File < routes.Skips[j].File
+	})
+	return routes, nil
+}
+
 // Targets returns every loop on this machine whose repo matches, case
 // insensitively.
 //
@@ -41,67 +210,21 @@ func (t Target) Ref() loopcmd.ProjectRef {
 // of a loop that silently does not receive deliveries until a cache entry
 // happens to turn over.
 func Targets(repo string) ([]Target, error) {
-	projects, err := registry.List()
+	routes, err := Scan()
 	if err != nil {
-		// Returned, not logged-and-skipped: an empty result here would look
-		// exactly like "no loop watches this repository," and the delivery
-		// would be dropped with no recorded outcome anywhere. The per-project
-		// failures below are different -- they still leave every OTHER
-		// project's loops routable.
-		return nil, fmt.Errorf("list registered projects: %w", err)
+		return nil, err
 	}
 
 	var out []Target
-	for _, p := range projects {
-		if !p.Exists() {
-			// registry.Project.Exists documents that a moved or deleted
-			// project stays in the registry until pruned. One vanished
-			// directory must not stop every other project's loop from
-			// ticking, so this is logged and skipped, not returned.
-			slog.Warn("skipping project: directory no longer exists",
-				"project", p.Name, "dir", p.AgentUtilsDir)
+	for _, t := range routes.Targets {
+		// EqualFold, not ==: matches ghub.ListOpenPullRequests, which
+		// folds for the same reason -- GitHub's own casing of a
+		// full_name and the casing an operator typed into a yaml file
+		// need not agree.
+		if !strings.EqualFold(t.Repo, repo) {
 			continue
 		}
-
-		entries, err := config.List(p.AgentUtilsDir)
-		if err != nil {
-			if errors.Is(err, config.ErrNoConfigs) {
-				// The normal state of a registered project that has not (or
-				// not yet) grown a configs/ directory. Logged at Info, not
-				// Warn, so it does not read as a problem when it is not one.
-				slog.Info("skipping project: no loop configurations",
-					"project", p.Name, "dir", p.AgentUtilsDir)
-			} else {
-				slog.Warn("skipping project: cannot list loop configurations",
-					"project", p.Name, "dir", p.AgentUtilsDir, "err", err)
-			}
-			continue
-		}
-
-		for _, e := range entries {
-			if e.Err != nil {
-				// One unparsable loop file must not stop this project's
-				// other loops, or any other project's loops, from ticking.
-				slog.Warn("skipping loop: cannot load config",
-					"loop", e.Name, "project", p.Name, "file", e.File, "err", e.Err)
-				continue
-			}
-			// EqualFold, not ==: matches ghub.ListOpenPullRequests, which
-			// folds for the same reason -- GitHub's own casing of a
-			// full_name and the casing an operator typed into a yaml file
-			// need not agree.
-			if !strings.EqualFold(e.Repo, repo) {
-				continue
-			}
-			out = append(out, Target{
-				ProjectID:   p.ID,
-				ProjectName: p.Name,
-				Dir:         p.AgentUtilsDir,
-				ConfigPath:  e.Path,
-				LoopName:    e.Name,
-				Repo:        e.Repo,
-			})
-		}
+		out = append(out, t)
 	}
 	return out, nil
 }

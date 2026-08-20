@@ -352,6 +352,46 @@ check. Change the bind address or port with `agent-utils config set webhook.list
 `config.yaml` — `config show` still reports the configured value, not what the installed agent
 actually binds).
 
+As it comes up, a foreground `listener start` prints the routing table it will use — every
+repository it will accept deliveries for, and the loops each one dispatches. This is the
+"did my setup work" check, and it is the first thing to read when a webhook seems to do
+nothing:
+
+```
+listening for deliveries on 2 repositories (configured locally; GitHub is not asked):
+  acme/widgets
+    widgets/planning
+  mcgarylabs/lawndominator-monorepo
+    lawndominator/execution
+    lawndominator/planning
+
+skipped, and therefore not routed:
+  ghost (/Users/you/old-project/.agent-utils): the project directory no longer exists
+  lawndominator/broken.yaml: cannot load config: parse config ...: yaml: unmarshal errors: line 2: field this_key_does_not_exist not found in type config.Config
+```
+
+That table comes from the loop configurations on THIS machine, and nothing else: it does not
+ask GitHub whether a webhook is really registered for those repositories, which would need an
+API call per repository and a token on the startup path (`project register-webhook` is where
+that happens). The `skipped` block is everything the same scan a delivery uses had to pass
+over — a registered project whose directory is gone, a project with no `configs/` directory,
+a loop file that does not load — so a silent misconfiguration shows up at startup rather
+than never. `--daemon` prints nothing of the sort: it installs the launchd agent and returns
+without serving; the agent it installs writes this table to
+`~/.agent-utils/listener.stdout.log` at every login.
+
+When the scan finds no loops at all, the banner says so loudly, because that daemon still
+verifies signatures and returns 200 for every delivery before doing nothing with it:
+
+```
+NOT LISTENING FOR ANYTHING: no loop on this machine watches any repository.
+This listener will still verify and accept GitHub deliveries, and then do
+nothing with them. Either:
+  * no project is registered on this host -- run `agent-utils project init`
+    in each project, and `agent-utils list` to see what is registered; or
+  * no loop configuration in .agent-utils/configs declares a `repo:`.
+```
+
 The listener needs the same `~/.agent-utils/env` file the [Cron](#cron) section has you
 create, with `GITHUB_TOKEN` in it: `listener start` refuses to start without it, and once
 running, the daemon re-reads it on every delivery so a rotated token needs no restart. If you
