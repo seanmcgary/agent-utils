@@ -163,6 +163,16 @@ func NameTaken(name string) bool {
 // A name is matched first and case-insensitively, because that is what an
 // operator types. An unambiguous path is accepted too, so a cron entry can name
 // a directory without knowing the project name.
+//
+// A name matching MORE than one project is an error, never a pick. This used
+// to return the first match while List() sorts by LastSeen descending, so a
+// registry holding two projects called "lawndominator" answered `project
+// --name lawndominator loop reset` with whichever one happened to have ticked
+// last -- acting on the wrong repository with nothing in the output saying so.
+// `project init` refuses to create such a duplicate, but a registry written
+// before that check existed can still hold one, so the read side has to
+// refuse too. An id or a path selector stays unambiguous by definition and is
+// what the error tells the operator to use.
 func Find(selector string) (Project, error) {
 	projects, err := List()
 	if err != nil {
@@ -173,9 +183,21 @@ func Find(selector string) (Project, error) {
 	}
 
 	var names []string
+	var byName []Project
 	for _, p := range projects {
 		names = append(names, p.Name)
-		if strings.EqualFold(p.Name, selector) || p.ID == selector {
+		if strings.EqualFold(p.Name, selector) {
+			byName = append(byName, p)
+		}
+	}
+	if len(byName) > 1 {
+		return Project{}, ambiguousNameErr(selector, byName)
+	}
+	if len(byName) == 1 {
+		return byName[0], nil
+	}
+	for _, p := range projects {
+		if p.ID == selector {
 			return p, nil
 		}
 	}
@@ -195,6 +217,22 @@ func Find(selector string) (Project, error) {
 
 // ErrNoProject reports that no registered project matched.
 var ErrNoProject = errors.New("no such project")
+
+// ErrAmbiguousProject reports that a name matched more than one registered
+// project, so the command refused to guess which one was meant.
+var ErrAmbiguousProject = errors.New("ambiguous project name")
+
+// ambiguousNameErr lists every candidate with its id and root, because the
+// only way out is to re-run the command with one of them: the operator cannot
+// choose between two projects they cannot tell apart.
+func ambiguousNameErr(selector string, matches []Project) error {
+	var lines []string
+	for _, p := range matches {
+		lines = append(lines, fmt.Sprintf("\n  %s (%s)", p.ID, p.Root))
+	}
+	return fmt.Errorf("%w %q; it matches %d projects:%s\nselect one by id or path instead",
+		ErrAmbiguousProject, selector, len(matches), strings.Join(lines, ""))
+}
 
 // Forget removes a project from the registry by name, id, or path. It does not
 // touch the project's own files.

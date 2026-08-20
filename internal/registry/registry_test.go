@@ -3,6 +3,7 @@ package registry
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -185,5 +186,77 @@ func TestReadToleratesAnEmptyFile(t *testing.T) {
 
 	if _, err := List(); err != nil {
 		t.Errorf("an empty registry must not be an error: %v", err)
+	}
+}
+
+// TestFindAmbiguousNameErrorsAndNamesBothCandidates pins the safety net for a
+// registry that already holds two projects sharing a name: Find used to walk
+// List() (LastSeen descending) and return the FIRST name match, so
+// `agent-utils project --name lawndominator status` silently acted on
+// whichever of the two was used most recently -- a status read, a tick, or a
+// reset aimed at the wrong repository, with nothing in the output saying so.
+func TestFindAmbiguousNameErrorsAndNamesBothCandidates(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", "")
+	t.Setenv("HOME", t.TempDir())
+	a := mkProject(t, t.TempDir())
+	b := mkProject(t, t.TempDir())
+	if err := Register(a, "id-a", "lawndominator"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Register(b, "id-b", "lawndominator"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Find("lawndominator")
+	if err == nil {
+		t.Fatal("Find on a duplicated name: want an error, got nil")
+	}
+	for _, want := range []string{filepath.Dir(a), filepath.Dir(b), "id-a", "id-b"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name candidate %q", err.Error(), want)
+		}
+	}
+
+	// An id selector is unambiguous by definition and must still resolve, or
+	// the error above would leave the operator with no way out.
+	got, err := Find("id-a")
+	if err != nil {
+		t.Fatalf("Find by id after the name became ambiguous: %v", err)
+	}
+	if got.AgentUtilsDir != a {
+		t.Errorf("Find(%q) = %q, want %q", "id-a", got.AgentUtilsDir, a)
+	}
+
+	// A path selector is unambiguous too.
+	got, err = Find(filepath.Dir(b))
+	if err != nil {
+		t.Fatalf("Find by path after the name became ambiguous: %v", err)
+	}
+	if got.AgentUtilsDir != b {
+		t.Errorf("Find by path = %q, want %q", got.AgentUtilsDir, b)
+	}
+}
+
+// TestFindUniqueNameStillResolves guards the ambiguity check from turning
+// every lookup into an error: one project answering to a name is the case
+// every command takes.
+func TestFindUniqueNameStillResolves(t *testing.T) {
+	t.Setenv("AGENT_UTILS_HOME", "")
+	t.Setenv("HOME", t.TempDir())
+	a := mkProject(t, t.TempDir())
+	b := mkProject(t, t.TempDir())
+	if err := Register(a, "id-a", "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Register(b, "id-b", "beta"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Find("ALPHA")
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if got.ID != "id-a" {
+		t.Errorf("Find(%q).ID = %q, want id-a", "ALPHA", got.ID)
 	}
 }
