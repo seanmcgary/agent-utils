@@ -89,6 +89,60 @@ func TestBuildArgsPutsPromptLast(t *testing.T) {
 	}
 }
 
+func piCfg() *config.Config {
+	return &config.Config{
+		Agent: config.Agent{
+			Harness:  config.HarnessPi,
+			Model:    "anthropic/claude-sonnet-4-5",
+			Effort:   "high",
+			Worktree: "per_issue",
+		},
+	}
+}
+
+func TestPiBuildArgsPrintMode(t *testing.T) {
+	args := PiBuildArgs(piCfg(), Invocation{SessionID: "s1", Prompt: "go"})
+	if args[0] != "-p" {
+		t.Errorf("argv[0] = %q, want -p", args[0])
+	}
+	if args[1] != "--mode" || args[2] != "json" {
+		t.Errorf("print mode header = %v, want --mode json", []string{args[1], args[2]})
+	}
+}
+
+func TestPiBuildArgsCarriesModelAndSession(t *testing.T) {
+	j := joined(PiBuildArgs(piCfg(), Invocation{SessionID: "s9", Prompt: "p"}))
+	for _, want := range []string{"--session-id s9", "--model anthropic/claude-sonnet-4-5"} {
+		if !strings.Contains(j, want) {
+			t.Errorf("missing %q in %s", want, j)
+		}
+	}
+}
+
+func TestPiBuildArgsAddsThinking(t *testing.T) {
+	j := joined(PiBuildArgs(piCfg(), Invocation{SessionID: "s", Prompt: "p"}))
+	if !strings.Contains(j, "--thinking high") {
+		t.Errorf("missing --thinking high in %s", j)
+	}
+}
+
+func TestPiBuildArgsOmitsEmptyEffort(t *testing.T) {
+	c := piCfg()
+	c.Agent.Effort = ""
+	j := joined(PiBuildArgs(c, Invocation{SessionID: "s", Prompt: "p"}))
+	if strings.Contains(j, "--thinking") {
+		t.Errorf("effort empty must omit --thinking: %s", j)
+	}
+}
+
+func TestPiBuildArgsPutsPromptLast(t *testing.T) {
+	args := PiBuildArgs(piCfg(), Invocation{SessionID: "s", Prompt: "the prompt"})
+	if args[len(args)-1] != "the prompt" {
+		t.Errorf("last argument = %q, want the prompt", args[len(args)-1])
+	}
+}
+
+
 func TestRenderPrompt(t *testing.T) {
 	got, err := RenderPrompt("issue {{.Issue.Number}} in {{.Repo}}", PromptData{
 		Repo:  "o/r",

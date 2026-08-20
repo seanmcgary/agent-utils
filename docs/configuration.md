@@ -188,6 +188,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `labels.review` | string | yes | — |
 | `labels.terminal` | string | no | empty |
 | `labels.veto` | list of string | no | empty |
+| `agent.harness` | enum | no | `claude` |
 | `agent.model` | string | yes | — |
 | `agent.effort` | enum | no | claude's own default |
 | `agent.permission_mode` | enum | no | claude's own default |
@@ -458,7 +459,27 @@ Quote any value containing `*`, or YAML may complain.
 
 ## `agent`
 
-How to invoke `claude` for a dispatch.
+How to invoke the agent for a dispatch. The `agent.harness` field selects which agent
+program runs; the rest of the `agent` fields map onto that program's flags (see below).
+
+### `agent.harness` — optional
+
+| Value | Agent run |
+|---|---|
+| `claude` | Runs `claude -p`, Stream stats stream-json. Default. |
+| `pi` | Runs `pi -p --mode json`. |
+
+Choose `pi` to use a model that `claude` does not offer. For a `pi` harness:
+
+- `agent.model` must be a `provider/id` or a pattern that pi resolves (for example
+  `anthropic/claude-sonnet-4-5`, `openrouter/...`), not a claude alias like `opus`.
+- `agent.effort` maps to pi's `--thinking` level. `low`, `medium`, `high`, `xhigh`, `max`
+  are valid for both harnesses.
+- `agent.permission_mode` is claude-only. A `pi` config must not set it; the loop rejects it.
+- `agent.max_budget_usd` is a claude-only ceiling. For `pi` it is accepted but has no
+  effect, because pi exposes no cost-ceiling flag.
+- A `pi` run's session resumes by the same session id, because pi's `--session-id`
+  creates a session when new and resumes it when known.
 
 ### `agent.model` — required
 

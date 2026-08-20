@@ -255,3 +255,85 @@ func TestLoadRejectsNegativeMaxBudget(t *testing.T) {
 		t.Errorf("err = %v, want it to name max_budget_usd", err)
 	}
 }
+
+func TestLoadAcceptsHarnessDefault(t *testing.T) {
+	cfg, err := Load(writeTemp(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.Harness != HarnessClaude {
+		t.Errorf("Harness (unset) = %q, want %q", cfg.Agent.Harness, HarnessClaude)
+	}
+}
+
+const piYAML = `
+name: planning
+repo: mcgarylabs/lawndominator-monorepo
+checkout_base_dir: /tmp/checkout
+worktree_dir: /tmp/worktrees
+state_dir: /tmp/state
+default_branch: master
+labels:
+  trigger: t
+  in_flight: f
+  blocked: b
+  review: r
+i_understand_bypass_permissions: false
+agent:
+  harness: pi
+  model: anthropic/claude-sonnet-4-5
+  effort: high
+  worktree: per_issue
+  max_budget_usd: 0
+  timeout: 3h
+retry:
+  max: 1
+  backoff: [0s]
+  breaker: {orphan_threshold: 2, cooldown: 1m}
+prompt: "plan {{.Issue.Number}}"
+resume_prompt: "resume {{.Issue.Number}}"
+`
+
+func TestLoadAcceptsPiHarness(t *testing.T) {
+	cfg, err := Load(writeTemp(t, piYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.Harness != HarnessPi {
+		t.Errorf("Harness = %q, want %q", cfg.Agent.Harness, HarnessPi)
+	}
+}
+
+func TestLoadRejectsBadHarness(t *testing.T) {
+	body := replaceOnce(piYAML, "  harness: pi\n", "  harness: gemini\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want error for a bad harness, got nil")
+	}
+	if !strings.Contains(err.Error(), "harness") {
+		t.Errorf("err = %v, want it to name harness", err)
+	}
+}
+
+func TestRejectsPiPermissionMode(t *testing.T) {
+	body := replaceOnce(piYAML, "  worktree: per_issue\n",
+		"  permission_mode: acceptEdits\n  worktree: per_issue\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want reject permission_mode for a pi harness, got nil")
+	}
+	if !strings.Contains(err.Error(), "permission_mode") {
+		t.Errorf("err = %v, want it to name permission_mode", err)
+	}
+}
+
+func TestAcceptsPiBudgetNoOp(t *testing.T) {
+	body := replaceOnce(piYAML, "  max_budget_usd: 0\n", "  max_budget_usd: 50\n")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("Load pi with non-zero budget: %v", err)
+	}
+	if cfg.Agent.Harness != HarnessPi {
+		t.Errorf("Harness = %q, want %q", cfg.Agent.Harness, HarnessPi)
+	}
+}

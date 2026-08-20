@@ -55,6 +55,27 @@ func BuildArgs(cfg *config.Config, inv Invocation) []string {
 	return append(args, inv.Prompt)
 }
 
+// PiBuildArgs returns the argument list for pi.
+//
+// pi in print mode with json event output is the pi equivalent of claude's
+// --output-format stream-json. --session-id both creates and resumes a session, so
+// start and resume carry the same flag. The model must be a provider/id or pattern.
+// pi has no cost-ceiling flag: the config layer accepts max_budget_usd but this
+// builder never emits it.
+func PiBuildArgs(cfg *config.Config, inv Invocation) []string {
+	args := []string{
+		"-p",
+		"--mode", "json",
+		"--session-id", inv.SessionID,
+		"--model", cfg.Agent.Model,
+	}
+	if cfg.Agent.Effort != "" {
+		args = append(args, "--thinking", cfg.Agent.Effort)
+	}
+	// The prompt is positional and must come last.
+	return append(args, inv.Prompt)
+}
+
 // PromptIssue is the issue view a prompt template can read.
 type PromptIssue struct {
 	Number int
