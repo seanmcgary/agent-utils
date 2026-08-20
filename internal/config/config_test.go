@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -33,7 +34,7 @@ agent:
 tend_pr: true
 retry:
   max: 3
-  backoff_ticks: [0, 1, 2]
+  backoff: [0s, 15m, 30m]
   breaker:
     orphan_threshold: 2
     cooldown: 30m
@@ -68,6 +69,12 @@ func TestLoadValid(t *testing.T) {
 	if got := cfg.Retry.Breaker.Cooldown.Std(); got != 30*time.Minute {
 		t.Errorf("Cooldown = %v, want 30m", got)
 	}
+	if len(cfg.Retry.Backoff) != 3 {
+		t.Fatalf("Backoff = %v, want 3 entries", cfg.Retry.Backoff)
+	}
+	if got := cfg.Retry.Backoff[1].Std(); got != 15*time.Minute {
+		t.Errorf("Backoff[1] = %v, want 15m", got)
+	}
 	if !cfg.TendPR {
 		t.Error("TendPR = false, want true")
 	}
@@ -96,7 +103,7 @@ labels:
   in_flight: f
   blocked: b
 agent: {model: opus, worktree: per_issue, timeout: 1h}
-retry: {max: 1, backoff_ticks: [0], breaker: {orphan_threshold: 2, cooldown: 1m}}
+retry: {max: 1, backoff: [0s], breaker: {orphan_threshold: 2, cooldown: 1m}}
 prompt: p
 resume_prompt: rp
 `
@@ -130,10 +137,48 @@ func TestRejectsUnknownPermissionMode(t *testing.T) {
 }
 
 func TestLoadRejectsShortBackoff(t *testing.T) {
-	body := replaceOnce(validYAML, "backoff_ticks: [0, 1, 2]", "backoff_ticks: [0]")
+	// max: 3 with two backoff entries: the acceptance criterion is literal
+	// about "two entries", so use two rather than relying on one to exercise
+	// the same len(backoff) < retry.max branch.
+	body := replaceOnce(validYAML, "backoff: [0s, 15m, 30m]", "backoff: [0s, 15m]")
 	_, err := Load(writeTemp(t, body))
 	if err == nil {
-		t.Fatal("want error when len(backoff_ticks) < retry.max, got nil")
+		t.Fatal("want error when len(backoff) < retry.max, got nil")
+	}
+}
+
+// retry.backoff_ticks is a rejection shim: a stale config that still uses it
+// must fail with a message that names the old key, the new key, and a value
+// to copy, not a bare "unknown field" error. This asserts on text only the
+// shim's own error branch can produce (not the separate "len(backoff) <
+// retry.max" length error, which would also contain "retry.backoff" and so
+// would let this test pass even if the shim were deleted).
+func TestLoadRejectsBackoffTicks(t *testing.T) {
+	body := replaceOnce(validYAML, "backoff: [0s, 15m, 30m]", "backoff_ticks: [0, 1, 2]")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want error for retry.backoff_ticks, got nil")
+	}
+	for _, want := range []string{
+		"retry.backoff_ticks is no longer supported",
+		"backoff: [0s, 15m, 30m]",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err.Error(), want)
+		}
+	}
+}
+
+// retry.max: 0 means never retry, so retry.backoff may legitimately be
+// empty. Nothing may index it without a length check first.
+func TestLoadAcceptsEmptyBackoffWhenMaxZero(t *testing.T) {
+	body := replaceOnce(validYAML, "max: 3\n  backoff: [0s, 15m, 30m]", "max: 0")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Retry.Backoff) != 0 {
+		t.Errorf("Backoff = %v, want empty", cfg.Retry.Backoff)
 	}
 }
 
@@ -176,4 +221,37 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// max_budget_usd: 0 is how a loop runs with no cost ceiling:
+// internal/runner/args.go only appends --max-budget-usd when the value is greater
+// than zero, so 0 omits the flag entirely. Nothing in validate may start
+// requiring a positive number without deliberately taking that away, so the
+// behaviour is pinned here rather than left to be discovered by an operator
+// whose uncapped loop suddenly refuses to load.
+func TestLoadAcceptsZeroMaxBudget(t *testing.T) {
+	body := replaceOnce(validYAML, "  max_budget_usd: 25\n", "  max_budget_usd: 0\n")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("max_budget_usd: 0 must load, it means no cap: %v", err)
+	}
+	if cfg.Agent.MaxBudgetUSD != 0 {
+		t.Errorf("MaxBudgetUSD = %v, want 0", cfg.Agent.MaxBudgetUSD)
+	}
+}
+
+// A negative budget is silently identical to no budget: args.go gates on
+// "> 0", so -25 omits --max-budget-usd and the dispatch runs uncapped. An
+// operator who typed a stray minus sign asked for a $25 ceiling and would
+// have got none, with nothing said. Reject it at load, so a hand-edited file
+// is caught and not only a wizard answer.
+func TestLoadRejectsNegativeMaxBudget(t *testing.T) {
+	body := replaceOnce(validYAML, "  max_budget_usd: 25\n", "  max_budget_usd: -25\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want error for a negative max_budget_usd, got nil")
+	}
+	if !strings.Contains(err.Error(), "max_budget_usd") {
+		t.Errorf("err = %v, want it to name max_budget_usd", err)
+	}
 }

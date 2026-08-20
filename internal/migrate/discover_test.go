@@ -29,7 +29,7 @@ agent:
   timeout: 1h
 retry:
   max: 3
-  backoff_ticks: [1, 2, 4]
+  backoff: [0s, 15m, 30m]
   breaker:
     orphan_threshold: 2
     cooldown: 30m

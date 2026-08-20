@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -81,13 +82,20 @@ func TestSpawnFailureDoesNotStrandIssue(t *testing.T) {
 }
 
 // Regression: the retry ladder end to end across real ticks.
-// Original: still fires 1,2,3 then parks, with backoff [0,1,2].
+// Original: still fires 1,2,3 then parks, with backoff [0s, 15m, 30m].
+//
+// The clock is advanced an hour between ticks, past every entry of the ladder.
+// Without that the wall-clock deadline defers the second retry and the ladder
+// never reaches the cap inside the test.
 func TestRetryLadderFiresThreeTimesThenParksOnce(t *testing.T) {
 	cfg := tickConfig(t)
 	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"in-flight"}}}}
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
 	deps.IsAlive = func(int, int64) bool { return false }
+
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	deps.Now = func() time.Time { return now }
 
 	_ = deps.Store.PutIssueState(store.IssueState{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
@@ -98,10 +106,12 @@ func TestRetryLadderFiresThreeTimesThenParksOnce(t *testing.T) {
 			Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindStart, SessionID: "s",
 		})
 		_ = deps.Store.SetDispatchProcess(id, 999999, time.Now().Add(-time.Hour))
-		_ = deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 1)
+		_ = deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 1, now, runner.RetryBackoff(cfg))
 	}
 	mkDead()
 	for i := 0; i < 8; i++ {
+		// Advance past the longest wait in the ladder BEFORE the tick decides.
+		now = now.Add(time.Hour)
 		before := spawned
 		if _, err := Tick(context.Background(), cfg, deps); err != nil {
 			t.Fatal(err)
@@ -120,4 +130,92 @@ func TestRetryLadderFiresThreeTimesThenParksOnce(t *testing.T) {
 		t.Errorf("comments=%d, want exactly 1 cap comment", len(gh.comments))
 	}
 
+}
+
+// Regression: the two-writer bug that plan review caught and no unit test would
+// have.
+//
+// MarkNeedsRetry is the only writer of a NON-ZERO retry_after; every other
+// statement that touches the column only ever clears it (see store.go). If
+// dispatch also stamped a deadline, every needs-retry transition would still
+// run through MarkNeedsRetry and overwrite it, so the escalating list would
+// collapse to its first entry forever -- and after the migration that entry is
+// 0s, which means the backoff would silently be nothing at all.
+//
+// The whole sequence is driven here, because only the sequence catches it:
+// record a failure, tick so the retry dispatches, record a second failure, and
+// read the deadline back.
+func TestRetryDeadlineEscalatesAcrossTheDispatch(t *testing.T) {
+	cfg := tickConfig(t) // backoff 0s, 15m, 30m
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"in-flight"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	base := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	now := base
+	deps.Now = func() time.Time { return now }
+
+	if err := deps.Store.PutIssueState(store.IssueState{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
+		SessionStarted: true, UpdatedAt: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// First failure, at retry_count 0: the deadline is Backoff[0], which is 0s.
+	if err := deps.Store.MarkNeedsRetry(
+		cfg.Name, cfg.Repo, 1, now, runner.RetryBackoff(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.RetryAfter.Equal(base) {
+		t.Fatalf("after the first failure RetryAfter = %v, want %v (Backoff[0])",
+			st.RetryAfter, base)
+	}
+
+	// The tick dispatches the retry. It must not touch the deadline.
+	//
+	// It runs AFTER the deadline, not on it. Backoff[0] is 0s, so a dispatch
+	// that stamped now + Backoff[state.RetryCount] before the increment would
+	// land on the very instant the assertion below expects and hide itself.
+	now = base.Add(5 * time.Minute)
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+	if spawned != 1 {
+		t.Fatalf("spawned = %d, want 1 retry once the deadline has passed", spawned)
+	}
+	st, err = deps.Store.IssueState(cfg.Name, cfg.Repo, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.RetryAfter.Equal(base) {
+		t.Errorf("the dispatch stamped RetryAfter = %v, want it untouched at %v; "+
+			"MarkNeedsRetry is the only writer of a real deadline", st.RetryAfter, base)
+	}
+	if st.RetryCount != 1 {
+		t.Fatalf("RetryCount = %d, want 1; it is what the next failure indexes with",
+			st.RetryCount)
+	}
+
+	// Second failure, an hour later and at retry_count 1: the deadline is now
+	// Backoff[1], measured from THIS failure.
+	now = base.Add(time.Hour)
+	if err := deps.Store.MarkNeedsRetry(
+		cfg.Name, cfg.Repo, 1, now, runner.RetryBackoff(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	st, err = deps.Store.IssueState(cfg.Name, cfg.Repo, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := now.Add(15 * time.Minute)
+	if !st.RetryAfter.Equal(want) {
+		t.Errorf("after the second failure RetryAfter = %v, want %v: Backoff[1] "+
+			"from the second failure, not Backoff[0] and not a dispatch stamp",
+			st.RetryAfter, want)
+	}
 }

@@ -75,32 +75,122 @@ func TestFindDirErrorsWhenNothingExists(t *testing.T) {
 	}
 }
 
-// Regression. The home directory holds the cross-project registry, so
-// $HOME/.agent-utils exists as soon as any project is used. Falling back to it
-// made an unrelated directory report "configs does not exist" instead of
-// honestly saying there is no project here -- and would have let one project's
-// loops be run from another project's directory.
-func TestFindDirDoesNotFallBackToHome(t *testing.T) {
+// Regression. The machine-wide directory ($AGENT_UTILS_HOME, or plain
+// $HOME/.agent-utils) is a parent of everything under the home tree, so an
+// unmodified walk-up reaches it as an ORDINARY ancestor for any command run
+// from a directory under $HOME that is not inside a project -- e.g.
+// ~/Downloads/scratch. FindDir must not treat that ancestor as a match: doing
+// so would make the caller write a project descriptor into the machine-wide
+// directory the registry and the canonical state database also live in.
+//
+// $AGENT_UTILS_HOME, not $HOME, is set here: $HOME also steers git and ssh,
+// which a test must not disturb.
+func TestFindDirDoesNotAdoptTheMachineWideDirectory(t *testing.T) {
 	t.Setenv("AGENT_UTILS_DIR", "")
 
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	// A home .agent-utils exists, exactly as the registry creates it.
-	if err := os.MkdirAll(filepath.Join(home, DirName, ConfigsSubdir), 0o700); err != nil {
+	homeDir := t.TempDir()
+	machineWide := filepath.Join(homeDir, DirName)
+	t.Setenv("AGENT_UTILS_HOME", machineWide)
+	// The machine-wide directory itself, exactly as the registry creates it.
+	if err := os.MkdirAll(filepath.Join(machineWide, ConfigsSubdir), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(
-		filepath.Join(home, DirName, ConfigsSubdir, "elsewhere.yaml"),
+		filepath.Join(machineWide, ConfigsSubdir, "elsewhere.yaml"),
 		[]byte(validYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := FindDir(t.TempDir())
+	scratch := filepath.Join(homeDir, "Downloads", "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindDir(scratch)
 	if err == nil {
-		t.Fatalf("FindDir = %q, want an error; a home directory must never be adopted", got)
+		t.Fatalf("FindDir = %q, want an error; the machine-wide directory must never be adopted", got)
 	}
 	if !errors.Is(err, ErrNoDir) {
 		t.Fatalf("err = %v, want ErrNoDir", err)
+	}
+	// FindDir's own message no longer names the fix (`agent-utils project
+	// init`): loopcmd.ResolveProject's noProjectErr is the one place that
+	// now does, so the same line is not printed twice on this exact path.
+}
+
+// Regression. home.Dir() and a walk candidate can name the same directory in
+// two different spellings: macOS resolves /var to /private/var, and
+// FindDir's only caller (internal/loopcmd/resolve.go) feeds it os.Getwd(),
+// which returns the RESOLVED spelling whenever $PWD is unset -- exactly the
+// case for a launchd-started process such as the listener daemon this
+// feature adds. AGENT_UTILS_HOME is set here to the raw (unresolved)
+// spelling, as an operator or a plist would write it, while the walk starts
+// from the resolved spelling, as os.Getwd() would hand FindDir under
+// launchd. A guard that compares raw strings never fires in this case and
+// silently lets the machine-wide directory through.
+func TestFindDirDoesNotAdoptTheMachineWideDirectoryAcrossASymlink(t *testing.T) {
+	t.Setenv("AGENT_UTILS_DIR", "")
+
+	homeDir := t.TempDir()
+	resolvedHome, err := filepath.EvalSymlinks(homeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedHome == homeDir {
+		t.Skip("temp dir is not reached through a symlink on this platform; the spellings cannot diverge")
+	}
+
+	// AGENT_UTILS_HOME holds the raw spelling, the way an operator would
+	// write it or launchd's plist would name it.
+	machineWide := filepath.Join(homeDir, DirName)
+	t.Setenv("AGENT_UTILS_HOME", machineWide)
+	if err := os.MkdirAll(filepath.Join(machineWide, ConfigsSubdir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The walk starts from the RESOLVED spelling, the way os.Getwd() returns
+	// it when $PWD is unset.
+	scratch := filepath.Join(resolvedHome, "Downloads", "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindDir(scratch)
+	if err == nil {
+		t.Fatalf("FindDir = %q, want an error; the machine-wide directory must never be adopted, even spelled through a symlink", got)
+	}
+	if !errors.Is(err, ErrNoDir) {
+		t.Fatalf("err = %v, want ErrNoDir", err)
+	}
+}
+
+// A genuine project nested under the same tree as the machine-wide directory
+// (e.g. ~/Downloads/myproject) must still resolve. Skipping the machine-wide
+// directory must not turn into skipping every ancestor.
+func TestFindDirStillResolvesAProjectNearTheMachineWideDirectory(t *testing.T) {
+	t.Setenv("AGENT_UTILS_DIR", "")
+
+	homeDir := t.TempDir()
+	machineWide := filepath.Join(homeDir, DirName)
+	t.Setenv("AGENT_UTILS_HOME", machineWide)
+	if err := os.MkdirAll(filepath.Join(machineWide, ConfigsSubdir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	project := filepath.Join(homeDir, "Downloads", "myproject")
+	want := mkConfigs(t, project, nil)
+
+	deep := filepath.Join(project, "sub", "dir")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindDir(deep)
+	if err != nil {
+		t.Fatalf("FindDir: %v", err)
+	}
+	if got != want {
+		t.Errorf("FindDir = %q, want the project's own %q", got, want)
 	}
 }
 
@@ -242,5 +332,81 @@ func TestDuplicatesReportsSharedNames(t *testing.T) {
 	}
 	if len(Duplicates(entries[1:])) != 0 {
 		t.Error("Duplicates should be empty when every name is unique")
+	}
+}
+
+// An absolute checkout_base_dir or worktree_dir is what every configuration
+// written before this resolution existed contains, so it must come back
+// byte-identical: resolution may not rewrite a working configuration.
+func TestResolveWorkDirsLeavesAbsolutePathsUnchanged(t *testing.T) {
+	cfg := &Config{CheckoutBaseDir: "/srv/checkout", WorktreeDir: "/srv/worktrees"}
+
+	checkout, worktrees, err := cfg.ResolveWorkDirs(
+		filepath.Join(t.TempDir(), DirName), "/anywhere/loop.yaml")
+	if err != nil {
+		t.Fatalf("ResolveWorkDirs: %v", err)
+	}
+	if checkout != "/srv/checkout" {
+		t.Errorf("checkout_base_dir = %q, want it unchanged", checkout)
+	}
+	if worktrees != "/srv/worktrees" {
+		t.Errorf("worktree_dir = %q, want it unchanged", worktrees)
+	}
+}
+
+// A leading ~ is expanded exactly as state_dir's is, so one configuration can
+// be written portably across machines whose home directories differ.
+func TestResolveWorkDirsExpandsALeadingTilde(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := &Config{CheckoutBaseDir: "~/Code/example", WorktreeDir: "~/worktrees"}
+
+	checkout, worktrees, err := cfg.ResolveWorkDirs(
+		filepath.Join(t.TempDir(), DirName), "/anywhere/loop.yaml")
+	if err != nil {
+		t.Fatalf("ResolveWorkDirs: %v", err)
+	}
+	if want := filepath.Join(home, "Code", "example"); checkout != want {
+		t.Errorf("checkout_base_dir = %q, want %q", checkout, want)
+	}
+	if want := filepath.Join(home, "worktrees"); worktrees != want {
+		t.Errorf("worktree_dir = %q, want %q", worktrees, want)
+	}
+}
+
+// The whole point: a relative path means "under the project", never "under
+// whatever directory this process happens to have been started in".
+func TestResolveWorkDirsJoinsARelativePathToTheProjectRoot(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{CheckoutBaseDir: ".", WorktreeDir: "build/worktrees"}
+
+	checkout, worktrees, err := cfg.ResolveWorkDirs(
+		filepath.Join(root, DirName), filepath.Join(root, DirName, "configs", "loop.yaml"))
+	if err != nil {
+		t.Fatalf("ResolveWorkDirs: %v", err)
+	}
+	if checkout != root {
+		t.Errorf("checkout_base_dir = %q, want the project root %q", checkout, root)
+	}
+	if want := filepath.Join(root, "build", "worktrees"); worktrees != want {
+		t.Errorf("worktree_dir = %q, want %q", worktrees, want)
+	}
+}
+
+// --config can name a file outside any .agent-utils directory, and then there
+// is no project root to resolve against. Saying so beats silently resolving
+// against the process's working directory, which for the launchd daemon is
+// the machine-wide ~/.agent-utils.
+func TestResolveWorkDirsRejectsARelativePathWithNoProjectRoot(t *testing.T) {
+	cfg := &Config{CheckoutBaseDir: ".", WorktreeDir: "/srv/worktrees"}
+
+	_, _, err := cfg.ResolveWorkDirs("", "/elsewhere/loop.yaml")
+	if err == nil {
+		t.Fatal("want an error for a relative path with no project root, got nil")
+	}
+	for _, want := range []string{"checkout_base_dir", "/elsewhere/loop.yaml", DirName} {
+		if !contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
 	}
 }

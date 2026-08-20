@@ -24,8 +24,13 @@ func testConfig() *config.Config {
 		Agent:  config.Agent{Model: "opus", Worktree: config.WorktreePerIssue},
 		TendPR: true,
 		Retry: config.Retry{
-			Max:          3,
-			BackoffTicks: []int{0, 1, 2},
+			Max: 3,
+			// 0s, 15m, 30m. Wall-clock waits, one per retry.
+			Backoff: []config.Duration{
+				0,
+				config.Duration(15 * time.Minute),
+				config.Duration(30 * time.Minute),
+			},
 			Breaker: config.Breaker{
 				OrphanThreshold: 2,
 				Cooldown:        config.Duration(30 * time.Minute),
@@ -139,7 +144,6 @@ func TestFailedIssueRetriesImmediatelyOnFirstAttempt(t *testing.T) {
 		Issues: map[int]store.IssueState{
 			1: {Number: 1, SessionID: "s", SessionStarted: true, NeedsRetry: true},
 		},
-		TickCount: 5,
 	}
 	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryResume {
@@ -156,7 +160,6 @@ func TestRetryStartsWhenSessionWasNeverCreated(t *testing.T) {
 		Issues: map[int]store.IssueState{
 			1: {Number: 1, SessionID: "s", SessionStarted: false, NeedsRetry: true},
 		},
-		TickCount: 5,
 	}
 	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryStart {
@@ -175,8 +178,7 @@ func TestFailedIssueWithoutInFlightLabelIsCleared(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Blocked)}}
 	st := State{
-		Issues:    map[int]store.IssueState{1: {Number: 1, NeedsRetry: true}},
-		TickCount: 5,
+		Issues: map[int]store.IssueState{1: {Number: 1, NeedsRetry: true}},
 	}
 	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindClearRetry {
@@ -201,7 +203,6 @@ func TestRetryStartCarriesNoSessionID(t *testing.T) {
 		Issues: map[int]store.IssueState{
 			1: {Number: 1, SessionID: "burned-uuid", SessionStarted: false, NeedsRetry: true},
 		},
-		TickCount: 5,
 	}
 	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryStart {
@@ -239,25 +240,88 @@ func TestLiveIssueDispatchSuppressesTend(t *testing.T) {
 // dispatch row the reconcile pass consumes.
 func TestBackoffDefersButDoesNotLoseTheRetry(t *testing.T) {
 	cfg := testConfig()
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
 	st := State{
 		Issues: map[int]store.IssueState{
-			1: {Number: 1, RetryCount: 2, LastRetryTick: 5, NeedsRetry: true,
-				SessionID: "s", SessionStarted: true},
+			1: {Number: 1, RetryCount: 2, NeedsRetry: true,
+				SessionID: "s", SessionStarted: true,
+				RetryAfter: now.Add(30 * time.Minute)},
 		},
-		TickCount: 5,
 	}
-	// backoff_ticks[2] == 2, so tick 5 and tick 6 defer.
-	for _, tick := range []int64{5, 6} {
-		st.TickCount = tick
-		if p := Decide(cfg, snap, st, time.Now()); len(p.Decisions) != 0 {
-			t.Fatalf("tick %d: decisions = %v, want none inside backoff", tick, kinds(p))
+	// The deadline is wall-clock now, so a tick before it defers however many
+	// ticks have run in between.
+	for _, at := range []time.Time{now, now.Add(29 * time.Minute)} {
+		if p := Decide(cfg, snap, st, at); len(p.Decisions) != 0 {
+			t.Fatalf("at %v: decisions = %v, want none inside backoff", at, kinds(p))
 		}
 	}
-	st.TickCount = 7
+	p := Decide(cfg, snap, st, now.Add(30*time.Minute))
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryResume {
+		t.Fatalf("at the deadline: decisions = %v, want the retry to fire", kinds(p))
+	}
+}
+
+// The same issue, the same state, one field apart: the decision is the clock
+// against the stored deadline and nothing else.
+func TestRetryAfterGatesTheRetryOnTheClock(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name  string
+		after time.Time
+		want  int
+	}{
+		{"deadline in the future", now.Add(time.Minute), 0},
+		{"deadline in the past", now.Add(-time.Minute), 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := testConfig()
+			snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
+			st := State{Issues: map[int]store.IssueState{
+				1: {Number: 1, NeedsRetry: true, SessionID: "s", SessionStarted: true,
+					RetryAfter: c.after},
+			}}
+			p := Decide(cfg, snap, st, now)
+			if len(p.Decisions) != c.want {
+				t.Fatalf("decisions = %v, want %d", kinds(p), c.want)
+			}
+			if c.want == 1 && p.Decisions[0].Kind != KindRetryResume {
+				t.Errorf("kind = %v, want retry_resume", p.Decisions[0].Kind)
+			}
+		})
+	}
+}
+
+// A zero deadline means "no deadline". retry.max may be 0, so retry.backoff may
+// be absent entirely, and a row imported from a per-loop database carries no
+// deadline at all; neither may strand the issue.
+func TestZeroRetryAfterRetriesAtOnce(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, NeedsRetry: true, SessionID: "s", SessionStarted: true},
+	}}
 	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryResume {
-		t.Fatalf("tick 7: decisions = %v, want the retry to fire", kinds(p))
+		t.Fatalf("decisions = %v, want the retry to fire with no deadline", kinds(p))
+	}
+}
+
+// The cap is checked before the deadline. A future deadline must not postpone a
+// park, or an issue past its budget sits in the loop carrying an in-flight label
+// no agent owns.
+func TestRetryCapParksEvenInsideTheBackoffWindow(t *testing.T) {
+	cfg := testConfig()
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, RetryCount: 3, NeedsRetry: true,
+			RetryAfter: now.Add(time.Hour)},
+	}}
+	p := Decide(cfg, snap, st, now)
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindParkRetryExhausted {
+		t.Fatalf("decisions = %v, want one park", kinds(p))
 	}
 }
 
@@ -266,9 +330,8 @@ func TestParksAtRetryCap(t *testing.T) {
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
 	st := State{
 		Issues: map[int]store.IssueState{
-			1: {Number: 1, RetryCount: 3, LastRetryTick: 1, NeedsRetry: true},
+			1: {Number: 1, RetryCount: 3, NeedsRetry: true},
 		},
-		TickCount: 99,
 	}
 	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindParkRetryExhausted {
@@ -321,7 +384,6 @@ func TestCircuitBreakerDropsDispatchesButKeepsParks(t *testing.T) {
 			2: {Number: 2, NeedsRetry: true},
 			4: {Number: 4, NeedsRetry: true, RetryCount: 3},
 		},
-		TickCount: 10,
 	}
 	p := Decide(cfg, snap, st, time.Now())
 	if !p.BreakerTripped {

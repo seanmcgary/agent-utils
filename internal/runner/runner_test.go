@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -119,6 +120,53 @@ func TestSuperviseRecordsFailureWhenStreamHasNoResult(t *testing.T) {
 	}
 }
 
+// The detached runner is the second MarkNeedsRetry call site, and the one with
+// neither a configuration nor a clock in scope before this change. A failure
+// recorded here must carry the configured wait, indexed by the retry count the
+// row already holds, or every agent that dies under the runner retries with no
+// backoff at all.
+func TestFinishStampsTheRetryDeadlineFromTheConfiguration(t *testing.T) {
+	s := newStore(t)
+	id, _ := s.CreateDispatch(store.Dispatch{
+		Loop: "planning", Repo: "o/r", Number: 9, Kind: store.KindStart, SessionID: "z",
+	})
+	d, _ := s.GetDispatch(id)
+	if err := s.PutIssueState(store.IssueState{
+		Loop: "planning", Repo: "o/r", Number: 9, RetryCount: 1,
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Retry: config.Retry{
+		Max: 3,
+		Backoff: []config.Duration{
+			0,
+			config.Duration(15 * time.Minute),
+			config.Duration(30 * time.Minute),
+		},
+	}}
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	// Finish returns the failure it recorded; the record is what is under test.
+	_ = Finish(cfg, s, d, store.DispatchResult{
+		Status: store.StatusFailed, ExitCode: 1, APIError: "boom",
+	}, now)
+
+	st, err := s.IssueState("planning", "o/r", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.NeedsRetry {
+		t.Error("NeedsRetry = false, want true")
+	}
+	want := now.Add(15 * time.Minute)
+	if !st.RetryAfter.Equal(want) {
+		t.Errorf("RetryAfter = %v, want %v (Backoff[1], indexed by retry_count 1)",
+			st.RetryAfter, want)
+	}
+}
+
 // The agent runs with permission prompts disabled on third-party issue text, so
 // it must not inherit the repository-write credential. This is asserted rather
 // than assumed because both hops (the detached runner and the agent) had to be
@@ -146,5 +194,25 @@ func TestAgentEnvExcludesCredentials(t *testing.T) {
 	}
 	if !sawHome {
 		t.Error("HOME must be preserved; the agent needs it to run git and gh")
+	}
+}
+
+// Spawn must return the child's REAL process identifier.
+//
+// os.Process.Release invalidates the handle and sets Pid to -1, so reading
+// cmd.Process.Pid after the Release call returned -1 on every successful
+// spawn. The tick wrote that -1 into the dispatch row, and a later tick read
+// it as a dead runner and retried an issue whose agent was still working --
+// a second agent in a worktree that already held one.
+func TestSpawnReturnsTheRealPidNotTheReleasedHandle(t *testing.T) {
+	// /bin/echo takes the runner's arguments, prints them and exits. Nothing
+	// about the child matters here except that the kernel gave it a pid.
+	pid, err := Spawn("/bin/echo", 7, testProject, "/tmp/loop.yaml",
+		filepath.Join(t.TempDir(), "runner-7.log"))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("Spawn returned pid %d; a spawned process always has a positive pid", pid)
 	}
 }

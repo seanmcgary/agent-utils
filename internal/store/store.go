@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/home"
@@ -41,6 +42,13 @@ CREATE TABLE IF NOT EXISTS issues (
   needs_retry     INTEGER NOT NULL DEFAULT 0,
   session_started INTEGER NOT NULL DEFAULT 0,
   parked          INTEGER NOT NULL DEFAULT 0,
+  -- retry_after is Unix seconds, and 0 means "no deadline". It is an INTEGER
+  -- where every other timestamp in this schema is a TIMESTAMP
+  -- (issues.updated_at, cooldowns.until, ticks.started_at, the dispatches time
+  -- columns). It does NOT match that precedent: addedColumns needs a literal
+  -- DEFAULT so an existing database gains the column without a backfill, and no
+  -- literal TIMESTAMP default reads back as the zero time.
+  retry_after     INTEGER NOT NULL DEFAULT 0,
   updated_at      TIMESTAMP NOT NULL,
   PRIMARY KEY (project_id, loop, repo, number)
 );
@@ -95,6 +103,31 @@ CREATE TABLE IF NOT EXISTS cooldowns (
   loop       TEXT NOT NULL,
   until      TIMESTAMP NOT NULL,
   PRIMARY KEY (project_id, loop)
+);
+
+-- One row per repository this project has registered a webhook for.
+--
+-- The row exists because registration used to leave NOTHING on this machine.
+-- register-webhook found an existing hook by matching Config.URL against
+-- webhook.url, so changing webhook.url and re-running it created a SECOND hook
+-- at GitHub while the first kept delivering to a dead endpoint -- orphaned,
+-- invisible here, and removable only by hand in GitHub's UI. Recording what was
+-- registered is what makes that recoverable.
+CREATE TABLE IF NOT EXISTS webhooks (
+  project_id    TEXT NOT NULL,
+  repo          TEXT NOT NULL,
+  -- hook_id is GitHub's identifier for the hook, and it is the column this
+  -- table exists for. deregister-webhook deletes by it rather than by matching
+  -- a URL, which is the only way to remove the hook a project actually
+  -- registered AFTER webhook.url has been changed -- the exact case that
+  -- otherwise leaves an orphaned hook delivering to a dead endpoint forever.
+  hook_id       INTEGER NOT NULL,
+  -- url is the delivery target the hook carried when it was recorded. It is
+  -- kept for the operator, not for matching: after a webhook.url change it is
+  -- the only local record of where the hook still points.
+  url           TEXT NOT NULL,
+  registered_at TIMESTAMP NOT NULL,
+  PRIMARY KEY (project_id, repo)
 );
 
 -- One row per legacy per-loop database this canonical file has imported.
@@ -155,12 +188,22 @@ func Open(path string) (*DB, error) {
 	// this file. Passing the pragmas in the DSN is the only way to guarantee it.
 	//
 	// 30s, not 10s: this one file now takes the writes of every tick and every
-	// detached runner on the machine. Each write is a single small statement, so
-	// a wait this long only ever covers a queue, never a slow transaction.
+	// detached runner on the machine. Almost every write is a single small
+	// statement, and the transactions that are not (the schema pass, the legacy
+	// import, MarkNeedsRetry) hold the lock only for the few statements inside
+	// them, so a wait this long only ever covers a queue.
+	//
+	// _txlock=immediate takes the write lock when a transaction BEGINS.
+	// MarkNeedsRetry reads retry_count and then writes it back, and a deferred
+	// transaction would take a read snapshot first and try to upgrade at the
+	// write. SQLite answers that upgrade with SQLITE_BUSY_SNAPSHOT and does NOT
+	// invoke the busy handler, so busy_timeout would not cover it: the failure
+	// flag would be lost and the issue stranded holding the in-flight label.
 	dsn := "file:" + path +
 		"?_pragma=busy_timeout(30000)" +
 		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=foreign_keys(1)"
+		"&_pragma=foreign_keys(1)" +
+		"&_txlock=immediate"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -282,6 +325,7 @@ var addedColumns = []struct{ table, column, def string }{
 	{"dispatches", "legacy_source", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "legacy_id", "INTEGER NOT NULL DEFAULT 0"},
 	{"ticks", "project_id", "TEXT NOT NULL DEFAULT ''"},
+	{"issues", "retry_after", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // addColumns adds any column missing from an existing database. Each column has
@@ -307,7 +351,8 @@ func addColumns(tx *sql.Tx) error {
 // columns to carry over. SQLite cannot ALTER a key, so each is rebuilt.
 var rebuilt = []struct{ table, columns string }{
 	{"issues", `loop, repo, number, session_id, worktree_path, retry_count,
-		last_retry_tick, needs_retry, session_started, parked, updated_at`},
+		last_retry_tick, needs_retry, session_started, parked, retry_after,
+		updated_at`},
 	{"pr_links", `loop, repo, number, pr_number, head_ref, base_ref, behind_by`},
 	{"cooldowns", `loop, until`},
 }
@@ -390,7 +435,7 @@ func hasColumn(q querier, table, column string) (bool, error) {
 func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	rows, err := s.db.Query(`
 		SELECT number, session_id, worktree_path, retry_count, last_retry_tick,
-		       needs_retry, session_started, parked, updated_at
+		       needs_retry, session_started, parked, retry_after, updated_at
 		FROM issues WHERE project_id = ? AND loop = ? AND repo = ?`,
 		s.projectID, loop, repo)
 	if err != nil {
@@ -401,14 +446,34 @@ func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	out := make(map[int]IssueState)
 	for rows.Next() {
 		st := IssueState{ProjectID: s.projectID, Loop: loop, Repo: repo}
+		var retryAfter int64
 		if err := rows.Scan(&st.Number, &st.SessionID, &st.WorktreePath,
 			&st.RetryCount, &st.LastRetryTick, &st.NeedsRetry, &st.SessionStarted,
-			&st.Parked, &st.UpdatedAt); err != nil {
+			&st.Parked, &retryAfter, &st.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan issue: %w", err)
 		}
+		st.RetryAfter = retryAfterTime(retryAfter)
 		out[st.Number] = st
 	}
 	return out, rows.Err()
+}
+
+// retryAfterSeconds encodes a deadline for the retry_after column. The zero
+// time is stored as 0, which is also the column's default, so a row that never
+// carried a deadline and a row whose deadline was cleared read back the same.
+func retryAfterSeconds(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
+// retryAfterTime decodes the retry_after column back into a deadline.
+func retryAfterTime(sec int64) time.Time {
+	if sec == 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0).UTC()
 }
 
 // PutIssueState inserts or replaces one issue record.
@@ -419,8 +484,8 @@ func (s *Store) PutIssueState(st IssueState) error {
 	_, err := s.db.Exec(`
 		INSERT INTO issues (project_id, loop, repo, number, session_id, worktree_path,
 		                    retry_count, last_retry_tick, needs_retry,
-		                    session_started, parked, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                    session_started, parked, retry_after, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
 		  session_id      = excluded.session_id,
 		  worktree_path   = excluded.worktree_path,
@@ -429,27 +494,75 @@ func (s *Store) PutIssueState(st IssueState) error {
 		  needs_retry     = excluded.needs_retry,
 		  session_started = excluded.session_started,
 		  parked          = excluded.parked,
+		  retry_after     = excluded.retry_after,
 		  updated_at      = excluded.updated_at`,
 		s.projectID, st.Loop, st.Repo, st.Number, st.SessionID, st.WorktreePath,
 		st.RetryCount, st.LastRetryTick, st.NeedsRetry, st.SessionStarted,
-		st.Parked, st.UpdatedAt.UTC())
+		st.Parked, retryAfterSeconds(st.RetryAfter), st.UpdatedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("put issue state: %w", err)
 	}
 	return nil
 }
 
-// MarkNeedsRetry records that a dispatch for this issue failed. It is durable,
-// so a tick that declines to act on the failure (backoff or circuit breaker)
-// does not lose it.
-func (s *Store) MarkNeedsRetry(loop, repo string, number int) error {
-	_, err := s.db.Exec(`
-		INSERT INTO issues (project_id, loop, repo, number, needs_retry, updated_at)
-		VALUES (?, ?, ?, ?, 1, ?)
-		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
-		  needs_retry = 1, updated_at = excluded.updated_at`,
-		s.projectID, loop, repo, number, time.Now().UTC())
+// MarkNeedsRetry records that a dispatch for this issue failed, and stamps the
+// earliest time a retry may run. It is durable, so a tick that declines to act
+// on the failure (backoff or circuit breaker) does not lose it.
+//
+// It is the only writer of a NON-ZERO retry_after. Four other statements write
+// that column, and every one of them only ever clears it: ClearNeedsRetry,
+// ClearRetryAfter, BeginDispatch on a human trigger, and PutIssueState, whose
+// one remaining caller is the park path in internal/loopcmd, which zeroes the
+// deadline with the flag it is retiring. Every needs-retry
+// transition runs through here, so a second writer of a real deadline -- one
+// stamped by the dispatch, say -- would be overwritten by the very next
+// failure, and the escalating list would collapse to its first entry forever.
+//
+// It reads retry_count inside the same transaction and indexes backoff with it,
+// clamped to the last entry. An empty list means no deadline: retry.max may be
+// 0, in which case retry.backoff is absent and no retry will ever be decided.
+func (s *Store) MarkNeedsRetry(loop, repo string, number int, now time.Time, backoff []time.Duration) error {
+	tx, err := s.db.Begin()
 	if err != nil {
+		return fmt.Errorf("mark needs retry: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// The count is read here rather than taken from the caller because it is
+	// what the index must agree with: the row on disk is the only thing every
+	// failure path shares.
+	var retryCount int
+	err = tx.QueryRow(
+		`SELECT retry_count FROM issues
+		 WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
+		s.projectID, loop, repo, number).Scan(&retryCount)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read retry count: %w", err)
+	}
+
+	var deadline int64
+	if len(backoff) > 0 {
+		i := retryCount
+		if i >= len(backoff) {
+			i = len(backoff) - 1
+		}
+		if i < 0 {
+			i = 0
+		}
+		deadline = retryAfterSeconds(now.Add(backoff[i]))
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO issues (project_id, loop, repo, number, needs_retry, retry_after, updated_at)
+		VALUES (?, ?, ?, ?, 1, ?, ?)
+		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
+		  needs_retry = 1,
+		  retry_after = excluded.retry_after,
+		  updated_at  = excluded.updated_at`,
+		s.projectID, loop, repo, number, deadline, time.Now().UTC()); err != nil {
+		return fmt.Errorf("mark needs retry: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("mark needs retry: %w", err)
 	}
 	return nil
@@ -458,13 +571,103 @@ func (s *Store) MarkNeedsRetry(loop, repo string, number int) error {
 // ClearNeedsRetry clears a failure flag that no retry can act on. Without it an
 // issue whose failure was recorded while it was not in flight is stranded
 // permanently.
+//
+// The deadline goes with the flag. A deadline that is never cleared is a
+// permanent past deadline, and the daemon's wake query would then re-tick this
+// loop forever, each pass reading the GitHub API with a repository-write token.
 func (s *Store) ClearNeedsRetry(loop, repo string, number int) error {
 	_, err := s.db.Exec(`
-		UPDATE issues SET needs_retry = 0, updated_at = ?
+		UPDATE issues SET needs_retry = 0, retry_after = 0, updated_at = ?
 		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
 		time.Now().UTC(), s.projectID, loop, repo, number)
 	if err != nil {
 		return fmt.Errorf("clear needs retry: %w", err)
+	}
+	return nil
+}
+
+// ClearRetryAfter drops a retry DEADLINE while leaving the failure flag alone.
+//
+// It exists for an issue the loop can no longer see: closed, transferred, or
+// carrying a veto label. engine.Decide iterates the open, non-vetoed issues
+// only, so such a row can never reach KindClearRetry, while the daemon's wake
+// query (EarliestRetryAfterAt) selects on retry_after alone and would hand the
+// same permanently-past deadline back every MinWakeInterval forever -- a full
+// tick each time, GitHub reads included, with a repository-write token.
+//
+// Only the deadline goes. needs_retry stays, so the failure is not destroyed:
+// reopening the issue, or removing the veto label, puts it back in front of
+// engine.Decide with a zero deadline, which retryDecision treats as due now.
+// Clearing the flag as well would be irreversible -- nothing re-derives it --
+// and would strand the issue holding an in-flight label with no agent.
+func (s *Store) ClearRetryAfter(loop, repo string, number int) error {
+	_, err := s.db.Exec(`
+		UPDATE issues SET retry_after = 0, updated_at = ?
+		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
+		time.Now().UTC(), s.projectID, loop, repo, number)
+	if err != nil {
+		return fmt.Errorf("clear retry after: %w", err)
+	}
+	return nil
+}
+
+// BeginDispatch records the issue state a dispatch owns, just before the agent
+// is spawned: the session it will run under, a cleared park and failure flag,
+// and the retry budget this attempt spends.
+//
+// It writes named columns rather than a whole IssueState read a moment earlier
+// (PutIssueState) because the tick is NOT the only writer of this row. A
+// detached runner process finishing a failed dispatch calls MarkNeedsRetry from
+// outside the loop flock the tick holds, so a read-modify-write spanning the
+// spawn can land on top of a failure recorded in between: the flag, the
+// deadline and the retry budget would all be lost, which is exactly the
+// uncapped redispatch needs_retry exists to prevent. The window is reachable --
+// runner.finish writes FinishDispatch and MarkNeedsRetry as two statements, and
+// a webhook tick between them sees the issue as neither live nor failed.
+//
+// retry is what the failure path costs: on a retry the budget is spent in SQL
+// (retry_count + 1) rather than incremented from a value read before the gap,
+// for the same reason. A human trigger begins a new episode, so it resets the
+// budget and drops any deadline left over from the previous one.
+func (s *Store) BeginDispatch(loop, repo string, number int, sessionID string, retry bool, now time.Time) error {
+	// A retry deliberately leaves retry_after alone: MarkNeedsRetry is the only
+	// writer of a non-zero deadline, and a deadline stamped before the agent
+	// runs would be overwritten by the failure that follows, collapsing the
+	// escalating backoff list to its first entry forever.
+	count, update := 1, "retry_count = retry_count + 1"
+	if !retry {
+		count, update = 0, "retry_count = 0, retry_after = 0"
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO issues (project_id, loop, repo, number, session_id,
+		                    needs_retry, parked, retry_count, updated_at)
+		VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
+		  session_id  = excluded.session_id,
+		  needs_retry = 0,
+		  parked      = 0,
+		  `+update+`,
+		  updated_at  = excluded.updated_at`,
+		s.projectID, loop, repo, number, sessionID, count, now.UTC())
+	if err != nil {
+		return fmt.Errorf("begin dispatch: %w", err)
+	}
+	return nil
+}
+
+// SetWorktreePath records where a dispatch's agent is working.
+//
+// Separate from BeginDispatch, and a targeted UPDATE, for the reason given
+// there: the worktree is created between the two writes, and re-persisting a
+// whole IssueState read before that could clobber a failure another process
+// recorded while git was working.
+func (s *Store) SetWorktreePath(loop, repo string, number int, path string, now time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE issues SET worktree_path = ?, updated_at = ?
+		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
+		path, now.UTC(), s.projectID, loop, repo, number)
+	if err != nil {
+		return fmt.Errorf("set worktree path: %w", err)
 	}
 	return nil
 }
@@ -494,7 +697,7 @@ func (s *Store) MarkSucceeded(loop, repo string, number int) error {
 	_, err := s.db.Exec(`
 		UPDATE issues
 		SET needs_retry = 0, parked = 0, retry_count = 0, session_started = 1,
-		    updated_at = ?
+		    retry_after = 0, updated_at = ?
 		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
 		time.Now().UTC(), s.projectID, loop, repo, number)
 	if err != nil {
@@ -938,6 +1141,76 @@ func (d *DB) LoopStates() ([]LoopState, error) {
 		out = append(out, *st)
 	}
 	return out, nil
+}
+
+// EarliestRetryAfterAt returns the soonest pending retry deadline, if there is
+// one, with the cooldown boundary judged against the supplied clock.
+//
+// The clock is a parameter rather than time.Now() read inside: the daemon
+// carries its own Now seam and has to be able to freeze this boundary against
+// it in a test, and MarkNeedsRetry already takes its time from the caller for
+// the same reason. There is deliberately no time.Now() convenience wrapper
+// beside this: one existed, no production code ever called it, and a second
+// entry point that reads a clock this package cannot control is exactly what
+// the seam exists to avoid.
+//
+// It is scoped to rows that a retry can still act on. A parked issue, or one
+// whose failure flag was cleared, keeps its old deadline in the row, and
+// returning that value would give the daemon a deadline permanently in the past
+// to spin on. A loop whose circuit breaker is in cooldown is excluded for the
+// same reason: Decide returns with no decisions at all while the cooldown runs,
+// so needs_retry stays set and the deadline stays in the past for its whole
+// length.
+//
+// The deadline is selected as a column and ordered by, not read with MIN().
+// An aggregate has no declared type, so the driver hands back a value of a
+// different type than every other read of that column.
+//
+// The cooldown comparison is done in SQL. Every timestamp in this database is
+// written through time.Time.UTC(), which the driver stores as text with a fixed
+// "+0000 UTC" suffix, so a text comparison orders them correctly. A writer that
+// omitted .UTC() would break this and legacy.go's refresh comparison together.
+//
+// skip names loops whose rows this call must step over, and it exists because
+// exactly one row is returned. A caller that cannot act on the earliest row --
+// the daemon, when the loop it names cannot be routed right now -- would
+// otherwise be handed that same row on every call and would never see any other
+// loop's due deadline: one stuck loop starves the whole machine. The set is the
+// CALLER's, and deliberately not a column here: nothing about being unservable
+// belongs in the durable state, and the caller re-establishes it every pass.
+func (d *DB) EarliestRetryAfterAt(now time.Time, skip []LoopKey) (RetryDue, bool, error) {
+	var (
+		due        RetryDue
+		retryAfter int64
+	)
+	// Placeholders, never the loop names interpolated into the SQL: a project
+	// id and a loop name both come from files on disk, and one apostrophe in a
+	// loop name would otherwise be a syntax error at best.
+	args := make([]any, 0, 1+2*len(skip))
+	args = append(args, now.UTC())
+	var excluded strings.Builder
+	for _, k := range skip {
+		excluded.WriteString(" AND NOT (i.project_id = ? AND i.loop = ?)")
+		args = append(args, k.ProjectID, k.Loop)
+	}
+	err := d.db.QueryRow(`
+		SELECT i.project_id, i.loop, i.repo, i.number, i.retry_after
+		FROM issues i
+		LEFT JOIN cooldowns c
+		  ON c.project_id = i.project_id AND c.loop = i.loop
+		WHERE i.retry_after > 0 AND i.needs_retry = 1 AND i.parked = 0
+		  AND (c.until IS NULL OR c.until <= ?)`+excluded.String()+`
+		ORDER BY i.retry_after ASC
+		LIMIT 1`, args...).
+		Scan(&due.ProjectID, &due.Loop, &due.Repo, &due.Number, &retryAfter)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RetryDue{}, false, nil
+	}
+	if err != nil {
+		return RetryDue{}, false, fmt.Errorf("earliest retry after: %w", err)
+	}
+	due.At = retryAfterTime(retryAfter)
+	return due, true, nil
 }
 
 // eachRow runs a query and calls scan for every row. It exists so the three

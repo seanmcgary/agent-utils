@@ -65,6 +65,47 @@ type PullRequest struct {
 	Trusted bool
 }
 
+// Hook is the subset of a GitHub repository webhook that register-webhook
+// needs to decide whether one already exists.
+type Hook struct {
+	ID  int64
+	URL string // Config.URL, the delivery target
+	// GitHub returns Config.Secret obfuscated (see CreateHook), so it is
+	// never carried into this type: nothing here can compare it, and a field
+	// that always reads as obfuscated would invite exactly that mistake.
+	Events []string
+	Active bool
+}
+
+// HookSpec is what register-webhook sends to create or update a hook.
+type HookSpec struct {
+	URL    string
+	Secret string
+	Events []string
+}
+
+// HookEvents is the event set a loop reacts to. It is declared once, here,
+// because two callers must agree: register-webhook subscribes to it, and the
+// listener drops any delivery outside it. Two independent lists would drift,
+// and the daemon would answer every delivery and do nothing.
+var HookEvents = []string{
+	"issues",
+	"issue_comment",
+	"pull_request",
+	"pull_request_review",
+	"pull_request_review_comment",
+}
+
+// IsHookEvent reports whether name is one this daemon acts on.
+func IsHookEvent(name string) bool {
+	for _, e := range HookEvents {
+		if e == name {
+			return true
+		}
+	}
+	return false
+}
+
 // safeRef matches a git branch name this program is willing to pass to git.
 // It rejects a leading dash, which git would read as an option.
 var safeRef = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._/-]*$`)

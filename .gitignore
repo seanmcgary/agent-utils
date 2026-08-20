@@ -8,3 +8,6 @@ coverage.html
 # Local loop state, if anyone points a config at the repo
 /state/
 release/
+
+# Agent scratch workspace
+/.superpowers/

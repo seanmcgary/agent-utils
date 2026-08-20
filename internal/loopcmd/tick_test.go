@@ -2,6 +2,7 @@ package loopcmd
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,13 +21,51 @@ type fakeGH struct {
 	comments []string
 	added    []string
 	removed  []string
+
+	// The counters and the fetch logs are what a scoped tick is judged by:
+	// the token burn this whole change exists to stop is invisible in the
+	// dispatch count and visible only in which endpoints were called.
+	listedIssues  int
+	listedPRs     int
+	fetchedIssues []int
+	fetchedPRs    []int
 }
 
 func (f *fakeGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
+	f.listedIssues++
 	return f.issues, nil
 }
 func (f *fakeGH) ListOpenPullRequests(context.Context, string, string) ([]ghub.PullRequest, error) {
+	f.listedPRs++
 	return f.prs, nil
+}
+
+// Issue answers from the same fixture the list does, so a scoped tick and a
+// full tick decide from identical data. A number the fixture holds as a pull
+// request answers ErrNotAnIssue, exactly as GitHub's issues endpoint does.
+func (f *fakeGH) Issue(_ context.Context, _, _ string, number int) (ghub.Issue, error) {
+	f.fetchedIssues = append(f.fetchedIssues, number)
+	for _, pr := range f.prs {
+		if pr.Number == number {
+			return ghub.Issue{}, fmt.Errorf("o/r#%d: %w", number, ghub.ErrNotAnIssue)
+		}
+	}
+	for _, iss := range f.issues {
+		if iss.Number == number {
+			return iss, nil
+		}
+	}
+	return ghub.Issue{}, fmt.Errorf("issue #%d not found", number)
+}
+
+func (f *fakeGH) PullRequest(_ context.Context, _, _ string, number int) (ghub.PullRequest, error) {
+	f.fetchedPRs = append(f.fetchedPRs, number)
+	for _, pr := range f.prs {
+		if pr.Number == number {
+			return pr, nil
+		}
+	}
+	return ghub.PullRequest{}, fmt.Errorf("pull request #%d not found", number)
 }
 func (f *fakeGH) BehindBy(_ context.Context, _, _, _, head string) (int, error) {
 	for _, pr := range f.prs {
@@ -66,7 +105,14 @@ func tickConfig(t *testing.T) *config.Config {
 			Model: "opus", Worktree: config.WorktreeNone, Timeout: config.Duration(time.Hour),
 		},
 		Retry: config.Retry{
-			Max: 3, BackoffTicks: []int{0, 1, 2},
+			// 0s, 15m, 30m: the first retry is immediate and the rest escalate,
+			// so a test that advances no clock sees exactly one retry.
+			Max: 3,
+			Backoff: []config.Duration{
+				0,
+				config.Duration(15 * time.Minute),
+				config.Duration(30 * time.Minute),
+			},
 			Breaker: config.Breaker{OrphanThreshold: 2, Cooldown: config.Duration(30 * time.Minute)},
 		},
 		Prompt:       "plan #{{.Issue.Number}}",
@@ -382,5 +428,189 @@ func TestRenderProjectsFlagsOrphans(t *testing.T) {
 	}})
 	if !strings.Contains(out, "2+1!") {
 		t.Errorf("orphans should be marked in the LIVE column:\n%s", out)
+	}
+}
+
+// A retry deadline is only reachable through engine.Decide, which iterates the
+// OPEN issues. Close the issue and the row is stranded: nothing clears it, and
+// the webhook daemon's wake query hands the same past deadline back every
+// MinWakeInterval, running a full tick -- GitHub reads included -- each time,
+// forever. The tick that can see the issue is gone must retire the deadline.
+func TestTickClearsTheDeadlineOfAnIssueTheLoopCanNoLongerSee(t *testing.T) {
+	cfg := tickConfig(t)
+	// Issue 7 is not in the snapshot: closed, or transferred away.
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"trigger"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	now := time.Now().UTC()
+	if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 7, now,
+		[]time.Duration{time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.RetryAfter.IsZero() {
+		t.Errorf("RetryAfter = %v, want zero: the daemon's wake query would spin on it forever", st.RetryAfter)
+	}
+	// The flag survives on purpose. Nothing re-derives it, so destroying it
+	// would strand the issue holding an in-flight label with no agent; keeping
+	// it means reopening the issue retries at once.
+	if !st.NeedsRetry {
+		t.Error("NeedsRetry = false; a closed issue's failure must survive so reopening it retries")
+	}
+}
+
+// The same strand, reached by the other ordinary operator action: a veto label
+// makes engine.Decide skip the issue before it ever reads NeedsRetry, so the
+// row is just as unreachable as a closed one.
+func TestTickClearsTheDeadlineOfAVetoedIssue(t *testing.T) {
+	cfg := tickConfig(t)
+	cfg.Labels.Veto = []string{"hold"}
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 7, Labels: []string{"in-flight", "hold"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 7, time.Now().UTC(),
+		[]time.Duration{time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.RetryAfter.IsZero() {
+		t.Errorf("RetryAfter = %v, want zero for a vetoed issue", st.RetryAfter)
+	}
+	if !st.NeedsRetry {
+		t.Error("NeedsRetry = false; removing the veto label must resume the retry")
+	}
+}
+
+// The sweep must not touch a row the engine CAN reach. An issue inside its
+// backoff window is the case that would break loudest: clearing its deadline
+// would run the retry immediately and spend the whole escalating list as fast
+// as the GitHub API answers.
+func TestTickKeepsTheDeadlineOfAnIssueStillInTheSnapshot(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 7, Labels: []string{"in-flight"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 7, time.Now().UTC(),
+		[]time.Duration{time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Tick(context.Background(), cfg, deps); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.RetryAfter.IsZero() {
+		t.Error("RetryAfter was cleared for an issue the engine can still reach; its backoff window is gone")
+	}
+}
+
+// A dispatch row whose pid is NON-POSITIVE and younger than the grace period
+// is a live agent whose pid has not been recorded yet, not a dead runner.
+//
+// runner.Spawn used to return -1 for every successful spawn (os.Process.Release
+// invalidates the handle), and the grace period covered pid 0 only, so a tick
+// landing in that window called proc.IsAlive(-1) -- always false -- retired the
+// row, flagged the issue for retry, and let a later tick put a SECOND agent in
+// a worktree that already held one. Under cron the window was minutes wide and
+// effectively unreachable; under the webhook daemon deliveries arrive seconds
+// apart, which is why it surfaced. Both halves are fixed; this covers the row
+// as it may still be found on disk.
+func TestAYoungDispatchWithANonPositivePidIsNotReaped(t *testing.T) {
+	for _, pid := range []int{0, -1} {
+		t.Run(fmt.Sprintf("pid%d", pid), func(t *testing.T) {
+			cfg := tickConfig(t)
+			gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"in-flight"}}}}
+			spawned := 0
+			deps := newDeps(t, cfg, gh, &spawned)
+			// The agent IS alive, but nothing can prove it from a pid the
+			// kernel never issued; the row's age is the only evidence there is.
+			deps.IsAlive = func(int, int64) bool { return false }
+
+			id, _ := deps.Store.CreateDispatch(store.Dispatch{
+				Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindStart, SessionID: "s",
+			})
+			_ = deps.Store.SetDispatchProcess(id, pid, time.Now())
+			_ = deps.Store.PutIssueState(store.IssueState{
+				Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
+				SessionStarted: true, UpdatedAt: time.Now(),
+			})
+
+			sum, err := Tick(context.Background(), cfg, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sum.Orphans != 0 {
+				t.Errorf("Orphans = %d, want 0: a live agent was reaped", sum.Orphans)
+			}
+			if sum.Live != 1 {
+				t.Errorf("Live = %d, want 1", sum.Live)
+			}
+			if spawned != 0 {
+				t.Errorf("spawned = %d, want 0: a second agent was sent into the same worktree", spawned)
+			}
+			running, _ := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
+			if len(running) != 1 {
+				t.Errorf("running dispatches = %d, want the row left alone", len(running))
+			}
+			states, _ := deps.Store.IssueStates(cfg.Name, cfg.Repo)
+			if states[1].NeedsRetry {
+				t.Error("the issue was queued for retry while its agent was still working")
+			}
+		})
+	}
+}
+
+// The grace period is a window, not an exemption: a row carrying a
+// non-positive pid past it is a runner that died before it could register,
+// and it must still be reaped.
+func TestAnOldDispatchWithANonPositivePidIsStillReaped(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"in-flight"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+	deps.IsAlive = func(int, int64) bool { return false }
+	// The row's age is measured from its INSERT (started_at), which the store
+	// stamps itself, so the clock is moved rather than the row: the tick reads
+	// the grace period against deps.Now.
+	deps.Now = func() time.Time { return time.Now().Add(2 * pidGracePeriod) }
+
+	id, _ := deps.Store.CreateDispatch(store.Dispatch{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindStart, SessionID: "s",
+	})
+	_ = deps.Store.SetDispatchProcess(id, -1, time.Now())
+	_ = deps.Store.PutIssueState(store.IssueState{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
+		SessionStarted: true, UpdatedAt: time.Now(),
+	})
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Orphans != 1 {
+		t.Errorf("Orphans = %d, want 1: a runner that never registered is dead", sum.Orphans)
 	}
 }

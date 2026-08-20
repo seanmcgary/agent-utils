@@ -82,24 +82,23 @@ func Save(agentUtilsDir string, c *Config) error {
 	return nil
 }
 
-// Ensure loads a project's descriptor, creating one when it does not exist.
+// EnsureNamed loads a project's descriptor, creating one when it does not
+// exist. A new project is named base; when base is already taken by another
+// project, a numeric suffix is added until it is unique, starting at 2, and
+// renamedFrom is set to base so the caller can report what happened. taken
+// reports whether a name is already in use elsewhere.
 //
-// A new project is named after its directory. When that name is already taken
-// by another project, a numeric suffix is added until it is unique, and the
-// chosen name is returned so the caller can say what happened. taken reports
-// whether a name is already in use elsewhere.
-//
-// It returns the descriptor and whether it had to be created.
-func Ensure(agentUtilsDir string, taken func(name string) bool) (*Config, bool, error) {
-	c, err := Load(agentUtilsDir)
+// It returns the descriptor and whether it had to be created; renamedFrom is
+// only ever set when created is true.
+func EnsureNamed(agentUtilsDir, base string, taken func(name string) bool) (c *Config, created bool, renamedFrom string, err error) {
+	c, err = Load(agentUtilsDir)
 	if err == nil {
-		return c, false, nil
+		return c, false, "", nil
 	}
 	if !errors.Is(err, ErrNoConfig) {
-		return nil, false, err
+		return nil, false, "", err
 	}
 
-	base := Slug(filepath.Base(filepath.Dir(agentUtilsDir)))
 	if base == "" {
 		base = "project"
 	}
@@ -110,9 +109,12 @@ func Ensure(agentUtilsDir string, taken func(name string) bool) (*Config, bool, 
 
 	c = &Config{Name: name, ID: uuid.NewString()}
 	if err := Save(agentUtilsDir, c); err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
-	return c, true, nil
+	if name != base {
+		renamedFrom = base
+	}
+	return c, true, renamedFrom, nil
 }
 
 // unsafeChars matches everything a project name may not contain. A name is

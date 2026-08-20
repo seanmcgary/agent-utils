@@ -16,7 +16,11 @@ import (
 // supplies now.
 func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	if !st.CooldownUntil.IsZero() && now.Before(st.CooldownUntil) {
-		return Plan{CooldownUntil: st.CooldownUntil}
+		return Plan{
+			CooldownUntil: st.CooldownUntil,
+			Halted: fmt.Sprintf("the circuit breaker is in cooldown until %s",
+				st.CooldownUntil.Format(time.RFC3339)),
+		}
 	}
 
 	liveIssues := make(map[int]bool, len(st.Running))
@@ -35,10 +39,16 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	var decisions []Decision
 	var parks []Decision
 	decided := make(map[int]bool)
+	// skips records why each examined issue got no decision. Entries are
+	// removed at the end for every issue that turned out to have one, so an
+	// issue skipped by the trigger check and then picked up by tendDecisions
+	// does not carry a reason contradicting its own decision.
+	skips := make(map[int]string)
 	eligibleRetries := 0
 
 	for _, iss := range issues {
 		if iss.HasAnyLabel(cfg.Labels.Veto) {
+			skips[iss.Number] = "a veto label is present"
 			continue
 		}
 		if liveIssues[iss.Number] {
@@ -50,6 +60,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			// hazard as two dispatches, and the agent flips its own labels
 			// asynchronously, so the review label can still be present here.
 			decided[iss.Number] = true
+			skips[iss.Number] = "a dispatch is already live for this issue"
 			continue
 		}
 
@@ -79,7 +90,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				})
 				continue
 			}
-			d, eligible := retryDecision(cfg, iss.Number, state, st)
+			d, eligible, skip := retryDecision(cfg, iss.Number, state, now)
 			if eligible {
 				eligibleRetries++
 			}
@@ -90,6 +101,8 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				} else {
 					decisions = append(decisions, *d)
 				}
+			} else {
+				skips[iss.Number] = skip
 			}
 			continue
 		}
@@ -98,6 +111,9 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// the trigger label, so the check below already skips it, and a human who
 		// re-applies that label deliberately un-parks the issue.
 		if !iss.HasLabel(cfg.Labels.Trigger) {
+			// Not final: tendDecisions may still act on this issue below, and
+			// it replaces this reason with its own when it does not.
+			skips[iss.Number] = "no trigger label is present"
 			continue
 		}
 
@@ -125,43 +141,76 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	// rather than several unrelated crashes. It drops every DISPATCH decision.
 	// Parks survive: the reference loop states that a cap-reached comment already
 	// due is still posted during a breaker tick.
+	//
+	// KNOWN GAP: eligibleRetries counts retries within THIS call, so a call
+	// scoped to one issue can never reach a threshold above 1. Every webhook
+	// delivery is such a call (loopcmd.TickIssue), which means the breaker no
+	// longer sees the platform-wide failure it was written to catch -- only the
+	// cron sweep still can. The chosen fix is to count failures over a rolling
+	// time window instead of within one call; that needs new database state and
+	// is a separate change. Until then loopcmd.warnBreakerNotEvaluated logs
+	// every scoped retry that was dispatched without this check, so the gap is
+	// visible in the operator's log rather than silent.
 	if eligibleRetries >= cfg.Retry.Breaker.OrphanThreshold {
-		return Plan{
+		// Every dispatch decided above is dropped here, so each one becomes a
+		// skip. Without this an issue the engine WAS going to act on reports
+		// no reason at all, which is the same all-zeros line this change
+		// exists to explain.
+		for _, d := range decisions {
+			skips[d.Issue] = "the circuit breaker tripped this tick and every dispatch was dropped"
+		}
+		return finish(Plan{
 			Decisions:      parks,
+			Skips:          skips,
 			BreakerTripped: true,
 			CooldownUntil:  now.Add(cfg.Retry.Breaker.Cooldown.Std()),
-		}
+		})
 	}
 
 	decisions = append(decisions, parks...)
 
 	if cfg.TendPR {
-		decisions = append(decisions, tendDecisions(cfg, issues, snap, liveTendPRs, decided)...)
+		decisions = append(decisions, tendDecisions(cfg, issues, snap, liveTendPRs, decided, skips)...)
 	}
 
-	return Plan{Decisions: decisions}
+	return finish(Plan{Decisions: decisions, Skips: skips})
+}
+
+// finish drops the skip reason of every issue that ended up with a decision.
+// The reasons are recorded as the pass goes, before it is known whether a
+// later stage acts on the same issue, so this is what keeps "why nothing
+// happened" from being reported for an issue where something did.
+func finish(p Plan) Plan {
+	for _, d := range p.Decisions {
+		delete(p.Skips, d.Issue)
+	}
+	return p
 }
 
 // retryDecision returns the action for one failed issue. The second result
 // reports whether the failure cleared its backoff window, which is what the
-// circuit breaker counts.
-func retryDecision(cfg *config.Config, number int, state store.IssueState, st State) (*Decision, bool) {
+// circuit breaker counts. The third explains a nil decision, so the caller
+// never has to re-derive it from the same state.
+//
+// The window is a wall-clock deadline stored on the issue, not a count of
+// ticks. A tick used to be a fixed cron interval, but the webhook daemon can
+// tick a loop at any moment, so a tick count no longer names a stable wait.
+// MarkNeedsRetry stamps the deadline where the failure is recorded.
+func retryDecision(cfg *config.Config, number int, state store.IssueState, now time.Time) (*Decision, bool, string) {
 	if state.RetryCount >= cfg.Retry.Max {
 		return &Decision{
 			Kind:   KindParkRetryExhausted,
 			Issue:  number,
 			Reason: fmt.Sprintf("retry cap reached (%d/%d)", state.RetryCount, cfg.Retry.Max),
-		}, false
+		}, false, ""
 	}
 
-	wait := 0
-	if state.RetryCount < len(cfg.Retry.BackoffTicks) {
-		wait = cfg.Retry.BackoffTicks[state.RetryCount]
-	}
-	if wait > 0 && st.TickCount-state.LastRetryTick < int64(wait) {
+	if !state.RetryAfter.IsZero() && now.Before(state.RetryAfter) {
 		// Still inside the backoff window. Take no action and post no comment.
 		// NeedsRetry stays set in the store, so the next tick sees it again.
-		return nil, false
+		return nil, false, fmt.Sprintf(
+			"waiting for the retry backoff window to expire at %s",
+			state.RetryAfter.Format(time.RFC3339))
 	}
 
 	// Resume only when claude actually created the session. Otherwise "-r" would
@@ -177,23 +226,30 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, st St
 			Issue:     number,
 			SessionID: state.SessionID,
 			Reason:    fmt.Sprintf("retry %d/%d, resuming the existing session", state.RetryCount+1, cfg.Retry.Max),
-		}, true
+		}, true, ""
 	}
 	return &Decision{
 		Kind:      KindRetryStart,
 		Issue:     number,
 		SessionID: "",
 		Reason:    fmt.Sprintf("retry %d/%d with a new session; the previous attempt never started one", state.RetryCount+1, cfg.Retry.Max),
-	}, true
+	}, true, ""
 }
 
 // tendDecisions selects stale pull requests for issues awaiting review.
+//
+// It refines skips for the issues it examines and declines to act on. An issue
+// awaiting review reached this point via the trigger check, whose reason ("no
+// trigger label") is true but useless for a review issue: what the operator
+// needs is that the pull request is current, or already being tended, or not
+// linked at all.
 func tendDecisions(
 	cfg *config.Config,
 	issues []ghub.Issue,
 	snap Snapshot,
 	liveTendPRs map[int]bool,
 	decided map[int]bool,
+	skips map[int]string,
 ) []Decision {
 	var out []Decision
 	for _, iss := range issues {
@@ -206,17 +262,22 @@ func tendDecisions(
 			continue
 		}
 		if !iss.HasLabel(cfg.Labels.Review) {
+			// Not a review issue at all: the trigger check already said why
+			// this one produced nothing, and tending has nothing to add.
 			continue
 		}
 		pr, ok := LinkPR(iss.Number, snap.PRs)
 		if !ok {
+			skips[iss.Number] = "the issue is awaiting review and no trusted pull request is linked"
 			continue
 		}
 		if liveTendPRs[pr.Number] {
+			skips[iss.Number] = "a tend dispatch is already live for the linked pull request"
 			continue
 		}
 		if snap.BehindBy[pr.Number] <= 0 {
 			// A current pull request produces nothing. Silence is correct.
+			skips[iss.Number] = "the linked pull request is already up to date with its base"
 			continue
 		}
 		out = append(out, Decision{

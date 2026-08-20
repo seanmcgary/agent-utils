@@ -36,7 +36,9 @@ type IssueState struct {
 	SessionID    string
 	WorktreePath string
 	RetryCount   int
-	// LastRetryTick is the tick counter value when the last retry was dispatched.
+	// LastRetryTick is dead. Nothing writes it since retries moved to a
+	// wall-clock deadline; the column and this field survive so a legacy import
+	// round-trips, and dropping a column costs a table rebuild.
 	LastRetryTick int64
 	// NeedsRetry is durable failure state. A dispatch that dies or exits non-zero
 	// sets it. Only a retry, a park, or a success clears it. It must NOT be
@@ -48,8 +50,11 @@ type IssueState struct {
 	// session that was never created fails every time.
 	SessionStarted bool
 	// Parked records that the loop gave up after the retry cap.
-	Parked    bool
-	UpdatedAt time.Time
+	Parked bool
+	// RetryAfter is the deadline before which no retry for this issue may run.
+	// The zero value means no deadline, so a pending retry runs at once.
+	RetryAfter time.Time
+	UpdatedAt  time.Time
 }
 
 // Dispatch is one agent run.
@@ -148,6 +153,17 @@ type LoopKey struct {
 	Loop      string
 }
 
+// RetryDue is the earliest pending retry deadline on this machine. It names the
+// project as well as the loop, because one file holds every project and the
+// daemon has to tick the right one.
+type RetryDue struct {
+	ProjectID string
+	Loop      string
+	Repo      string
+	Number    int
+	At        time.Time
+}
+
 // LoopState is one loop's totals, read machine-wide in a single pass.
 type LoopState struct {
 	ProjectID string
@@ -161,4 +177,24 @@ type LoopState struct {
 	// configuration still holds the old repository's dispatches, and a report of
 	// what it costs today must not add the two together.
 	CostByRepo map[string]float64
+}
+
+// Webhook is the record of one repository's GitHub webhook registration.
+//
+// It is written only after GitHub confirms the create or the edit, so a row
+// here is evidence that a hook exists, not that one was asked for.
+type Webhook struct {
+	// ProjectID is the owning project's UUID, the first half of the key.
+	ProjectID string
+	// Repo is "owner/name", the second half.
+	Repo string
+	// HookID is GitHub's identifier for the hook. It is what deregistration
+	// deletes by: matching on URL instead cannot find the hook a project
+	// registered before webhook.url was changed.
+	HookID int64
+	// URL is the delivery target the hook carried when it was recorded. After
+	// a webhook.url change it is the only local record of where the live hook
+	// still points, which is what makes an orphan diagnosable.
+	URL          string
+	RegisteredAt time.Time
 }

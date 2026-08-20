@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/seanmcgary/agent-utils/internal/home"
 )
 
 // DirName is the directory that holds this tool's local files.
@@ -57,16 +59,28 @@ type Entry struct {
 // It looks in two places, in order:
 //
 //  1. $AGENT_UTILS_DIR, when set. This is the escape hatch for an unusual
-//     layout.
+//     layout, and it is trusted to name any directory -- including the
+//     machine-wide one, if that is really what the caller wants.
 //  2. A .agent-utils directory in startDir or any parent of it, the way git
 //     finds .git. This is what makes the tool work from a subdirectory.
 //
-// It deliberately does NOT fall back to $HOME/.agent-utils. Configurations are
-// project-local: running in an unrelated directory must say there is no project
-// here, not silently adopt some other project's loops. The home directory holds
-// the cross-project registry, which is why it exists at all and why falling
-// back to it produced a confusing "configs does not exist" error rather than an
-// honest "no project here".
+// Step 2 skips the machine-wide directory (internal/home.Dir()) when the
+// walk reaches it. That directory is an ORDINARY ancestor of everything under
+// $HOME, so an unguarded walk-up would silently adopt it as the project
+// directory for any command run outside a project -- e.g. from
+// ~/Downloads/scratch, once any project on the machine has been used and so
+// created ~/.agent-utils. The caller would then write a project descriptor
+// into the same directory the registry and the canonical state database live
+// in. Configurations are project-local: running in an unrelated directory
+// must say there is no project here, not silently adopt the machine-wide one.
+//
+// The comparison resolves symlinks on both sides (internal/home.Resolve).
+// FindDir's only caller feeds it os.Getwd(), and on Darwin os.Getwd returns
+// the fully resolved spelling (/private/var/...) whenever $PWD is unset --
+// which is exactly the case for a launchd-started process such as the
+// listener daemon. A raw string compare against home.Dir()'s unresolved
+// /var/... spelling would then never match, and the guard above would fail
+// open: it existed but silently let the machine-wide directory through.
 //
 // A cron entry should pass --config with an absolute path, which needs no
 // discovery at all.
@@ -79,13 +93,26 @@ func FindDir(startDir string) (string, error) {
 			ErrNoDir, env)
 	}
 
+	// A raw string compare is not enough: home.Dir() and the walk candidate
+	// can name one directory in two spellings, and the guard would then
+	// silently pass the machine-wide directory through. An unresolvable
+	// machineWide (no machine-wide directory at all, or home.Dir() erroring)
+	// degrades to "", which cannot spuriously match an existing candidate,
+	// so the walk-up is simply unguarded -- there is nothing to protect.
+	machineWide := ""
+	if dir, err := home.Dir(); err == nil {
+		machineWide = home.Resolve(dir)
+	}
+
 	dir, err := filepath.Abs(startDir)
 	if err != nil {
 		return "", fmt.Errorf("resolve %q: %w", startDir, err)
 	}
 	for {
 		candidate := filepath.Join(dir, DirName)
-		if isDir(candidate) {
+		// home.Resolve(candidate) is safe here because isDir(candidate) has
+		// already established the path exists, so EvalSymlinks succeeds.
+		if isDir(candidate) && (machineWide == "" || home.Resolve(candidate) != machineWide) {
 			return candidate, nil
 		}
 		parent := filepath.Dir(dir)
@@ -95,8 +122,14 @@ func FindDir(startDir string) (string, error) {
 		dir = parent
 	}
 
-	return "", fmt.Errorf(
-		"%w in %s or any parent directory", ErrNoDir, startDir)
+	// The message used to end "; run `agent-utils project init` to create
+	// one" here too. loopcmd.ResolveProject wraps this error in a fuller
+	// message that already names that command, so the same instruction
+	// would otherwise print twice on the one path that actually reaches an
+	// operator (a bare FindDir caller has no such wrapper today, but this is
+	// a location, not a fix; the fix belongs to the caller that knows what a
+	// project is).
+	return "", fmt.Errorf("%w in %s or any parent directory", ErrNoDir, startDir)
 }
 
 // ConfigsDir returns the configurations directory inside a .agent-utils dir.
@@ -254,6 +287,60 @@ func (c *Config) ResolveStateDir(configPath string) (string, error) {
 	return "", fmt.Errorf(
 		"state_dir is required for %s: it is not inside a %s directory, so a "+
 			"per-project state directory cannot be derived", configPath, DirName)
+}
+
+// ResolveWorkDirs returns checkout_base_dir and worktree_dir as absolute
+// paths, resolved against the project root the way state_dir already is.
+//
+// agentUtilsDir is the project's .agent-utils directory, so the project root
+// is its parent. configPath names the file only so an error can point at it.
+//
+// A relative value used raw resolves against the working directory of
+// whichever process reads the configuration, and the three processes that read
+// it do not share one:
+//
+//   - a CLI command run inside the project -- the project root, correct only
+//     by luck;
+//   - `--name <project>` run from anywhere else -- the operator's shell;
+//   - the listener daemon -- ~/.agent-utils, because its launchd plist sets
+//     WorkingDirectory to the machine-wide directory. A relative
+//     checkout_base_dir there silently means ~/.agent-utils, and
+//     checkout_base_dir becomes the agent's cmd.Dir, so the daemon would run
+//     the agent in the directory holding the registry and the state database
+//     rather than in the repository.
+//
+// Resolving here, from the project, makes every one of those contexts produce
+// the same absolute path.
+func (c *Config) ResolveWorkDirs(agentUtilsDir, configPath string) (checkout, worktrees string, err error) {
+	checkout, err = resolveProjectPath("checkout_base_dir", c.CheckoutBaseDir, agentUtilsDir, configPath)
+	if err != nil {
+		return "", "", err
+	}
+	worktrees, err = resolveProjectPath("worktree_dir", c.WorktreeDir, agentUtilsDir, configPath)
+	if err != nil {
+		return "", "", err
+	}
+	return checkout, worktrees, nil
+}
+
+// resolveProjectPath is ResolveWorkDirs for one field. An absolute path is
+// returned unchanged, so every configuration written before this existed is
+// unaffected; a leading ~ expands as state_dir's does.
+func resolveProjectPath(field, value, agentUtilsDir, configPath string) (string, error) {
+	expanded, err := expandHome(strings.TrimSpace(value))
+	if err != nil {
+		return "", err
+	}
+	if filepath.IsAbs(expanded) {
+		return expanded, nil
+	}
+	if agentUtilsDir == "" {
+		return "", fmt.Errorf(
+			"%s is relative (%q) in %s, which is not inside a %s directory, so there "+
+				"is no project root to resolve it against; use an absolute path",
+			field, expanded, configPath, DirName)
+	}
+	return filepath.Join(filepath.Dir(agentUtilsDir), expanded), nil
 }
 
 // expandHome expands a leading ~ so a configuration can be written portably.

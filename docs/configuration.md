@@ -72,15 +72,17 @@ discovery at all.
 ### The machine-wide directory
 
 `$AGENT_UTILS_HOME` names the machine-wide `.agent-utils` directory itself. It defaults to
-`~/.agent-utils`, and it holds the registry and the canonical state database. It is not a
-replacement for `$HOME`: nothing else the tool or the agent reads moves with it.
+`~/.agent-utils`, and it holds the registry, the canonical state database, and the machine-wide
+`config.yaml` the webhook listener reads (see [Two different `config.yaml` files](#two-different-configyaml-files)
+below). It is not a replacement for `$HOME`: nothing else the tool or the agent reads moves
+with it.
 
 Do not confuse it with `$AGENT_UTILS_DIR`: `AGENT_UTILS_HOME` names the ONE machine-wide
 directory, and `AGENT_UTILS_DIR` names ONE project's `.agent-utils` directory.
 
 | Variable | Names | Default |
 |---|---|---|
-| `AGENT_UTILS_HOME` | The machine-wide directory: the registry and the state database | `~/.agent-utils` |
+| `AGENT_UTILS_HOME` | The machine-wide directory: the registry, the state database, and `config.yaml` | `~/.agent-utils` |
 | `AGENT_UTILS_DIR` | One project's `.agent-utils` directory | Found by walking up from the working directory |
 
 Pointing `AGENT_UTILS_HOME` at a path that exists and is not a directory is an error rather
@@ -89,6 +91,54 @@ ask for, and the mistake would surface much later as missing state.
 
 Set it to run a test, or a second machine-wide installation, against its own state. Moving
 `$HOME` instead would also move the git and ssh configuration the agent still needs.
+
+It also holds `env`, the shell-sourceable file `GITHUB_TOKEN` is read from — by the webhook
+listener on every delivery, and by the cron entry in the README. Write it with:
+
+```bash
+agent-utils config token
+```
+
+The command looks for a token you already have before it asks for one. `$GITHUB_TOKEN`, if it
+is set in the environment, is used as it stands and nothing is prompted for. Otherwise, if `gh`
+is installed and logged in, the token `gh auth token` reports becomes the prompt's **default**,
+which Enter accepts and typing anything else replaces. Only when neither turns one up does it
+ask outright. A discovered token is never echoed, not even as a default: it is shown as a
+masked fingerprint (`ghp_…AB12`, the last four characters) so you can tell which credential is
+about to be stored without the value landing in your scrollback or a screen share. A `gh` that
+is absent, not logged in, or slow to answer is simply "no token found" — never an error, and
+never gh's own stderr reported as this program's.
+
+It writes the file atomically at mode `0600`, creating `~/.agent-utils` if it does not exist;
+anything else already in the file is preserved, since cron sources it and it may hold unrelated
+exports. It never takes the token as a flag or an argument — a value on the command line shows
+up in `ps` output and in shell history — but it does read one piped to it (`echo "$TOKEN" |
+agent-utils config token`), for a scripted machine build, and a piped value wins over
+`$GITHUB_TOKEN` because it was given explicitly. With no terminal, nothing piped, and no
+`$GITHUB_TOKEN`, it refuses rather than hanging. Writing the file by hand still works, as long
+as the mode is `0600` and the file is owned by the account the listener runs as, which is what
+the reader enforces:
+
+```bash
+install -m 600 /dev/null ~/.agent-utils/env
+echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
+```
+
+### Two different `config.yaml` files
+
+`~/.agent-utils/config.yaml` (the machine-wide settings file, `AGENT_UTILS_HOME`) and
+`<project>/.agent-utils/config.yaml` (one project's descriptor: its name and its UUID) are
+**different files that happen to share a base name**, distinguished only by which directory
+holds them. The machine-wide one is never described by this document — it is not a loop
+configuration — and is read and written entirely through `agent-utils config`.
+
+That name collision is not a coincidence to shrug off: it is exactly why `agent-utils project
+init` refuses to run inside the machine-wide directory. Without that refusal, `cd ~ &&
+agent-utils project init` would mint a *project* descriptor at `~/.agent-utils/config.yaml`,
+overwriting the machine-wide settings file — or, run the other way, pointing `$AGENT_UTILS_HOME`
+at a project's `.agent-utils` directory would hand a project descriptor to code expecting the
+machine-wide settings shape. Both `internal/settings` (Load and Save) and `project init` guard
+against this explicitly, by probing the file's shape before trusting it.
 
 ### How a configuration is chosen
 
@@ -128,8 +178,8 @@ absolute path** — it depends on no working directory and can never prompt.
 |---|---|---|---|
 | `name` | string | yes | — |
 | `repo` | string `owner/name` | yes | — |
-| `checkout_base_dir` | path | yes | — |
-| `worktree_dir` | path | yes | — |
+| `checkout_base_dir` | path, relative to the project root | yes | — |
+| `worktree_dir` | path, relative to the project root | yes | — |
 | `state_dir` | path | no | `<project>/.agent-utils/state/<name>` |
 | `default_branch` | string | yes | — |
 | `labels.trigger` | string | yes | — |
@@ -147,7 +197,8 @@ absolute path** — it depends on no working directory and can never prompt.
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
 | `tend_pr` | bool | no | `false` |
 | `retry.max` | int | no | `0`, meaning never retry |
-| `retry.backoff_ticks` | list of int | yes if `retry.max > 0` | empty |
+| `retry.backoff` | list of duration | yes if `retry.max > 0` | empty |
+| `retry.backoff_ticks` (removed) | — | — | — |
 | `retry.breaker.orphan_threshold` | int ≥ 1 | yes | — |
 | `retry.breaker.cooldown` | duration | yes | — |
 | `prompt` | template | yes | — |
@@ -202,8 +253,18 @@ branch. You can keep working in it yourself while the loop runs.
 When `agent.worktree` is `none`, this directory is also the agent's working directory. That
 is only safe with one issue at a time.
 
+**A relative path is resolved against the project root** — the directory containing
+`.agent-utils` — never against the working directory of whatever ran the command. That is
+what makes `.` correct, and what the wizard writes: the same file then works for a CLI run
+from anywhere, for `--name <project>` typed in another directory, and for the listener
+daemon, whose working directory is `~/.agent-utils`. A leading `~` is expanded. An absolute
+path is used as written.
+
+A configuration outside any `.agent-utils` directory has no project root, so a relative path
+there is an error naming the file; use an absolute path.
+
 ```yaml
-checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+checkout_base_dir: .   # the project itself; an absolute path works too
 ```
 
 ### `worktree_dir`
@@ -220,6 +281,11 @@ The path is stable across ticks, so a resumed run finds the branch state it left
 
 Each worktree is a full checkout. Nothing prunes them today: an issue the loop has touched
 keeps its worktree until you run `loop reset`. Budget disk accordingly.
+
+It is resolved exactly like `checkout_base_dir`: a relative path against the project root, a
+leading `~` expanded, an absolute path as written. The wizard defaults it to
+`<home>/worktrees` rather than something relative, so a second full checkout does not land
+inside the repository the agent works in.
 
 ```yaml
 worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
@@ -246,11 +312,17 @@ It holds two things:
 | `{state_dir}/{name}.lock` | The per-loop tick lock |
 | `{state_dir}/logs/{name}/` | Agent transcripts and runner logs |
 
-**The database is not one of them.** Issue state, dispatches, pull request links and ticks
-live in one canonical database for the machine, at `$HOME/.agent-utils/state.db`. Every row
-carries the UUID of the project that owns it, so one file holds every project without any of
-them seeing another's state. That is why a `state_dir` shared between two projects no longer
-mixes their state — only their lock and their logs.
+**The database is not one of them.** Issue state, dispatches, pull request links, ticks and
+webhook registrations live in one canonical database for the machine, at
+`$HOME/.agent-utils/state.db`. Every row carries the UUID of the project that owns it, so one
+file holds every project without any of them seeing another's state. That is why a `state_dir`
+shared between two projects no longer mixes their state — only their lock and their logs.
+
+Webhook registrations are keyed by project and repository, and hold the hook id GitHub
+assigned. `agent-utils project register-webhook` writes the row once GitHub confirms, and
+`agent-utils project deregister-webhook` deletes the hook by that id and removes the row.
+The id is what makes a hook findable after `webhook.url` changes; see
+[Webhooks](../README.md#webhooks).
 
 The same directory holds `registry.json`, which records which projects have been used so
 `agent-utils list` can list them. It is an index only: deleting it loses the list and nothing
@@ -438,13 +510,21 @@ worktree: per_issue
 
 ### `agent.max_budget_usd` — optional
 
-Passed as `--max-budget-usd`. Omit or set `0` for no limit.
+Passed to the agent as `--max-budget-usd`. The dispatch is stopped when the session's cost
+exceeds it.
+
+**`0`, or omitting the field, disables the cap.** The flag is then not passed at all and the
+dispatch runs with no cost ceiling — bounded only by `agent.timeout`. That is deliberate and
+supported; set it knowingly.
+
+A negative value is rejected at load. It would otherwise behave exactly like `0`, so `-25`
+typed for `25` would have run uncapped and said nothing.
 
 This is a per-dispatch ceiling, not a per-issue or per-day one. An issue that is retried
 three times can spend up to three times this amount.
 
 ```yaml
-max_budget_usd: 25
+max_budget_usd: 25   # or 0 for no cap
 ```
 
 ### `agent.timeout` — required
@@ -532,20 +612,33 @@ its lifetime with successes in between is not parked on its next single failure.
 max: 3
 ```
 
-### `retry.backoff_ticks`
+### `retry.backoff`
 
-How many ticks to wait before each retry. One entry per retry, so the list must be at least
-as long as `retry.max`.
+How long to wait before each retry. One entry per retry, so the list must be at least as long
+as `retry.max`. Entry 0 is the wait before the first retry.
 
-`[0, 1, 2]` means: retry 1 on the tick the failure is noticed, retry 2 at least 1 tick later,
-retry 3 at least 2 ticks after that. `[0, 0, 0]` retries as fast as the cron interval allows.
+`[0s, 15m, 30m]` means: retry 1 as soon as the failure is noticed, retry 2 at least 15 minutes
+later, retry 3 at least 30 minutes after that. `[0s, 0s, 0s]` retries as fast as the loop is
+ticked.
 
-Waiting costs nothing. A deferred retry stays pending in the database, so a tick that
-declines to act changes nothing and the next tick sees the same failure.
+The computed deadline is a wall-clock timestamp stored on the issue's row, not a tick count.
+That is what makes it correct under both drivers: `loop tick` running on a cron interval and
+the webhook daemon ticking on delivery both read the same stored deadline and compare it
+against the current time, so a retry due in 15 minutes waits 15 minutes regardless of which
+one next calls tick. Waiting costs nothing — a deferred retry stays pending in the database,
+so a tick that declines to act changes nothing and the next tick, from either driver, sees the
+same failure.
 
 ```yaml
-backoff_ticks: [0, 1, 2]
+backoff: [0s, 15m, 30m]
 ```
+
+#### `retry.backoff_ticks` (removed)
+
+A tick was a fixed interval only under cron; the webhook daemon can tick a loop at any moment,
+so a count of ticks no longer names a stable wait. A config that still sets it fails to load
+with an error naming `retry.backoff` as the replacement. Multiply the old tick count by the
+cron interval you were running to get a starting duration.
 
 ### `retry.breaker.orphan_threshold`
 
@@ -642,11 +735,14 @@ Beyond the required fields in the quick reference:
 | `agent.effort` ∈ {`low`,`medium`,`high`,`xhigh`,`max`} or empty | `… is not a valid effort level` |
 | `agent.permission_mode` is a real claude mode or empty | `… is not a valid claude permission mode` |
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
+| `agent.max_budget_usd` ≥ 0 (`0` means no cap) | `agent.max_budget_usd must not be negative` |
 | `agent.timeout` > 0 | `agent.timeout must be greater than zero` |
 | `retry.max` ≥ 0 | `retry.max must not be negative` |
-| `len(retry.backoff_ticks)` ≥ `retry.max` | `it needs one entry per retry` |
+| `len(retry.backoff)` ≥ `retry.max` | `it needs one entry per retry` |
+| `retry.backoff_ticks` must be empty | `is no longer supported; ... replace it with retry.backoff` |
 | `retry.breaker.orphan_threshold` ≥ 1 | `must be at least 1` |
 | `retry.breaker.cooldown` > 0 | `must be greater than zero` |
+| `checkout_base_dir`/`worktree_dir` relative needs a project root | `… so there is no project root to resolve it against` |
 | `tend_prompt` non-empty when `tend_pr` | `tend_prompt is required when tend_pr is true` |
 | All three prompts parse as templates | `prompt: template: …` |
 | No unknown keys anywhere | `field … not found in type config.Config` |
@@ -664,5 +760,6 @@ Both read only local state, so they need no token and work offline. A file that 
 is reported as `INVALID` with its error rather than being skipped.
 
 `agent-utils project loop status --name <loop>` validates too, but it also lists the
-repository's open issues, so it needs `GITHUB_TOKEN` and network access. A config error names
+repository's open issues, so it needs `GITHUB_TOKEN` (see [The machine-wide
+directory](#the-machine-wide-directory), or `agent-utils config token`) and network access. A config error names
 the offending field, so it is easy to tell from an authentication error.
