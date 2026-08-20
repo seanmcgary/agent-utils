@@ -105,6 +105,31 @@ CREATE TABLE IF NOT EXISTS cooldowns (
   PRIMARY KEY (project_id, loop)
 );
 
+-- One row per repository this project has registered a webhook for.
+--
+-- The row exists because registration used to leave NOTHING on this machine.
+-- register-webhook found an existing hook by matching Config.URL against
+-- webhook.url, so changing webhook.url and re-running it created a SECOND hook
+-- at GitHub while the first kept delivering to a dead endpoint -- orphaned,
+-- invisible here, and removable only by hand in GitHub's UI. Recording what was
+-- registered is what makes that recoverable.
+CREATE TABLE IF NOT EXISTS webhooks (
+  project_id    TEXT NOT NULL,
+  repo          TEXT NOT NULL,
+  -- hook_id is GitHub's identifier for the hook, and it is the column this
+  -- table exists for. deregister-webhook deletes by it rather than by matching
+  -- a URL, which is the only way to remove the hook a project actually
+  -- registered AFTER webhook.url has been changed -- the exact case that
+  -- otherwise leaves an orphaned hook delivering to a dead endpoint forever.
+  hook_id       INTEGER NOT NULL,
+  -- url is the delivery target the hook carried when it was recorded. It is
+  -- kept for the operator, not for matching: after a webhook.url change it is
+  -- the only local record of where the hook still points.
+  url           TEXT NOT NULL,
+  registered_at TIMESTAMP NOT NULL,
+  PRIMARY KEY (project_id, repo)
+);
+
 -- One row per legacy per-loop database this canonical file has imported.
 --
 -- The key is a triple, not a path. Two loops may share one state_dir, so one

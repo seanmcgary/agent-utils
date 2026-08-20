@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -52,6 +53,7 @@ type fakeHookAdmin struct {
 	listCalls   int
 	createCalls int
 	editCalls   int
+	deleteCalls int
 }
 
 func newFakeHookAdmin() *fakeHookAdmin {
@@ -90,6 +92,20 @@ func (f *fakeHookAdmin) EditHook(_ context.Context, owner, repo string, id int64
 		}
 	}
 	return errors.New("no such hook")
+}
+
+func (f *fakeHookAdmin) DeleteHook(_ context.Context, owner, repo string, id int64) error {
+	f.deleteCalls++
+	key := owner + "/" + repo
+	for i := range f.hooks[key] {
+		if f.hooks[key][i].ID == id {
+			f.hooks[key] = append(f.hooks[key][:i], f.hooks[key][i+1:]...)
+			return nil
+		}
+	}
+	// The real client reports GitHub's 404 this way, and a caller tidying up a
+	// hook that is already gone branches on it rather than on the message.
+	return fmt.Errorf("hooks %s/%s: 404: %w", owner, repo, ghub.ErrHookNotFound)
 }
 
 // TestCollectReposDedupsAcrossLoops covers: "Two loops naming one repository

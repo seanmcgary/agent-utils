@@ -178,3 +178,23 @@ type LoopState struct {
 	// what it costs today must not add the two together.
 	CostByRepo map[string]float64
 }
+
+// Webhook is the record of one repository's GitHub webhook registration.
+//
+// It is written only after GitHub confirms the create or the edit, so a row
+// here is evidence that a hook exists, not that one was asked for.
+type Webhook struct {
+	// ProjectID is the owning project's UUID, the first half of the key.
+	ProjectID string
+	// Repo is "owner/name", the second half.
+	Repo string
+	// HookID is GitHub's identifier for the hook. It is what deregistration
+	// deletes by: matching on URL instead cannot find the hook a project
+	// registered before webhook.url was changed.
+	HookID int64
+	// URL is the delivery target the hook carried when it was recorded. After
+	// a webhook.url change it is the only local record of where the live hook
+	// still points, which is what makes an orphan diagnosable.
+	URL          string
+	RegisteredAt time.Time
+}

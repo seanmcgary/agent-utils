@@ -3,6 +3,7 @@ package ghub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -204,5 +205,78 @@ func TestIsHookEvent(t *testing.T) {
 	}
 	if IsHookEvent("push") {
 		t.Error(`IsHookEvent("push") = true, want false`)
+	}
+}
+
+func TestDeleteHook(t *testing.T) {
+	mux := http.NewServeMux()
+	called := false
+	mux.HandleFunc("/repos/o/r/hooks/7", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("method = %s, want DELETE", r.Method)
+		}
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	g := newTestClient(t, srv)
+	if err := g.DeleteHook(context.Background(), "o", "r", 7); err != nil {
+		t.Fatalf("DeleteHook: %v", err)
+	}
+	if !called {
+		t.Error("DeleteHook made no request")
+	}
+}
+
+// A 404 from the delete endpoint has two causes -- the hook is already gone, or
+// the token lacks admin:repo_hook -- and GitHub reports both the same way. The
+// error therefore has to do two things: name the scope, so an operator who is
+// missing it is not sent looking for a deleted repository, and carry
+// ErrHookNotFound, so deregister-webhook can treat an already-gone hook as the
+// tidy-up it is instead of failing and leaving a row nothing can clear.
+func TestDeleteHook404IsReportedAsNotFoundAndNamesScope(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/hooks/7", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(&github.ErrorResponse{Message: "Not Found"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	g := newTestClient(t, srv)
+	err := g.DeleteHook(context.Background(), "o", "r", 7)
+	if err == nil {
+		t.Fatal("DeleteHook: want error on 404, got nil")
+	}
+	if !errors.Is(err, ErrHookNotFound) {
+		t.Errorf("error = %v, want it to wrap ErrHookNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "admin:repo_hook") {
+		t.Errorf("error = %q, want it to name admin:repo_hook", err.Error())
+	}
+}
+
+// A non-404 failure must NOT read as "already gone": treating a 500 that way
+// would drop the recorded row while the hook kept delivering.
+func TestDeleteHook500IsNotNotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/hooks/7", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(&github.ErrorResponse{Message: "boom"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	g := newTestClient(t, srv)
+	err := g.DeleteHook(context.Background(), "o", "r", 7)
+	if err == nil {
+		t.Fatal("DeleteHook: want error on 500, got nil")
+	}
+	if errors.Is(err, ErrHookNotFound) {
+		t.Errorf("error = %v, want it NOT to read as an already-gone hook", err)
 	}
 }

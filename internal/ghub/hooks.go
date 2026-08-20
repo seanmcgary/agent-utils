@@ -14,7 +14,19 @@ type HookAdmin interface {
 	ListHooks(ctx context.Context, owner, repo string) ([]Hook, error)
 	CreateHook(ctx context.Context, owner, repo string, h HookSpec) (int64, error)
 	EditHook(ctx context.Context, owner, repo string, id int64, h HookSpec) error
+	DeleteHook(ctx context.Context, owner, repo string, id int64) error
 }
+
+// ErrHookNotFound reports that GitHub answered a hook call with 404.
+//
+// It says nothing more than that. GitHub answers BOTH "no such hook" and "your
+// token lacks admin:repo_hook" with 404 (see missingScopeErr), so a caller that
+// treats this as "already deleted" is choosing the first reading. That choice
+// is safe only where the alternative is worse -- deregister-webhook makes it,
+// because refusing there would leave a recorded row that nothing on this
+// machine can ever clear -- and the wrapped message still names the scope so
+// the operator can tell the two apart.
+var ErrHookNotFound = errors.New("hook not found")
 
 // ListHooks returns every webhook configured on the repository.
 func (g *GitHubClient) ListHooks(ctx context.Context, owner, repo string) ([]Hook, error) {
@@ -69,6 +81,19 @@ func (g *GitHubClient) EditHook(ctx context.Context, owner, repo string, id int6
 	return nil
 }
 
+// DeleteHook removes a webhook by its GitHub identifier.
+//
+// It deletes by id, never by matching a delivery URL, which is the entire
+// reason the id is recorded locally: after `config set webhook.url` the live
+// hook still points at the previous endpoint, and a URL match would fail to
+// find exactly the orphan the operator is trying to remove.
+func (g *GitHubClient) DeleteHook(ctx context.Context, owner, repo string, id int64) error {
+	if _, err := g.c.Repositories.DeleteHook(ctx, owner, repo, id); err != nil {
+		return missingScopeErr(owner, repo, err)
+	}
+	return nil
+}
+
 // hookRequest builds the go-github Hook the API expects from a HookSpec.
 //
 // It refuses an empty secret rather than sending one. The Config below is a
@@ -103,7 +128,12 @@ func hookRequest(h HookSpec) (*github.Hook, error) {
 func missingScopeErr(owner, repo string, err error) error {
 	var ge *github.ErrorResponse
 	if errors.As(err, &ge) && ge.Response != nil && ge.Response.StatusCode == 404 {
-		return fmt.Errorf("hooks %s/%s: 404 (token likely missing the admin:repo_hook scope): %w", owner, repo, err)
+		// ErrHookNotFound is joined in so a caller can branch on the 404
+		// without parsing the message, while the message still names the
+		// scope: the two causes are indistinguishable from the response
+		// alone, so both readings have to survive into the error.
+		return fmt.Errorf("hooks %s/%s: 404 (token likely missing the admin:repo_hook scope): %w",
+			owner, repo, errors.Join(ErrHookNotFound, err))
 	}
 	return fmt.Errorf("hooks %s/%s: %w", owner, repo, err)
 }
