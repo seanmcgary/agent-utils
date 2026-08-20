@@ -2,7 +2,7 @@ name: execution
 repo: mcgarylabs/lawndominator-monorepo
 
 checkout_base_dir: /Users/seanmcgary/Code/lawndominator
-worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
+worktree_dir: .agent-utils/worktrees
 # state_dir is optional. When omitted it defaults to
 # <project>/.agent-utils/state/<name>, which keeps this loop's tick
 # lock and its logs beside the project. Loop state itself lives in
