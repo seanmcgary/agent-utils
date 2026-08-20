@@ -64,7 +64,32 @@ type Decision struct {
 
 // Plan is the full output of one decision pass.
 type Plan struct {
-	Decisions      []Decision
+	Decisions []Decision
+	// Skips explains, per issue number, why an issue Decide examined produced
+	// no decision. It exists because a scoped tick's summary is all zeros for
+	// half a dozen quite different reasons -- a veto label, a live agent, an
+	// unexpired backoff window, no trigger label -- and an operator reading
+	// "nothing happened" cannot tell which. The reason has to come from HERE
+	// rather than be re-derived by the caller: a second copy of these rules
+	// would be free to disagree with the one that actually decided.
+	//
+	// An issue that DID get a decision is absent from the map, so a caller can
+	// log the entry whenever there is one.
+	Skips map[int]string
+	// Halted explains why the pass returned without examining any issue at
+	// all. Only the breaker cooldown does that, and it happens before any
+	// issue is looked at, so it cannot be a per-issue skip.
+	Halted         string
 	BreakerTripped bool
 	CooldownUntil  time.Time
+}
+
+// NoDecisionReason returns why issue got no decision this pass, or "" when it
+// got one. It is the single accessor a caller needs, so no caller has to know
+// that a whole-pass halt and a per-issue skip are recorded differently.
+func (p Plan) NoDecisionReason(issue int) string {
+	if p.Halted != "" {
+		return p.Halted
+	}
+	return p.Skips[issue]
 }

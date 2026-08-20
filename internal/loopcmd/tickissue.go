@@ -181,8 +181,17 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	if _, err := deps.Store.RecordTick(cfg.Name, plan.BreakerTripped, string(body)); err != nil {
 		return sum, err
 	}
-	slog.Info("issue tick complete", "loop", cfg.Name, "issue", iss.Number,
-		"summary", string(body))
+	// The reason comes from the plan, never from re-reading the labels and the
+	// state here. Two copies of the skip rules would be free to disagree, and
+	// the engine's is the tested one. An all-zeros summary with no explanation
+	// is what an operator was left holding: "nothing happened" reads the same
+	// whether a veto label stopped it, an agent is already live, a backoff
+	// window has not expired, or the breaker is in cooldown.
+	attrs := []any{"loop", cfg.Name, "issue", iss.Number, "summary", string(body)}
+	if reason := plan.NoDecisionReason(iss.Number); reason != "" {
+		attrs = append(attrs, "reason", reason)
+	}
+	slog.Info("issue tick complete", attrs...)
 	return sum, nil
 }
 
