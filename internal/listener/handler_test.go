@@ -863,3 +863,112 @@ func TestDrainReturnsImmediatelyWithNothingInFlight(t *testing.T) {
 		t.Fatal("Drain blocked with nothing in flight")
 	}
 }
+
+// repoActionPayload returns the JSON body of a webhook delivery carrying a
+// repository full_name and the "action" field the issue and pull request
+// events carry (opened, labeled, closed...).
+func repoActionPayload(t *testing.T, fullName, action string) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"action":     action,
+		"repository": map[string]any{"full_name": fullName},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return body
+}
+
+// An ACCEPTED delivery must log what it was. Every rejection and every skip
+// already logs; success logged nothing, so the ticks a delivery causes
+// appeared in the operator's log with no line explaining why. The report that
+// prompted this: a fresh unlabelled issue was created, and seconds later a
+// tend was dispatched for a DIFFERENT issue -- correct behaviour (a delivery
+// reconciles the whole loop) that was indistinguishable from a bug because
+// nothing said a delivery had arrived at all.
+func TestAnAcceptedDeliveryIsLogged(t *testing.T) {
+	logs := captureLogs(t)
+	tickCh := make(chan string, 1)
+	s := newServer(t, tickCh)
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body := repoActionPayload(t, "octo/hello", "opened")
+	deliveryID := uuid.NewString()
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+		github.DeliveryIDHeader:      deliveryID,
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	waitTick(t, tickCh)
+
+	out := logs.String()
+	for _, want := range []string{
+		"accepted delivery", "event=issues", "action=opened",
+		"repo=octo/hello", "delivery=" + deliveryID,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the accepted delivery log does not carry %q:\n%s", want, out)
+		}
+	}
+}
+
+// The action is decoded out of the payload, so it is bounded and shape-checked
+// before it reaches a log line for the same reason the delivery id and the
+// repository full_name are: an unbounded string with an embedded newline in it
+// would otherwise forge a whole log record in the operator's file.
+func TestAnOutOfShapeActionIsNotLoggedVerbatim(t *testing.T) {
+	logs := captureLogs(t)
+	tickCh := make(chan string, 1)
+	s := newServer(t, tickCh)
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	evil := "opened\nlevel=ERROR msg=\"the daemon is on fire\"" + strings.Repeat("a", 500)
+	body := repoActionPayload(t, "octo/hello", evil)
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	waitTick(t, tickCh)
+
+	out := logs.String()
+	if strings.Contains(out, "the daemon is on fire") {
+		t.Errorf("the raw action reached the log:\n%s", out)
+	}
+	if !strings.Contains(out, "action=<invalid>") {
+		t.Errorf("an out-of-shape action must be reported as such:\n%s", out)
+	}
+}
+
+// An event that carries no action at all (push, for one) must still log its
+// accepted line, and must not report a missing field as an invalid one: an
+// operator who sees "<invalid>" goes looking for an attack.
+func TestAnAcceptedDeliveryWithNoActionIsStillLogged(t *testing.T) {
+	logs := captureLogs(t)
+	tickCh := make(chan string, 1)
+	s := newServer(t, tickCh)
+	ts := httptest.NewServer(s.Handler(context.Background()))
+	defer ts.Close()
+
+	body := repoPayload(t, "octo/hello")
+	resp := doRequest(t, ts.URL+"/webhook", body, map[string]string{
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	waitTick(t, tickCh)
+
+	out := logs.String()
+	if !strings.Contains(out, "accepted delivery") {
+		t.Errorf("no accepted line for an action-less event:\n%s", out)
+	}
+	if strings.Contains(out, "action=<invalid>") {
+		t.Errorf("an absent action must not be reported as invalid:\n%s", out)
+	}
+}

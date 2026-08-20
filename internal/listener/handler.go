@@ -43,6 +43,30 @@ var repoFullName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,1
 // string as its key.
 var deliveryIDShape = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 
+// webhookAction matches the "action" field an issue, pull request or comment
+// event carries: a short lowercase identifier such as opened, labeled or
+// closed. Like the delivery id and the repository full_name, the action is a
+// value this daemon logs and does not otherwise use, so it is bounded and
+// character-restricted before it reaches a log line. The payload is
+// HMAC-verified by the time it is decoded, but an unbounded string with an
+// embedded newline in it would forge a whole record in the operator's log
+// file, and nothing about the signature check makes that safe to skip.
+var webhookAction = regexp.MustCompile(`^[a-z_]{1,40}$`)
+
+// safeAction returns action if it looks like a webhook action, "" if the event
+// carries none, and "<invalid>" otherwise.
+//
+// Absent and out-of-shape are deliberately different answers: most events do
+// carry an action, but not all do (push does not), and reporting a missing
+// field as "<invalid>" would send an operator looking for an attack that is
+// not happening.
+func safeAction(action string) string {
+	if action == "" || webhookAction.MatchString(action) {
+		return action
+	}
+	return "<invalid>"
+}
+
 // safeDeliveryID returns id if it looks like a delivery id and "<invalid>"
 // otherwise. X-Github-Delivery is read and logged before anything else about
 // the request has been validated, so an anonymous, unauthenticated caller
@@ -306,6 +330,12 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// rejected before it is ever logged, so the raw value never appears
 		// in the operator's log file.
 		var body struct {
+			// Action is decoded only to be logged. It is what tells the
+			// operator WHICH change arrived -- "issues/opened" rather than
+			// "something happened in this repository" -- and it is the field
+			// that lets a delivery be matched against what the human just did
+			// in the browser. See safeAction for why it is bounded.
+			Action     string `json:"action"`
 			Repository struct {
 				FullName string `json:"full_name"`
 			} `json:"repository"`
@@ -374,6 +404,18 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// let that Wait observe a zero counter before the goroutine
 			// ever ran, since nothing orders "go func(){...}()" returning
 			// against the Add its body would perform.
+			// The accepted delivery is logged HERE, before the tick starts,
+			// and it is the only line that explains why any tick exists. Every
+			// rejection and every skip above already logs; a success logged
+			// nothing, so ticks appeared in the operator's log from nowhere.
+			//
+			// It is NOT throttled, unlike the rejections: a delivery that
+			// reaches this point carried a valid signature, so its rate is
+			// bounded by GitHub and by the projects registered on this
+			// machine, not by a stranger.
+			slog.Info("accepted delivery", "delivery", safeDeliveryID(deliveryID),
+				"event", event, "action", safeAction(body.Action), "repo", repo)
+
 			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.sem }()

@@ -327,6 +327,12 @@ Passing `--config` with an absolute path works too and skips discovery entirely.
 
 The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
 request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
+A delivery is a wake-up, not an instruction: it triggers a full reconcile of every loop
+watching that repository, exactly as the cron tick does, and nothing in the payload beyond the
+repository name is acted on. So an unrelated issue that was already eligible can be dispatched
+by a delivery about some other issue — the same work cron would have done at the next interval,
+only sooner. The `accepted delivery` and `reconciling every loop...` lines in the log are what
+tie a delivery to the ticks it caused.
 Set it up in this order:
 
 ```bash

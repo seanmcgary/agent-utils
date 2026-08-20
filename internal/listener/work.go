@@ -184,6 +184,16 @@ func NewWorker(db *store.DB) *Worker {
 }
 
 // Deliver ticks every loop that watches repo.
+//
+// A delivery is a WAKE-UP, not an instruction. The tick it starts reconciles
+// the loop's whole issue set against GitHub; it does not act on the issue the
+// payload happened to name, and the payload is not even read past the
+// repository. So creating one unlabelled issue can dispatch an agent for a
+// completely different issue that was already eligible -- the same thing the
+// cron tick would have done within its interval, only sooner. That is by
+// design, and it looks like a bug from the outside, which is why the log lines
+// below and in handler.go exist: they are what makes the chain
+// delivery -> repository -> loops -> ticks readable after the fact.
 func (w *Worker) Deliver(ctx context.Context, repo string) {
 	targets, err := w.Targets(repo)
 	if err != nil {
@@ -197,6 +207,17 @@ func (w *Worker) Deliver(ctx context.Context, repo string) {
 		slog.Info("no loop watches this repository", "repo", repo)
 		return
 	}
+	// The non-zero case is logged too, not only the zero one. Without it the
+	// only delivery that said anything was the one that did nothing, and the
+	// fan-out -- one delivery, several projects, several agents, on several
+	// token budgets -- was invisible.
+	loops := make([]string, 0, len(targets))
+	for _, t := range targets {
+		loops = append(loops, t.ProjectName+"/"+t.LoopName)
+	}
+	slog.Info("reconciling every loop that watches this repository",
+		"repo", repo, "loops", loops)
+
 	for _, t := range targets {
 		// Sequential, and one target's failure never returns early: the
 		// loops that share a repository are separate projects with separate

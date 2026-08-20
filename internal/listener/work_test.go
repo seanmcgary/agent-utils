@@ -1067,3 +1067,27 @@ func TestTheUnroutableWarningIsThrottledPerLoop(t *testing.T) {
 		t.Errorf("summary does not carry the suppressed count: %s", buf.String())
 	}
 }
+
+// The fan-out a delivery causes has to be visible. Deliver already logged the
+// zero case ("no loop watches this repository"), so the ONLY delivery that
+// said anything was the one that did nothing: a delivery that ticked three
+// loops produced ticks with nothing tying them back to it. Without this line
+// an operator cannot tell "my issue caused this" from "cron would have done it
+// anyway".
+func TestDeliverLogsTheLoopsItIsAboutToTick(t *testing.T) {
+	buf := captureLogs(t)
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning"), h.target("execution")}
+
+	h.w.Deliver(context.Background(), "o/r")
+
+	out := buf.String()
+	if !strings.Contains(out, "repo=o/r") {
+		t.Errorf("the fan-out line does not name the repository:\n%s", out)
+	}
+	for _, loop := range []string{"planning", "execution"} {
+		if !strings.Contains(out, loop) {
+			t.Errorf("the fan-out line does not name loop %q:\n%s", loop, out)
+		}
+	}
+}
