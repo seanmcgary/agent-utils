@@ -9,12 +9,12 @@ Design: [`docs/superpowers/specs/2026-08-20-pi-harness-design.md`](../specs/2026
 
 | Field   | Value                                                                 |
 |---------|-----------------------------------------------------------------------|
-| stage   | 2 (plan review)                                                       |
+| stage   | 4 (commit review)                                                  |
 | class   | standard (adds a config surface and a second output parser; contained) |
 | profile | backend                                                               |
 | branch  | feat/pi-harness                                                       |
 | pr      | #6                                                                    |
-| gate    | pending                                                               |
+| gate    | approved 2026-08-20                                                   |
 | round   | 0                                                                     |
 
 ## Architecture
