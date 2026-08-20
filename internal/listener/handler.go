@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -52,6 +53,106 @@ var deliveryIDShape = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 // embedded newline in it would forge a whole record in the operator's log
 // file, and nothing about the signature check makes that safe to skip.
 var webhookAction = regexp.MustCompile(`^[a-z_]{1,40}$`)
+
+// maxLoggedTextRunes bounds ONE free-text payload field on the accepted
+// delivery line: an issue or pull request title, a label name, a sender login.
+//
+// Unlike the action and the repository full_name, these cannot be
+// shape-checked -- a title is arbitrary text written by whoever opened the
+// issue -- so a length cap is the whole bound. It is needed for the same
+// reason those are: slog goes to stdout as JSON (cmd/agent-utils/main.go) and
+// launchd appends that to ~/.agent-utils/listener.stdout.log with NO rotation
+// (internal/service/service_darwin.go). A 5 MiB title (the body limit) written
+// verbatim on every delivery is an attacker choosing how much this daemon
+// writes to the operator's home volume, and the KeepAlive respawn then meets a
+// full disk. 120 runes is long enough to recognise an issue by its title.
+const maxLoggedTextRunes = 120
+
+// maxLoggedLabels bounds how many of an issue's labels are printed. The label
+// list is a second axis the payload's author controls: each name can be inside
+// maxLoggedTextRunes and the slice still arbitrarily long. GitHub caps labels
+// per issue, but nothing in this process enforces GitHub's cap, and this line
+// is written before any of the payload has been acted on.
+const maxLoggedLabels = 12
+
+// truncationMarker is appended to anything this file shortened. A silently cut
+// title reads as the whole title, which is worse than no title: an operator
+// would match it against the wrong issue.
+const truncationMarker = "<truncated>"
+
+// safeText bounds one free-text payload field for logging. It cuts on a rune
+// boundary, so a multi-byte character split in half cannot put invalid UTF-8
+// into the log file, and it marks what it cut.
+//
+// It deliberately does NOT reject or rewrite the contents the way safeAction
+// does: a title legitimately contains spaces, punctuation and any script.
+// Escaping is the log handler's job -- both slog handlers quote a value
+// carrying a newline -- and the bound this daemon owns is the length.
+func safeText(s string) string {
+	n := 0
+	for i := range s {
+		n++
+		if n > maxLoggedTextRunes {
+			return s[:i] + truncationMarker
+		}
+	}
+	return s
+}
+
+// safeLabels bounds a label list for logging: every name through safeText, at
+// most maxLoggedLabels of them, and a count of what did not fit. The count is
+// printed rather than dropped for the same reason throttledLog reports its
+// suppressed total: a shortened list that does not say it is short understates
+// what the engine actually decided from.
+func safeLabels(names []string) []string {
+	if len(names) <= maxLoggedLabels {
+		out := make([]string, 0, len(names))
+		for _, n := range names {
+			out = append(out, safeText(n))
+		}
+		return out
+	}
+	out := make([]string, 0, maxLoggedLabels+1)
+	for _, n := range names[:maxLoggedLabels] {
+		out = append(out, safeText(n))
+	}
+	return append(out, fmt.Sprintf("<%d more>", len(names)-maxLoggedLabels))
+}
+
+// nameOnly is the one field this daemon reads out of a label object. The rest
+// of GitHub's label representation (id, color, description) is decoded away
+// deliberately: nothing here needs it, and every decoded field is another
+// attacker-written string that could reach a log line by accident later.
+type nameOnly struct {
+	Name string `json:"name"`
+}
+
+// names flattens the first non-empty label list. A delivery carries labels
+// under issue or under pull_request, never meaningfully under both.
+func names(lists ...[]nameOnly) []string {
+	for _, list := range lists {
+		if len(list) == 0 {
+			continue
+		}
+		out := make([]string, 0, len(list))
+		for _, l := range list {
+			out = append(out, l.Name)
+		}
+		return out
+	}
+	return nil
+}
+
+// firstNonEmpty returns the first non-empty string, used to take a title from
+// whichever object the delivery carried.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
 
 // safeAction returns action if it looks like a webhook action, "" if the event
 // carries none, and "<invalid>" otherwise.
@@ -339,18 +440,41 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			Repository struct {
 				FullName string `json:"full_name"`
 			} `json:"repository"`
+			// Label is the label that was added or removed. It is present
+			// only on the labeled and unlabeled actions, and it is the whole
+			// point of those deliveries: this loop is driven entirely by
+			// labels, so "a label changed" without saying WHICH is the least
+			// useful true statement the log can make. See safeText for why a
+			// name that is free text is bounded before it is printed.
+			Label struct {
+				Name string `json:"name"`
+			} `json:"label"`
 			// The subject of the delivery. All five subscribed events carry a
 			// number: issues and issue_comment in issue.number, and
 			// pull_request, pull_request_review and pull_request_review_comment
 			// in pull_request.number. Both are decoded because issue_comment
 			// fires on pull requests too, and because a delivery this daemon
 			// cannot attribute to one number is one it cannot act on.
+			//
+			// The title says which issue this is without a browser round trip,
+			// and the labels are what engine.Decide actually decides from, so
+			// a line carrying them explains the tick that follows rather than
+			// only announcing it. Both are attacker-written free text.
 			Issue struct {
-				Number int `json:"number"`
+				Number int        `json:"number"`
+				Title  string     `json:"title"`
+				Labels []nameOnly `json:"labels"`
 			} `json:"issue"`
 			PullRequest struct {
-				Number int `json:"number"`
+				Number int        `json:"number"`
+				Title  string     `json:"title"`
+				Labels []nameOnly `json:"labels"`
 			} `json:"pull_request"`
+			// Who caused this delivery. An operator reading a surprise tick
+			// needs to know whether a human or a bot moved the label.
+			Sender struct {
+				Login string `json:"login"`
+			} `json:"sender"`
 		}
 		if err := json.Unmarshal(payload, &body); err != nil || !repoFullName.MatchString(body.Repository.FullName) {
 			s.rejected(w, deliveryID, "repository", http.StatusBadRequest)
@@ -448,9 +572,30 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// no other. The line an operator reads is "delivery X said issue
 			// #51 changed", which is exactly what they can match against what
 			// they just did in the browser.
-			slog.Info("accepted delivery", "delivery", safeDeliveryID(deliveryID),
+			// The remaining fields are appended only when the payload
+			// carried them: a labeled delivery and an opened delivery must
+			// not both print an empty label, which would say nothing while
+			// looking like it said something. Each one is bounded first --
+			// see safeText and safeLabels for the unrotated-log-file failure
+			// that requires it.
+			attrs := []any{"delivery", safeDeliveryID(deliveryID),
 				"event", event, "action", safeAction(body.Action), "repo", repo,
-				"number", number)
+				"number", number}
+			if body.Label.Name != "" {
+				attrs = append(attrs, "label", safeText(body.Label.Name))
+			}
+			if title := firstNonEmpty(body.Issue.Title, body.PullRequest.Title); title != "" {
+				attrs = append(attrs, "title", safeText(title))
+			}
+			if body.Sender.Login != "" {
+				attrs = append(attrs, "sender", safeText(body.Sender.Login))
+			}
+			// Issue first, then pull request, matching how the number above is
+			// chosen: issue_comment on a pull request carries both objects.
+			if labels := names(body.Issue.Labels, body.PullRequest.Labels); len(labels) > 0 {
+				attrs = append(attrs, "labels", safeLabels(labels))
+			}
+			slog.Info("accepted delivery", attrs...)
 
 			s.wg.Add(1)
 			go func() {
