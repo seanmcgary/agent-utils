@@ -47,11 +47,15 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	}
 
 	// 1. name
+	//
+	// Defaulted from the template just chosen, like the label and prompt
+	// answers below: someone starting from the execution template is far more
+	// likely to want a loop called "execution" than one called "planning".
 	cfg.Name, err = p.Ask(Question{
 		Key:      "name",
 		Label:    "Loop name",
 		Help:     "Unique in this project. Keys the loop's state, its lock file, and its state directory.",
-		Default:  "planning",
+		Default:  tmpl.Name,
 		Validate: validateName,
 	})
 	if err != nil {

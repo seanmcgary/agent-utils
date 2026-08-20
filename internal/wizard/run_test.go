@@ -56,6 +56,13 @@ func TestRunAcceptsEveryDefault(t *testing.T) {
 				t.Fatalf("Run: %v", err)
 			}
 
+			// The loop name defaults to the template just chosen, so
+			// accepting every default from the execution template produces
+			// an "execution" loop, not a "planning" one.
+			if cfg.Name != tmplName {
+				t.Errorf("Name = %q, want %q -- the chosen template's name", cfg.Name, tmplName)
+			}
+
 			// The one security-relevant default: accepting every default must
 			// never produce bypassPermissions. config.validate would accept
 			// bypassPermissions just as happily as acceptEdits once the
