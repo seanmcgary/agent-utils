@@ -196,3 +196,23 @@ func TestAgentEnvExcludesCredentials(t *testing.T) {
 		t.Error("HOME must be preserved; the agent needs it to run git and gh")
 	}
 }
+
+// Spawn must return the child's REAL process identifier.
+//
+// os.Process.Release invalidates the handle and sets Pid to -1, so reading
+// cmd.Process.Pid after the Release call returned -1 on every successful
+// spawn. The tick wrote that -1 into the dispatch row, and a later tick read
+// it as a dead runner and retried an issue whose agent was still working --
+// a second agent in a worktree that already held one.
+func TestSpawnReturnsTheRealPidNotTheReleasedHandle(t *testing.T) {
+	// /bin/echo takes the runner's arguments, prints them and exits. Nothing
+	// about the child matters here except that the kernel gave it a pid.
+	pid, err := Spawn("/bin/echo", 7, testProject, "/tmp/loop.yaml",
+		filepath.Join(t.TempDir(), "runner-7.log"))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("Spawn returned pid %d; a spawned process always has a positive pid", pid)
+	}
+}

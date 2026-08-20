@@ -79,11 +79,21 @@ func Spawn(selfPath string, dispatchID int64, projectID, configPath, runnerLog s
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("spawn runner for dispatch %d: %w", dispatchID, err)
 	}
+	// Capture the pid BEFORE Release, and return the captured value. Release
+	// invalidates the os.Process and sets its Pid to -1, so reading
+	// cmd.Process.Pid afterwards returned -1 on EVERY successful spawn. The
+	// tick wrote that -1 into the dispatch row, and a tick arriving before the
+	// runner self-registered its real pid read the row as a dead runner: it
+	// retired the dispatch, flagged the issue for retry, and let a later tick
+	// put a second agent into a worktree that already held one. Do not
+	// "simplify" this back to reading cmd.Process.Pid at the end.
+	pid := cmd.Process.Pid
+
 	// Release the child so it is not left as a zombie when the tick exits.
 	if err := cmd.Process.Release(); err != nil {
-		return cmd.Process.Pid, fmt.Errorf("release runner process: %w", err)
+		return pid, fmt.Errorf("release runner process: %w", err)
 	}
-	return cmd.Process.Pid, nil
+	return pid, nil
 }
 
 // Supervise runs claude for one dispatch, writes the stream to logPath, and

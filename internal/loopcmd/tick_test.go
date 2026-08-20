@@ -2,6 +2,7 @@ package loopcmd
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -485,5 +486,93 @@ func TestTickKeepsTheDeadlineOfAnIssueStillInTheSnapshot(t *testing.T) {
 	}
 	if st.RetryAfter.IsZero() {
 		t.Error("RetryAfter was cleared for an issue the engine can still reach; its backoff window is gone")
+	}
+}
+
+// A dispatch row whose pid is NON-POSITIVE and younger than the grace period
+// is a live agent whose pid has not been recorded yet, not a dead runner.
+//
+// runner.Spawn used to return -1 for every successful spawn (os.Process.Release
+// invalidates the handle), and the grace period covered pid 0 only, so a tick
+// landing in that window called proc.IsAlive(-1) -- always false -- retired the
+// row, flagged the issue for retry, and let a later tick put a SECOND agent in
+// a worktree that already held one. Under cron the window was minutes wide and
+// effectively unreachable; under the webhook daemon deliveries arrive seconds
+// apart, which is why it surfaced. Both halves are fixed; this covers the row
+// as it may still be found on disk.
+func TestAYoungDispatchWithANonPositivePidIsNotReaped(t *testing.T) {
+	for _, pid := range []int{0, -1} {
+		t.Run(fmt.Sprintf("pid%d", pid), func(t *testing.T) {
+			cfg := tickConfig(t)
+			gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"in-flight"}}}}
+			spawned := 0
+			deps := newDeps(t, cfg, gh, &spawned)
+			// The agent IS alive, but nothing can prove it from a pid the
+			// kernel never issued; the row's age is the only evidence there is.
+			deps.IsAlive = func(int, int64) bool { return false }
+
+			id, _ := deps.Store.CreateDispatch(store.Dispatch{
+				Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindStart, SessionID: "s",
+			})
+			_ = deps.Store.SetDispatchProcess(id, pid, time.Now())
+			_ = deps.Store.PutIssueState(store.IssueState{
+				Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
+				SessionStarted: true, UpdatedAt: time.Now(),
+			})
+
+			sum, err := Tick(context.Background(), cfg, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sum.Orphans != 0 {
+				t.Errorf("Orphans = %d, want 0: a live agent was reaped", sum.Orphans)
+			}
+			if sum.Live != 1 {
+				t.Errorf("Live = %d, want 1", sum.Live)
+			}
+			if spawned != 0 {
+				t.Errorf("spawned = %d, want 0: a second agent was sent into the same worktree", spawned)
+			}
+			running, _ := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
+			if len(running) != 1 {
+				t.Errorf("running dispatches = %d, want the row left alone", len(running))
+			}
+			states, _ := deps.Store.IssueStates(cfg.Name, cfg.Repo)
+			if states[1].NeedsRetry {
+				t.Error("the issue was queued for retry while its agent was still working")
+			}
+		})
+	}
+}
+
+// The grace period is a window, not an exemption: a row carrying a
+// non-positive pid past it is a runner that died before it could register,
+// and it must still be reaped.
+func TestAnOldDispatchWithANonPositivePidIsStillReaped(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"in-flight"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+	deps.IsAlive = func(int, int64) bool { return false }
+	// The row's age is measured from its INSERT (started_at), which the store
+	// stamps itself, so the clock is moved rather than the row: the tick reads
+	// the grace period against deps.Now.
+	deps.Now = func() time.Time { return time.Now().Add(2 * pidGracePeriod) }
+
+	id, _ := deps.Store.CreateDispatch(store.Dispatch{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindStart, SessionID: "s",
+	})
+	_ = deps.Store.SetDispatchProcess(id, -1, time.Now())
+	_ = deps.Store.PutIssueState(store.IssueState{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, SessionID: "s",
+		SessionStarted: true, UpdatedAt: time.Now(),
+	})
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Orphans != 1 {
+		t.Errorf("Orphans = %d, want 1: a runner that never registered is dead", sum.Orphans)
 	}
 }

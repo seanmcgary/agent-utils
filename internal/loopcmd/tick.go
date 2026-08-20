@@ -47,9 +47,16 @@ func count(n *int, err error) error {
 	return err
 }
 
-// pidGracePeriod is how long a dispatch row may carry pid 0 before the tick
-// treats it as dead. It covers the window between the row insert and the pid
-// write, so a crash in that window cannot cause a duplicate dispatch.
+// pidGracePeriod is how long a dispatch row may carry a non-positive pid
+// before the tick treats it as dead. It covers the window between the row
+// insert and the pid write, so a crash in that window cannot cause a duplicate
+// dispatch.
+//
+// Non-positive, not zero: a spawn can record a placeholder that is not 0.
+// runner.Spawn returned -1 for every successful spawn until it was fixed
+// (os.Process.Release invalidates the handle), and rows written by that build
+// still exist on disk. proc.IsAlive answers false for any pid <= 0, so a
+// condition testing only 0 sends a live agent's row straight to the reaper.
 const pidGracePeriod = 90 * time.Second
 
 // Summary reports what one tick did.
@@ -138,9 +145,14 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	st := engine.State{Issues: states, CooldownUntil: time.Time{}}
 	for _, d := range running {
 		// A row whose process has not registered its pid yet is NOT an orphan.
-		// The tick writes the pid just after the spawn, so a young row with
-		// pid 0 is a live agent in that window, not a dead one.
-		if d.PID == 0 && now.Sub(d.StartedAt) < pidGracePeriod {
+		// The tick writes the pid just after the spawn, so a young row with a
+		// non-positive pid is a live agent in that window, not a dead one.
+		// Any pid <= 0 counts as unregistered: proc.IsAlive rejects all of
+		// them, and a spawn can leave a placeholder other than 0 (see
+		// pidGracePeriod). Under cron this window was minutes from the next
+		// tick; under the webhook daemon deliveries arrive seconds apart, and
+		// reaping here retried an issue whose agent was still working.
+		if d.PID <= 0 && now.Sub(d.StartedAt) < pidGracePeriod {
 			st.Running = append(st.Running, d)
 			continue
 		}
