@@ -71,7 +71,15 @@ type Summary struct {
 	BreakerTripped bool `json:"breaker_tripped"`
 }
 
-// Tick runs one reconcile and dispatch pass.
+// Tick runs one FULL reconcile and dispatch pass over every open issue.
+//
+// This is the sweep, and it stays: it is what catches the work no webhook
+// event names. GitHub sends no delivery when a pull request falls behind
+// because someone pushed to master (that is a push event, which this daemon
+// does not subscribe to), and none when a retry deadline passes on an issue
+// nobody touched. `project loop tick` under cron runs this; the daemon runs
+// TickIssue for the fast path. Both may run at once -- the per-loop lock in
+// RunTick and TickIssue makes an overlapping pass harmless.
 func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	var sum Summary
 	now := deps.Now()
@@ -142,54 +150,12 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	// Split running rows into live and dead by asking the operating system.
 	// This is the fact the LLM orchestrator could not obtain, and it is why the
 	// retry policy here needs no marker comments.
-	st := engine.State{Issues: states, CooldownUntil: time.Time{}}
-	for _, d := range running {
-		// A row whose process has not registered its pid yet is NOT an orphan.
-		// The tick writes the pid just after the spawn, so a young row with a
-		// non-positive pid is a live agent in that window, not a dead one.
-		// Any pid <= 0 counts as unregistered: proc.IsAlive rejects all of
-		// them, and a spawn can leave a placeholder other than 0 (see
-		// pidGracePeriod). Under cron this window was minutes from the next
-		// tick; under the webhook daemon deliveries arrive seconds apart, and
-		// reaping here retried an issue whose agent was still working.
-		if d.PID <= 0 && now.Sub(d.StartedAt) < pidGracePeriod {
-			st.Running = append(st.Running, d)
-			continue
-		}
-		if deps.IsAlive(d.PID, d.RunnerID()) {
-			st.Running = append(st.Running, d)
-			continue
-		}
-
-		// The runner died without recording an outcome. Retire the row AND write
-		// the durable failure flag. The flag is what the next decision reads: a
-		// tick that declines to act (backoff or breaker) must not lose the fact.
-		if err := deps.Store.FinishDispatch(d.ID, store.DispatchResult{
-			Status: store.StatusFailed, ExitCode: -1, APIError: "runner process died",
-		}); err != nil {
-			return sum, fmt.Errorf("retire dead dispatch %d: %w", d.ID, err)
-		}
-		if d.Kind != store.KindTend {
-			if err := deps.Store.MarkNeedsRetry(
-				cfg.Name, cfg.Repo, d.Number, now, runner.RetryBackoff(cfg)); err != nil {
-				return sum, fmt.Errorf("mark issue %d for retry: %w", d.Number, err)
-			}
-			// Reflect the write in the snapshot this tick decides from. The row
-			// is read back rather than patched by hand: MarkNeedsRetry stamps a
-			// retry deadline as well as the flag, and a tick deciding from a
-			// snapshot without it would dispatch the retry immediately and skip
-			// the first backoff entry entirely.
-			sIssue, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Number)
-			if err != nil {
-				return sum, fmt.Errorf("re-read issue %d after marking it for retry: %w",
-					d.Number, err)
-			}
-			states[d.Number] = sIssue
-		}
-		sum.Orphans++
+	live, err := reapDead(cfg, deps, running, states, now, &sum)
+	if err != nil {
+		return sum, err
 	}
-	sum.Live = len(st.Running)
-	st.Issues = states
+	st := engine.State{Issues: states, Running: live, CooldownUntil: time.Time{}}
+	sum.Live = len(live)
 
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
 		return sum, err
@@ -224,6 +190,72 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	}
 	slog.Info("tick complete", "loop", cfg.Name, "summary", string(body))
 	return sum, nil
+}
+
+// reapDead splits running rows into the live ones it returns and the dead ones
+// it retires, marking each dead row's issue for retry and reflecting that write
+// back into states.
+//
+// It is shared by the full tick and the issue-scoped one rather than copied.
+// The caller chooses the ROWS -- the whole loop's for a sweep, one issue's for
+// a delivery -- and nothing else about reaping may differ between them: a
+// second copy that drifted on the pid grace period would put a second agent
+// into a worktree that already holds one.
+func reapDead(
+	cfg *config.Config,
+	deps Deps,
+	running []store.Dispatch,
+	states map[int]store.IssueState,
+	now time.Time,
+	sum *Summary,
+) ([]store.Dispatch, error) {
+	var live []store.Dispatch
+	for _, d := range running {
+		// A row whose process has not registered its pid yet is NOT an orphan.
+		// The tick writes the pid just after the spawn, so a young row with a
+		// non-positive pid is a live agent in that window, not a dead one.
+		// Any pid <= 0 counts as unregistered: proc.IsAlive rejects all of
+		// them, and a spawn can leave a placeholder other than 0 (see
+		// pidGracePeriod). Under cron this window was minutes from the next
+		// tick; under the webhook daemon deliveries arrive seconds apart, and
+		// reaping here retried an issue whose agent was still working.
+		if d.PID <= 0 && now.Sub(d.StartedAt) < pidGracePeriod {
+			live = append(live, d)
+			continue
+		}
+		if deps.IsAlive(d.PID, d.RunnerID()) {
+			live = append(live, d)
+			continue
+		}
+
+		// The runner died without recording an outcome. Retire the row AND write
+		// the durable failure flag. The flag is what the next decision reads: a
+		// tick that declines to act (backoff or breaker) must not lose the fact.
+		if err := deps.Store.FinishDispatch(d.ID, store.DispatchResult{
+			Status: store.StatusFailed, ExitCode: -1, APIError: "runner process died",
+		}); err != nil {
+			return nil, fmt.Errorf("retire dead dispatch %d: %w", d.ID, err)
+		}
+		if d.Kind != store.KindTend {
+			if err := deps.Store.MarkNeedsRetry(
+				cfg.Name, cfg.Repo, d.Number, now, runner.RetryBackoff(cfg)); err != nil {
+				return nil, fmt.Errorf("mark issue %d for retry: %w", d.Number, err)
+			}
+			// Reflect the write in the snapshot this tick decides from. The row
+			// is read back rather than patched by hand: MarkNeedsRetry stamps a
+			// retry deadline as well as the flag, and a tick deciding from a
+			// snapshot without it would dispatch the retry immediately and skip
+			// the first backoff entry entirely.
+			sIssue, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Number)
+			if err != nil {
+				return nil, fmt.Errorf("re-read issue %d after marking it for retry: %w",
+					d.Number, err)
+			}
+			states[d.Number] = sIssue
+		}
+		sum.Orphans++
+	}
+	return live, nil
 }
 
 // clearUnreachableDeadlines drops the retry DEADLINE from every stamped row

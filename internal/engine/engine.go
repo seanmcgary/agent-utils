@@ -125,6 +125,16 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	// rather than several unrelated crashes. It drops every DISPATCH decision.
 	// Parks survive: the reference loop states that a cap-reached comment already
 	// due is still posted during a breaker tick.
+	//
+	// KNOWN GAP: eligibleRetries counts retries within THIS call, so a call
+	// scoped to one issue can never reach a threshold above 1. Every webhook
+	// delivery is such a call (loopcmd.TickIssue), which means the breaker no
+	// longer sees the platform-wide failure it was written to catch -- only the
+	// cron sweep still can. The chosen fix is to count failures over a rolling
+	// time window instead of within one call; that needs new database state and
+	// is a separate change. Until then loopcmd.warnBreakerNotEvaluated logs
+	// every scoped retry that was dispatched without this check, so the gap is
+	// visible in the operator's log rather than silent.
 	if eligibleRetries >= cfg.Retry.Breaker.OrphanThreshold {
 		return Plan{
 			Decisions:      parks,
