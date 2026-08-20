@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -129,6 +130,11 @@ type Worker struct {
 	Targets   func(repo string) ([]Target, error)
 	TargetFor func(projectID, loop string) (Target, Routing, error)
 	Token     func() (string, error)
+	// NewClient builds the GitHub client ONE pass shares across the loops it
+	// ticks. Production wires it to ghub.New; it is a seam so a test can count
+	// the calls a delivery makes, which is the only place the saving is
+	// visible.
+	NewClient func(token string) ghub.Client
 	Open      func(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error)
 	// RunIssue acts on ONE issue, taking the loop's lock first. It is
 	// loopcmd.TickIssue, never loopcmd.RunTick: the daemon answers events, and
@@ -171,6 +177,7 @@ func NewWorker(db *store.DB) *Worker {
 		Targets:         Targets,
 		TargetFor:       TargetFor,
 		Token:           Token,
+		NewClient:       func(token string) ghub.Client { return ghub.New(token) },
 		Open:            loopcmd.Open,
 		RunIssue:        loopcmd.TickIssue,
 		Now:             time.Now,
@@ -232,12 +239,91 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 	slog.Info("acting on this issue in every loop that watches the repository",
 		"repo", repo, "number", number, "loops", loops)
 
+	// One token read, one client, one memo, for the whole delivery -- created
+	// HERE and dropped when Deliver returns. See access: the lifetime is the
+	// correctness property, not the saving.
+	acc, err := w.access()
+	if err != nil {
+		// Reported once for the delivery rather than once per loop: the token
+		// is machine-wide, so every loop would have failed on the identical
+		// read. No retry is scheduled, for the reason access states.
+		slog.Error("cannot read the github token", "repo", repo, "number", number,
+			"loops", loops, "err", err)
+		return
+	}
+
 	for _, t := range targets {
 		// Sequential, and one target's failure never returns early: the
 		// loops that share a repository are separate projects with separate
 		// state, and one broken project must not strand the others.
-		w.tickOne(ctx, t, number)
+		w.tickOne(ctx, t, number, acc)
 	}
+}
+
+// access is the GitHub access ONE pass hands to the loops it ticks: the token
+// read for that pass, and a client that answers the repeated reads of the
+// delivered number from a single fetch.
+//
+// A delivery fans out across every loop watching the repository, and each of
+// those loops began by fetching the SAME issue: two loops meant two identical
+// fetches for one event, ten meant ten, plus a pull request and the issue it
+// closes on top for a delivery that named a pull request.
+//
+// # Lifetime
+//
+// A value of this type belongs to ONE pass and must not outlive it. Every
+// producer creates it inside the function that serves the pass -- Deliver for a
+// delivery, tickFresh for a retry timer or a wake -- and drops it on return, so
+// no caller can hold one by accident and none is stored on the Worker.
+//
+// That is a correctness rule, not a tidiness one, and it is what a later reader
+// would be tempted to "optimise" by caching the client on the Worker. This
+// daemon decides from an issue's LABELS. A memo that outlived its pass would
+// answer the NEXT delivery -- the one raised BECAUSE a label changed -- with the
+// labels from before that change, so a freshly triggered issue would get no
+// agent and an issue whose trigger label was just removed would get one. That
+// is strictly worse than the extra fetch the sharing avoids. See
+// ghub.DeliveryCache, which states the same rule where the memo lives.
+//
+// The token is read once per pass rather than once per loop. It is machine-wide
+// (~/.agent-utils/env), so it is not per-project, and a pass is a single moment:
+// re-reading it per pass keeps the property that rotating the token needs no
+// daemon restart.
+type access struct {
+	token string
+	gh    ghub.Client
+}
+
+// access reads the token and builds the pass's client and memo.
+//
+// A token that cannot be read schedules no retry anywhere it is called from: a
+// bad file mode or an absent file is an operator problem that is identical on
+// the next attempt, and retrying would log the same error retry.max times. The
+// token itself is never in err: env.go keeps it out deliberately.
+func (w *Worker) access() (*access, error) {
+	tok, err := w.Token()
+	if err != nil {
+		return nil, err
+	}
+	return &access{token: tok, gh: ghub.NewDeliveryCache(w.NewClient(tok))}, nil
+}
+
+// tickFresh ticks one loop with GitHub access of its OWN.
+//
+// It is the entry for the two paths that serve a single loop at a moment of
+// their own: a retry timer that fires minutes after the delivery that armed it,
+// and a wake for a retry deadline. Neither may reuse a delivery's access, and
+// this is where that is enforced -- a retry re-runs precisely because something
+// failed, and re-deciding it from labels fetched before the failure would make
+// the retry a replay of a stale moment rather than a fresh look.
+func (w *Worker) tickFresh(ctx context.Context, t Target, number int) {
+	acc, err := w.access()
+	if err != nil {
+		slog.Error("cannot read the github token", "loop", t.LoopName,
+			"project", t.ProjectName, "issue", number, "err", err)
+		return
+	}
+	w.tickOne(ctx, t, number, acc)
 }
 
 // tickOne acts on one issue in one loop and decides what the outcome means
@@ -247,22 +333,15 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 // SAME scoped pass rather than widening into a reconcile: a delivery that
 // failed and is retried a minute later must still be about the issue the
 // delivery named.
-func (w *Worker) tickOne(ctx context.Context, t Target, number int) {
+func (w *Worker) tickOne(ctx context.Context, t Target, number int, acc *access) {
 	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
 
-	tok, err := w.Token()
-	if err != nil {
-		// No retry is scheduled. A bad file mode or an absent file is an
-		// operator problem that retrying cannot fix, and retrying would log
-		// the same error retry.max times per delivery. The token itself is
-		// never in err: env.go keeps it out deliberately.
-		slog.Error("cannot read the github token", "loop", t.LoopName,
-			"project", t.ProjectName, "err", err)
-		return
-	}
-
 	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
-		Token:         tok,
+		Token: acc.token,
+		// The pass's own client, so every loop of this delivery reads the
+		// delivered issue from one fetch. Open builds its own only when this
+		// is nil, which is what keeps `project loop tick` unchanged.
+		GH:            acc.gh,
 		RequireGitHub: true,
 		// The write path. A tick against a database missing this loop's rows
 		// would re-dispatch every open issue and start a second agent in a
@@ -406,7 +485,10 @@ func (w *Worker) schedule(ctx context.Context, t Target, number int, kind retryK
 		}
 		slog.Info("retrying a failed tick", "loop", t.LoopName,
 			"project", t.ProjectName, "issue", number, "attempt", n)
-		w.tickOne(ctx, t, number)
+		// tickFresh, never the access of the delivery that armed this timer:
+		// that value is gone with Deliver's frame, and reusing one would
+		// re-decide the issue from labels read before the failure.
+		w.tickFresh(ctx, t, number)
 	})
 	slog.Info("scheduled a retry", "loop", t.LoopName, "project", t.ProjectName,
 		"attempt", n, "in", d)
@@ -542,7 +624,9 @@ func (w *Worker) Wake(ctx context.Context) (next time.Time, ok bool) {
 			// that issue alone. A whole-loop reconcile here would decide every
 			// open issue of the loop because ONE of them came due, which is the
 			// same repository-wide cost a delivery used to pay.
-			w.tickOne(ctx, t, due.Number)
+			// tickFresh: a wake is its own moment, minutes or hours after
+			// whatever delivery flagged this issue, so it reads GitHub afresh.
+			w.tickFresh(ctx, t, due.Number)
 
 			// The handled deadline is returned, not a fresh query for the
 			// next one. The tick may legitimately have decided nothing (its

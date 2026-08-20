@@ -54,6 +54,18 @@ type Options struct {
 	Token           string
 	RequireGitHub   bool
 	MigrationPolicy MigrationPolicy
+	// GH is the GitHub client this tick must use. Nil means "build one from
+	// Token", which is what every CLI command does.
+	//
+	// The webhook daemon passes one instead: a delivery fans out across every
+	// loop watching the repository, and each loop's tick starts by fetching the
+	// SAME issue, so the daemon builds one authenticated, memoising client for
+	// the delivery and hands it to each Open. The token is machine-wide, so one
+	// client per delivery is legitimate; the memo is not, beyond that delivery.
+	// listener.access and ghub.DeliveryCache both state why the lifetime must
+	// stay with the caller: a client cached any longer would decide from stale
+	// LABELS.
+	GH ghub.Client
 }
 
 // Open resolves a project's loop configuration and builds everything one tick
@@ -107,8 +119,16 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 	// nor carry the token. Requiring it there would put a repository-write
 	// credential in the environment of a process whose child is the agent.
 	token := opts.Token
-	if token == "" && opts.RequireGitHub {
+	if token == "" && opts.RequireGitHub && opts.GH == nil {
 		return nil, Deps{}, nil, fmt.Errorf("GITHUB_TOKEN is not set")
+	}
+
+	// A caller-supplied client is used as it is. Building a second one here
+	// would silently undo the sharing the daemon set up and put the per-loop
+	// fetches back.
+	gh := opts.GH
+	if gh == nil {
+		gh = ghub.New(token)
 	}
 
 	if _, err := home.EnsureDir(); err != nil {
@@ -164,7 +184,7 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 	deps := Deps{
 		Store:      db.Project(ref.ID),
 		ProjectID:  ref.ID,
-		GH:         ghub.New(token),
+		GH:         gh,
 		WT:         wt,
 		SelfPath:   self,
 		ConfigPath: abs,

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -406,5 +407,177 @@ func TestTickIssueDoesNotTendAnUntrustedPullRequest(t *testing.T) {
 	links, _ := deps.Store.PRLinks(cfg.Name, cfg.Repo)
 	if _, ok := links[51]; ok {
 		t.Errorf("an untrusted pull request was stored as issue 51's link: %+v", links)
+	}
+}
+
+// secondLoopConfig returns a second loop of the same repository, with its own
+// name and its own state directory.
+//
+// It exists because the saving under test is only visible with more than one
+// loop watching one repository: that is the shape the webhook daemon fans a
+// delivery out into, and the shape that made one event cost N identical
+// fetches of one issue.
+func secondLoopConfig(t *testing.T, name string) *config.Config {
+	t.Helper()
+	cfg := tickConfig(t)
+	cfg.Name = name
+	return cfg
+}
+
+// The fan-out: one delivery, two loops watching the repository, ONE fetch of
+// the issue it named. Each loop keeps its own state and spends its own budget,
+// but they were all asking GitHub the same question at the same instant.
+func TestOneDeliveryFetchesTheIssueOnceAcrossEveryLoop(t *testing.T) {
+	planning := tickConfig(t)
+	execution := secondLoopConfig(t, "execution")
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 51, Labels: []string{"trigger"}}}}
+	// One cache for one delivery -- exactly what listener.Deliver builds and
+	// drops around its loop over the targets.
+	shared := ghub.NewDeliveryCache(gh)
+
+	spawned := 0
+	for _, cfg := range []*config.Config{planning, execution} {
+		deps := newDeps(t, cfg, shared, &spawned)
+		if _, err := TickIssue(context.Background(), cfg, deps, 51); err != nil {
+			t.Fatalf("TickIssue(%s): %v", cfg.Name, err)
+		}
+	}
+
+	if len(gh.fetchedIssues) != 1 || gh.fetchedIssues[0] != 51 {
+		t.Errorf("fetched issues = %v, want exactly [51] for one delivery to two loops", gh.fetchedIssues)
+	}
+	// The control. Without it the assertion above would also pass if the
+	// second loop had simply decided nothing at all.
+	if spawned != 2 {
+		t.Errorf("spawned = %d, want one agent per loop: the shared fetch must not skip a loop", spawned)
+	}
+}
+
+// The staleness guard, and the reason the cache's lifetime is one delivery.
+//
+// The daemon decides from LABELS. This is the exact sequence the daemon exists
+// to answer: a delivery about an issue with nothing to do, then the delivery
+// raised BECAUSE the trigger label was added. A cache that outlived the first
+// delivery would answer the second with the labels from before the label that
+// caused it, and no agent would ever start.
+func TestASecondDeliveryFetchesTheIssueAgainAndSeesTheNewLabels(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 51}}}
+	spawned := 0
+	deps := newDeps(t, cfg, ghub.NewDeliveryCache(gh), &spawned)
+
+	if _, err := TickIssue(context.Background(), cfg, deps, 51); err != nil {
+		t.Fatalf("TickIssue: %v", err)
+	}
+	if spawned != 0 {
+		t.Fatalf("spawned = %d, want 0 for an issue carrying no trigger label", spawned)
+	}
+
+	// The label that raises the second delivery.
+	gh.issues = []ghub.Issue{{Number: 51, Labels: []string{"trigger"}}}
+	deps.GH = ghub.NewDeliveryCache(gh)
+	if _, err := TickIssue(context.Background(), cfg, deps, 51); err != nil {
+		t.Fatalf("TickIssue (second delivery): %v", err)
+	}
+
+	if len(gh.fetchedIssues) != 2 {
+		t.Errorf("fetched issues = %v, want one fetch per delivery", gh.fetchedIssues)
+	}
+	if spawned != 1 {
+		t.Errorf("spawned = %d, want 1: the second delivery must decide from the labels that raised it", spawned)
+	}
+}
+
+// A delivery about a pull request costs the same two fetches however many
+// loops watch the repository: the delivered number (answered as a pull
+// request), then the issue it closes. engine.ClosesIssue reads the body those
+// fetches returned, so the resolution is settled once for the delivery.
+func TestOneDeliveryResolvesAPullRequestToItsIssueOnce(t *testing.T) {
+	planning := tickConfig(t)
+	execution := secondLoopConfig(t, "execution")
+	gh := &fakeGH{
+		issues: []ghub.Issue{{Number: 51, Labels: []string{"trigger"}}},
+		prs: []ghub.PullRequest{{
+			Number: 108, HeadRef: "feat/51", BaseRef: "master",
+			Body: "Closes #51", Trusted: true,
+		}},
+	}
+	shared := ghub.NewDeliveryCache(gh)
+
+	spawned := 0
+	var stores []*store.Store
+	for _, cfg := range []*config.Config{planning, execution} {
+		deps := newDeps(t, cfg, shared, &spawned)
+		stores = append(stores, deps.Store)
+		if _, err := TickIssue(context.Background(), cfg, deps, 108); err != nil {
+			t.Fatalf("TickIssue(%s): %v", cfg.Name, err)
+		}
+	}
+
+	if len(gh.fetchedPRs) != 1 || gh.fetchedPRs[0] != 108 {
+		t.Errorf("fetched pull requests = %v, want exactly [108]", gh.fetchedPRs)
+	}
+	if len(gh.fetchedIssues) != 2 || gh.fetchedIssues[0] != 108 || gh.fetchedIssues[1] != 51 {
+		t.Errorf("fetched issues = %v, want [108 51]: the delivered number once, then the issue it closes once",
+			gh.fetchedIssues)
+	}
+	// The control: both loops really did resolve the pull request to issue 51.
+	if spawned != 2 {
+		t.Fatalf("spawned = %d, want one agent per loop", spawned)
+	}
+	for i, s := range stores {
+		running, _ := s.RunningDispatches([]string{"planning", "execution"}[i], "o/r")
+		if len(running) != 1 || running[0].Number != 51 {
+			t.Errorf("loop %d running = %+v, want one dispatch keyed by issue 51", i, running)
+		}
+	}
+}
+
+// Trust is still decided per the existing path when the fetch is shared.
+// Tending checks the head branch out and runs an agent inside it, so the
+// Trusted flag convertPR set at the API boundary is what every loop of the
+// delivery must read -- neither dropped by the sharing nor recomputed beside
+// it.
+func TestASharedFetchStillDecidesTrustForATend(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trusted bool
+		want    int
+	}{
+		{"trusted head", true, 2},
+		{"fork head", false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			planning := tickConfig(t)
+			planning.TendPR = true
+			execution := secondLoopConfig(t, "execution")
+			execution.TendPR = true
+			gh := &fakeGH{
+				issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
+				prs: []ghub.PullRequest{{
+					Number: 108, HeadRef: "feat/51", BaseRef: "master",
+					Body: "Closes #51", HeadRepo: "o/r", Trusted: tc.trusted,
+				}},
+				behind: map[int]int{108: 16},
+			}
+			shared := ghub.NewDeliveryCache(gh)
+
+			spawned, tended := 0, 0
+			for _, cfg := range []*config.Config{planning, execution} {
+				deps := newDeps(t, cfg, shared, &spawned)
+				sum, err := TickIssue(context.Background(), cfg, deps, 108)
+				if err != nil {
+					t.Fatalf("TickIssue(%s): %v", cfg.Name, err)
+				}
+				tended += sum.Tended
+			}
+
+			if tended != tc.want || spawned != tc.want {
+				t.Errorf("tended = %d, spawned = %d, want %d of each", tended, spawned, tc.want)
+			}
+			if len(gh.fetchedPRs) != 1 {
+				t.Errorf("fetched pull requests = %v, want one fetch for the delivery", gh.fetchedPRs)
+			}
+		})
 	}
 }

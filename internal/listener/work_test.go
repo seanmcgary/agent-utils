@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -106,9 +107,16 @@ type harness struct {
 	// succeeds.
 	runFn func(cfg *config.Config) error
 
+	// gh is the one underlying GitHub client every pass in a test is built
+	// on. The saving a shared fetch buys is invisible in what a tick decides
+	// and visible only in this fake's counters.
+	gh *deliveryGH
+
 	mu           sync.Mutex
 	tokenErr     error
 	openErr      error
+	tokenCalls   int
+	clients      int
 	targetsCalls int
 	nowCalls     int
 	opens        []openCall
@@ -127,9 +135,18 @@ type harness struct {
 func newHarness(db *store.DB) *harness {
 	h := &harness{
 		timers: &timers{},
+		gh:     &deliveryGH{},
 		max:    1,
 	}
 	w := NewWorker(db)
+	// Every pass builds its client through this seam, so a test can count both
+	// the clients a delivery builds and the fetches they make.
+	w.NewClient = func(token string) ghub.Client {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.clients++
+		return h.gh
+	}
 	w.Now = h.now
 	w.After = h.timers.After
 	w.Token = h.token
@@ -183,6 +200,7 @@ func (h *harness) now() time.Time {
 func (h *harness) token() (string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.tokenCalls++
 	if h.tokenErr != nil {
 		return "", h.tokenErr
 	}
@@ -211,7 +229,9 @@ func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (
 		defer h.mu.Unlock()
 		h.cleanups++
 	}
-	return cfg, loopcmd.Deps{}, cleanup, nil
+	// The client the caller handed in is what the tick would use, exactly as
+	// loopcmd.Open does with Options.GH.
+	return cfg, loopcmd.Deps{GH: o.GH}, cleanup, nil
 }
 
 func (h *harness) runIssue(
@@ -226,10 +246,62 @@ func (h *harness) runIssue(
 	fn := h.runFn
 	h.mu.Unlock()
 
+	// The first thing loopcmd.TickIssue does is fetch the issue the delivery
+	// named (subject). The fake does it too, because a fake that ignored
+	// deps.GH would let a "one fetch per delivery" assertion pass without the
+	// client ever being shared.
+	if deps.GH != nil {
+		if _, err := deps.GH.Issue(ctx, "o", "r", number); err != nil {
+			return loopcmd.Summary{}, err
+		}
+	}
+
 	if fn != nil {
 		return loopcmd.Summary{}, fn(cfg)
 	}
 	return loopcmd.Summary{}, nil
+}
+
+// deliveryGH is a ghub.Client that records the numbers it was asked to fetch.
+// Only the issue fetch is exercised here; the scoped tick's own use of the
+// rest is covered in internal/loopcmd.
+type deliveryGH struct {
+	mu      sync.Mutex
+	fetched []int
+	err     error
+}
+
+func (f *deliveryGH) Issue(_ context.Context, _, _ string, number int) (ghub.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetched = append(f.fetched, number)
+	if f.err != nil {
+		return ghub.Issue{}, f.err
+	}
+	return ghub.Issue{Number: number}, nil
+}
+
+func (f *deliveryGH) fetches() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.fetched...)
+}
+
+func (f *deliveryGH) PullRequest(context.Context, string, string, int) (ghub.PullRequest, error) {
+	return ghub.PullRequest{}, nil
+}
+func (f *deliveryGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
+	return nil, nil
+}
+func (f *deliveryGH) ListOpenPullRequests(context.Context, string, string) ([]ghub.PullRequest, error) {
+	return nil, nil
+}
+func (f *deliveryGH) BehindBy(context.Context, string, string, string, string) (int, error) {
+	return 0, nil
+}
+func (f *deliveryGH) PostComment(context.Context, string, string, int, string) error { return nil }
+func (f *deliveryGH) EditLabels(context.Context, string, string, int, []string, []string) error {
+	return nil
 }
 
 // loopFromPath recovers a loop name from a fake target's config path, so the
@@ -1175,5 +1247,174 @@ func TestWakeActsOnTheIssueNamedByTheDeadline(t *testing.T) {
 	got := h.ranNumbers()
 	if len(got) != 1 || got[0] != 51 {
 		t.Fatalf("wake ran for issues %v, want only [51]", got)
+	}
+}
+
+// openedClients reports the client each Open was handed, in call order.
+func (h *harness) openedClients() []ghub.Client {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]ghub.Client, 0, len(h.opens))
+	for _, o := range h.opens {
+		out = append(out, o.opts.GH)
+	}
+	return out
+}
+
+// One delivery, N loops, ONE fetch of the issue it named. Every loop watching
+// the repository used to ask GitHub for the same issue at the same instant:
+// two loops meant two identical fetches per event, ten meant ten.
+func TestOneDeliveryFetchesTheDeliveredIssueOnce(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning"), h.target("execution")}
+
+	h.w.Deliver(context.Background(), "o/r", 51)
+
+	if got := h.gh.fetches(); len(got) != 1 || got[0] != 51 {
+		t.Errorf("fetched %v, want exactly [51] for one delivery to two loops", got)
+	}
+	// The control: both loops really did run. Without it the assertion above
+	// would also pass if the second loop had been skipped entirely.
+	if got := h.ranLoops(); len(got) != 2 {
+		t.Errorf("ran %v, want both loops", got)
+	}
+}
+
+// The staleness guard, and the reason the shared value dies with Deliver.
+//
+// The daemon decides from an issue's LABELS, and a delivery exists BECAUSE
+// something about the issue changed. A memo that outlived one delivery would
+// answer the next one with the labels from before the change that raised it.
+// This test must fail if anyone widens that lifetime.
+func TestTwoDeliveriesForOneIssueFetchItTwice(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+
+	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), "o/r", 51)
+
+	if got := h.gh.fetches(); len(got) != 2 {
+		t.Errorf("fetched %v, want one fetch per delivery", got)
+	}
+	if h.clients != 2 {
+		t.Errorf("built %d clients, want one per delivery", h.clients)
+	}
+}
+
+// The sharing is what makes the single fetch possible: every loop of one
+// delivery is opened with the SAME client, so the second loop's fetch is
+// answered from the first loop's.
+func TestEveryLoopOfOneDeliveryIsOpenedWithTheSameClient(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning"), h.target("execution")}
+
+	h.w.Deliver(context.Background(), "o/r", 51)
+
+	got := h.openedClients()
+	if len(got) != 2 {
+		t.Fatalf("opened %d times, want 2", len(got))
+	}
+	if got[0] == nil || got[1] == nil {
+		t.Fatalf("Open was handed a nil client: %v", got)
+	}
+	if got[0] != got[1] {
+		t.Errorf("each loop was opened with a client of its own; want one per delivery")
+	}
+}
+
+// The token is machine-wide, so a delivery reads it once instead of once per
+// loop. It is still read per delivery, which is what keeps a rotated token
+// working without a daemon restart.
+func TestTheTokenIsReadOncePerDelivery(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning"), h.target("execution"), h.target("review")}
+
+	h.w.Deliver(context.Background(), "o/r", 51)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.tokenCalls != 1 {
+		t.Errorf("read the token %d times, want once for the whole delivery", h.tokenCalls)
+	}
+	if h.clients != 1 {
+		t.Errorf("built %d clients, want one for the whole delivery", h.clients)
+	}
+}
+
+// A retry fires minutes after the delivery that armed it, and it re-runs
+// precisely because something failed. It must look at GitHub afresh: deciding
+// it from the labels the failed delivery fetched would make the retry a replay
+// of a stale moment rather than a new attempt.
+func TestARetryFetchesAgainInsteadOfReusingTheDeliverysFetch(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.backoff = []time.Duration{time.Minute}
+	h.runFn = func(*config.Config) error { return errBoom }
+
+	h.w.Deliver(context.Background(), "o/r", 51)
+	if h.timers.len() != 1 {
+		t.Fatalf("armed %d timers, want 1", h.timers.len())
+	}
+	h.timers.at(t, 0).f()
+
+	if got := h.gh.fetches(); len(got) != 2 {
+		t.Errorf("fetched %v, want the delivery's fetch and a fresh one for the retry", got)
+	}
+	got := h.openedClients()
+	if len(got) != 2 {
+		t.Fatalf("opened %d times, want the tick and the retry", len(got))
+	}
+	if got[0] == got[1] {
+		t.Error("the retry reused the delivery's client; it must read GitHub afresh")
+	}
+}
+
+// Wake serves one loop at a moment of its own, hours after whatever flagged
+// the issue. It goes through the same scoped path and gets access of its own.
+func TestWakeTicksThroughTheScopedPathWithItsOwnClient(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	seedDeadline(t, db, "planning", 51, workNow.Add(-time.Minute))
+
+	if _, ok := h.w.Wake(context.Background()); !ok {
+		t.Fatal("ok = false, want the past deadline")
+	}
+
+	if got := h.ranNumbers(); len(got) != 1 || got[0] != 51 {
+		t.Fatalf("wake ran for issues %v, want only [51]", got)
+	}
+	if got := h.gh.fetches(); len(got) != 1 || got[0] != 51 {
+		t.Errorf("fetched %v, want the wake's own fetch of [51]", got)
+	}
+	got := h.openedClients()
+	if len(got) != 1 || got[0] == nil {
+		t.Fatalf("Open was handed %v, want one non-nil client", got)
+	}
+}
+
+// A shared fetch fails every loop of the delivery at once, which is the same
+// outcome as before -- each would have failed identically a moment apart. What
+// must not be lost is WHICH loops it stopped: the failure is still reported
+// per loop, and each loop still schedules its own retry.
+func TestASharedFetchFailureIsStillAttributedToEveryLoop(t *testing.T) {
+	buf := captureLogs(t)
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning"), h.target("execution")}
+	h.backoff = []time.Duration{time.Minute}
+	h.gh.err = errors.New("403 rate limit exceeded")
+
+	h.w.Deliver(context.Background(), "o/r", 51)
+
+	out := buf.String()
+	for _, loop := range []string{"planning", "execution"} {
+		if !strings.Contains(out, "loop="+loop) {
+			t.Errorf("the failure was not attributed to loop %q:\n%s", loop, out)
+		}
+	}
+	if !strings.Contains(out, "rate limit exceeded") {
+		t.Errorf("the failure does not carry the error:\n%s", out)
+	}
+	if n := h.pendingLen(); n != 2 {
+		t.Errorf("pending = %d, want a retry for each loop the shared fetch stopped", n)
 	}
 }
