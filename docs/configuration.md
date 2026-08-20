@@ -99,14 +99,25 @@ listener on every delivery, and by the cron entry in the README. Write it with:
 agent-utils config token
 ```
 
-The command prompts without echoing the token, creates `~/.agent-utils` if it does not exist,
-and writes the file atomically at mode `0600`; anything else already in the file is preserved,
-since cron sources it and it may hold unrelated exports. It never takes the token as a flag or
-an argument — a value on the command line shows up in `ps` output and in shell history — but it
-does read one piped to it (`echo "$TOKEN" | agent-utils config token`), for a scripted machine
-build. With neither a terminal nor a pipe it refuses rather than hanging. Writing the file by
-hand still works, as long as the mode is `0600` and the file is owned by the account the
-listener runs as, which is what the reader enforces:
+The command looks for a token you already have before it asks for one. `$GITHUB_TOKEN`, if it
+is set in the environment, is used as it stands and nothing is prompted for. Otherwise, if `gh`
+is installed and logged in, the token `gh auth token` reports becomes the prompt's **default**,
+which Enter accepts and typing anything else replaces. Only when neither turns one up does it
+ask outright. A discovered token is never echoed, not even as a default: it is shown as a
+masked fingerprint (`ghp_…AB12`, the last four characters) so you can tell which credential is
+about to be stored without the value landing in your scrollback or a screen share. A `gh` that
+is absent, not logged in, or slow to answer is simply "no token found" — never an error, and
+never gh's own stderr reported as this program's.
+
+It writes the file atomically at mode `0600`, creating `~/.agent-utils` if it does not exist;
+anything else already in the file is preserved, since cron sources it and it may hold unrelated
+exports. It never takes the token as a flag or an argument — a value on the command line shows
+up in `ps` output and in shell history — but it does read one piped to it (`echo "$TOKEN" |
+agent-utils config token`), for a scripted machine build, and a piped value wins over
+`$GITHUB_TOKEN` because it was given explicitly. With no terminal, nothing piped, and no
+`$GITHUB_TOKEN`, it refuses rather than hanging. Writing the file by hand still works, as long
+as the mode is `0600` and the file is owned by the account the listener runs as, which is what
+the reader enforces:
 
 ```bash
 install -m 600 /dev/null ~/.agent-utils/env

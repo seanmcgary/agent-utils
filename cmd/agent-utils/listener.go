@@ -167,7 +167,22 @@ func ensureToken(in io.Reader, out io.Writer, interactive bool) error {
 		return fmt.Errorf("github token: %w", err)
 	}
 
-	_, _ = fmt.Fprintln(out, "No GitHub token is stored yet. The listener reads one from "+
+	// The first sentence reports what discovery already turned up, so the
+	// operator is not told there is nothing a line before the token they
+	// exported gets used. Only the environment is named here: a `gh` token
+	// announces itself in the prompt that follows immediately ("[ghp_…AB12
+	// from `gh auth token`...]"), and running `gh auth token` a second time
+	// just to phrase this sentence would double a subprocess that is already
+	// allowed to take five seconds.
+	//
+	// The second sentence stays as it was: it is what explains why this file
+	// exists at all, rather than the token being asked for once and kept in
+	// memory.
+	found := "No GitHub token is stored yet."
+	if _, ok := environmentToken(); ok {
+		found = "No GitHub token is stored yet, but $" + githubTokenEnv + " is set in this environment."
+	}
+	_, _ = fmt.Fprintln(out, found+" The listener reads one from "+
 		"~/.agent-utils/env on every delivery.")
 	if err := storeToken(in, out); err != nil {
 		return err

@@ -301,10 +301,14 @@ Put it in a file instead:
 agent-utils config token
 ```
 
-That prompts for the token without echoing it, and writes `~/.agent-utils/env` at mode `0600`,
-creating the file if it is not there and leaving every other line in it alone. Scripting a
-machine build? Pipe it in — `echo "$TOKEN" | agent-utils config token` — or write the file by
-hand, which is all the command is doing:
+That checks for a token you already have before asking for one: `$GITHUB_TOKEN` is used as it
+stands, and otherwise a token from `gh auth token` is offered as the prompt's default, which
+Enter accepts. Neither is ever echoed — you see a masked fingerprint like `ghp_…AB12` — and with
+neither available it prompts for the token without echoing it. Either way it writes
+`~/.agent-utils/env` at mode `0600`, creating the file if it is not there and leaving every
+other line in it alone. Scripting a machine build? Pipe it in — `echo "$TOKEN" | agent-utils
+config token`, which beats `$GITHUB_TOKEN` when both are there — or write the file by hand,
+which is all the command is doing:
 
 ```bash
 install -m 600 /dev/null ~/.agent-utils/env
@@ -325,7 +329,8 @@ request updated — directly into a `loop tick`, instead of waiting for the next
 Set it up in this order:
 
 ```bash
-agent-utils config token                 # prompts, without echoing; writes ~/.agent-utils/env 0600
+agent-utils config token                 # uses $GITHUB_TOKEN or gh's token if there is one, else
+                                         # prompts without echoing; writes ~/.agent-utils/env 0600
 agent-utils config webhook --enable --url https://hooks.example.com/webhook
 agent-utils project register-webhook
 agent-utils listener start --daemon
@@ -357,7 +362,9 @@ agent-utils config token
 ```
 
 `listener start` also offers that prompt itself when the file does not exist and you are at a
-terminal, so the setup above works even if you skip this step. It only offers: with no terminal
+terminal, so the setup above works even if you skip this step — and it discovers a token the
+same way, so with `$GITHUB_TOKEN` set or `gh` logged in there is nothing to type. It only
+offers: with no terminal
 (launchd, cron, CI) it fails with instructions instead, because a prompt nobody can answer
 would hang the daemon forever. And it only offers for a MISSING file — a wrong mode, a symlink,
 or a file owned by another account still fails outright, since something put a credential file
