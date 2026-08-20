@@ -284,11 +284,15 @@ keeps its worktree until you run `loop reset`. Budget disk accordingly.
 
 It is resolved exactly like `checkout_base_dir`: a relative path against the project root, a
 leading `~` expanded, an absolute path as written. The wizard defaults it to
-`<home>/worktrees` rather than something relative, so a second full checkout does not land
-inside the repository the agent works in.
+`.agent-utils/worktrees`, so each project's worktrees land beside that project rather than in
+a shared directory under your home.
+
+Because the default is inside the repository, the worktrees show up as untracked files there.
+Add `.agent-utils/worktrees/` to the repository's `.gitignore`, or point this at a path
+outside the checkout, if that matters to you.
 
 ```yaml
-worktree_dir: /Users/seanmcgary/.agent-utils/worktrees
+worktree_dir: .agent-utils/worktrees   # relative to the project root; an absolute path works too
 ```
 
 ### `state_dir`

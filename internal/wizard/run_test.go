@@ -1,13 +1,10 @@
 package wizard
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
-	"github.com/seanmcgary/agent-utils/internal/home"
 )
 
 // detected is a fully-populated Detected so every default that depends on it
@@ -22,17 +19,9 @@ func detected(t *testing.T) Detected {
 	}
 }
 
-// setHome points internal/home at a scratch directory so Run's worktree_dir
-// default does not depend on, or write anything under, the real user's home.
-func setHome(t *testing.T) {
-	t.Helper()
-	t.Setenv(home.EnvVar, t.TempDir())
-}
-
 func TestRunAcceptsEveryDefault(t *testing.T) {
 	for _, tmplName := range templateNames {
 		t.Run(tmplName, func(t *testing.T) {
-			setHome(t)
 			d := detected(t)
 
 			answers := []string{
@@ -65,6 +54,13 @@ func TestRunAcceptsEveryDefault(t *testing.T) {
 			cfg, err := Run(p, d)
 			if err != nil {
 				t.Fatalf("Run: %v", err)
+			}
+
+			// The loop name defaults to the template just chosen, so
+			// accepting every default from the execution template produces
+			// an "execution" loop, not a "planning" one.
+			if cfg.Name != tmplName {
+				t.Errorf("Name = %q, want %q -- the chosen template's name", cfg.Name, tmplName)
 			}
 
 			// The one security-relevant default: accepting every default must
@@ -100,7 +96,6 @@ func TestRunAcceptsEveryDefault(t *testing.T) {
 // not just default false — this exercises the loop actually resetting it,
 // not merely never having set it.
 func TestRunBypassPermissionsDeclineThenAcceptEditsStaysUnacknowledged(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	answers := []string{
@@ -145,7 +140,6 @@ func TestRunBypassPermissionsDeclineThenAcceptEditsStaysUnacknowledged(t *testin
 }
 
 func TestRunBypassPermissionsDeclineReasksThenAccepts(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	answers := []string{
@@ -192,7 +186,6 @@ func TestRunBypassPermissionsDeclineReasksThenAccepts(t *testing.T) {
 }
 
 func TestRunRetryBackoffFewerEntriesThanMaxReasks(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	answers := []string{
@@ -233,7 +226,6 @@ func TestRunRetryBackoffFewerEntriesThanMaxReasks(t *testing.T) {
 }
 
 func TestRunRepoNotOwnerSlashNameReasks(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	answers := []string{
@@ -274,7 +266,6 @@ func TestRunRepoNotOwnerSlashNameReasks(t *testing.T) {
 }
 
 func TestRunInvalidAgentTimeoutReasks(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	answers := []string{
@@ -315,7 +306,6 @@ func TestRunInvalidAgentTimeoutReasks(t *testing.T) {
 }
 
 func TestRunVetoListIsSplitFromTemplateDefault(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	tmpl, ok := TemplateNamed("planning")
@@ -360,57 +350,46 @@ func TestRunVetoListIsSplitFromTemplateDefault(t *testing.T) {
 }
 
 // TestRunRequiredFieldWithEmptyDefaultReasks covers the exact failure a
-// reviewer found end to end: outside a git work tree (or when home.Dir()
-// cannot resolve), Detect leaves default_branch with no default, and
-// worktree_dir's own default depends on home.Dir() succeeding.
-// (checkout_base_dir no longer belongs in that list: its default is the
-// literal ".", which is portable and never empty.) Before Ask consulted Question.Optional, an empty answer to any
-// of those sailed through as "", and the resulting invalid file only failed
-// at Write's reload — by which point the target filename was already
-// claimed, so a retry was refused by the overwrite guard. This proves the
-// re-ask happens immediately, mid-script, the same way a failed Validate
-// does.
+// reviewer found end to end: outside a git work tree Detect leaves
+// default_branch with no default. (Neither checkout_base_dir nor worktree_dir
+// belongs in that list any more: both default to a literal relative path,
+// which is portable and never empty.) Before Ask consulted Question.Optional,
+// an empty answer to such a question sailed through as "", and the resulting
+// invalid file only failed at Write's reload -- by which point the target
+// filename was already claimed, so a retry was refused by the overwrite
+// guard. This proves the re-ask happens immediately, mid-script, the same way
+// a failed Validate does.
 func TestRunRequiredFieldWithEmptyDefaultReasks(t *testing.T) {
-	// A file, not a directory: home.Dir() errors on this the same way it
-	// would if $HOME could not be resolved at all, so worktree_dir's default
-	// comes out empty exactly like the non-git-directory case.
-	notADir := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(home.EnvVar, notADir)
-
 	// Detected{} is what Detect returns outside a git work tree: every
 	// git-derived default is empty, which is precisely the case this test
 	// covers.
 	d := Detected{}
 
 	answers := []string{
-		"planning",       // 24. prompt template
-		"",               // 1.  name
-		"acme/example",   // 2.  repo
-		"",               // 3.  checkout_base_dir: defaults to "." -- resolved against the project root, so it is never empty
-		"",               // 4.  worktree_dir, attempt 1: home.Dir() errored, no default -> re-asked
-		"/tmp/worktrees", // 4.  worktree_dir, re-asked
-		"",               // 5.  state_dir (optional; empty is fine)
-		"",               // 6.  default_branch, attempt 1: no default, required -> re-asked
-		"main",           // 6.  default_branch, re-asked
-		"",               // 7.  labels.trigger
-		"",               // 8.  labels.in_flight
-		"",               // 9.  labels.blocked
-		"",               // 10. labels.review
-		"",               // 11. labels.terminal
-		"",               // 12. labels.veto
-		"",               // 13. agent.model
-		"",               // 14. agent.effort
-		"",               // 15. agent.permission_mode
-		"",               // 16. agent.worktree
-		"",               // 17. agent.max_budget_usd
-		"",               // 18. agent.timeout
-		"",               // 20. retry.max
-		"",               // 21. retry.backoff
-		"",               // 22. retry.breaker.orphan_threshold
-		"",               // 23. retry.breaker.cooldown
+		"planning",     // 24. prompt template
+		"",             // 1.  name
+		"acme/example", // 2.  repo
+		"",             // 3.  checkout_base_dir: defaults to "." -- resolved against the project root, so it is never empty
+		"",             // 4.  worktree_dir: defaults to .agent-utils/worktrees -- resolved against the project root, so it is never empty
+		"",             // 5.  state_dir (optional; empty is fine)
+		"",             // 6.  default_branch, attempt 1: no default, required -> re-asked
+		"main",         // 6.  default_branch, re-asked
+		"",             // 7.  labels.trigger
+		"",             // 8.  labels.in_flight
+		"",             // 9.  labels.blocked
+		"",             // 10. labels.review
+		"",             // 11. labels.terminal
+		"",             // 12. labels.veto
+		"",             // 13. agent.model
+		"",             // 14. agent.effort
+		"",             // 15. agent.permission_mode
+		"",             // 16. agent.worktree
+		"",             // 17. agent.max_budget_usd
+		"",             // 18. agent.timeout
+		"",             // 20. retry.max
+		"",             // 21. retry.backoff
+		"",             // 22. retry.breaker.orphan_threshold
+		"",             // 23. retry.breaker.cooldown
 	}
 	p := &scriptPrompter{t: t, answers: answers}
 
@@ -421,8 +400,8 @@ func TestRunRequiredFieldWithEmptyDefaultReasks(t *testing.T) {
 	if cfg.CheckoutBaseDir != "." {
 		t.Fatalf("CheckoutBaseDir = %q, want %q", cfg.CheckoutBaseDir, ".")
 	}
-	if cfg.WorktreeDir != "/tmp/worktrees" {
-		t.Fatalf("WorktreeDir = %q, want %q", cfg.WorktreeDir, "/tmp/worktrees")
+	if cfg.WorktreeDir != worktreeDirDefault {
+		t.Fatalf("WorktreeDir = %q, want %q", cfg.WorktreeDir, worktreeDirDefault)
 	}
 	if cfg.DefaultBranch != "main" {
 		t.Fatalf("DefaultBranch = %q, want %q", cfg.DefaultBranch, "main")
@@ -437,7 +416,6 @@ func TestRunRequiredFieldWithEmptyDefaultReasks(t *testing.T) {
 }
 
 func TestRunInvalidNameReasks(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	answers := []string{
@@ -478,7 +456,6 @@ func TestRunInvalidNameReasks(t *testing.T) {
 }
 
 func TestRunNonPositiveAgentTimeoutReasks(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	answers := []string{
@@ -519,7 +496,6 @@ func TestRunNonPositiveAgentTimeoutReasks(t *testing.T) {
 }
 
 func TestRunNegativeRetryBreakerCooldownReasks(t *testing.T) {
-	setHome(t)
 	d := detected(t)
 
 	answers := []string{
@@ -573,7 +549,6 @@ func TestRunNegativeAgentMaxBudgetReasksAndZeroIsAccepted(t *testing.T) {
 		{"zero means no cap", []string{"0"}, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			setHome(t)
 			d := detected(t)
 
 			answers := []string{

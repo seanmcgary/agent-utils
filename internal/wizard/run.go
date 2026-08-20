@@ -2,15 +2,18 @@ package wizard
 
 import (
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
-	"github.com/seanmcgary/agent-utils/internal/home"
 )
+
+// worktreeDirDefault is the default answer to question 4. It is relative, so
+// config.ResolveWorkDirs resolves it against the project root, giving every
+// project its own worktrees under its own .agent-utils directory.
+const worktreeDirDefault = config.DirName + "/worktrees"
 
 // Run asks every question and returns a configuration that config.validate
 // accepts.
@@ -44,11 +47,15 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	}
 
 	// 1. name
+	//
+	// Defaulted from the template just chosen, like the label and prompt
+	// answers below: someone starting from the execution template is far more
+	// likely to want a loop called "execution" than one called "planning".
 	cfg.Name, err = p.Ask(Question{
 		Key:      "name",
 		Label:    "Loop name",
 		Help:     "Unique in this project. Keys the loop's state, its lock file, and its state directory.",
-		Default:  "planning",
+		Default:  tmpl.Name,
 		Validate: validateName,
 	})
 	if err != nil {
@@ -87,20 +94,17 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 
 	// 4. worktree_dir
 	//
-	// Deliberately NOT relative, unlike question 3: a worktree under the
-	// repository would put a full second checkout inside the tree the agent
-	// works in, where git status and the agent's own file searches would both
-	// see it.
-	worktreeDefault := ""
-	if h, err := home.Dir(); err == nil {
-		worktreeDefault = filepath.Join(h, "worktrees")
-	}
+	// Relative, like question 3, and resolved against the project root the
+	// same way: the worktrees belong to the project they are checked out
+	// from, not to whoever's home directory the wizard happened to run under.
+	// Keeping them under .agent-utils puts them beside the project's other
+	// generated state instead of loose in the repository.
 	cfg.WorktreeDir, err = p.Ask(Question{
 		Key:   "worktree_dir",
 		Label: "Worktree directory",
 		Help: "Where this loop's per-issue worktrees are checked out. " +
 			"A relative path is resolved against the project root.",
-		Default: worktreeDefault,
+		Default: worktreeDirDefault,
 	})
 	if err != nil {
 		return nil, err
