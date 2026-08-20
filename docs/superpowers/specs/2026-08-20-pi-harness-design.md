@@ -18,6 +18,7 @@ one existing path.
   `examples/`. All are in this repository.
 - **Prior art.** The `agent` section already exists with `model`, `effort`,
   `permission_mode`, `max_budget_usd`, `timeout`. A new `harness` field selects the binary
+  and the argument mapping.
   and the argument mapping. The `agent.worktree` fence, the `agent.timeout` process-group
   kill, and the `retry` / breaker / tend paths are harness-agnostic and stay unchanged.
 - **Contradiction scan.** The code matches the docs and the user's description: the loop
@@ -52,7 +53,10 @@ the id is new and resumes it when the id exists. This is the session-continuity 
 
 **No cost ceiling, no duration in the stream.** pi has no `--max-budget-usd` flag and the
 JSON stream carries no wall-clock duration. The `agent.timeout` group kill and `retry`
-accounting are unaffected. The plan rejects a non-zero `max_budget_usd` for `harness: pi`.
+accounting are unaffected. `max_budget_usd` is accepted for a `pi` harness but has no
+ceiling: pi exposes no cost-ceiling flag, so the value is a documented no-op (the claude
+path keeps the `--max-budget-usd` flag). `agent.permission_mode` is rejected for `pi`, because
+pi has no permission-mode and `-p` is already gate-free.
 
 **Non-interactive mode has no permission gate.** In `-p` print mode pi runs tools (for
 example `bash`) to completion with no prompt, matching the claude no-prompt posture. Trust

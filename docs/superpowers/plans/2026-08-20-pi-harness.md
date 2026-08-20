@@ -141,15 +141,15 @@ anything that touches the process boundary or the trust boundary.
 - [ ] Accept `claude` and `pi`. Reject any other value with a message naming the two values.
 - [ ] When `Harness` is `pi`, reject a non-empty `PermissionMode` with a message saying
       `agent.permission_mode` is claude-only.
-- [ ] When `Harness` is `pi`, reject a non-zero `MaxBudgetUSD` with a message saying pi has no
-      cost ceiling and a non-zero value is a user error.
+      the value is a documented no-op, not an error and not a silent drop.
 
 **Acceptance.**
 - [ ] `TestLoadAcceptsHarnessDefault` loads a config with no `harness` and reads `"claude"`.
 - [ ] `TestLoadAcceptsPiHarness` loads `harness: pi` and reads `"pi"`.
 - [ ] `TestLoadRejectsBadHarness` rejects `harness: gemini` with the two-value message.
 - [ ] `TestRejectsPiPermissionMode` rejects `harness: pi` with a non-empty `permission_mode`.
-- [ ] `TestRejectsPiBudget` rejects `harness: pi` with a non-zero `max_budget_usd`.
+- [ ] `TestAcceptsPiBudgetNoOp` loads `harness: pi` with a non-zero `max_budget_usd` and
+      succeeds, proving the value is accepted for pi.
 - [ ] The claude path tests (`TestLoadValid`, effort, timeout, budget) still pass untouched.
 
 ### 2. Add the pi argument builder (review: no)
@@ -304,6 +304,8 @@ anything that touches the process boundary or the trust boundary.
 - [ ] In the model row, note that for `pi` the model must be a `provider/id` path or pattern,
       and that this is documentation-only (no load-time check), exactly as the claude model
       row is.
+- [ ] In the `agent.max_budget_usd` row, state that it is a claude-only ceiling: for a `pi`
+      harness it is accepted but has no effect, because pi exposes no cost-ceiling flag.
 
 **Acceptance:**
 - [ ] The docs mention `harness: pi` and no longer claim that claude is the only path.
