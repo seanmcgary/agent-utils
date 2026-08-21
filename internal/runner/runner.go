@@ -108,6 +108,7 @@ func Supervise(
 	workDir string,
 	logPath string,
 ) error {
+	start := time.Now()
 	if timeout := cfg.Agent.Timeout.Std(); timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -130,7 +131,19 @@ func Supervise(
 	}
 	defer logFile.Close()
 
-	cmd := exec.CommandContext(ctx, "claude", BuildArgs(cfg, inv)...)
+	// Pick the agent binary and the matching argument builder and stream parser
+	// from the harness. The pi integration is a different program with a
+	// different stream shape, so the select is per-harness.
+	bin := "claude"
+	build := func(inv Invocation) []string { return BuildArgs(cfg, inv) }
+	parse := ParseStream
+	if cfg.Agent.Harness == config.HarnessPi {
+		bin = "pi"
+		build = func(inv Invocation) []string { return PiBuildArgs(cfg, inv) }
+		parse = ParsePiStream
+	}
+
+	cmd := exec.CommandContext(ctx, bin, build(inv)...)
 	cmd.Dir = workDir
 	cmd.Env = agentEnv()
 	// Put the agent in its own process group so a timeout can kill the whole
@@ -173,7 +186,7 @@ func Supervise(
 	// Tee the stream to the log file and parse it at the same time, so one read
 	// serves both the record and the operator.
 	tee := io.TeeReader(stdout, logFile)
-	result, parseErr := ParseStream(tee)
+	result, parseErr := parse(tee)
 
 	// ParseStream can return early on a scanner error, for example a stream line
 	// above its buffer cap. Drain whatever is left before Wait: an undrained pipe
@@ -195,9 +208,13 @@ func Supervise(
 		CostUSD:    result.CostUSD,
 		DurationMS: result.DurationMS,
 		APIError:   result.APIError,
-		// A session identifier in the stream proves claude created the session,
+		// A session identifier in the stream proves the agent created the session,
 		// whatever happened afterwards.
 		SessionStarted: result.SessionID != "",
+	}
+	// pi reports no wall-clock duration in its stream; the runner measures it.
+	if cfg.Agent.Harness == config.HarnessPi {
+		res.DurationMS = time.Since(start).Milliseconds()
 	}
 
 	switch {

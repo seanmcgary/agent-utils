@@ -36,6 +36,8 @@ type LogOptions struct {
 	Thinking bool
 	// PathOnly prints the log's path and nothing else.
 	PathOnly bool
+	// Harness selects the stream shape the renderer expects.
+	Harness string
 }
 
 // LogStream identifies one of the three files a dispatch writes.
@@ -197,14 +199,16 @@ func Tail(ctx context.Context, out io.Writer, path string, d store.Dispatch, opt
 type renderer struct {
 	out  io.Writer
 	opts LogOptions
+	// harness selects the stream shape the renderer expects.
+	harness string
 	// err holds the first write failure. Writing to standard output really can
-	// fail: `agent-utils logs -f | head` closes the pipe, and a renderer that
+	// fail: `agent-utils logs -f` | head` closes the pipe, and a renderer that
 	// ignored that would spin until the agent exited.
 	err error
 }
 
 func newRenderer(out io.Writer, opts LogOptions) *renderer {
-	return &renderer{out: out, opts: opts}
+	return &renderer{out: out, opts: opts, harness: opts.Harness}
 }
 
 // printf writes unless a previous write already failed.
@@ -243,6 +247,10 @@ type streamLine struct {
 }
 
 func (r *renderer) line(raw string) {
+	if r.harness == config.HarnessPi {
+		r.piLine(raw)
+		return
+	}
 	if raw == "" {
 		return
 	}
@@ -315,4 +323,50 @@ func summarise(raw json.RawMessage, width int) string {
 	}
 	s = strings.Join(strings.Fields(s), " ")
 	return truncate(s, width)
+}
+
+// piStreamLine is the subset of a pi event line the renderer reads.
+type piStreamLine struct {
+	Type    string `json:"type"`
+	Message struct {
+		Role    string `json:"role"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"message"`
+	ToolName string `json:"toolName"`
+}
+
+// piLine renders one pi event line. It mirrors the claude renderer's
+// presentation: assistant text as plain lines, tool calls as arrows.
+func (r *renderer) piLine(raw string) {
+	if raw == "" {
+		return
+	}
+	if !strings.HasPrefix(raw, "{") {
+		r.printf("%s\n", raw)
+		return
+	}
+	var l piStreamLine
+	if err := json.Unmarshal([]byte(raw), &l); err != nil {
+		r.printf("%s\n", raw)
+		return
+	}
+	switch l.Type {
+	case "session":
+		r.printf("── session start\n")
+	case "message_end":
+		if l.Message.Role == "assistant" {
+			for _, c := range l.Message.Content {
+				if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
+					r.printf("\n%s\n", strings.TrimSpace(c.Text))
+				}
+			}
+		}
+	case "tool_execution_start":
+		r.printf("  → %s\n", l.ToolName)
+	case "tool_execution_end":
+		r.printf("  ← %s\n", l.ToolName)
+	}
 }

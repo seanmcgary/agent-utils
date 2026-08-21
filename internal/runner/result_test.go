@@ -73,3 +73,90 @@ func TestParseStreamHandlesVeryLongLines(t *testing.T) {
 		t.Errorf("long line broke the parse: %+v", got)
 	}
 }
+
+const piSuccess = `{"type":"session","id":"abc"}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop","usage":{"cost":{"total":0.01}}}}
+`
+
+func TestParsePiStreamReadsSessionId(t *testing.T) {
+	got, err := ParsePiStream(strings.NewReader(piSuccess))
+	if err != nil {
+		t.Fatalf("ParsePiStream: %v", err)
+	}
+	if got.SessionID != "abc" {
+		t.Errorf("SessionID = %q, want abc", got.SessionID)
+	}
+	if got.IsError {
+		t.Error("IsError = true, want false")
+	}
+}
+
+func TestParsePiStreamSumsCost(t *testing.T) {
+	body := `{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop","usage":{"cost":{"total":0.01}}}}` + "\n" +
+		`{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop","usage":{"cost":{"total":0.02}}}}` + "\n"
+	got, err := ParsePiStream(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CostUSD != 0.03 {
+		t.Errorf("CostUSD = %v, want 0.03", got.CostUSD)
+	}
+}
+
+func TestParsePiStreamCapturesError(t *testing.T) {
+	body := `{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"rate limited 429"}}` + "\n"
+	got, err := ParsePiStream(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.IsError || !strings.Contains(got.APIError, "429") {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func TestParsePiStreamIgnoresNoise(t *testing.T) {
+	body := "not-json\n{\n" + piSuccess
+	got, err := ParsePiStream(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.IsError {
+		t.Error("noise broke the parse")
+	}
+}
+
+func TestParsePiStreamErrorsWhenNoMessage(t *testing.T) {
+	body := `{"type":"session","id":"x"}` + "\n" +
+		`{"type":"tool_execution_end","toolName":"bash"}` + "\n"
+	if _, err := ParsePiStream(strings.NewReader(body)); err == nil {
+		t.Fatal("want ErrNoResult when no assistant message appears")
+	}
+}
+
+func TestParsePiStreamTreatsNonStopAsFailure(t *testing.T) {
+	body := `{"type":"session","id":"x"}` + "\n" +
+		`{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"max_tokens","usage":{"cost":{"total":0.1}}}}` + "\n"
+	got, err := ParsePiStream(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.IsError || !strings.Contains(got.APIError, "max_tokens") {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func TestParsePiStreamIgnoresNonAssistant(t *testing.T) {
+	body := `{"type":"session","id":"x"}` + "\n" +
+		`{"type":"message_end","message":{"role":"user","content":[],"usage":{"cost":{"total":0.5}}}}` + "\n" +
+		`{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop","usage":{"cost":{"total":0.1}}}}` + "\n"
+	got, err := ParsePiStream(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CostUSD != 0.1 {
+		t.Errorf("CostUSD = %v, want 0.1 (user message must not sum)", got.CostUSD)
+	}
+	if got.SessionID != "x" {
+		t.Errorf("SessionID = %q, want x", got.SessionID)
+	}
+}

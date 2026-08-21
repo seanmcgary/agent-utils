@@ -1,6 +1,8 @@
 # agent-utils
 
-A Go CLI that reads GitHub issues by label and dispatches `claude -p` agents on a schedule.
+A Go CLI that reads GitHub issues by label and dispatches a coding agent on a schedule.
+The agent harness is selectable per loop: it runs `claude -p` by default, or `pi -p` when
+the loop sets `agent.harness: pi`, so a loop can drive a model that claude does not offer.
 
 It replaces the LLM orchestrator in an issue-driven planning loop and execution loop. Go owns
 the deterministic decisions — selecting issues by label, session and worktree bookkeeping,
@@ -271,6 +273,13 @@ engine reduces the blast radius in three ways, none of which is a substitute for
 - Only a pull request opened by an OWNER, MEMBER, or COLLABORATOR, whose head branch lives in
   the target repository, is ever linked to an issue or tended.
 - `bypassPermissions` requires `i_understand_bypass_permissions: true` in the loop config.
+
+A loop with `agent.harness: pi` keeps the same posture. `pi -p` is non-interactive and runs
+tools with no gate, like claude with permission off, and the filtered environment still strips
+`GITHUB_TOKEN` at both hops. pi reads its own provider credentials from disk, not from the
+agent environment. For the worktree, trust of `AGENTS.md`/`CLAUDE.md` follows pi's
+`defaultProjectTrust`; keep an open trust default off for a loop whose worktree is fed with
+untrusted issue text. See [docs/configuration.md](docs/configuration.md#agent-harness-optional).
 
 The webhook listener adds one more thing worth naming plainly: it accepts a request from the
 internet that starts an agent. That is a stronger claim than "a cron job reads issues on a

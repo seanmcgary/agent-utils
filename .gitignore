@@ -11,3 +11,6 @@ release/
 
 # Agent scratch workspace
 /.superpowers/
+
+# A local build artifact, if one lands at the root
+/agent-utils

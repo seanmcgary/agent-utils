@@ -47,8 +47,9 @@ type Labels struct {
 	Veto     []string `yaml:"veto"`
 }
 
-// Agent holds the claude invocation settings.
+// Agent holds the agent invocation settings.
 type Agent struct {
+	Harness        string   `yaml:"harness"`
 	Model          string   `yaml:"model"`
 	Effort         string   `yaml:"effort"`
 	PermissionMode string   `yaml:"permission_mode"`
@@ -90,6 +91,12 @@ const (
 	WorktreeNone     = "none"
 )
 
+// Harness names.
+const (
+	HarnessClaude = "claude"
+	HarnessPi     = "pi"
+)
+
 // RepoOwner returns the owner part of repo.
 func (c *Config) RepoOwner() string {
 	owner, _, _ := strings.Cut(c.Repo, "/")
@@ -116,6 +123,9 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if cfg.Agent.Harness == "" {
+		cfg.Agent.Harness = HarnessClaude
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
@@ -164,22 +174,37 @@ func (c *Config) validate() error {
 		}
 	}
 
-	switch c.Agent.PermissionMode {
-	case "", "acceptEdits", "auto", "manual", "dontAsk", "plan":
-	case "bypassPermissions":
-		// bypassPermissions disables every permission prompt. The agent reads
-		// issue and comment text written by third parties, so an injected
-		// instruction executes with no gate. Require the operator to say so.
-		if !c.AcknowledgeBypassPermissions {
+	switch c.Agent.Harness {
+	case "", HarnessClaude:
+	case HarnessPi:
+		if c.Agent.PermissionMode != "" {
 			errs = append(errs, errors.New(
-				"agent.permission_mode is \"bypassPermissions\", which disables every "+
-					"permission prompt on third-party issue text; set "+
-					"i_understand_bypass_permissions: true to confirm"))
+				"agent.permission_mode is claude-only; remove it for harness: pi"))
 		}
 	default:
 		errs = append(errs, fmt.Errorf(
-			"agent.permission_mode %q is not a valid claude permission mode",
-			c.Agent.PermissionMode))
+			"agent.harness must be %q or %q, got %q",
+			HarnessClaude, HarnessPi, c.Agent.Harness))
+	}
+
+	if c.Agent.Harness != HarnessPi {
+		switch c.Agent.PermissionMode {
+		case "", "acceptEdits", "auto", "manual", "dontAsk", "plan":
+		case "bypassPermissions":
+			// bypassPermissions disables every permission prompt. The agent reads
+			// issue and comment text written by third parties, so an injected
+			// instruction executes with no gate. Require the operator to say so.
+			if !c.AcknowledgeBypassPermissions {
+				errs = append(errs, errors.New(
+					"agent.permission_mode is \"bypassPermissions\", which disables every "+
+						"permission prompt on third-party issue text; set "+
+						"i_understand_bypass_permissions: true to confirm"))
+			}
+		default:
+			errs = append(errs, fmt.Errorf(
+				"agent.permission_mode %q is not a valid claude permission mode",
+				c.Agent.PermissionMode))
+		}
 	}
 
 	switch c.Agent.Worktree {

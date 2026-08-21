@@ -216,3 +216,61 @@ func TestSpawnReturnsTheRealPidNotTheReleasedHandle(t *testing.T) {
 		t.Fatalf("Spawn returned pid %d; a spawned process always has a positive pid", pid)
 	}
 }
+
+// stubPi writes a fake pi onto PATH. It records its own argv to a file (so the
+// test can prove the binary and header were used), then prints a pi JSON stream
+// and exits with the given code.
+func stubPi(t *testing.T, exitCode int, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	argvLog := filepath.Join(dir, "pi-argv.log")
+	script := "#!/bin/sh\n"
+	script += "echo \"$@\" > " + argvLog + "\n"
+	script += "cat <<'EOF'\n" + body + "\nEOF\nexit " + strconv.Itoa(exitCode) + "\n"
+	p := filepath.Join(dir, "pi")
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return argvLog
+}
+
+func TestSupervisePiUsesPiExecutable(t *testing.T) {
+	piStream := `{"type":"session","id":"abc"}` + "\n" +
+		`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop","usage":{"cost":{"total":0.1}}}}` + "\n"
+	argvLog := stubPi(t, 0, piStream)
+
+	s := newStore(t)
+	id, err := s.CreateDispatch(store.Dispatch{
+		Loop: "planning", Repo: "o/r", Number: 4,
+		Kind: store.KindStart, SessionID: "abc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := s.GetDispatch(id)
+
+	cfg := &config.Config{Agent: config.Agent{
+		Harness: config.HarnessPi, Model: "anthropic/claude-x",
+		Timeout: config.Duration(60e9),
+	}}
+	_ = Supervise(context.Background(), cfg, s, d,
+		Invocation{SessionID: "abc", Prompt: "go"}, t.TempDir(),
+		filepath.Join(t.TempDir(), "run.jsonl"))
+
+	got, _ := s.GetDispatch(id)
+	if got.Status != store.StatusSucceeded {
+		t.Errorf("Status = %q, want succeeded", got.Status)
+	}
+	if got.SessionID != "abc" {
+		t.Errorf("SessionID = %q, want abc", got.SessionID)
+	}
+	argv, err := os.ReadFile(argvLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trimmed := strings.TrimSpace(string(argv))
+	if !strings.HasPrefix(trimmed, "-p --mode json --session-id abc") {
+		t.Errorf("pi argv = %q, want it to begin with -p --mode json --session-id", trimmed)
+	}
+}

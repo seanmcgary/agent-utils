@@ -12,7 +12,7 @@ import (
 // a template must fail here, not at three in the morning inside a detached
 // process whose output nobody is reading.
 func TestExampleConfigsLoadAndRender(t *testing.T) {
-	for _, name := range []string{"planning.yaml", "execution.yaml"} {
+	for _, name := range []string{"planning.yaml", "execution.yaml", "pi.yaml"} {
 		t.Run(name, func(t *testing.T) {
 			cfg, err := config.Load(filepath.Join("..", "..", "examples", name))
 			if err != nil {
@@ -50,6 +50,20 @@ func TestExampleConfigsLoadAndRender(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The pi example must be a pi harness with the claude-only fields absent.
+func TestPiExampleIsPiHarness(t *testing.T) {
+	cfg, err := config.Load(filepath.Join("..", "..", "examples", "pi.yaml"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.Harness != config.HarnessPi {
+		t.Errorf("Harness = %q, want %q", cfg.Agent.Harness, config.HarnessPi)
+	}
+	if cfg.Agent.PermissionMode != "" {
+		t.Errorf("pi example must omit permission_mode, got %q", cfg.Agent.PermissionMode)
 	}
 }
 

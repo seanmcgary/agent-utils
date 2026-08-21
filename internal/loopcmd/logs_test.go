@@ -248,3 +248,30 @@ func TestRenderProjectDetailReportsRecordedWebhooks(t *testing.T) {
 		t.Errorf("a repository with no recorded webhook must say so, got %q:\n%s", quiet, out)
 	}
 }
+
+func TestRendererPiShowsTextAndTools(t *testing.T) {
+	out := render(t, LogOptions{Harness: config.HarnessPi},
+		`{"type":"session","id":"abc"}`,
+		`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"I opened the work."},{"type":"text","text":" Right."}]}}`,
+		`{"type":"tool_execution_start","toolName":"bash"}`,
+		`{"type":"tool_execution_end","toolName":"bash"}`,
+		`{"type":"agent_settled"}`,
+	)
+	for _, want := range []string{"session start", "I opened the work.", "Right.", "→ bash", "← bash"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("pi output should contain %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRendererPiIsolatedFromClaude(t *testing.T) {
+	// A claude system line must not render as a pi assistant message.
+	out := render(t, LogOptions{Harness: config.HarnessPi},
+		`{"type":"system","subtype":"init","model":"opus"}`)
+	if strings.Contains(out, "model=opus") {
+		t.Errorf("pi renderer misread a claude system line:\n%s", out)
+	}
+	if strings.Contains(out, "assistant") {
+		t.Errorf("pi renderer misread a claude system line as assistant text:\n%s", out)
+	}
+}

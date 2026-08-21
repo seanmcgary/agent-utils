@@ -184,16 +184,35 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	}
 	cfg.Labels.Veto = splitList(vetoAnswer)
 
-	// 13. agent.model
+	// 13. agent.harness
+	harness, err := p.Ask(Question{
+		Key:     "agent.harness",
+		Label:   "Agent harness",
+		Help:    "claude runs claude -p. pi runs pi -p; choose pi for a model claude does not offer.",
+		Default: config.HarnessClaude,
+		Choices: []string{config.HarnessClaude, config.HarnessPi},
+	})
+	if err != nil {
+		return nil, err
+	}
+	cfg.Agent.Harness = harness
+	pi := harness == config.HarnessPi
+
+	modelHelp := "Passed to claude as the model name."
+	if pi {
+		modelHelp = "A pi model id pi resolves, like anthropic/claude-sonnet-4-5."
+	}
+
+	// 14. agent.model
 	cfg.Agent.Model, err = p.Ask(Question{
 		Key: "agent.model", Label: "Agent model",
-		Help: "Passed to claude as the model name.", Default: "opus",
+		Help: modelHelp, Default: "opus",
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// 14. agent.effort
+	// 15. agent.effort
 	cfg.Agent.Effort, err = p.Ask(Question{
 		Key: "agent.effort", Label: "Agent effort",
 		Help: "How hard the agent thinks before acting.", Default: "high",
@@ -203,48 +222,52 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, err
 	}
 
-	// 15. agent.permission_mode, gated by a separate confirmation for
-	// bypassPermissions.
-	for {
-		mode, err := p.Ask(Question{
-			Key:     "agent.permission_mode",
-			Label:   "Agent permission mode",
-			Help:    "acceptEdits prompts for anything beyond file edits. bypassPermissions disables every prompt; choosing it asks a separate confirmation.",
-			Default: "acceptEdits",
-			Choices: []string{"acceptEdits", "auto", "manual", "dontAsk", "plan", "bypassPermissions"},
-		})
-		if err != nil {
-			return nil, err
-		}
-		if mode != "bypassPermissions" {
-			cfg.Agent.PermissionMode = mode
-			cfg.AcknowledgeBypassPermissions = false
-			break
-		}
+	// 16. agent.permission_mode, gated by a separate confirmation for
+	// bypassPermissions. A pi harness has none and skips the question.
+	if pi {
+		cfg.Agent.PermissionMode = ""
+	} else {
+		for {
+			mode, err := p.Ask(Question{
+				Key:     "agent.permission_mode",
+				Label:   "Agent permission mode",
+				Help:    "acceptEdits prompts for anything beyond file edits. bypassPermissions disables every prompt; choosing it asks a separate confirmation.",
+				Default: "acceptEdits",
+				Choices: []string{"acceptEdits", "auto", "manual", "dontAsk", "plan", "bypassPermissions"},
+			})
+			if err != nil {
+				return nil, err
+			}
+			if mode != "bypassPermissions" {
+				cfg.Agent.PermissionMode = mode
+				cfg.AcknowledgeBypassPermissions = false
+				break
+			}
 
-		// bypassPermissions disables every permission prompt on text the
-		// agent reads from the issue and its comments, which third parties
-		// write. An instruction hidden in a comment then executes with no
-		// gate — the same reasoning config.validate gives when the
-		// acknowledgement is missing. The confirmation defaults to No, and
-		// declining returns to question 15 rather than aborting the wizard.
-		confirmed, err := p.Confirm(
-			"Confirm bypassPermissions",
-			"This disables every permission prompt on third-party issue text; an instruction hidden in an issue comment executes.",
-			false,
-		)
-		if err != nil {
-			return nil, err
+			// bypassPermissions disables every permission prompt on text the
+			// agent reads from the issue and its comments, which third parties
+			// write. An instruction hidden in a comment then executes with no
+			// gate — the same reasoning config.validate gives when the
+			// acknowledgement is missing. The confirmation defaults to No, and
+			// declining returns to question 16 rather than aborting the wizard.
+			confirmed, err := p.Confirm(
+				"Confirm bypassPermissions",
+				"This disables every permission prompt on third-party issue text; an instruction hidden in an issue comment executes.",
+				false,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if confirmed {
+				cfg.Agent.PermissionMode = mode
+				cfg.AcknowledgeBypassPermissions = true
+				break
+			}
+			// Declined: loop back and re-ask question 16, not the whole wizard.
 		}
-		if confirmed {
-			cfg.Agent.PermissionMode = mode
-			cfg.AcknowledgeBypassPermissions = true
-			break
-		}
-		// Declined: loop back and re-ask question 15, not the whole wizard.
 	}
 
-	// 16. agent.worktree
+	// 17. agent.worktree
 	cfg.Agent.Worktree, err = p.Ask(Question{
 		Key: "agent.worktree", Label: "Agent worktree mode",
 		Help: "per_issue isolates each issue's dispatch in its own worktree.", Default: config.WorktreePerIssue,
@@ -254,22 +277,26 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, err
 	}
 
-	// 17. agent.max_budget_usd
-	budgetAnswer, err := p.Ask(Question{
-		Key: "agent.max_budget_usd", Label: "Agent max budget (USD)",
-		Help: "Dispatch stops if the agent's session cost exceeds this; 0 means no limit.", Default: "25",
-		Validate: validateNonNegativeFloat,
-	})
-	if err != nil {
-		return nil, err
-	}
-	cfg.Agent.MaxBudgetUSD, err = strconv.ParseFloat(budgetAnswer, 64)
-	if err != nil {
-		// Unreachable: validateFloat already accepted budgetAnswer.
-		return nil, fmt.Errorf("agent.max_budget_usd: %w", err)
+	// 18. agent.max_budget_usd
+	if pi {
+		// pi exposes no cost-ceiling flag; the budget is a no-op.
+		cfg.Agent.MaxBudgetUSD = 0
+	} else {
+		budgetAnswer, err := p.Ask(Question{
+			Key: "agent.max_budget_usd", Label: "Agent max budget (USD)",
+			Help: "Dispatch stops if the agent's session cost exceeds this; 0 means no limit.", Default: "25",
+			Validate: validateNonNegativeFloat,
+		})
+		if err != nil {
+			return nil, err
+		}
+		cfg.Agent.MaxBudgetUSD, err = strconv.ParseFloat(budgetAnswer, 64)
+		if err != nil {
+			return nil, fmt.Errorf("agent.max_budget_usd: %w", err)
+		}
 	}
 
-	// 18. agent.timeout
+	// 19. agent.timeout
 	timeoutAnswer, err := p.Ask(Question{
 		Key: "agent.timeout", Label: "Agent timeout",
 		Help: "Maximum wall time for one dispatch, e.g. 3h.", Default: "3h",
@@ -283,7 +310,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, fmt.Errorf("agent.timeout: %w", err)
 	}
 
-	// 19. tend_pr, defaulted from the chosen template.
+	// 20. tend_pr, defaulted from the chosen template.
 	cfg.TendPR, err = p.Confirm(
 		"Tend open pull requests?",
 		"Rebase and push this loop's own pull request when its base branch moves ahead of it.",
@@ -293,7 +320,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, err
 	}
 
-	// 20. retry.max
+	// 21. retry.max
 	maxAnswer, err := p.Ask(Question{
 		Key: "retry.max", Label: "Retry max",
 		Help: "How many times a failed dispatch is retried before it is parked.", Default: "3",
@@ -307,7 +334,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, fmt.Errorf("retry.max: %w", err)
 	}
 
-	// 21. retry.backoff
+	// 22. retry.backoff
 	backoffAnswer, err := p.Ask(Question{
 		Key:   "retry.backoff",
 		Label: "Retry backoff",
@@ -326,7 +353,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, fmt.Errorf("retry.backoff: %w", err)
 	}
 
-	// 22. retry.breaker.orphan_threshold
+	// 23. retry.breaker.orphan_threshold
 	orphanAnswer, err := p.Ask(Question{
 		Key: "retry.breaker.orphan_threshold", Label: "Retry breaker orphan threshold",
 		Help: "Trips the breaker when this many issues need a retry in the same tick.", Default: "2",
@@ -340,7 +367,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, fmt.Errorf("retry.breaker.orphan_threshold: %w", err)
 	}
 
-	// 23. retry.breaker.cooldown
+	// 24. retry.breaker.cooldown
 	cooldownAnswer, err := p.Ask(Question{
 		Key: "retry.breaker.cooldown", Label: "Retry breaker cooldown",
 		Help: "How long the breaker stays tripped once it trips.", Default: "30m",
