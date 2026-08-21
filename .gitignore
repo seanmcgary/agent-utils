@@ -14,3 +14,5 @@ release/
 
 # A local build artifact, if one lands at the root
 /agent-utils
+
+.idea
