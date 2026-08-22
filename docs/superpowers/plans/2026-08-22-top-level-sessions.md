@@ -9,7 +9,7 @@ Design: [`docs/superpowers/specs/2026-08-22-top-level-sessions-design.md`](../sp
 
 | Field   | Value                                                              |
 |---------|--------------------------------------------------------------------|
-| stage   | 3 (implementation)                                                 |
+| stage   | 5 (pr feedback loop)                                               |
 | class   | standard (adds a public CLI surface and a new read; no risky boundary) |
 | profile | backend                                                            |
 | branch  | feat/top-level-sessions                                            |
