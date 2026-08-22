@@ -181,6 +181,53 @@ func TestRenderSessionsExplainsAnEmptyList(t *testing.T) {
 	}
 }
 
+func TestRenderAllSessionsShowsTheProjectColumnAndFlagsAnOrphan(t *testing.T) {
+	out := RenderAllSessions([]Session{
+		{ID: "sess-a", Project: "weather", Loop: "planning", Issue: 42,
+			Title: "Add zone lookup", Dispatches: 3, Cost: 5.05,
+			LastStatus: store.StatusSucceeded},
+		{ID: "sess-b", Project: "atlas", Loop: "planning", Issue: 57,
+			Title: "Timezone bug", Dispatches: 1, Cost: 2.40,
+			LastStatus: store.StatusRunning, Orphaned: true},
+		{ID: "sess-c", Project: "(unclaimed)", Loop: "execution", Issue: 58,
+			Dispatches: 1, LastStatus: store.StatusRunning, Live: true},
+	}, SessionFilter{})
+
+	for _, want := range []string{"PROJECT", "weather", "atlas", "(unclaimed)",
+		"sess-a", "Add zone lookup", "$5.05", "ORPHANED", "running", "--session"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output should contain %q:\n%s", want, out)
+		}
+	}
+	// The follow command must name the project: top-level logs resolves the
+	// project from the working directory, which is not where this table is read.
+	if !strings.Contains(out, "project --name") {
+		t.Errorf("output should contain %q:\n%s", "project --name", out)
+	}
+	// A project header belongs to the per-project report, not this one.
+	if strings.Contains(out, "project weather  (") {
+		t.Errorf("output should not contain a project header:\n%s", out)
+	}
+}
+
+func TestRenderAllSessionsExplainsAnEmptyList(t *testing.T) {
+	out := RenderAllSessions(nil, SessionFilter{})
+	if !strings.Contains(out, "No sessions yet") {
+		t.Errorf("an unfiltered empty list must explain itself:\n%s", out)
+	}
+	if !strings.Contains(out, "agent-utils list") {
+		t.Errorf("an unfiltered empty list must point at %q:\n%s", "agent-utils list", out)
+	}
+
+	filtered := RenderAllSessions(nil, SessionFilter{Loop: "planning"})
+	if !strings.Contains(filtered, "No sessions matched") {
+		t.Errorf("a filtered empty list must say the filter excluded everything:\n%s", filtered)
+	}
+	if strings.Contains(filtered, "No sessions yet") {
+		t.Errorf("a filtered empty list must not claim nothing has run:\n%s", filtered)
+	}
+}
+
 func TestRenderProjectDetailShowsIdentityAndKeepsTheTableOnOneLine(t *testing.T) {
 	p := &Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}
 	out := RenderProjectDetail(&ProjectDetail{

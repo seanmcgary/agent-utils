@@ -9,12 +9,12 @@ Design: [`docs/superpowers/specs/2026-08-22-top-level-sessions-design.md`](../sp
 
 | Field   | Value                                                              |
 |---------|--------------------------------------------------------------------|
-| stage   | 2 (plan review)                                                    |
+| stage   | 3 (implementation)                                                 |
 | class   | standard (adds a public CLI surface and a new read; no risky boundary) |
 | profile | backend                                                            |
 | branch  | feat/top-level-sessions                                            |
 | pr      | #7                                                                 |
-| gate    | pending                                                            |
+| gate    | approved 2026-08-22 (pre-approved in chat by @seanmcgary)           |
 | round   | 0                                                                  |
 
 ## Architecture

@@ -119,6 +119,44 @@ func TestRunningDispatchesSpansEveryProject(t *testing.T) {
 	}
 }
 
+// The machine-wide sessions report cannot be built from a scoped read: it has
+// to name every project's sessions in one table, and it relies on the newest
+// dispatch appearing first so the summary keeps its ordering.
+func TestDispatchesSpansEveryProjectNewestFirst(t *testing.T) {
+	db := openDB(t)
+	var ids []int64
+	for _, p := range []string{testProject, otherProject} {
+		id, err := db.Project(p).CreateDispatch(Dispatch{
+			Loop: "planning", Repo: "o/r", Number: 1, Kind: KindStart,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+
+	all, err := db.Dispatches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("len = %d, want both projects' rows", len(all))
+	}
+	seen := map[string]bool{}
+	for _, d := range all {
+		seen[d.ProjectID] = true
+	}
+	if !seen[testProject] || !seen[otherProject] {
+		t.Errorf("Dispatches missed a project: %v", seen)
+	}
+	if all[0].ID != ids[1] {
+		t.Errorf("all[0].ID = %d, want %d", all[0].ID, ids[1])
+	}
+	if all[1].ID != ids[0] {
+		t.Errorf("all[1].ID = %d, want %d", all[1].ID, ids[0])
+	}
+}
+
 // A loop that has ticked but never dispatched must still be reported. A join
 // would drop it, and reporting "0 ticks" for a live loop is worse than silence.
 func TestLoopStatesIncludesALoopThatNeverDispatched(t *testing.T) {
