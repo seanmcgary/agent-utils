@@ -415,9 +415,9 @@ func projectLoopNewRun(deps projectLoopNewDeps) error {
 // --name here selects a LOOP, and it shadows project's own --name (which
 // selects the PROJECT): urfave/cli lets a child command declare a flag with
 // the same name as its parent's, and the child's own value wins for
-// c.String("name") read from the child. sessionsCommand does exactly this
-// for the same reason, and selectedProject's doc comment states the general
-// rule this command follows: resolve the project by walking the lineage
+// c.String("name") read from the child. projectSessionsCommand does exactly
+// this for the same reason, and selectedProject's doc comment states the
+// general rule this command follows: resolve the project by walking the lineage
 // (openProject/selectedProject), and read the loop selector directly off
 // this command with c.String("name").
 func registerWebhookCommand() *cli.Command {

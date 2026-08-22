@@ -189,8 +189,11 @@ func TestRenderAllSessionsShowsTheProjectColumnAndFlagsAnOrphan(t *testing.T) {
 		{ID: "sess-b", Project: "atlas", Loop: "planning", Issue: 57,
 			Title: "Timezone bug", Dispatches: 1, Cost: 2.40,
 			LastStatus: store.StatusRunning, Orphaned: true},
+		// LastStatus is deliberately NOT "running": the Live branch has to be
+		// the only thing that can produce that word, or deleting the branch
+		// leaves the output identical and the assertion below proves nothing.
 		{ID: "sess-c", Project: "(unclaimed)", Loop: "execution", Issue: 58,
-			Dispatches: 1, LastStatus: store.StatusRunning, Live: true},
+			Dispatches: 1, LastStatus: store.StatusSucceeded, Live: true},
 	}, SessionFilter{})
 
 	for _, want := range []string{"PROJECT", "weather", "atlas", "(unclaimed)",
@@ -204,9 +207,22 @@ func TestRenderAllSessionsShowsTheProjectColumnAndFlagsAnOrphan(t *testing.T) {
 	if !strings.Contains(out, "project --name") {
 		t.Errorf("output should contain %q:\n%s", "project --name", out)
 	}
-	// A project header belongs to the per-project report, not this one.
-	if strings.Contains(out, "project weather  (") {
-		t.Errorf("output should not contain a project header:\n%s", out)
+	// Header and rows must stay pinned to each other. Both are written from
+	// separate format strings, so widening one and not the other misaligns
+	// every row of the table while every Contains assertion above still
+	// passes.
+	lines := strings.Split(strings.TrimLeft(out, "\n"), "\n")
+	header, row := lines[0], lines[1]
+	for _, col := range []struct{ head, cell string }{
+		{"PROJECT", "weather"},
+		{"SESSION", "sess-a"},
+		{"LOOP", "planning"},
+		{"TITLE", "Add zone lookup"},
+	} {
+		if got, want := strings.Index(row, col.cell), strings.Index(header, col.head); got != want {
+			t.Errorf("column %s starts at %d in the row and %d in the header:\n%s",
+				col.head, got, want, out)
+		}
 	}
 }
 

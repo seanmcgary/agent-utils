@@ -138,9 +138,10 @@ func keepState(s Session, running, orphaned bool) bool {
 //     scoped query returns them and no --project selector can ever reach them,
 //     so they are marked (unclaimed).
 //   - An id the registry has forgotten, or recorded before it had a name. The
-//     row still carries its identity, so the first eight characters name it
-//     well enough to tell its rows apart and to hand back as a selector. A
-//     shorter id is used whole.
+//     first eight characters are enough to tell one such project's rows from
+//     another's. They are NOT a selector: registry.Find compares an id with
+//     ==, so a prefix resolves to nothing, and a forgotten project is not in
+//     the registry to be found at all. A shorter id is used whole.
 func nameProjects(sessions []Session, names map[string]string) {
 	for i := range sessions {
 		id := sessions[i].ProjectID
@@ -358,8 +359,12 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 		case s.Orphaned:
 			state = "ORPHANED"
 		}
+		// Project is padded but never truncated. The footer asks the operator
+		// to type this value back into --name, and registry.Find matches a
+		// name exactly, so an elided name is a selector that cannot resolve.
+		// RenderProjects pads loop names the same way, for the same reason.
 		fmt.Fprintf(&b, "%-16s %-38s %-12s %-6d %-30s %-5d $%-8.2f %-10s %s\n",
-			truncate(s.Project, 16), s.ID, truncate(s.Loop, 12), s.Issue,
+			s.Project, s.ID, truncate(s.Loop, 12), s.Issue,
 			truncate(s.Title, 30), s.Dispatches, s.Cost, state,
 			s.Last.Local().Format("2006-01-02 15:04"))
 	}

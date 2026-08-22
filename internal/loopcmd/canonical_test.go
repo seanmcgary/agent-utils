@@ -2,6 +2,8 @@ package loopcmd
 
 import (
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -303,10 +305,17 @@ func TestAllSessionsRestrictsToOneProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openCanonical: %v", err)
 	}
-	for _, p := range []struct{ id, session string }{{projectA, "sess-a"}, {projectB, "sess-b"}} {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, p := range []struct {
+		id, session string
+		startedAt   time.Time
+	}{
+		{projectA, "sess-a", now.Add(-time.Hour)},
+		{projectB, "sess-b", now},
+	} {
 		if _, err := db.Project(p.id).CreateDispatch(store.Dispatch{
 			Loop: "planning", Repo: "o/r", Number: 1,
-			Kind: store.KindStart, SessionID: p.session,
+			Kind: store.KindStart, SessionID: p.session, StartedAt: p.startedAt,
 		}); err != nil {
 			t.Fatalf("CreateDispatch(%s): %v", p.id, err)
 		}
@@ -337,7 +346,99 @@ func TestAllSessionsRestrictsToOneProject(t *testing.T) {
 		t.Fatalf("AllSessions unfiltered: %v", err)
 	}
 	if len(all) != 2 {
-		t.Errorf("unfiltered sessions = %d, want both projects' 2", len(all))
+		t.Fatalf("unfiltered sessions = %d, want both projects' 2", len(all))
+	}
+	// Newest activity first. Nothing else observes the sort, so dropping it
+	// would otherwise be invisible.
+	if all[0].ID != "sess-b" {
+		t.Errorf("first session = %q, want the newer %q", all[0].ID, "sess-b")
+	}
+}
+
+// The filters have to be wired to AllSessions, not merely to exist. keepState
+// and sessionsFrom are tested on their own, and neither can see whether the
+// aggregator actually passes the operator's flags to them: dropping either
+// call site makes `sessions list --loop x --running` print every session on
+// the machine, with every other test still green.
+func TestAllSessionsAppliesTheLoopAndStateFilters(t *testing.T) {
+	isolate(t)
+
+	dir := filepath.Join(t.TempDir(), config.DirName)
+	if err := registry.Register(dir, projectA, "alpha"); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+
+	db, err := openCanonical()
+	if err != nil {
+		t.Fatalf("openCanonical: %v", err)
+	}
+	// One finished session in each of two loops, so a loop filter has
+	// something to exclude, and one left running so the state filters have an
+	// orphan to find. CreateDispatch always writes status running and ignores
+	// the Status and PID fields, so a finished row has to be finished through
+	// FinishDispatch, and the orphan keeps pid 0, which can never be alive.
+	for _, d := range []struct {
+		loop, session string
+		finish        bool
+	}{
+		{"planning", "sess-plan", true},
+		{"execution", "sess-exec", true},
+		{"planning", "sess-orphan", false},
+	} {
+		id, err := db.Project(projectA).CreateDispatch(store.Dispatch{
+			Loop: d.loop, Repo: "o/r", Number: 1, Kind: store.KindStart,
+			SessionID: d.session,
+		})
+		if err != nil {
+			t.Fatalf("CreateDispatch(%s): %v", d.session, err)
+		}
+		if !d.finish {
+			continue
+		}
+		if err := db.Project(projectA).FinishDispatch(id, store.DispatchResult{
+			Status: store.StatusSucceeded,
+		}); err != nil {
+			t.Fatalf("FinishDispatch(%s): %v", d.session, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := func(sessions []Session) []string {
+		out := make([]string, 0, len(sessions))
+		for _, s := range sessions {
+			out = append(out, s.ID)
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	for _, tc := range []struct {
+		name   string
+		filter SessionFilter
+		want   []string
+	}{
+		{"no filter keeps every session", SessionFilter{},
+			[]string{"sess-exec", "sess-orphan", "sess-plan"}},
+		{"loop keeps only that loop", SessionFilter{Loop: "execution"},
+			[]string{"sess-exec"}},
+		{"orphaned keeps only the orphan", SessionFilter{Orphaned: true},
+			[]string{"sess-orphan"}},
+		{"running keeps nothing when no agent is alive", SessionFilter{Running: true},
+			[]string{}},
+		{"loop and state compose", SessionFilter{Loop: "planning", Orphaned: true},
+			[]string{"sess-orphan"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := AllSessions(tc.filter)
+			if err != nil {
+				t.Fatalf("AllSessions: %v", err)
+			}
+			if !slices.Equal(ids(got), tc.want) {
+				t.Errorf("sessions = %v, want %v", ids(got), tc.want)
+			}
+		})
 	}
 }
 

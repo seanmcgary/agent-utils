@@ -117,7 +117,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 |---|---|
 | `agent-utils list` | Every project on this machine, with each loop's ticks, live dispatches, cost and last tick |
 | `agent-utils sessions list [--project <p>] [--loop <l>] [--running] [--orphaned]` | Every session on this machine, with its project, issue, runs, cost and state |
-| `agent-utils logs --project <p> --session <id>` | Log search across projects |
+| `agent-utils logs [--name <loop>] [--session <id>]` | The log of a dispatched agent, for the project in the current directory |
 | `agent-utils forget <name\|id\|path>` | Drop a project from the registry, touching none of its files |
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
 | `agent-utils version` | Version and commit |
