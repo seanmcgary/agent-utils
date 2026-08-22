@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -137,15 +138,17 @@ func Supervise(
 	bin := "claude"
 	build := func(inv Invocation) []string { return BuildArgs(cfg, inv) }
 	parse := ParseStream
+	extraEnv := claudeEnv(cfg)
 	if cfg.Agent.Harness == config.HarnessPi {
 		bin = "pi"
 		build = func(inv Invocation) []string { return PiBuildArgs(cfg, inv) }
 		parse = ParsePiStream
+		extraEnv = nil
 	}
 
 	cmd := exec.CommandContext(ctx, bin, build(inv)...)
 	cmd.Dir = workDir
-	cmd.Env = agentEnv()
+	cmd.Env = append(agentEnv(), extraEnv...)
 	// Put the agent in its own process group so a timeout can kill the whole
 	// tree. A coding agent routinely leaves dev servers and watchers behind, and
 	// CommandContext kills only the direct child.
@@ -174,7 +177,12 @@ func Supervise(
 		}, time.Now())
 	}
 	defer errFile.Close()
-	cmd.Stderr = errFile
+	// Watch the stderr as it is written, rather than re-reading the file after
+	// Wait. The wind-down notice is one line in a stream that can be megabytes
+	// of tool noise, and a post-hoc read would have to choose between reading
+	// all of it and reading a tail that the notice may not be in.
+	abandoned := newSentinelWriter(errFile, windDownNotice)
+	cmd.Stderr = abandoned
 
 	if err := cmd.Start(); err != nil {
 		return finish(cfg, st, d, store.DispatchResult{
@@ -232,6 +240,25 @@ func Supervise(
 		res.ExitCode = -1
 		if res.APIError == "" {
 			res.APIError = parseErr.Error()
+		}
+	case abandoned.Seen():
+		// claude exited ZERO here, and its stream carries an ordinary success
+		// result: the wind-down happens after the model's last turn, so the
+		// transcript's own last word is the agent describing work it had just
+		// handed to subagents and never saw land. Believing that exit code
+		// retires the issue and loses the work for good. Fail instead, so the
+		// issue is marked for retry and the next tick RESUMES the session and
+		// picks the abandoned tasks back up.
+		res.Status = store.StatusFailed
+		res.ExitCode = -1
+		res.APIError = "claude terminated background work before it finished and " +
+			"still exited zero; the dispatch is incomplete"
+		if cfg.Agent.BackgroundTasksEnabled() {
+			// Only say this when it is actually the operator's lever. Naming a
+			// setting that is already at the recommended value sends whoever
+			// reads this to change something that is not the cause.
+			res.APIError += "; this loop sets agent.background_tasks: true, " +
+				"which is what allows a subagent to outlive the turn"
 		}
 	case result.IsError:
 		res.Status = store.StatusFailed
@@ -317,6 +344,66 @@ func agentEnv() []string {
 	}
 	return out
 }
+
+// windDownNotice is the line claude writes to stderr when it gives up waiting
+// on background work, kills it and exits. It is matched as a substring: the
+// full line names a duration that changes with the ceiling, and a future
+// release may extend it.
+const windDownNotice = "Background tasks still running after"
+
+// claudeEnv returns the claude-specific environment for one dispatch. It is
+// separate from agentEnv because agentEnv also feeds the detached runner hop,
+// which is this program, and because pi reads none of it.
+func claudeEnv(cfg *config.Config) []string {
+	// Wait for background work rather than killing it at claude's own 10-minute
+	// ceiling. agent.timeout is the outer bound for a dispatch and must be the
+	// only one; a second, shorter, invisible deadline silently preempts it.
+	// This is belt and braces: with background tasks disabled there is nothing
+	// to wait for, but the two settings gate different code paths.
+	env := []string{"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0"}
+	if !cfg.Agent.BackgroundTasksEnabled() {
+		env = append(env, "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1")
+	}
+	return env
+}
+
+// sentinelWriter passes writes through to w and records whether marker has
+// appeared anywhere in the stream.
+type sentinelWriter struct {
+	w      io.Writer
+	marker []byte
+	// tail holds the last len(marker)-1 bytes written, so a marker split
+	// across two writes is still found. Without it the match depends on
+	// where the pipe happened to break, which is not something the child
+	// controls or a test can pin.
+	tail []byte
+	seen bool
+}
+
+func newSentinelWriter(w io.Writer, marker string) *sentinelWriter {
+	return &sentinelWriter{w: w, marker: []byte(marker)}
+}
+
+func (s *sentinelWriter) Write(p []byte) (int, error) {
+	if !s.seen {
+		joined := make([]byte, 0, len(s.tail)+len(p))
+		joined = append(append(joined, s.tail...), p...)
+		if bytes.Contains(joined, s.marker) {
+			s.seen = true
+			s.tail = nil
+		} else if keep := len(s.marker) - 1; keep > 0 {
+			if len(joined) > keep {
+				joined = joined[len(joined)-keep:]
+			}
+			s.tail = joined
+		}
+	}
+	return s.w.Write(p)
+}
+
+// Seen reports whether the marker has appeared. Call it only after Wait: the
+// writer is used from the goroutine that copies the child's stderr.
+func (s *sentinelWriter) Seen() bool { return s.seen }
 
 func exitCodeOf(err error) int {
 	var ee *exec.ExitError

@@ -194,6 +194,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.permission_mode` | enum | no | claude's own default |
 | `agent.worktree` | enum | yes | — |
 | `agent.max_budget_usd` | number | no | `0`, meaning no limit |
+| `agent.background_tasks` | bool | no | `false` |
 | `agent.timeout` | duration | yes | — |
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
 | `tend_pr` | bool | no | `false` |
@@ -476,6 +477,7 @@ Choose `pi` to use a model that `claude` does not offer. For a `pi` harness:
 - `agent.effort` maps to pi's `--thinking` level. `low`, `medium`, `high`, `xhigh`, `max`
   are valid for both harnesses.
 - `agent.permission_mode` is claude-only. A `pi` config must not set it; the loop rejects it.
+- `agent.background_tasks` is claude-only. A `pi` config must not set it; the loop rejects it.
 - `agent.max_budget_usd` is a claude-only ceiling. For `pi` it is accepted but has no
   effect, because pi exposes no cost-ceiling flag.
 - A `pi` run's session resumes by the same session id, because pi's `--session-id`
@@ -550,6 +552,42 @@ three times can spend up to three times this amount.
 
 ```yaml
 max_budget_usd: 25   # or 0 for no cap
+```
+
+### `agent.background_tasks` — optional
+
+Whether claude may run its background tasks. **Default `false`, and you almost certainly want
+to leave it there.**
+
+Claude backgrounds a subagent unless told otherwise, and `claude -p` waits only a bounded time
+for background work at the end of a run before it **kills that work and exits zero**. An agent
+that fanned out to subagents could therefore have them killed mid-edit while the transcript's
+last word was the agent describing what it had just delegated — and the loop, seeing exit zero
+and a success result, recorded the dispatch succeeded and retired the issue. The work was
+never picked up again.
+
+With the default, the loop sets `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and a subagent becomes
+an ordinary blocking tool call. **Fan-out is not lost**: several subagents dispatched in one
+turn still run concurrently. What is lost is *cross-turn* backgrounding — dispatching a subagent
+and continuing to work while it runs — which for an unattended loop is a liability anyway, since
+it lets two agents edit the same file with neither aware of the other.
+
+The loop also sets `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` in both cases, so `agent.timeout`
+is the only deadline for a dispatch. Claude's own ten-minute background ceiling is otherwise a
+second, shorter, invisible deadline that silently preempts the one you configured.
+
+Two further effects of the default, neither load-bearing for a loop: the Bash tool loses its
+`run_in_background` parameter (shell `&` still works, and the process group is swept at the
+end of a dispatch either way), and observer agents are off.
+
+Whatever this is set to, a run whose background work is terminated is recorded **failed**, not
+succeeded, so the issue is marked for retry and the next tick resumes the session and picks the
+abandoned tasks back up.
+
+Claude-only. A `pi` config must not set it; the loop rejects it.
+
+```yaml
+background_tasks: false   # true only if you know why you want it
 ```
 
 ### `agent.timeout` — required
@@ -761,6 +799,7 @@ Beyond the required fields in the quick reference:
 | `agent.permission_mode` is a real claude mode or empty | `… is not a valid claude permission mode` |
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
 | `agent.max_budget_usd` ≥ 0 (`0` means no cap) | `agent.max_budget_usd must not be negative` |
+| `agent.background_tasks` unset for `harness: pi` | `agent.background_tasks is claude-only` |
 | `agent.timeout` > 0 | `agent.timeout must be greater than zero` |
 | `retry.max` ≥ 0 | `retry.max must not be negative` |
 | `len(retry.backoff)` ≥ `retry.max` | `it needs one entry per retry` |
