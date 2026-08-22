@@ -9,13 +9,13 @@ Design: [`docs/superpowers/specs/2026-08-22-top-level-sessions-design.md`](../sp
 
 | Field   | Value                                                              |
 |---------|--------------------------------------------------------------------|
-| stage   | 5 (pr feedback loop)                                               |
+| stage   | 5 complete (CI green, no bot in this repo, awaiting human review)  |
 | class   | standard (adds a public CLI surface and a new read; no risky boundary) |
 | profile | backend                                                            |
 | branch  | feat/top-level-sessions                                            |
 | pr      | #7                                                                 |
 | gate    | approved 2026-08-22 (pre-approved in chat by @seanmcgary)           |
-| round   | 0                                                                  |
+| round   | 1 (clean: CI green, no findings)                                    |
 
 ## Architecture
 
