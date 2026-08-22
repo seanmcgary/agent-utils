@@ -337,3 +337,47 @@ func TestAcceptsPiBudgetNoOp(t *testing.T) {
 		t.Errorf("Harness = %q, want %q", cfg.Agent.Harness, HarnessPi)
 	}
 }
+
+func TestRejectsPiBackgroundTasks(t *testing.T) {
+	body := replaceOnce(piYAML, "  worktree: per_issue\n",
+		"  background_tasks: true\n  worktree: per_issue\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want reject background_tasks for a pi harness, got nil")
+	}
+	if !strings.Contains(err.Error(), "background_tasks") {
+		t.Errorf("err = %v, want it to name background_tasks", err)
+	}
+}
+
+// The field is a pointer for the tri-state, and the whole point of the pointer
+// is that an absent field and an explicit false must both mean disabled while
+// only an explicit true opts in. A plain bool would read absent as false too --
+// correct today, and silently wrong the moment the safe default has to change.
+func TestBackgroundTasksIsOffUnlessExplicitlyOn(t *testing.T) {
+	cfg, err := Load(writeTemp(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.BackgroundTasks != nil {
+		t.Errorf("BackgroundTasks = %v, want nil for an absent field", *cfg.Agent.BackgroundTasks)
+	}
+	if cfg.Agent.BackgroundTasksEnabled() {
+		t.Error("an absent background_tasks must mean disabled")
+	}
+
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{{"false", false}, {"true", true}} {
+		body := replaceOnce(validYAML, "  worktree: per_issue\n",
+			"  background_tasks: "+tc.value+"\n  worktree: per_issue\n")
+		cfg, err := Load(writeTemp(t, body))
+		if err != nil {
+			t.Fatalf("Load background_tasks: %s: %v", tc.value, err)
+		}
+		if got := cfg.Agent.BackgroundTasksEnabled(); got != tc.want {
+			t.Errorf("background_tasks: %s -> Enabled() = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}

@@ -56,6 +56,26 @@ type Agent struct {
 	Worktree       string   `yaml:"worktree"`
 	MaxBudgetUSD   float64  `yaml:"max_budget_usd"`
 	Timeout        Duration `yaml:"timeout"`
+
+	// BackgroundTasks re-enables claude's background tasks, which this
+	// program disables by default. Claude backgrounds a subagent unless told
+	// otherwise, and "claude -p" waits only a bounded time for background
+	// work before killing it and exiting ZERO. A dispatch whose agent fanned
+	// out to subagents was therefore recorded as succeeded with its work
+	// abandoned mid-flight, and the loop retired the issue. Disabled, a
+	// subagent is an ordinary blocking tool call: fan-out within one turn
+	// still runs concurrently, but no turn can end with work outstanding.
+	//
+	// A pointer for the tri-state. Absent must mean disabled, and a plain
+	// bool cannot distinguish an absent field from an explicit false.
+	// claude-only: pi has no equivalent.
+	BackgroundTasks *bool `yaml:"background_tasks"`
+}
+
+// BackgroundTasksEnabled reports whether the claude child may background its
+// subagents and shells. Absent means disabled; see Agent.BackgroundTasks.
+func (a Agent) BackgroundTasksEnabled() bool {
+	return a.BackgroundTasks != nil && *a.BackgroundTasks
 }
 
 // Retry holds the failure policy.
@@ -180,6 +200,10 @@ func (c *Config) validate() error {
 		if c.Agent.PermissionMode != "" {
 			errs = append(errs, errors.New(
 				"agent.permission_mode is claude-only; remove it for harness: pi"))
+		}
+		if c.Agent.BackgroundTasks != nil {
+			errs = append(errs, errors.New(
+				"agent.background_tasks is claude-only; remove it for harness: pi"))
 		}
 	default:
 		errs = append(errs, fmt.Errorf(

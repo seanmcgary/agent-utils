@@ -1,9 +1,11 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -272,5 +274,141 @@ func TestSupervisePiUsesPiExecutable(t *testing.T) {
 	trimmed := strings.TrimSpace(string(argv))
 	if !strings.HasPrefix(trimmed, "-p --mode json --session-id abc") {
 		t.Errorf("pi argv = %q, want it to begin with -p --mode json --session-id", trimmed)
+	}
+}
+
+// Background tasks must be off by default.
+//
+// claude backgrounds a subagent unless told otherwise, and "claude -p" waits a
+// bounded time for background work, then KILLS it and exits zero. A dispatch
+// that fanned out to subagents was recorded as succeeded with its work
+// abandoned, and the loop retired the issue on that lie.
+func TestClaudeEnvDisablesBackgroundTasksByDefault(t *testing.T) {
+	env := claudeEnv(&config.Config{})
+
+	if !slices.Contains(env, "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1") {
+		t.Errorf("background tasks must be disabled unless the operator opts in; got %v", env)
+	}
+	// agent.timeout is the outer bound for a dispatch. claude's own ten-minute
+	// background ceiling is a second, shorter, invisible deadline that silently
+	// preempts it.
+	if !slices.Contains(env, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0") {
+		t.Errorf("the background wait ceiling must be lifted; got %v", env)
+	}
+}
+
+func TestClaudeEnvHonoursTheOptIn(t *testing.T) {
+	on := true
+	env := claudeEnv(&config.Config{Agent: config.Agent{BackgroundTasks: &on}})
+
+	if slices.Contains(env, "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1") {
+		t.Errorf("background_tasks: true must reach the agent; got %v", env)
+	}
+	if !slices.Contains(env, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0") {
+		t.Errorf("the ceiling stays lifted even when backgrounding is allowed; got %v", env)
+	}
+}
+
+// The notice is one line in a stream that arrives in arbitrary chunks, so a
+// match that depends on where the pipe broke would fail in production and pass
+// in a test that writes the line whole.
+func TestSentinelWriterFindsAMarkerSplitAcrossWrites(t *testing.T) {
+	var sink bytes.Buffer
+	w := newSentinelWriter(&sink, windDownNotice)
+
+	half := len(windDownNotice) / 2
+	for _, chunk := range []string{
+		"tool noise\n",
+		windDownNotice[:half],
+		windDownNotice[half:] + " 600s; terminating.\n",
+	} {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	if !w.Seen() {
+		t.Error("Seen() = false; the marker spanned two writes and must still match")
+	}
+	// The stream must reach the log byte for byte: it is the operator's only
+	// record of what the agent's stderr said.
+	if got := sink.String(); !strings.Contains(got, windDownNotice+" 600s; terminating.") {
+		t.Errorf("stderr was not passed through intact: %q", got)
+	}
+}
+
+func TestSentinelWriterStaysQuietOnOrdinaryStderr(t *testing.T) {
+	var sink bytes.Buffer
+	w := newSentinelWriter(&sink, windDownNotice)
+
+	for i := 0; i < 50; i++ {
+		if _, err := w.Write([]byte("Background tasks are fine here\n")); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	if w.Seen() {
+		t.Error("Seen() = true on stderr that never carried the notice")
+	}
+}
+
+// The regression this whole change exists for.
+//
+// claude exits ZERO after killing background work it gave up waiting on, and
+// the stream still carries an ordinary success result. Believed, that exit code
+// marks the issue succeeded and the loop never returns to it: a real run lost
+// half a phase of committed-to work this way, with the transcript's last word
+// being the agent describing tasks it had handed to subagents and never saw
+// land. The dispatch must fail so the next tick RESUMES the session.
+func TestSuperviseFailsWhenClaudeAbandonsBackgroundWork(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		`echo '{"type":"result","subtype":"success","session_id":"bg","total_cost_usd":36.47,"duration_ms":26385,"is_error":false,"result":"Once that lands I will commit phase C."}'` + "\n" +
+		"echo 'Background tasks still running after 600s; terminating." +
+		" Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.' >&2\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	s := newStore(t)
+	// Follow the tick's own order: BeginDispatch writes the issue row before
+	// anything is spawned, and MarkSessionStarted updates that row rather than
+	// creating one.
+	if err := s.BeginDispatch("execution", "o/r", 68, "bg", false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := s.CreateDispatch(store.Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 68, Kind: store.KindStart, SessionID: "bg",
+	})
+	d, _ := s.GetDispatch(id)
+
+	cfg := &config.Config{
+		Agent: config.Agent{Model: "opus", Timeout: config.Duration(60e9)},
+		Retry: config.Retry{Max: 3, Backoff: []config.Duration{config.Duration(60e9)}},
+	}
+	_ = Supervise(context.Background(), cfg, s, d,
+		Invocation{SessionID: "bg", Prompt: "go"}, t.TempDir(),
+		filepath.Join(t.TempDir(), "run.jsonl"))
+
+	got, _ := s.GetDispatch(id)
+	if got.Status != store.StatusFailed {
+		t.Fatalf("Status = %q, want failed: claude exited zero with its subagents killed", got.Status)
+	}
+	if !strings.Contains(got.APIError, "background") {
+		t.Errorf("APIError = %q, want it to name the abandoned background work", got.APIError)
+	}
+	// The issue must come back, and it must come back as a RESUME: the session
+	// exists, and claude refuses a reused --session-id outright.
+	st, err := s.IssueState("execution", "o/r", 68)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.NeedsRetry {
+		t.Error("NeedsRetry = false; the abandoned work would never be picked up again")
+	}
+	if !st.SessionStarted {
+		t.Error("SessionStarted = false; the retry must resume, not restart")
 	}
 }
