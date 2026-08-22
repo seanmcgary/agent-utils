@@ -1059,6 +1059,26 @@ func (d *DB) DispatchesForProject(projectID string) ([]Dispatch, error) {
 	return scanDispatches(rows)
 }
 
+// Dispatches returns every dispatch on the machine, newest first.
+//
+// The sessions report spans the machine, so the per-project read cannot answer
+// it: naming one project at a time would need the caller to know every project
+// up front, and the report exists to tell it what is there.
+//
+// It is also the only read that returns rows with an empty project_id. Those
+// are pre-project rows the sweep could not claim (see upgradeKeys), and every
+// scoped query hides them because no project selector can ever match an empty
+// string. A machine-wide report has to show them anyway, so the caller must be
+// ready to label a dispatch that belongs to no project it can name.
+func (d *DB) Dispatches() ([]Dispatch, error) {
+	rows, err := d.db.Query(
+		`SELECT ` + dispatchColumns + ` FROM dispatches ORDER BY id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("query dispatches: %w", err)
+	}
+	return scanDispatches(rows)
+}
+
 // LoopStates returns the tick count, the last tick and the total cost of every
 // loop on the machine.
 //

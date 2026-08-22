@@ -181,6 +181,69 @@ func TestRenderSessionsExplainsAnEmptyList(t *testing.T) {
 	}
 }
 
+func TestRenderAllSessionsShowsTheProjectColumnAndFlagsAnOrphan(t *testing.T) {
+	out := RenderAllSessions([]Session{
+		{ID: "sess-a", Project: "weather", Loop: "planning", Issue: 42,
+			Title: "Add zone lookup", Dispatches: 3, Cost: 5.05,
+			LastStatus: store.StatusSucceeded},
+		{ID: "sess-b", Project: "atlas", Loop: "planning", Issue: 57,
+			Title: "Timezone bug", Dispatches: 1, Cost: 2.40,
+			LastStatus: store.StatusRunning, Orphaned: true},
+		// LastStatus is deliberately NOT "running": the Live branch has to be
+		// the only thing that can produce that word, or deleting the branch
+		// leaves the output identical and the assertion below proves nothing.
+		{ID: "sess-c", Project: "(unclaimed)", Loop: "execution", Issue: 58,
+			Dispatches: 1, LastStatus: store.StatusSucceeded, Live: true},
+	}, SessionFilter{})
+
+	for _, want := range []string{"PROJECT", "weather", "atlas", "(unclaimed)",
+		"sess-a", "Add zone lookup", "$5.05", "ORPHANED", "running", "--session"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output should contain %q:\n%s", want, out)
+		}
+	}
+	// The follow command must name the project: top-level logs resolves the
+	// project from the working directory, which is not where this table is read.
+	if !strings.Contains(out, "project --name") {
+		t.Errorf("output should contain %q:\n%s", "project --name", out)
+	}
+	// Header and rows must stay pinned to each other. Both are written from
+	// separate format strings, so widening one and not the other misaligns
+	// every row of the table while every Contains assertion above still
+	// passes.
+	lines := strings.Split(strings.TrimLeft(out, "\n"), "\n")
+	header, row := lines[0], lines[1]
+	for _, col := range []struct{ head, cell string }{
+		{"PROJECT", "weather"},
+		{"SESSION", "sess-a"},
+		{"LOOP", "planning"},
+		{"TITLE", "Add zone lookup"},
+	} {
+		if got, want := strings.Index(row, col.cell), strings.Index(header, col.head); got != want {
+			t.Errorf("column %s starts at %d in the row and %d in the header:\n%s",
+				col.head, got, want, out)
+		}
+	}
+}
+
+func TestRenderAllSessionsExplainsAnEmptyList(t *testing.T) {
+	out := RenderAllSessions(nil, SessionFilter{})
+	if !strings.Contains(out, "No sessions yet") {
+		t.Errorf("an unfiltered empty list must explain itself:\n%s", out)
+	}
+	if !strings.Contains(out, "agent-utils list") {
+		t.Errorf("an unfiltered empty list must point at %q:\n%s", "agent-utils list", out)
+	}
+
+	filtered := RenderAllSessions(nil, SessionFilter{Loop: "planning"})
+	if !strings.Contains(filtered, "No sessions matched") {
+		t.Errorf("a filtered empty list must say the filter excluded everything:\n%s", filtered)
+	}
+	if strings.Contains(filtered, "No sessions yet") {
+		t.Errorf("a filtered empty list must not claim nothing has run:\n%s", filtered)
+	}
+}
+
 func TestRenderProjectDetailShowsIdentityAndKeepsTheTableOnOneLine(t *testing.T) {
 	p := &Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}
 	out := RenderProjectDetail(&ProjectDetail{

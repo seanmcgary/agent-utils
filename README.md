@@ -116,7 +116,8 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | Command | Does |
 |---|---|
 | `agent-utils list` | Every project on this machine, with each loop's ticks, live dispatches, cost and last tick |
-| `agent-utils logs --project <p> --session <id>` | Log search across projects |
+| `agent-utils sessions list [--project <p>] [--loop <l>] [--running] [--orphaned]` | Every session on this machine, with its project, issue, runs, cost and state |
+| `agent-utils logs [--name <loop>] [--session <id>]` | The log of a dispatched agent, for the project in the current directory |
 | `agent-utils forget <name\|id\|path>` | Drop a project from the registry, touching none of its files |
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
 | `agent-utils version` | Version and commit |
@@ -165,7 +166,40 @@ aa11-session-one   planning   42     Add zone lookup        3     $5.05    succe
 ```
 
 `ORPHANED` marks a session whose dispatch is still recorded as running but whose process is
-gone. `--name <loop>` restricts the list to one loop.
+gone.
+
+`agent-utils sessions list` is the same report for the whole machine. It adds a PROJECT column
+and reads every registered project in one pass:
+
+```
+$ agent-utils sessions list
+PROJECT          SESSION                                LOOP         ISSUE  TITLE                          RUNS  COST      STATE      LAST RUN
+lawndominator    9b94f0e1-7d39-4960-8c84-58f2d830217b   execution    51     Fix timezone bug               1     $0.28     succeeded  2026-08-20 10:58
+agent-utils      fbad5873-023d-48a5-8b4f-d8cc4e3e34bf   planning     42     Add zone lookup                3     $5.05     running    2026-08-20 10:55
+agent-utils      3c1d0a77-5e2b-4f18-9a30-6b7c8d9e0f11   planning     42     Add zone lookup                1     $2.40     ORPHANED   2026-08-20 09:12
+
+Follow one with: agent-utils project --name <PROJECT> logs --session <SESSION>
+```
+
+| Flag | Effect |
+|---|---|
+| `--project <name\|id\|path>` | Restrict to one project. The same selector `forget` takes |
+| `--loop <name>` | Restrict to loops with this name |
+| `--running` | Only sessions whose agent is still alive |
+| `--orphaned` | Only sessions marked running whose process is gone |
+
+Pass `--running` and `--orphaned` together to see both. A project the registry no longer names
+shows the first eight characters of its identifier instead, and a row left by the pre-project
+database layout shows `(unclaimed)`.
+
+The two commands spell the loop filter differently, because the machine-wide one needs
+`--project` and `--loop` on one command and cannot have two flags called `name`:
+`agent-utils project sessions list` takes `--name <loop>`, and `agent-utils sessions list` takes
+`--loop <loop>`.
+
+Follow a session from the machine-wide list with `agent-utils project --name <project> logs
+--session <id>`. The project selector is needed because top-level `logs` resolves the project
+from the current directory.
 
 ## Watching a run
 

@@ -1,15 +1,22 @@
 package loopcmd
 
 import (
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
 const (
 	projectA = "11111111-1111-1111-1111-111111111111"
 	projectB = "22222222-2222-2222-2222-222222222222"
+	projectC = "33333333-3333-3333-3333-333333333333"
 )
 
 // A session is one conversation across every dispatch that used it. The rows
@@ -89,6 +96,50 @@ func TestSessionsFromReportsAnOrphan(t *testing.T) {
 	}
 }
 
+// Two projects can hold the same session identifier: nothing in the schema
+// makes one unique across projects, and a copied worktree or an imported
+// legacy source reproduces one. Keying on the identifier alone would merge
+// them, and the machine-wide report would show one project's runs and cost
+// under the other project's name.
+func TestSessionsFromKeepsTwoProjectsApart(t *testing.T) {
+	now := time.Now().UTC()
+	ds := []store.Dispatch{
+		{
+			ID: 2, ProjectID: projectA, Loop: "planning", SessionID: "shared",
+			Status: store.StatusSucceeded, StartedAt: now, CostUSD: 1,
+		},
+		{
+			ID: 1, ProjectID: projectB, Loop: "planning", SessionID: "shared",
+			Status: store.StatusSucceeded, StartedAt: now.Add(-time.Hour), CostUSD: 2,
+		},
+	}
+
+	got := sessionsFrom(ds, "")
+	if len(got) != 2 {
+		t.Fatalf("sessions = %d, want 2", len(got))
+	}
+	if got[0].ProjectID != projectA {
+		t.Errorf("got[0].ProjectID = %q, want %q", got[0].ProjectID, projectA)
+	}
+	if got[1].ProjectID != projectB {
+		t.Errorf("got[1].ProjectID = %q, want %q", got[1].ProjectID, projectB)
+	}
+	for _, s := range got {
+		if s.ID != "shared" {
+			t.Errorf("ID = %q, want %q", s.ID, "shared")
+		}
+		if s.Dispatches != 1 {
+			t.Errorf("project %s has Dispatches = %d, want its own 1", s.ProjectID, s.Dispatches)
+		}
+	}
+	if got[0].Cost != 1 {
+		t.Errorf("got[0].Cost = %v, want 1", got[0].Cost)
+	}
+	if got[1].Cost != 2 {
+		t.Errorf("got[1].Cost = %v, want 2", got[1].Cost)
+	}
+}
+
 // The snapshot is the join between a configuration file and the database. Its
 // key is the project AND the loop: a loop name alone exists in more than one
 // project, and keying on it would add two projects' numbers together.
@@ -164,4 +215,270 @@ func openCanonicalForTest(t *testing.T) *store.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// The state flags are a selection, not a chain of independent filters. Neither
+// flag means every state, and both flags together mean the union: a naive AND
+// would answer `sessions list --running --orphaned` with nothing at all, since
+// no session is both live and orphaned.
+func TestKeepStateSelectsTheRequestedStates(t *testing.T) {
+	liveSession := Session{Live: true}
+	orphanSession := Session{Orphaned: true}
+	doneSession := Session{}
+
+	cases := []struct {
+		name         string
+		running      bool
+		orphaned     bool
+		wantLive     bool
+		wantOrphan   bool
+		wantFinished bool
+	}{
+		{"neither flag keeps every state", false, false, true, true, true},
+		{"running alone keeps the live session", true, false, true, false, false},
+		{"orphaned alone keeps the orphan", false, true, false, true, false},
+		{"both flags keep their union", true, true, true, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := keepState(liveSession, tc.running, tc.orphaned); got != tc.wantLive {
+				t.Errorf("keepState(live, %v, %v) = %v, want %v",
+					tc.running, tc.orphaned, got, tc.wantLive)
+			}
+			if got := keepState(orphanSession, tc.running, tc.orphaned); got != tc.wantOrphan {
+				t.Errorf("keepState(orphaned, %v, %v) = %v, want %v",
+					tc.running, tc.orphaned, got, tc.wantOrphan)
+			}
+			if got := keepState(doneSession, tc.running, tc.orphaned); got != tc.wantFinished {
+				t.Errorf("keepState(finished, %v, %v) = %v, want %v",
+					tc.running, tc.orphaned, got, tc.wantFinished)
+			}
+		})
+	}
+}
+
+// A session the registry cannot name still belongs in the machine-wide report.
+// Two different things can go unnamed and they must not read the same: a
+// forgotten project keeps its identifier, so a short id is enough to tell its
+// rows apart and to look it up, while a pre-project row has no identifier at
+// all and no project selector can ever reach it. Printing an empty column for
+// either one would make the rows look like a rendering bug.
+//
+// The last case is why this tests the NAME and not the map key. A project
+// registered before it had a descriptor is in the registry with an empty name,
+// which RenderProjects already handles with its own (unnamed) fallback. Keyed
+// on map presence, such a project would take the naming branch and render a
+// blank column.
+func TestNameProjectsMarksForgottenAndUnclaimedProjects(t *testing.T) {
+	sessions := []Session{
+		{ProjectID: projectA},
+		{ProjectID: projectB},
+		{ProjectID: "abc"},
+		{ProjectID: ""},
+		{ProjectID: projectC},
+	}
+
+	nameProjects(sessions, map[string]string{projectA: "lawndominator", projectC: ""})
+
+	want := []string{"lawndominator", projectB[:8], "abc", "(unclaimed)", projectC[:8]}
+	for i, w := range want {
+		if got := sessions[i].Project; got != w {
+			t.Errorf("sessions[%d].Project = %q, want %q", i, got, w)
+		}
+	}
+}
+
+// This is the only test that proves --project filters on the project id the
+// selector resolved to and not on the raw selector. Filtering on the selector
+// would match no dispatch row at all, because a dispatch records the id.
+func TestAllSessionsRestrictsToOneProject(t *testing.T) {
+	isolate(t)
+
+	for _, p := range []struct{ id, name string }{{projectA, "alpha"}, {projectB, "beta"}} {
+		dir := filepath.Join(t.TempDir(), config.DirName)
+		if err := registry.Register(dir, p.id, p.name); err != nil {
+			t.Fatalf("registry.Register(%s): %v", p.name, err)
+		}
+	}
+
+	db, err := openCanonical()
+	if err != nil {
+		t.Fatalf("openCanonical: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, p := range []struct {
+		id, session string
+		startedAt   time.Time
+	}{
+		{projectA, "sess-a", now.Add(-time.Hour)},
+		{projectB, "sess-b", now},
+	} {
+		if _, err := db.Project(p.id).CreateDispatch(store.Dispatch{
+			Loop: "planning", Repo: "o/r", Number: 1,
+			Kind: store.KindStart, SessionID: p.session, StartedAt: p.startedAt,
+		}); err != nil {
+			t.Fatalf("CreateDispatch(%s): %v", p.id, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := AllSessions(SessionFilter{Project: "alpha"})
+	if err != nil {
+		t.Fatalf("AllSessions: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("sessions = %d, want only the one project's 1", len(got))
+	}
+	if got[0].ID != "sess-a" {
+		t.Errorf("ID = %q, want %q", got[0].ID, "sess-a")
+	}
+	if got[0].ProjectID != projectA {
+		t.Errorf("ProjectID = %q, want %q", got[0].ProjectID, projectA)
+	}
+	if got[0].Project != "alpha" {
+		t.Errorf("Project = %q, want %q", got[0].Project, "alpha")
+	}
+
+	all, err := AllSessions(SessionFilter{})
+	if err != nil {
+		t.Fatalf("AllSessions unfiltered: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("unfiltered sessions = %d, want both projects' 2", len(all))
+	}
+	// Newest activity first. Nothing else observes the sort, so dropping it
+	// would otherwise be invisible.
+	if all[0].ID != "sess-b" {
+		t.Errorf("first session = %q, want the newer %q", all[0].ID, "sess-b")
+	}
+}
+
+// The filters have to be wired to AllSessions, not merely to exist. keepState
+// and sessionsFrom are tested on their own, and neither can see whether the
+// aggregator actually passes the operator's flags to them: dropping either
+// call site makes `sessions list --loop x --running` print every session on
+// the machine, with every other test still green.
+func TestAllSessionsAppliesTheLoopAndStateFilters(t *testing.T) {
+	isolate(t)
+
+	dir := filepath.Join(t.TempDir(), config.DirName)
+	if err := registry.Register(dir, projectA, "alpha"); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+
+	db, err := openCanonical()
+	if err != nil {
+		t.Fatalf("openCanonical: %v", err)
+	}
+	// One finished session in each of two loops, so a loop filter has
+	// something to exclude, and one left running so the state filters have an
+	// orphan to find. CreateDispatch always writes status running and ignores
+	// the Status and PID fields, so a finished row has to be finished through
+	// FinishDispatch, and the orphan keeps pid 0, which can never be alive.
+	for _, d := range []struct {
+		loop, session string
+		finish        bool
+	}{
+		{"planning", "sess-plan", true},
+		{"execution", "sess-exec", true},
+		{"planning", "sess-orphan", false},
+	} {
+		id, err := db.Project(projectA).CreateDispatch(store.Dispatch{
+			Loop: d.loop, Repo: "o/r", Number: 1, Kind: store.KindStart,
+			SessionID: d.session,
+		})
+		if err != nil {
+			t.Fatalf("CreateDispatch(%s): %v", d.session, err)
+		}
+		if !d.finish {
+			continue
+		}
+		if err := db.Project(projectA).FinishDispatch(id, store.DispatchResult{
+			Status: store.StatusSucceeded,
+		}); err != nil {
+			t.Fatalf("FinishDispatch(%s): %v", d.session, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := func(sessions []Session) []string {
+		out := make([]string, 0, len(sessions))
+		for _, s := range sessions {
+			out = append(out, s.ID)
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	for _, tc := range []struct {
+		name   string
+		filter SessionFilter
+		want   []string
+	}{
+		{"no filter keeps every session", SessionFilter{},
+			[]string{"sess-exec", "sess-orphan", "sess-plan"}},
+		{"loop keeps only that loop", SessionFilter{Loop: "execution"},
+			[]string{"sess-exec"}},
+		{"orphaned keeps only the orphan", SessionFilter{Orphaned: true},
+			[]string{"sess-orphan"}},
+		{"running keeps nothing when no agent is alive", SessionFilter{Running: true},
+			[]string{}},
+		{"loop and state compose", SessionFilter{Loop: "planning", Orphaned: true},
+			[]string{"sess-orphan"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := AllSessions(tc.filter)
+			if err != nil {
+				t.Fatalf("AllSessions: %v", err)
+			}
+			if !slices.Equal(ids(got), tc.want) {
+				t.Errorf("sessions = %v, want %v", ids(got), tc.want)
+			}
+		})
+	}
+}
+
+// A registry entry is allowed to hold an empty id, and a project scoped to one
+// would report no sessions for a project that has many. Refusing is the only
+// answer that does not lie about the state.
+func TestAllSessionsRejectsAProjectWithNoIdentifier(t *testing.T) {
+	isolate(t)
+
+	dir := filepath.Join(t.TempDir(), config.DirName)
+	if err := registry.Register(dir, "", "nameless"); err != nil {
+		t.Fatalf("registry.Register: %v", err)
+	}
+
+	_, err := AllSessions(SessionFilter{Project: "nameless"})
+	if err == nil {
+		t.Fatal("AllSessions for a project with no id: want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "project init") {
+		t.Errorf("error = %q, want it to name `agent-utils project init`", err.Error())
+	}
+}
+
+// The renderer picks its empty-list text from this, and the two texts point at
+// different actions: nothing has run yet sends the operator to `agent-utils
+// list`, while nothing matched sends it back to its own flags. Any field going
+// unread here would print the wrong advice.
+func TestSessionFilterKnowsWhenItNarrowsTheReport(t *testing.T) {
+	if (SessionFilter{}).filtered() {
+		t.Error("empty SessionFilter.filtered() = true, want false")
+	}
+	cases := map[string]SessionFilter{
+		"project":  {Project: "alpha"},
+		"loop":     {Loop: "planning"},
+		"running":  {Running: true},
+		"orphaned": {Orphaned: true},
+	}
+	for name, f := range cases {
+		if !f.filtered() {
+			t.Errorf("SessionFilter{%s}.filtered() = false, want true", name)
+		}
+	}
 }

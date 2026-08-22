@@ -34,6 +34,7 @@ func main() {
 		Commands: []*cli.Command{
 			// Top level spans the machine.
 			listCommand(),
+			sessionsCommand(),
 			logsCommand(),
 			forgetCommand(),
 			migrateCommand(),
@@ -279,9 +280,9 @@ func projectStatusCommand() *cli.Command {
 	}
 }
 
-// sessionsCommand groups everything about claude sessions. A session spans the
-// resumes of one issue, so it is a different unit from a dispatch.
-func sessionsCommand() *cli.Command {
+// projectSessionsCommand groups everything about claude sessions. A session
+// spans the resumes of one issue, so it is a different unit from a dispatch.
+func projectSessionsCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "sessions",
 		Usage: "inspect the claude sessions this project has created",
@@ -309,6 +310,61 @@ func sessionsCommand() *cli.Command {
 	}
 }
 
+// sessionsCommand reports the claude sessions on this machine.
+//
+// It is a separate command from projectSessionsCommand rather than the same one
+// registered twice: the top level is the machine-wide scope, so this one takes a
+// --project selector the project-scoped twin has no use for, and it prints a
+// table with a PROJECT column through a different renderer. Sharing a
+// constructor would mean one command whose flags and output both depend on where
+// it was registered.
+func sessionsCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "sessions",
+		Usage: "inspect the claude sessions on this machine",
+		Commands: []*cli.Command{
+			{
+				Name:  "list",
+				Usage: "list every session with its project, issue, runs, cost and state",
+				// The loop selector is spelled --loop here and --name under
+				// `project sessions list`. At the top level the project
+				// selector and the loop selector have to coexist on one
+				// command, and two flags cannot both be called name. The
+				// per-project twin has no --project flag to collide with,
+				// because `project --name` sits on the parent -- see the
+				// selectedProject comment above, which explains the shadowing
+				// that forced that older spelling. Deliberately no alias: the
+				// two commands are different surfaces, not one surface with two
+				// spellings.
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "project",
+						Usage: "restrict to one project, by name, id or path"},
+					&cli.StringFlag{Name: "loop",
+						Usage: "restrict to loops with this name"},
+					&cli.BoolFlag{Name: "running",
+						Usage: "restrict to sessions whose agent is still alive"},
+					&cli.BoolFlag{Name: "orphaned",
+						Usage: "restrict to sessions marked running whose process is gone"},
+				},
+				Action: func(_ context.Context, c *cli.Command) error {
+					filter := loopcmd.SessionFilter{
+						Project:  c.String("project"),
+						Loop:     c.String("loop"),
+						Running:  c.Bool("running"),
+						Orphaned: c.Bool("orphaned"),
+					}
+					sessions, err := loopcmd.AllSessions(filter)
+					if err != nil {
+						return err
+					}
+					fmt.Print(loopcmd.RenderAllSessions(sessions, filter))
+					return nil
+				},
+			},
+		},
+	}
+}
+
 // projectCommand groups everything scoped to one project. Naming it explicitly
 // is what makes the top level unambiguously machine-wide.
 func projectCommand() *cli.Command {
@@ -320,7 +376,7 @@ func projectCommand() *cli.Command {
 			projectInitCommand(),
 			projectStatusCommand(),
 			projectListCommand(),
-			sessionsCommand(),
+			projectSessionsCommand(),
 			logsCommand(),
 			loopCommand(),
 			registerWebhookCommand(),
