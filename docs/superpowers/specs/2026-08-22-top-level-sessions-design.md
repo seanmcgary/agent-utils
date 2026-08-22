@@ -28,7 +28,7 @@ design adds `agent-utils sessions list`, which spans the machine.
   - `registry.Find` (`internal/registry/registry.go:176`) resolves a project by name, id, or
     path, and returns a listed error for an ambiguous name. `agent-utils forget` already uses
     it. The new `--project` flag uses the same function, so the errors match.
-- **Contradiction scan.** One contradiction was found. `README.md:122` documents
+- **Contradiction scan.** One contradiction was found. `README.md:119` documents
   `agent-utils logs --project <p> --session <id>` as "Log search across projects".
   `logsCommand()` (`cmd/agent-utils/main.go:353`) declares no such flag. `openProject` reads the
   selector through `selectedProject` (`cmd/agent-utils/main.go:83`), which walks the command
@@ -60,20 +60,29 @@ recent first.
 The read path adds one query and one aggregation. Everything else is reuse.
 
 ```
-cmd/agent-utils.allSessionsCommand           (new, top level)
+cmd/agent-utils.sessionsCommand              (new, top level)
   |  SessionFilter{Project, Loop, Running, Orphaned}
   v
 loopcmd.AllSessions                          (new)
+  |  registry.Find(Project)   -> a project id, when --project is set
   |  registry.List()          -> project id -> display name
   |  openCanonical()          -> the one state database
-  |  store.DB.Dispatches()    (new: every dispatch, every project)
+  |  scoped:   DispatchesForProject(id)   (existing)
+  |  unscoped: Dispatches()               (new: every dispatch, every project)
   |  sessionsFrom(...)        (existing, re-keyed)
-  |  filter, then sort by Last descending
+  |  keepState, nameProjects, then a stable sort by Last descending
   v
 loopcmd.RenderAllSessions                    (new)
 ```
 
-`loopcmd.Sessions` keeps its signature and its behavior. `project sessions list` is unchanged.
+`loopcmd.Sessions` keeps its signature and its behavior. `project sessions list` prints what it
+prints today.
+
+Both aggregators sort with `sort.SliceStable`, not `sort.Slice`. `sessionsFrom` returns its
+sessions in `id DESC` order, which is total and deterministic. An unstable sort discards that
+order for sessions that share a `Last` timestamp, and the row order then varies between two runs
+of one command. Ties are more likely in the machine-wide report, because an imported dispatch
+carries whatever timestamp the old file recorded.
 
 ### The store method
 
@@ -110,9 +119,25 @@ merge two projects' runs into one row, and the row would report the wrong projec
 ### Project names
 
 `AllSessions` reads `registry.List()` once and builds a map from project identifier to name. A
-dispatch whose project is no longer registered still appears. Its `Project` field holds the
-first eight characters of the project identifier, so the row remains identifiable. This follows
-`RenderProjects`, which keeps a missing project in the report rather than hiding it.
+session whose project the map cannot name still appears, in one of two forms. This follows
+`RenderProjects`, which keeps a project it cannot read in the report rather than hiding it.
+
+- **A forgotten project.** The identifier is set but the registry no longer holds it. `Project`
+  holds the first eight characters of the identifier, so the row stays identifiable.
+- **An unclaimed row.** The identifier is empty. `Project` holds the literal `(unclaimed)`.
+  These rows are real: `dispatches.project_id` is `TEXT NOT NULL DEFAULT ''`, and `upgradeKeys`
+  (`internal/store/store.go:360`) records that rows from before the project key carry an empty
+  value. `stampInPlace` (`internal/store/legacy.go:363`) claims such a row only for a loop the
+  sweep still discovers, so a row for a deleted loop keeps the empty value permanently.
+  `DB.Dispatches()` is the first read in this tool with no project filter, so it is the first to
+  return them. `--project` can never select such a row, because no selector resolves to an empty
+  identifier.
+
+`registry.Project.ID` is itself allowed to be empty: `Register`
+(`internal/registry/registry.go:111`) matches an existing entry by path when the id is empty,
+and `RenderProjects` guards with `if p.ID != ""`. A `--project` selector that resolves to such an
+entry is rejected with an error naming `project init`. Filtering on an empty identifier would
+report no sessions for a project that has many, and exit successfully.
 
 ### Filters
 
@@ -127,7 +152,11 @@ type SessionFilter struct {
 
 - `Project` resolves through `registry.Find`. A name that matches two projects returns the
   listed `ErrAmbiguousProject` error, the same error `agent-utils forget` returns. An unknown
-  selector returns `ErrNoProject`.
+  selector returns `ErrNoProject`. **A resolved project is applied as a query, not as a Go
+  filter:** `AllSessions` calls the existing `DispatchesForProject(id)` when a project resolved,
+  and `Dispatches()` only when none did. This repository enforces project isolation at the query
+  layer, and `internal/store/scope_test.go` is the proof. A Go-side filter would make one `if`
+  statement the only thing that separates two projects' rows.
 - `Loop` matches the dispatch's loop name exactly, the same comparison `loopcmd.Sessions` makes.
 - `Running` and `Orphaned` select on the session's computed state. Neither flag means every
   state. Both flags mean the union of the two.
@@ -164,6 +193,13 @@ directory, so `agent-utils logs --session <id>` fails outside that project's tre
   legacy source as a warning on stderr and continues, which is the behavior this report wants.
 - An unknown or ambiguous `--project` selector fails the command with the registry's own error.
 - A dispatch row with an empty session identifier is skipped, as `sessionsFrom` already does.
+- **Accepted limitation.** `openCanonical` reports a legacy source it cannot import as a warning
+  on stderr, then continues. A project whose legacy state failed to import therefore contributes
+  no sessions, while the table on stdout looks complete. This is deliberate and is not new: it is
+  the read path's stated contract, and `agent-utils list` already reports the machine under the
+  same rule. Making the table say so on stdout would require `openCanonical` to return its sweep
+  report to all four of its callers, which is a larger change than this feature. The warning on
+  stderr stays the signal.
 
 ## Testing
 
@@ -178,11 +214,16 @@ method, which the store package already tests against a temporary file.
   running and orphaned.
 - A session whose project is not registered renders with the short project identifier.
 - `RenderAllSessions` prints the PROJECT column, marks an orphan, and explains an empty result.
+- `AllSessions` restricts to one project end to end, so the filter is proven to match the
+  resolved project identifier and not the raw selector. A test of the pure helpers alone cannot
+  catch that confusion: it compiles, returns nothing, and prints a legitimate-looking
+  "no session matched the filter".
+- `AllSessions` rejects a `--project` selector that resolves to an entry with no identifier.
 
 ## Out of scope
 
 - `--limit`. The operator can pipe the output.
-- A `--project` flag on the top-level `logs` command. `README.md:122` documents it and the code
+- A `--project` flag on the top-level `logs` command. `README.md:119` documents it and the code
   does not implement it. That gap is real and is recorded here, but this change does not close
   it.
 - Any change to `project sessions list`.
