@@ -77,7 +77,7 @@ func TendSweep(ctx context.Context, cfg *config.Config, deps Deps, base string) 
 		return sum, nil
 	}
 
-	snap, err := tendSnapshot(ctx, cfg, deps, base)
+	snap, links, err := tendSnapshot(ctx, cfg, deps, base)
 	if err != nil {
 		return sum, err
 	}
@@ -88,23 +88,30 @@ func TendSweep(ctx context.Context, cfg *config.Config, deps Deps, base string) 
 	}
 	defer l.Release()
 
-	return tendDispatch(ctx, cfg, deps, snap, base, &sum)
+	return tendDispatch(ctx, cfg, deps, snap, links, base, &sum)
 }
 
-// tendSnapshot reads GitHub and returns what engine.Decide needs. It takes no
-// lock and touches no git.
-func tendSnapshot(ctx context.Context, cfg *config.Config, deps Deps, base string) (engine.Snapshot, error) {
+// tendSnapshot reads GitHub and returns what engine.Decide needs, plus the
+// pull request links derived from it. It takes no lock, touches no git, and
+// writes nothing: the links are RETURNED rather than stored, because every
+// other pr_links write in this package happens under the loop lock and this
+// function deliberately runs outside it. Storing here would leave a
+// tens-of-seconds window in which a concurrent TickIssue, holding the lock,
+// upserts the same row -- and PutPRLink is last-writer-wins on behind_by and
+// head_ref, so the loser's values would be ones read at a different moment.
+func tendSnapshot(ctx context.Context, cfg *config.Config, deps Deps, base string) (engine.Snapshot, []store.PRLink, error) {
 	owner, repo := cfg.RepoOwner(), cfg.RepoName()
 
 	issues, err := deps.GH.ListOpenIssues(ctx, owner, repo)
 	if err != nil {
-		return engine.Snapshot{}, err
+		return engine.Snapshot{}, nil, err
 	}
 	prs, err := deps.GH.ListOpenPullRequests(ctx, owner, repo)
 	if err != nil {
-		return engine.Snapshot{}, err
+		return engine.Snapshot{}, nil, err
 	}
 
+	var links []store.PRLink
 	snap := engine.Snapshot{Issues: issues, PRs: prs, BehindBy: map[int]int{}}
 	for _, iss := range issues {
 		if !iss.HasLabel(cfg.Labels.Review) {
@@ -130,24 +137,24 @@ func tendSnapshot(ctx context.Context, cfg *config.Config, deps Deps, base strin
 			continue
 		}
 		snap.BehindBy[pr.Number] = behind
-		if err := deps.Store.PutPRLink(store.PRLink{
+		links = append(links, store.PRLink{
 			Loop: cfg.Name, Repo: cfg.Repo, Number: iss.Number,
 			PRNumber: pr.Number, HeadRef: pr.HeadRef, BaseRef: pr.BaseRef,
-			// Written, unlike in Tick and tickIssue, which both leave it zero.
-			// RunAgent renders it into the tend prompt, and a zero there tells
-			// the agent the opposite of why it was dispatched.
+			// The real count, unlike Tick and tickIssue, which both upsert this
+			// row with BehindBy unset. RunAgent renders it into the tend
+			// prompt, so a zero tells the agent the opposite of why it was
+			// dispatched. Best-effort only: the next full tick zeroes it again,
+			// and fixing that means teaching the other two writers to set it.
 			BehindBy: behind,
-		}); err != nil {
-			slog.Error("store pr link", "loop", cfg.Name, "issue", iss.Number, "err", err)
-		}
+		})
 	}
-	return snap, nil
+	return snap, links, nil
 }
 
 // tendDispatch decides and acts. The caller holds the loop lock.
 func tendDispatch(
 	ctx context.Context, cfg *config.Config, deps Deps,
-	snap engine.Snapshot, base string, sum *Summary,
+	snap engine.Snapshot, links []store.PRLink, base string, sum *Summary,
 ) (Summary, error) {
 	now := deps.Now()
 
@@ -158,6 +165,15 @@ func tendDispatch(
 	if deps.Fetch != nil {
 		if err := deps.Fetch(); err != nil {
 			return *sum, fmt.Errorf("fetch primary checkout: %w", err)
+		}
+	}
+
+	// Under the lock, so this pass cannot interleave its pr_links writes with a
+	// TickIssue holding it. One failed row must not abandon the sweep: the link
+	// is what the tend prompt renders, not what the decision reads.
+	for _, l := range links {
+		if err := deps.Store.PutPRLink(l); err != nil {
+			slog.Error("store pr link", "loop", cfg.Name, "issue", l.Number, "err", err)
 		}
 	}
 
@@ -209,6 +225,14 @@ func tendDispatch(
 	plan := engine.Decide(cfg, snap, st, now)
 	sum.BreakerTripped = plan.BreakerTripped
 
+	// A halted plan is the cooldown case, which leaves BreakerTripped false and
+	// so trips no warning below. Without this the operator gets an all-zeros
+	// summary and no reason -- the complaint that put a reason on the issue
+	// tick's own completion line.
+	if plan.Halted != "" {
+		slog.Info("tend sweep halted", "loop", cfg.Name, "reason", plan.Halted)
+	}
+
 	// clearUnreachableDeadlines is deliberately NOT called, for the reason
 	// tickIssue gives: this pass looked at review issues, so it holds no
 	// evidence about any other stamped row. Tick still runs it.
@@ -228,8 +252,10 @@ func tendDispatch(
 				tends = append(tends, d)
 			}
 		}
-		// Issue order, so a capped sweep takes the same batch every time
-		// rather than one the map iteration happened to produce.
+		// Issue order, so a capped sweep takes the low-numbered batch every
+		// time and the next merge takes the next one. engine.Decide guarantees
+		// no ordering of Plan.Decisions, so the batch identity is this sort's
+		// to establish, not something to inherit.
 		sort.Slice(tends, func(i, j int) bool { return tends[i].Issue < tends[j].Issue })
 	} else {
 		slog.Warn("circuit breaker tripped; skipping all dispatch",
@@ -252,8 +278,10 @@ func tendDispatch(
 	if dropped > 0 {
 		// Never silent. A capped sweep that said nothing would read as "every
 		// stale pull request was rebased", which is the opposite of the truth.
+		// sum.Tended, not len(tends): act failures are swallowed above, so the
+		// intended count would overstate what actually ran.
 		slog.Warn("tend sweep hit its per-sweep cap; the rest wait for the next merge",
-			"loop", cfg.Name, "dispatched", len(tends), "deferred", dropped)
+			"loop", cfg.Name, "dispatched", sum.Tended, "deferred", dropped)
 	}
 
 	// Recorded like any other tick -- including on the breaker path, where Tick

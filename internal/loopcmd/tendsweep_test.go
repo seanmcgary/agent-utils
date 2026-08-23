@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
@@ -221,6 +222,17 @@ func TestTendSweepRetiresDeadTendRowsOnly(t *testing.T) {
 	if st.NeedsRetry {
 		t.Error("issue 2 was flagged for retry by a pass that never examined it")
 	}
+	// The symmetric half, and the one that pins reapDead's KindTend guard: a
+	// retired TEND row must write no issue state either. Nothing clears that
+	// flag except a retry, and a tend row's issue has none to run, so writing
+	// it would strand the issue outside the loop.
+	st1, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st1.NeedsRetry {
+		t.Error("retiring a dead tend row flagged its issue for retry")
+	}
 }
 
 // A stale checkout is the one the tend agent would rebase in. The sweep stops
@@ -280,7 +292,12 @@ func TestTendSweepWritesNoCooldown(t *testing.T) {
 	cfg := sweepConfig(t)
 	cfg.Retry.Breaker.OrphanThreshold = 1
 	gh := &fakeGH{
-		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
+		// The in-flight label is load-bearing. engine.Decide sends a
+		// NeedsRetry issue WITHOUT it down the KindClearRetry branch, which
+		// never reaches retryDecision and never counts toward eligibleRetries
+		// -- so the breaker would not trip and this test would assert "no
+		// cooldown" in a run where no cooldown was ever possible.
+		issues: []ghub.Issue{{Number: 1, Labels: []string{"review", "in-flight"}}},
 		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
 		behind: map[int]int{11: 3},
 	}
@@ -291,8 +308,14 @@ func TestTendSweepWritesNoCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := TendSweep(context.Background(), cfg, deps, "master"); err != nil {
+	sum, err := TendSweep(context.Background(), cfg, deps, "master")
+	if err != nil {
 		t.Fatalf("TendSweep: %v", err)
+	}
+	// Without this the test passes whenever the fixture stops tripping the
+	// breaker, which is exactly how it read as green while proving nothing.
+	if !sum.BreakerTripped {
+		t.Fatal("the fixture did not trip the breaker; this test would be vacuous")
 	}
 
 	until, err := deps.Store.CooldownUntil(cfg.Name)
@@ -301,5 +324,31 @@ func TestTendSweepWritesNoCooldown(t *testing.T) {
 	}
 	if !until.IsZero() {
 		t.Errorf("CooldownUntil = %v, want zero: a tend sweep must not trip the breaker", until)
+	}
+}
+
+// The other half of the breaker contract: a cooldown this pass did not write
+// still stops it. engine.Decide halts on it, and the sweep must not dispatch
+// around that.
+func TestTendSweepObeysAnExistingCooldown(t *testing.T) {
+	cfg := sweepConfig(t)
+	gh := &fakeGH{
+		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
+		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
+		behind: map[int]int{11: 3},
+	}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+	if err := deps.Store.SetCooldown(cfg.Name, deps.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := TendSweep(context.Background(), cfg, deps, "master")
+	if err != nil {
+		t.Fatalf("TendSweep: %v", err)
+	}
+	if sum.Tended != 0 || spawned != 0 {
+		t.Errorf("Tended = %d, spawned = %d, want 0 and 0 while the breaker is in cooldown",
+			sum.Tended, spawned)
 	}
 }
