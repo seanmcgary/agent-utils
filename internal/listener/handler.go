@@ -424,7 +424,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			return
 		}
 
-		// 8. Decode and validate the two attacker-controlled values this
+		// 8. Decode and validate the three attacker-controlled values this
 		// daemon passes onward as data (rather than only ever logging a
 		// bounded, shape-checked form of them, as with the delivery id). An
 		// unmatched full_name (empty, the wrong shape, or absurdly long) is
@@ -465,10 +465,18 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				Title  string     `json:"title"`
 				Labels []nameOnly `json:"labels"`
 			} `json:"issue"`
+			// Merged and Base carry the one fact that arms a tend sweep: this
+			// delivery merged a pull request, and into which branch. Both are
+			// decoded here and judged per loop in Worker.tickOne, because
+			// default_branch is loop configuration the handler does not hold.
 			PullRequest struct {
 				Number int        `json:"number"`
 				Title  string     `json:"title"`
 				Labels []nameOnly `json:"labels"`
+				Merged bool       `json:"merged"`
+				Base   struct {
+					Ref string `json:"ref"`
+				} `json:"base"`
 			} `json:"pull_request"`
 			// Who caused this delivery. An operator reading a surprise tick
 			// needs to know whether a human or a bot moved the label.
@@ -498,6 +506,17 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		if number <= 0 {
 			s.rejected(w, deliveryID, "issue number", http.StatusBadRequest)
 			return
+		}
+
+		// A merged pull request is the only delivery that arms a sweep. The
+		// ACTION is checked as well as the flag: GitHub sends merged: true on
+		// later pull_request actions too (edited, unlabeled), and only the
+		// close is the moment the base branch moved. The event is checked
+		// because pull_request_review, pull_request_review_comment and
+		// issue_comment all carry a pull_request object as well.
+		var mergedInto string
+		if event == "pull_request" && body.Action == "closed" && body.PullRequest.Merged {
+			mergedInto = body.PullRequest.Base.Ref
 		}
 
 		// 9. GitHub redelivers on timeout and on manual "Redeliver," and the
@@ -595,17 +614,21 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if labels := names(body.Issue.Labels, body.PullRequest.Labels); len(labels) > 0 {
 				attrs = append(attrs, "labels", safeLabels(labels))
 			}
+			if mergedInto != "" {
+				attrs = append(attrs, "merged_into", safeText(mergedInto))
+			}
 			slog.Info("accepted delivery", attrs...)
 
 			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.sem }()
 				defer s.wg.Done()
-				s.Tick(ctx, repo, number)
+				s.Tick(ctx, Delivery{Repo: repo, Number: number, MergedInto: mergedInto})
 			}()
 		default:
 			slog.Warn("dropping delivery: worker pool full",
-				"delivery", safeDeliveryID(deliveryID), "repo", repo, "number", number)
+				"delivery", safeDeliveryID(deliveryID), "repo", repo, "number", number,
+				"merged_into", safeText(mergedInto))
 		}
 		w.WriteHeader(http.StatusAccepted)
 	}

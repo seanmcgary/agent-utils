@@ -507,7 +507,7 @@ func listenerServerForTest(t *testing.T) (*listener.Server, error) {
 	return listener.New(&listener.Server{
 		Secret: func() (string, error) { return "test-secret", nil },
 		Port:   port,
-		Tick:   func(context.Context, string, int) {},
+		Tick:   func(context.Context, listener.Delivery) {},
 	})
 }
 
@@ -520,14 +520,14 @@ func TestWrapTickUsesTickCtxNotHandlerCtx(t *testing.T) {
 	defer cancelTickCtx()
 
 	seen := make(chan context.Context, 1)
-	tick := wrapTick(tickCtx, func(ctx context.Context, _ string, _ int) {
+	tick := wrapTick(tickCtx, func(ctx context.Context, _ listener.Delivery) {
 		seen <- ctx
 	})
 
 	handlerCtx, cancelHandler := context.WithCancel(context.Background())
 	cancelHandler() // simulate cancelServer() firing before Tick runs
 
-	tick(handlerCtx, "owner/repo", 7)
+	tick(handlerCtx, listener.Delivery{Repo: "owner/repo", Number: 7})
 
 	select {
 	case got := <-seen:
@@ -545,14 +545,14 @@ func TestWrapTickUsesTickCtxNotHandlerCtx(t *testing.T) {
 // TestWrapTickRecoversPanic covers the recover decision: a panic inside
 // deliver must not escape wrapTick.
 func TestWrapTickRecoversPanic(t *testing.T) {
-	tick := wrapTick(context.Background(), func(context.Context, string, int) {
+	tick := wrapTick(context.Background(), func(context.Context, listener.Delivery) {
 		panic("boom")
 	})
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		tick(context.Background(), "owner/repo", 7)
+		tick(context.Background(), listener.Delivery{Repo: "owner/repo", Number: 7})
 	}()
 
 	select {

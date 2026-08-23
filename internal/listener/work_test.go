@@ -371,7 +371,7 @@ func TestALockHeldTickSchedulesNoRetry(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.runFn = func(*config.Config) error { return fmt.Errorf("run tick: %w", lock.ErrHeld) }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 0 {
 		t.Errorf("armed %d retry timers, want 0 for a held lock", n)
@@ -391,13 +391,13 @@ func TestALockHeldTickClearsAPendingAttempt(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 	if n := h.pendingLen(); n != 1 {
 		t.Fatalf("pending after a failed tick = %d, want 1", n)
 	}
 
 	h.runFn = func(*config.Config) error { return fmt.Errorf("run tick: %w", lock.ErrHeld) }
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.pendingLen(); n != 0 {
 		t.Errorf("pending after a held lock = %d, want 0", n)
@@ -416,7 +416,7 @@ func TestATickErrorIsRetriedAfterTheConfiguredDelay(t *testing.T) {
 	h.backoff = []time.Duration{45 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 1 {
 		t.Fatalf("armed %d retry timers, want 1", n)
@@ -444,7 +444,7 @@ func TestTheRetryStopsAfterRetryMax(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 	h.timers.at(t, 0).f()
 	h.timers.at(t, 1).f()
 
@@ -472,7 +472,7 @@ func TestRetryMaxZeroSchedulesNothingAndDoesNotPanic(t *testing.T) {
 	h.backoff = nil
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 0 {
 		t.Errorf("armed %d retry timers, want 0 for retry.max = 0", n)
@@ -487,7 +487,7 @@ func TestATokenErrorSchedulesNoRetry(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.tokenErr = errors.New("mode 0644 grants group access")
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	opens, runs, cleanups := h.counts()
 	if opens != 0 || runs != 0 || cleanups != 0 {
@@ -506,7 +506,7 @@ func TestAnOpenErrorSchedulesARetryAtOpenRetryDelay(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.openErr = errors.New("unimported legacy database")
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 1 {
 		t.Fatalf("armed %d retry timers, want 1 after an Open error", n)
@@ -533,7 +533,7 @@ func TestAZeroBackoffEntryStillWaitsMinRetryDelay(t *testing.T) {
 	h.backoff = []time.Duration{0}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if got := h.timers.at(t, 0).d; got != h.w.MinRetryDelay {
 		t.Errorf("retry delay = %v, want the MinRetryDelay floor %v", got, h.w.MinRetryDelay)
@@ -556,7 +556,7 @@ func TestCleanupRunsExactlyOncePerTick(t *testing.T) {
 			h.targets = []Target{h.target("planning")}
 			h.runFn = tc.run
 
-			h.w.Deliver(context.Background(), "o/r", 7)
+			h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 			if _, _, cleanups := h.counts(); cleanups != 1 {
 				t.Errorf("called cleanup %d times, want exactly 1", cleanups)
@@ -577,7 +577,7 @@ func TestTwoTargetsBothRunWhenTheFirstFails(t *testing.T) {
 		return nil
 	}
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	got := h.ranLoops()
 	if len(got) != 2 || got[0] != "planning" || got[1] != "review" {
@@ -595,7 +595,7 @@ func TestOpenIsCalledWithTheDaemonsOptions(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning")}
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -624,8 +624,8 @@ func TestSchedulingAgainStopsTheOldTimer(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute, 10 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 2 {
 		t.Fatalf("armed %d timers, want 2", n)
@@ -648,7 +648,7 @@ func TestARetryDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
 	h.runFn = func(*config.Config) error { return errBoom }
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h.w.Deliver(ctx, "o/r", 7)
+	h.w.Deliver(ctx, Delivery{Repo: "o/r", Number: 7})
 	cancel()
 	h.timers.at(t, 0).f()
 
@@ -832,7 +832,7 @@ func TestServeStopsEveryPendingTimerOnCancel(t *testing.T) {
 	h.runFn = func(*config.Config) error { return errBoom }
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h.w.Deliver(ctx, "o/r", 7)
+	h.w.Deliver(ctx, Delivery{Repo: "o/r", Number: 7})
 	if n := h.pendingLen(); n != 1 {
 		t.Fatalf("pending = %d before Serve, want 1", n)
 	}
@@ -965,8 +965,8 @@ func TestOpenFailuresDoNotSpendTheTickRetryBudget(t *testing.T) {
 	h.backoff = []time.Duration{45 * time.Minute}
 	h.openErr = errors.New("unimported legacy database")
 
-	h.w.Deliver(context.Background(), "o/r", 7)
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 	if n := h.timers.len(); n != 2 {
 		t.Fatalf("armed %d timers for two Open failures, want 2", n)
 	}
@@ -978,7 +978,7 @@ func TestOpenFailuresDoNotSpendTheTickRetryBudget(t *testing.T) {
 	h.mu.Unlock()
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 3 {
 		t.Fatalf("armed %d timers, want a third for the tick failure", n)
@@ -1173,7 +1173,7 @@ func TestDeliverLogsTheIssueAndTheLoopsThatWillEvaluateIt(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	out := buf.String()
 	if !strings.Contains(out, "repo=o/r") {
@@ -1210,7 +1210,7 @@ func TestDeliverScopesEveryTargetToTheDeliveredIssue(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	if got := h.ranLoops(); len(got) != 2 {
 		t.Fatalf("ran %v, want both loops", got)
@@ -1231,7 +1231,7 @@ func TestARetryStaysScopedToTheDeliveredIssue(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 	if h.timers.len() != 1 {
 		t.Fatalf("armed %d timers, want 1", h.timers.len())
 	}
@@ -1279,7 +1279,7 @@ func TestOneDeliveryFetchesTheDeliveredIssueOnce(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	if got := h.gh.fetches(); len(got) != 1 || got[0] != 51 {
 		t.Errorf("fetched %v, want exactly [51] for one delivery to two loops", got)
@@ -1301,8 +1301,8 @@ func TestTwoDeliveriesForOneIssueFetchItTwice(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	if got := h.gh.fetches(); len(got) != 2 {
 		t.Errorf("fetched %v, want one fetch per delivery", got)
@@ -1319,7 +1319,7 @@ func TestEveryLoopOfOneDeliveryIsOpenedWithTheSameClient(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	got := h.openedClients()
 	if len(got) != 2 {
@@ -1340,7 +1340,7 @@ func TestTheTokenIsReadOncePerDelivery(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution"), h.target("review")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1362,7 +1362,7 @@ func TestARetryFetchesAgainInsteadOfReusingTheDeliverysFetch(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 	if h.timers.len() != 1 {
 		t.Fatalf("armed %d timers, want 1", h.timers.len())
 	}
@@ -1414,7 +1414,7 @@ func TestASharedFetchFailureIsStillAttributedToEveryLoop(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute}
 	h.gh.err = errors.New("403 rate limit exceeded")
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	out := buf.String()
 	for _, loop := range []string{"planning", "execution"} {
@@ -1427,5 +1427,31 @@ func TestASharedFetchFailureIsStillAttributedToEveryLoop(t *testing.T) {
 	}
 	if n := h.pendingLen(); n != 2 {
 		t.Errorf("pending = %d, want a retry for each loop the shared fetch stopped", n)
+	}
+}
+
+// MergedInto is the ONE field that says "the default branch moved." An empty
+// value must never match a branch name, or every ordinary delivery -- an
+// opened issue, a moved label -- would start a repository-wide sweep. That is
+// the regression Worker.RunIssue records.
+func TestIsMergeIntoRequiresAMergedBaseRef(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Delivery
+		arg  string
+		want bool
+	}{
+		{"a merge into the branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, "master", true},
+		{"a merge into another branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "feature"}, "master", false},
+		{"not a merge", Delivery{Repo: "o/r", Number: 7}, "master", false},
+		{"not a merge, and the loop names no branch", Delivery{Repo: "o/r", Number: 7}, "", false},
+		{"a merge, but the loop names no branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.d.IsMergeInto(tc.arg); got != tc.want {
+				t.Errorf("IsMergeInto(%q) = %v, want %v", tc.arg, got, tc.want)
+			}
+		})
 	}
 }

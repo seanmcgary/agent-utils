@@ -196,6 +196,37 @@ func NewWorker(db *store.DB) *Worker {
 	return w
 }
 
+// Delivery is what one accepted webhook delivery tells the worker.
+//
+// It replaced a bare (repo, number) pair because a merged pull request must
+// start more work than an ordinary delivery, and the handler cannot judge
+// that on its own: the decision needs a loop's default_branch, and one
+// repository may be watched by several loops with different ones.
+type Delivery struct {
+	// Repo is the "owner/name" the delivery named. handleWebhook has already
+	// matched it against repoFullName, so nothing downstream re-validates it.
+	Repo string
+	// Number is the issue or pull request the delivery named. Every accepted
+	// delivery carries one; handleWebhook rejects a delivery without one
+	// rather than answering 202 for work it cannot name.
+	Number int
+	// MergedInto is the base branch of a pull request this delivery reports as
+	// MERGED, and is empty for every other delivery. Empty is the only safe
+	// default: it is what keeps an opened issue or a moved label from arming a
+	// repository-wide sweep. See Worker.Deliver for the regression that makes
+	// this the important property of this type.
+	MergedInto string
+}
+
+// IsMergeInto reports whether this delivery merged a pull request into branch.
+//
+// An empty branch never matches, even against an empty MergedInto. A loop with
+// no default_branch names no branch to compare against, so "they are both
+// empty" is not agreement, it is two absent values.
+func (d Delivery) IsMergeInto(branch string) bool {
+	return branch != "" && d.MergedInto == branch
+}
+
 // Deliver evaluates ONE issue of repo in every loop that watches it, and acts
 // wherever a loop decides there is something to do.
 //
@@ -216,17 +247,17 @@ func NewWorker(db *store.DB) *Worker {
 // each keeps its own state and spends its own budget. The log lines here and in
 // handler.go are what makes the chain delivery -> repository -> issue -> loops
 // readable after the fact.
-func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
-	targets, err := w.Targets(repo)
+func (w *Worker) Deliver(ctx context.Context, d Delivery) {
+	targets, err := w.Targets(d.Repo)
 	if err != nil {
 		// Logged and dropped: the routing failure is machine-wide (the
 		// registry could not be read), so there is no single loop to record
 		// it against and nothing a retry timer could usefully re-run.
-		slog.Error("cannot route delivery", "repo", repo, "err", err)
+		slog.Error("cannot route delivery", "repo", d.Repo, "err", err)
 		return
 	}
 	if len(targets) == 0 {
-		slog.Info("no loop watches this repository", "repo", repo)
+		slog.Info("no loop watches this repository", "repo", d.Repo)
 		return
 	}
 	// The non-zero case is logged too, not only the zero one. Without it the
@@ -246,7 +277,7 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 	// What each loop DECIDED belongs to the per-loop tick line, which carries
 	// a reason now.
 	slog.Info("evaluating this issue in every loop that watches the repository",
-		"repo", repo, "number", number, "loops", loops)
+		"repo", d.Repo, "number", d.Number, "loops", loops)
 
 	// One token read, one client, one memo, for the whole delivery -- created
 	// HERE and dropped when Deliver returns. See access: the lifetime is the
@@ -256,7 +287,7 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 		// Reported once for the delivery rather than once per loop: the token
 		// is machine-wide, so every loop would have failed on the identical
 		// read. No retry is scheduled, for the reason access states.
-		slog.Error("cannot read the github token", "repo", repo, "number", number,
+		slog.Error("cannot read the github token", "repo", d.Repo, "number", d.Number,
 			"loops", loops, "err", err)
 		return
 	}
@@ -265,7 +296,7 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 		// Sequential, and one target's failure never returns early: the
 		// loops that share a repository are separate projects with separate
 		// state, and one broken project must not strand the others.
-		w.tickOne(ctx, t, number, acc)
+		w.tickOne(ctx, t, d, acc)
 	}
 }
 
@@ -332,7 +363,11 @@ func (w *Worker) tickFresh(ctx context.Context, t Target, number int) {
 			"project", t.ProjectName, "issue", number, "err", err)
 		return
 	}
-	w.tickOne(ctx, t, number, acc)
+	// A retry re-runs the ISSUE pass only. A retry may fire minutes after the
+	// merge that caused it, and a sweep then is not what that merge asked for:
+	// the base has moved again or has not, and the next merge arms a sweep
+	// either way. MergedInto is left empty here on purpose.
+	w.tickOne(ctx, t, Delivery{Repo: t.Repo, Number: number}, acc)
 }
 
 // tickOne acts on one issue in one loop and decides what the outcome means
@@ -342,7 +377,8 @@ func (w *Worker) tickFresh(ctx context.Context, t Target, number int) {
 // SAME scoped pass rather than widening into a reconcile: a delivery that
 // failed and is retried a minute later must still be about the issue the
 // delivery named.
-func (w *Worker) tickOne(ctx context.Context, t Target, number int, acc *access) {
+func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access) {
+	number := d.Number
 	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
 
 	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
