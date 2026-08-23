@@ -1835,10 +1835,10 @@ later reader does not mistake a limit for an oversight.
 
 | Field   | Value                                                                        |
 |---------|------------------------------------------------------------------------------|
-| stage   | 2 (plan review)                                                              |
+| stage   | 3 (implementation)                                                           |
 | class   | standard (new trigger path, a widened seam, and new timer state; no schema)   |
 | profile | backend                                                                      |
 | branch  | feat/merge-triggered-tend-sweep                                              |
 | pr      | #9                                                                           |
-| gate    | pending                                                                      |
+| gate    | approved 2026-08-22                                                          |
 | round   | 0                                                                            |
