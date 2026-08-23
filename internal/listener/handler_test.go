@@ -1158,6 +1158,15 @@ func TestHandlerReportsOnlyAMergedPullRequestAsAMerge(t *testing.T) {
 			want:    "",
 		},
 		{
+			// issue_comment carries a pull_request object too, and its action
+			// is attacker-shaped text: with a closed action and a merged flag,
+			// only the EVENT check separates this from a real merge.
+			name:    "a comment delivery whose payload claims a closed merge",
+			event:   "issue_comment",
+			payload: `{"action":"closed","repository":{"full_name":"o/r"},"issue":{"number":7},"pull_request":{"number":7,"merged":true,"base":{"ref":"master"}}}`,
+			want:    "",
+		},
+		{
 			// pull_request_review carries a pull_request object as well, and
 			// it is not a merge whatever that object says.
 			name:    "a review on a merged pull request",

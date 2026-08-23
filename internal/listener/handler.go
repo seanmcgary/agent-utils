@@ -514,8 +514,16 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// close is the moment the base branch moved. The event is checked
 		// because pull_request_review, pull_request_review_comment and
 		// issue_comment all carry a pull_request object as well.
+		//
+		// The ref is shape-checked here, not merely bounded at log time, so
+		// this value is validated like the other two rather than only decoded.
+		// It costs nothing real: ghub.convertPR already refuses to trust a pull
+		// request whose base fails SafeRef, so a default_branch that failed it
+		// could never have been tended anyway. Failing the check leaves the
+		// value empty, which arms no sweep.
 		var mergedInto string
-		if event == "pull_request" && body.Action == "closed" && body.PullRequest.Merged {
+		if event == "pull_request" && body.Action == "closed" && body.PullRequest.Merged &&
+			ghub.SafeRef(body.PullRequest.Base.Ref) {
 			mergedInto = body.PullRequest.Base.Ref
 		}
 
@@ -626,9 +634,16 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				s.Tick(ctx, Delivery{Repo: repo, Number: number, MergedInto: mergedInto})
 			}()
 		default:
-			slog.Warn("dropping delivery: worker pool full",
-				"delivery", safeDeliveryID(deliveryID), "repo", repo, "number", number,
-				"merged_into", safeText(mergedInto))
+			// merged_into only when the payload carried one, for the reason
+			// the accepted line gives: an empty value would say nothing while
+			// looking like it said something. It is carried at all because a
+			// dropped merge is lost sweep work, not just one lost issue pass.
+			dropped := []any{"delivery", safeDeliveryID(deliveryID),
+				"repo", repo, "number", number}
+			if mergedInto != "" {
+				dropped = append(dropped, "merged_into", safeText(mergedInto))
+			}
+			slog.Warn("dropping delivery: worker pool full", dropped...)
 		}
 		w.WriteHeader(http.StatusAccepted)
 	}
