@@ -81,8 +81,9 @@ BehindBy(ctx context.Context, owner, repo, base, head string) (int, error)
 by pull request number (`engine.go:26-34`). A live tend dispatch for a pull request suppresses a
 second tend decision for it (`engine.go:277`).
 
-`internal/runner/runner.go` — `finish` writes issue state only when `d.Kind != store.KindTend`.
-A tend dispatch holds no issue state, so retiring a tend row writes no retry flag.
+`internal/loopcmd/tick.go:241` — `reapDead` calls `MarkNeedsRetry` only when
+`d.Kind != store.KindTend`. `internal/runner/runner.go`'s `finish` holds the same guard. A tend
+dispatch keeps no issue state, so retiring a dead tend row writes no retry flag.
 
 GitHub's `pull_request` payload carries `action`, `pull_request.merged` (bool) and
 `pull_request.base.ref` (string). A merge arrives as `action: "closed"` with `merged: true`.
