@@ -29,6 +29,18 @@ type fakeGH struct {
 	listedPRs     int
 	fetchedIssues []int
 	fetchedPRs    []int
+
+	// behindErr makes BehindBy fail for one pull request. A comparison CAN
+	// fail in production -- a force-pushed head, a deleted branch -- and a
+	// sweep must survive it, so a fake that cannot fail leaves the branch
+	// that survives it untested.
+	behindErr map[int]error
+
+	// compared records every pull request BehindBy was actually asked to
+	// compare, distinct from fetchedPRs (which counts single-PR fetches via
+	// PullRequest). A test asserting "the comparison was never made" needs
+	// this counter, not that one.
+	compared []int
 }
 
 func (f *fakeGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
@@ -70,6 +82,10 @@ func (f *fakeGH) PullRequest(_ context.Context, _, _ string, number int) (ghub.P
 func (f *fakeGH) BehindBy(_ context.Context, _, _, _, head string) (int, error) {
 	for _, pr := range f.prs {
 		if pr.HeadRef == head {
+			f.compared = append(f.compared, pr.Number)
+			if err := f.behindErr[pr.Number]; err != nil {
+				return 0, err
+			}
 			return f.behind[pr.Number], nil
 		}
 	}
