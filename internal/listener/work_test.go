@@ -112,6 +112,15 @@ type harness struct {
 	// and visible only in this fake's counters.
 	gh *deliveryGH
 
+	// defaultBranch and tendPR are the two fields of the fake config the open
+	// seam builds. Both are needed to arm a sweep: armTend is gated on
+	// cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch).
+	defaultBranch string
+	tendPR        bool
+	// tendFn decides what the RunTend seam returns. Nil means every sweep
+	// succeeds.
+	tendFn func(cfg *config.Config) error
+
 	mu           sync.Mutex
 	tokenErr     error
 	openErr      error
@@ -125,9 +134,12 @@ type harness struct {
 	// the same order as ran. A delivery decides one issue, so "which loop ran"
 	// is only half of what a test has to be able to assert.
 	ranIssues []int
-	cleanups  int
-	backoff   []time.Duration
-	max       int
+	// tends records "loop@base" for each sweep RunTend was asked to run, in
+	// order, guarded by mu like ran and ranIssues.
+	tends    []string
+	cleanups int
+	backoff  []time.Duration
+	max      int
 }
 
 // newHarness returns a Worker whose seams are all fakes. db may be nil for a
@@ -152,6 +164,7 @@ func newHarness(db *store.DB) *harness {
 	w.Token = h.token
 	w.Open = h.open
 	w.RunIssue = h.runIssue
+	w.RunTend = h.runTend
 	w.Targets = h.targetsSeam
 	w.TargetFor = func(projectID, loop string) (Target, Routing, error) {
 		if h.targetFor != nil {
@@ -211,6 +224,7 @@ func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (
 	h.mu.Lock()
 	h.opens = append(h.opens, openCall{ref: ref, path: path, opts: o})
 	openErr, backoff, max := h.openErr, h.backoff, h.max
+	branch, tend := h.defaultBranch, h.tendPR
 	h.mu.Unlock()
 
 	if openErr != nil {
@@ -219,7 +233,10 @@ func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (
 		return nil, loopcmd.Deps{}, nil, openErr
 	}
 
-	cfg := &config.Config{Name: loopFromPath(path), Repo: "o/r"}
+	cfg := &config.Config{
+		Name: loopFromPath(path), Repo: "o/r",
+		DefaultBranch: branch, TendPR: tend,
+	}
 	cfg.Retry.Max = max
 	for _, d := range backoff {
 		cfg.Retry.Backoff = append(cfg.Retry.Backoff, config.Duration(d))
@@ -256,6 +273,21 @@ func (h *harness) runIssue(
 		}
 	}
 
+	if fn != nil {
+		return loopcmd.Summary{}, fn(cfg)
+	}
+	return loopcmd.Summary{}, nil
+}
+
+// runTend is the fake RunTend seam. It records "loop@base" for each sweep,
+// so a test can prove which loop was swept and against which branch.
+func (h *harness) runTend(
+	_ context.Context, cfg *config.Config, _ loopcmd.Deps, base string,
+) (loopcmd.Summary, error) {
+	h.mu.Lock()
+	h.tends = append(h.tends, cfg.Name+"@"+base)
+	fn := h.tendFn
+	h.mu.Unlock()
 	if fn != nil {
 		return loopcmd.Summary{}, fn(cfg)
 	}
@@ -336,6 +368,14 @@ func (h *harness) pendingLen() int {
 	h.w.mu.Lock()
 	defer h.w.mu.Unlock()
 	return len(h.w.pending)
+}
+
+// tendedLoops returns "loop@base" for each sweep, in order, like ranLoops
+// does for issue passes.
+func (h *harness) tendedLoops() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.tends...)
 }
 
 // openWorkDB returns an empty canonical state database in a temporary
@@ -1453,5 +1493,121 @@ func TestIsMergeIntoRequiresAMergedBaseRef(t *testing.T) {
 				t.Errorf("IsMergeInto(%q) = %v, want %v", tc.arg, got, tc.want)
 			}
 		})
+	}
+}
+
+// The sweep is armed for exactly one case, and the issue pass always runs.
+func TestDeliverArmsATendSweepOnlyOnAMergeIntoTheLoopsDefaultBranch(t *testing.T) {
+	cases := []struct {
+		name     string
+		delivery Delivery
+		tendPR   bool
+		wantArm  bool
+	}{
+		{"a merge into the default branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, true, true},
+		{"a merge into a feature branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "feature"}, true, false},
+		{"not a merge", Delivery{Repo: "o/r", Number: 7}, true, false},
+		{"a merge, but the loop does not tend", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(nil)
+			h.targets = []Target{h.target("planning")}
+			h.defaultBranch = "master"
+			h.tendPR = tc.tendPR
+
+			h.w.Deliver(context.Background(), tc.delivery)
+
+			// The merged pull request's own pass moves its issue to a terminal
+			// state, and runs immediately whatever the sweep does.
+			if got := h.ranLoops(); len(got) != 1 {
+				t.Errorf("issue passes = %d, want 1", len(got))
+			}
+			want := 0
+			if tc.wantArm {
+				want = 1
+			}
+			if got := h.timers.len(); got != want {
+				t.Fatalf("armed %d timers, want %d", got, want)
+			}
+			if want == 1 {
+				h.timers.at(t, 0).f()
+				if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
+					t.Errorf("tends = %v, want [planning@master]", got)
+				}
+			}
+		})
+	}
+}
+
+// A merge train is one sweep, not one per merge. Each sweep can dispatch up to
+// maxTendPerSweep agents, and a tend agent that has already finished no longer
+// suppresses anything, so an uncoalesced train multiplies.
+func TestDeliverCoalescesAMergeTrainIntoOneSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	for i := 0; i < 5; i++ {
+		h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7 + i, MergedInto: "master"})
+	}
+
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1: a train must ride the first timer", got)
+	}
+	h.timers.at(t, 0).f()
+	if got := h.tendedLoops(); len(got) != 1 {
+		t.Errorf("tends = %v, want exactly one", got)
+	}
+	// Every merge still got its own issue pass.
+	if got := h.ranLoops(); len(got) != 5 {
+		t.Errorf("issue passes = %d, want 5", len(got))
+	}
+}
+
+// A failing issue pass schedules its retry as before, and the sweep is still
+// armed: the base branch moved whatever happened to that one issue.
+func TestDeliverArmsATendSweepEvenWhenTheIssuePassFails(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+	h.max = 1
+	h.backoff = []time.Duration{0}
+	h.runFn = func(*config.Config) error { return errors.New("boom") }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+
+	// One retry timer and one sweep timer.
+	if got := h.timers.len(); got != 2 {
+		t.Fatalf("armed %d timers, want 2 (one retry, one sweep)", got)
+	}
+}
+
+// A failed sweep is logged and dropped. It must not schedule a retry: the
+// retry path re-runs the ISSUE pass, and re-running it for a sweep failure
+// would spend that issue's retry budget on something the issue did not do.
+func TestDeliverDoesNotRetryAFailedTendSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+	h.max = 3
+	h.backoff = []time.Duration{0, 0, 0}
+	h.tendFn = func(*config.Config) error { return errors.New("sweep failed") }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1 (the sweep)", got)
+	}
+	h.timers.at(t, 0).f()
+
+	// The sweep failed. No SECOND timer may exist.
+	if got := h.timers.len(); got != 1 {
+		t.Errorf("armed %d timers after a failed sweep, want 1: a sweep must not schedule a retry", got)
+	}
+	if got := h.pendingLen(); got != 0 {
+		t.Errorf("pending retries = %d, want 0", got)
 	}
 }
