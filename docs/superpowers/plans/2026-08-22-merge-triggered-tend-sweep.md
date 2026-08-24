@@ -1804,6 +1804,71 @@ on the issue it names; both state that a sweep does not replace the periodic tic
 
 ---
 
+---
+
+### Task 5: Remove a closed pull request's worktrees
+
+Added after the gate, at the operator's request. A worktree of this repository's
+own monorepo is ~866MB (`node_modules`), and nothing has ever removed one: a
+merged issue's checkout sits on disk forever.
+
+**Decision, made by the operator with the risk stated:** on ANY close — merged or not — remove
+**both** the `pr-<N>` and the `issue-<M>` worktree. The alternative considered was removing only
+`pr-<N>` on an unmerged close, on the grounds that such a close often means the work continues
+and the agent will push a replacement. That was declined in favour of reclaiming the disk. The
+live-dispatch guard below is what keeps this from touching work in progress; what it does not
+protect is uncommitted, unpushed work in an *idle* worktree, which is the accepted risk.
+
+**Files:**
+- Modify: `internal/listener/work.go` (`Delivery.ClosedPR`, the `RunCleanup` seam, `cleanupPass`)
+- Modify: `internal/listener/handler.go` (set `ClosedPR`)
+- Create: `internal/loopcmd/cleanup.go`
+- Modify: `internal/loopcmd/tick.go` (extract the liveness predicate `reapDead` already uses)
+- Modify: `internal/worktree/worktree.go` (`Dirty`)
+- Test: `internal/loopcmd/cleanup_test.go`, `internal/listener/work_test.go`
+
+**Interfaces:**
+- Produces: `func CleanupClosedPR(ctx context.Context, cfg *config.Config, deps Deps, prNumber int) error`
+- Produces: `func (m *Manager) Dirty(path string) (bool, error)`
+- Produces: `Worker.RunCleanup func(ctx, cfg, deps, prNumber int) error`
+
+**Three rules this task exists to get right:**
+
+1. **The liveness check must use `reapDead`'s rule, not `Reset`'s.** `Reset` calls `isAlive`
+   directly. `reapDead` additionally treats a row younger than `pidGracePeriod` (90s) carrying a
+   non-positive pid as **live**, because the tick writes the pid just after the spawn. Cleanup
+   runs on the delivery path where a dispatch can be seconds old, so `Reset`'s rule would delete a
+   worktree out from under an agent that had just started. Extract the predicate from `reapDead`
+   so both share one definition rather than copying it.
+2. **A live dispatch cancels the WHOLE cleanup**, not just one path. If either the issue or the
+   pull request has a live row, remove neither: the two checkouts belong to one piece of work.
+3. **Removing is destructive and must leave a trace.** Log a warning naming the worktree if it
+   had uncommitted changes when removed. This does not block the removal — the operator chose
+   that — it makes the loss visible afterwards.
+
+**Resolving the issue costs no API call.** `DeliveryCache.PullRequest` is memoised per delivery,
+and the issue pass already fetched this pull request through `subject`. `engine.ClosesIssue`
+turns it into the issue number.
+
+- [ ] **Step 1: `worktree.Dirty`** — `git -C <path> status --porcelain`; non-empty output means
+  dirty. A path that does not exist is not dirty and is not an error.
+- [ ] **Step 2: Extract the liveness predicate** in `internal/loopcmd/tick.go` and make `reapDead`
+  call it. Behavior must not change; the existing `reapDead` tests are the proof.
+- [ ] **Step 3: Write the failing tests** in `internal/loopcmd/cleanup_test.go`: both worktrees
+  removed on a merged close; both removed on an unmerged close; NEITHER removed when the issue has
+  a live dispatch; neither removed when a row is younger than `pidGracePeriod` with pid 0; the
+  `pr-` worktree still removed when the pull request closes no issue; a dirty worktree is removed
+  AND warned about.
+- [ ] **Step 4: Write `internal/loopcmd/cleanup.go`.**
+- [ ] **Step 5: Wire it** — `Delivery.ClosedPR`, set in the handler beside `mergedInto`; the
+  `RunCleanup` seam; `cleanupPass` called from `tickOne` after `issuePass`.
+- [ ] **Step 6: Mutation-check** the liveness guard (delete it; the live-dispatch test must fail)
+  and the grace-period rule (swap it for `Reset`'s bare `isAlive`; the young-row test must fail).
+  Confirm each mutation applied before trusting a pass.
+- [ ] **Step 7: `make check` and `make test/race` green; commit once.**
+
+**review: yes** — this deletes user data on a webhook.
+
 ## Known limits
 
 Carried from the plan review. Each is a real gap, none is a blocker, and all are recorded so a
