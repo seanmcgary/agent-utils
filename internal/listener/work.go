@@ -31,12 +31,12 @@ const (
 	// or a row whose deadline stays in the past would otherwise spin the
 	// wake loop.
 	defaultMinWakeInterval = 30 * time.Second
-	// defaultSweepDelay is how long a merge waits before its tend sweep runs,
+	// defaultTendDelay is how long a merge waits before its tend sweep runs,
 	// so a merge train produces one sweep rather than one per merge. The loop
 	// lock only collapses sweeps that OVERLAP; merges a minute apart do not,
 	// and a tend agent that has already finished suppresses nothing, so an
 	// uncoalesced train multiplies by the number of merges in it.
-	defaultSweepDelay = time.Minute
+	defaultTendDelay = time.Minute
 )
 
 // openRetryMax caps the retries for a failure that happened inside
@@ -117,6 +117,12 @@ func (a *attempt) counter(kind retryKind) *int {
 	return &a.n
 }
 
+// tendTimer is one loop's armed tend sweep. It is a pointer so armTend can
+// tell ITS entry from one a later merge registered after this timer fired.
+type tendTimer struct {
+	timer *time.Timer // guarded by Worker.mu
+}
+
 // Worker turns a delivery, or a retry deadline that has passed, into a tick.
 //
 // Every collaborator is a field so the acceptance tests can be written
@@ -174,7 +180,7 @@ type Worker struct {
 	OpenRetryDelay  time.Duration // default 1m
 	MinRetryDelay   time.Duration // default 30s
 	MinWakeInterval time.Duration // default 30s
-	SweepDelay      time.Duration // default 1m
+	TendDelay       time.Duration // default 1m
 
 	mu      sync.Mutex
 	pending map[loopKey]*attempt // guarded by mu
@@ -183,9 +189,13 @@ type Worker struct {
 	// entry is dropped as soon as the loop routes again OR as soon as a wake
 	// cannot tell, so only agreeing observations accumulate.
 	orphans map[loopKey]int // guarded by mu
-	// sweeps holds the armed tend timer of each loop, guarded by mu. A merge
+	// tends holds the armed tend timer of each loop, guarded by mu. A merge
 	// arriving while one is armed rides it rather than arming a second.
-	sweeps map[loopKey]*time.Timer // guarded by mu
+	//
+	// Named tends, not sweeps: "sweep" already means the full reconcile in
+	// this program (see loopcmd.Tick), and a bare SweepDelay beside
+	// OpenRetryDelay would read as a delay before that.
+	tends map[loopKey]*tendTimer // guarded by mu
 	// unroutable throttles the "cannot route this deadline" warning per
 	// loop; it carries its own lock. See warnUnroutable.
 	unroutable *throttledLog
@@ -213,10 +223,10 @@ func NewWorker(db *store.DB) *Worker {
 		OpenRetryDelay:  defaultOpenRetryDelay,
 		MinRetryDelay:   defaultMinRetryDelay,
 		MinWakeInterval: defaultMinWakeInterval,
-		SweepDelay:      defaultSweepDelay,
+		TendDelay:       defaultTendDelay,
 		pending:         make(map[loopKey]*attempt),
 		orphans:         make(map[loopKey]int),
-		sweeps:          make(map[loopKey]*time.Timer),
+		tends:           make(map[loopKey]*tendTimer),
 		unroutable:      newThrottledLog(unroutableLogInterval),
 	}
 	// The throttle reads the Worker's OWN clock, and reads it late: a test
@@ -502,13 +512,13 @@ func (w *Worker) issuePass(
 // time, and the loop lock does not prevent it -- the lock only collapses
 // sweeps that OVERLAP, and a sweep whose agents have finished suppresses
 // nothing. Riding the armed timer rather than resetting it bounds the wait, so
-// a long train still gets a sweep every SweepDelay rather than none until it
+// a long train still gets a sweep every TendDelay rather than none until it
 // stops.
 func (w *Worker) armTend(ctx context.Context, t Target, base string) {
 	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
 
 	w.mu.Lock()
-	if _, armed := w.sweeps[key]; armed {
+	if _, armed := w.tends[key]; armed {
 		w.mu.Unlock()
 		slog.Info("a tend sweep is already armed for this loop; riding it",
 			"loop", t.LoopName, "project", t.ProjectName, "base", base)
@@ -516,12 +526,22 @@ func (w *Worker) armTend(ctx context.Context, t Target, base string) {
 	}
 	// Registered before the timer is built, so a second merge arriving between
 	// these two statements rides this one instead of arming its own.
-	w.sweeps[key] = nil
+	//
+	// The entry is an identity token, not a presence flag. Storing the timer
+	// back below has to know the entry is still THIS arm's: the timer can fire
+	// and delete the entry before the store, a later merge can then register
+	// its own, and a presence check would overwrite that live timer with this
+	// already-fired one -- leaving stopAll stopping a dead timer while a live
+	// one fires after shutdown.
+	ent := &tendTimer{}
+	w.tends[key] = ent
 	w.mu.Unlock()
 
-	timer := w.After(w.SweepDelay, func() {
+	timer := w.After(w.TendDelay, func() {
 		w.mu.Lock()
-		delete(w.sweeps, key)
+		if cur, ok := w.tends[key]; ok && cur == ent {
+			delete(w.tends, key)
+		}
 		w.mu.Unlock()
 		// Same rule schedule states: a cancelled context here means the daemon
 		// is shutting down, and a daemon told to stop starts no new agent.
@@ -532,15 +552,13 @@ func (w *Worker) armTend(ctx context.Context, t Target, base string) {
 	})
 
 	w.mu.Lock()
-	// Only if the entry is still ours: the timer may have fired and deleted it
-	// already, and storing it then would leave an entry no one removes.
-	if _, ok := w.sweeps[key]; ok {
-		w.sweeps[key] = timer
+	if cur, ok := w.tends[key]; ok && cur == ent {
+		cur.timer = timer
 	}
 	w.mu.Unlock()
 
 	slog.Info("armed a tend sweep", "loop", t.LoopName, "project", t.ProjectName,
-		"base", base, "in", w.SweepDelay)
+		"base", base, "in", w.TendDelay)
 }
 
 // tendFresh reads its own token and opens its own loop, like tickFresh: the
@@ -579,8 +597,16 @@ func (w *Worker) tendPass(
 ) {
 	if _, err := w.RunTend(ctx, cfg, deps, base); err != nil {
 		if errors.Is(err, lock.ErrHeld) {
-			slog.Info("skipping tend sweep: another tick holds the loop lock",
+			// Re-armed, not dropped. issuePass can drop a delivery that finds
+			// the lock held because the holder decides that same issue a moment
+			// later; TendSweep's own comment records that this reasoning is
+			// FALSE for a sweep, which decides no issue but the ones it tends.
+			// Dropping it here would lose the merge's rebases until another
+			// merge landed. The coalescing map bounds this to one arm in
+			// flight.
+			slog.Info("another tick holds the loop lock; re-arming the tend sweep",
 				"loop", cfg.Name, "project", t.ProjectName)
+			w.armTend(ctx, t, base)
 			return
 		}
 		slog.Error("tend sweep failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
@@ -757,11 +783,11 @@ func (w *Worker) stopAll() {
 		}
 		delete(w.pending, key)
 	}
-	for key, timer := range w.sweeps {
-		if timer != nil {
-			timer.Stop()
+	for key, ent := range w.tends {
+		if ent != nil && ent.timer != nil {
+			ent.timer.Stop()
 		}
-		delete(w.sweeps, key)
+		delete(w.tends, key)
 	}
 }
 

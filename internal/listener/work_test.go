@@ -112,19 +112,19 @@ type harness struct {
 	// and visible only in this fake's counters.
 	gh *deliveryGH
 
-	// defaultBranch and tendPR are the two fields of the fake config the open
-	// seam builds. Both are needed to arm a sweep: armTend is gated on
-	// cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch).
-	defaultBranch string
-	tendPR        bool
-	// tendFn decides what the RunTend seam returns. Nil means every sweep
-	// succeeds.
-	tendFn func(cfg *config.Config) error
-	// cleanupFn decides what the RunCleanup seam returns. Nil means every
-	// cleanup succeeds.
-	cleanupFn func(cfg *config.Config) error
+	mu sync.Mutex
+	// These four are set before the first Deliver and then read under mu by
+	// open, runTend and runCleanup, so they sit with the guarded fields rather
+	// than above the mutex with the write-once ones. defaultBranch and tendPR
+	// are the two config fields the open seam builds; both are needed to arm a
+	// sweep, which is gated on cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch).
+	// tendFn and cleanupFn decide what the RunTend and RunCleanup seams
+	// return; nil means success.
+	defaultBranch string                         // guarded by mu
+	tendPR        bool                           // guarded by mu
+	tendFn        func(cfg *config.Config) error // guarded by mu
+	cleanupFn     func(cfg *config.Config) error // guarded by mu
 
-	mu           sync.Mutex
 	tokenErr     error
 	openErr      error
 	tokenCalls   int
@@ -1712,5 +1712,52 @@ func TestDeliverDoesNotRetryAFailedCleanup(t *testing.T) {
 	}
 	if got := h.pendingLen(); got != 0 {
 		t.Errorf("pending retries = %d, want 0", got)
+	}
+}
+
+// A daemon told to stop must not dispatch a batch of rebase agents on the way
+// out. stopAll stops armed tend timers for the same reason it stops retry
+// timers; nothing pinned that, and deleting the loop left the suite green.
+func TestStopAllStopsAnArmedTendSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1", got)
+	}
+
+	h.w.stopAll()
+
+	h.w.mu.Lock()
+	n := len(h.w.tends)
+	h.w.mu.Unlock()
+	if n != 0 {
+		t.Errorf("tends holds %d entries after stopAll, want 0", n)
+	}
+}
+
+// The timer can already be waiting on the mutex when shutdown begins, past
+// anything stopAll could have stopped. The callback re-checks the context for
+// exactly that case, and a daemon told to stop starts no new agent.
+func TestAnArmedTendSweepDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.w.Deliver(ctx, Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1", got)
+	}
+
+	cancel()
+	h.timers.at(t, 0).f()
+
+	if got := h.tendedLoops(); len(got) != 0 {
+		t.Errorf("tends = %v, want none: a cancelled daemon must start no sweep", got)
 	}
 }

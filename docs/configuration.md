@@ -658,7 +658,18 @@ and it never parks an issue. A merge is a reason to rebase; it is not a reason t
 
 A sweep waits about a minute before it runs, so a merge train produces one sweep rather than one
 per merge, and it dispatches at most ten rebases. If more pull requests are behind than that,
-the rest are named in the log and wait for the next merge.
+the rest are named in the log line and wait for the next merge.
+
+**A closed pull request has its worktrees removed.** This is separate from `tend_pr` and is not
+gated by it. When GitHub reports a pull request closed — merged or not — the loop removes that
+pull request's `pr-<N>` worktree, and the `issue-<M>` worktree of the issue it closes, as soon
+as neither has a live dispatch. A worktree of a large repository is easily hundreds of
+megabytes, and nothing removed one before.
+
+Two limits apply. The issue link is honoured only for a trusted pull request, so an outside
+contributor cannot name someone else's issue in a `Closes #M` body and have its work deleted.
+And the live-dispatch guard protects work in progress, not uncommitted or unpushed work in an
+idle worktree — that is removed too, with a warning naming the worktree in the log.
 
 **A sweep does not replace a periodic tick.** `agent-utils project loop tick` is still the only
 full reconcile: it is what retires a dead runner for an issue no delivery names, and what finds

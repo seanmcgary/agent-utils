@@ -69,26 +69,24 @@ const maxTendPerSweep = 10
 // BehindBy is CompareCommits, a GitHub API call, so the comparisons do not
 // depend on Fetch having run and lose nothing by preceding it.
 func TendSweep(ctx context.Context, cfg *config.Config, deps Deps, base string) (Summary, error) {
-	var sum Summary
-
 	// Checked before anything is read. The caller checks it too; TendSweep is
 	// exported, so a loop that does not tend must cost nothing whoever calls.
 	if !cfg.TendPR {
-		return sum, nil
+		return Summary{}, nil
 	}
 
 	snap, links, err := tendSnapshot(ctx, cfg, deps, base)
 	if err != nil {
-		return sum, err
+		return Summary{}, err
 	}
 
 	l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
 	if err != nil {
-		return sum, err
+		return Summary{}, err
 	}
 	defer l.Release()
 
-	return tendDispatch(ctx, cfg, deps, snap, links, base, &sum)
+	return tendDispatch(ctx, cfg, deps, snap, links, base)
 }
 
 // tendSnapshot reads GitHub and returns what engine.Decide needs, plus the
@@ -154,8 +152,9 @@ func tendSnapshot(ctx context.Context, cfg *config.Config, deps Deps, base strin
 // tendDispatch decides and acts. The caller holds the loop lock.
 func tendDispatch(
 	ctx context.Context, cfg *config.Config, deps Deps,
-	snap engine.Snapshot, links []store.PRLink, base string, sum *Summary,
+	snap engine.Snapshot, links []store.PRLink, base string,
 ) (Summary, error) {
+	var sum Summary
 	now := deps.Now()
 
 	// Under the lock, and after the reads: the fetch prepares the checkout the
@@ -164,7 +163,7 @@ func tendDispatch(
 	// retries, this pass has only tending to do, so it stops.
 	if deps.Fetch != nil {
 		if err := deps.Fetch(); err != nil {
-			return *sum, fmt.Errorf("fetch primary checkout: %w", err)
+			return sum, fmt.Errorf("fetch primary checkout: %w", err)
 		}
 	}
 
@@ -179,11 +178,11 @@ func tendDispatch(
 
 	states, err := deps.Store.IssueStates(cfg.Name, cfg.Repo)
 	if err != nil {
-		return *sum, err
+		return sum, err
 	}
 	running, err := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
 	if err != nil {
-		return *sum, err
+		return sum, err
 	}
 
 	// Retire dead TEND rows only.
@@ -210,16 +209,16 @@ func tendDispatch(
 		}
 		live = append(live, d)
 	}
-	liveTend, err := reapDead(cfg, deps, tendRows, states, now, sum)
+	liveTend, err := reapDead(cfg, deps, tendRows, states, now, &sum)
 	if err != nil {
-		return *sum, err
+		return sum, err
 	}
 	live = append(live, liveTend...)
 	sum.Live = len(live)
 
 	st := engine.State{Issues: states, Running: live}
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
-		return *sum, err
+		return sum, err
 	}
 
 	plan := engine.Decide(cfg, snap, st, now)
@@ -262,35 +261,40 @@ func tendDispatch(
 			"loop", cfg.Name, "cooldown_until", plan.CooldownUntil)
 	}
 
-	dropped := 0
+	var deferred []int
 	if len(tends) > maxTendPerSweep {
-		dropped = len(tends) - maxTendPerSweep
+		for _, d := range tends[maxTendPerSweep:] {
+			deferred = append(deferred, d.Issue)
+		}
 		tends = tends[:maxTendPerSweep]
 	}
 
 	for _, d := range tends {
-		if err := act(ctx, cfg, deps, d, now, sum); err != nil {
+		if err := act(ctx, cfg, deps, d, now, &sum); err != nil {
 			// One failed decision must not abandon the rest of the sweep.
 			slog.Error("decision failed", "loop", cfg.Name, "kind", d.Kind,
 				"issue", d.Issue, "err", err)
 		}
 	}
-	if dropped > 0 {
+	if len(deferred) > 0 {
 		// Never silent. A capped sweep that said nothing would read as "every
 		// stale pull request was rebased", which is the opposite of the truth.
-		// sum.Tended, not len(tends): act failures are swallowed above, so the
-		// intended count would overstate what actually ran.
+		// The deferred issues are NAMED, not counted: this program's log lines
+		// carry "issue" and "pr" everywhere else, and a bare count leaves an
+		// operator no way to tell which work is waiting. sum.Tended rather than
+		// len(tends), because act failures are swallowed above and the intended
+		// count would overstate what ran.
 		slog.Warn("tend sweep hit its per-sweep cap; the rest wait for the next merge",
-			"loop", cfg.Name, "dispatched", sum.Tended, "deferred", dropped)
+			"loop", cfg.Name, "dispatched", sum.Tended, "deferred", deferred)
 	}
 
 	// Recorded like any other tick -- including on the breaker path, where Tick
 	// and tickIssue also record -- so the counter and the last-tick time keep
 	// meaning something in `project loop status`.
-	body, _ := json.Marshal(*sum)
+	body, _ := json.Marshal(sum)
 	if _, err := deps.Store.RecordTick(cfg.Name, plan.BreakerTripped, string(body)); err != nil {
-		return *sum, err
+		return sum, err
 	}
 	slog.Info("tend sweep complete", "loop", cfg.Name, "base", base, "summary", string(body))
-	return *sum, nil
+	return sum, nil
 }

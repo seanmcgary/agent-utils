@@ -371,10 +371,14 @@ Passing `--config` with an absolute path works too and skips discovery entirely.
 
 The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
 request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
-A delivery acts on the issue it names. The one exception is a pull request merged into a loop's
-`default_branch`: that merge is what makes every other open pull request stale while naming none
-of them, so it also sweeps the loop for rebases — tend agents only, capped, and only for loops
-with `tend_pr: true`. Otherwise, a delivery says "something about this issue changed, figure out
+A delivery acts on the issue it names. There are two exceptions, both on a `pull_request`
+delivery. A pull request **merged** into a loop's `default_branch` also sweeps the loop for
+rebases — that merge is what makes every other open pull request stale while naming none of
+them — dispatching tend agents only, capped, and only for loops with `tend_pr: true`. And a pull
+request that **closes**, merged or not, has its `pr-<N>` worktree removed, along with the
+`issue-<M>` worktree of the issue it closes, once neither has a live dispatch. That second one
+deletes files: the live-dispatch guard protects work in progress, not uncommitted or unpushed
+work sitting in an idle worktree, and only a trusted pull request's `Closes #M` is honoured. Otherwise, a delivery says "something about this issue changed, figure out
 what and dispatch the right executor." The daemon fetches that one issue, decides it, and stops —
 it does not read every open issue and every open pull request in the repository, which is what a
 full reconcile costs in tokens and rate limit on every delivery, per project watching that

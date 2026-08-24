@@ -2,6 +2,8 @@ package loopcmd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 
@@ -97,18 +99,26 @@ func CleanupClosedPR(ctx context.Context, cfg *config.Config, deps Deps, prNumbe
 		}
 	}
 
-	removeWorktree(cfg, deps, deps.WT.PathForPR(prNumber))
-	if hasIssue {
-		removeWorktree(cfg, deps, deps.WT.PathForIssue(issueNumber))
+	// Both attempted, and both failures reported. Swallowing them left the
+	// caller logging a success whose only trace of the failure was an ERROR
+	// line with none of the loop or pull request context.
+	var errs []error
+	if err := removeWorktree(cfg, deps, deps.WT.PathForPR(prNumber)); err != nil {
+		errs = append(errs, err)
 	}
-	return nil
+	if hasIssue {
+		if err := removeWorktree(cfg, deps, deps.WT.PathForIssue(issueNumber)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // removeWorktree deletes path. It does not block on path carrying
 // uncommitted changes -- the operator chose to reclaim the disk regardless
 // -- but it logs a warning naming the worktree first, so the loss is visible
 // after the fact rather than silent.
-func removeWorktree(cfg *config.Config, deps Deps, path string) {
+func removeWorktree(cfg *config.Config, deps Deps, path string) error {
 	dirty, err := deps.WT.Dirty(path)
 	if err != nil {
 		slog.Error("check worktree for uncommitted changes before removing it",
@@ -119,5 +129,7 @@ func removeWorktree(cfg *config.Config, deps Deps, path string) {
 	}
 	if err := deps.WT.Remove(path); err != nil {
 		slog.Error("remove worktree", "loop", cfg.Name, "path", path, "err", err)
+		return fmt.Errorf("remove worktree %s: %w", path, err)
 	}
+	return nil
 }

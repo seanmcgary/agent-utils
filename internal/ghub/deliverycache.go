@@ -116,9 +116,9 @@ func (d *DeliveryCache) PullRequest(ctx context.Context, owner, repo string, num
 
 // ListOpenIssues is not memoised: it belongs to a pass that reconciles a whole
 // repository and must read it as it is now. loopcmd.TendSweep calls it on the
-// delivery path, once per loop watching the repository, and that repetition is
-// deliberate. Memoising it would let the second loop of one delivery decide
-// from labels read before the first loop's EditLabels.
+// delivery path, but through an access of its own -- see
+// listener.Worker.tendFresh, which builds a fresh cache per sweep -- so no memo
+// would span two loops there anyway.
 func (d *DeliveryCache) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issue, error) {
 	return d.c.ListOpenIssues(ctx, owner, repo)
 }

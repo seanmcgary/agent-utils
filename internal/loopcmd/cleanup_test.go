@@ -103,37 +103,12 @@ func TestCleanupClosedPRRemovesThePRWorktreeWhenThePullRequestClosesNoIssue(t *t
 // A merged close removes both worktrees. CleanupClosedPR does not
 // distinguish merged from unmerged -- the operator's decision was "on any
 // close" -- but the merged case is the common one and gets its own test.
+// CleanupClosedPR is never told whether the pull request merged: a merged and
+// an unmerged close are the same call, and the operator chose to reclaim the
+// disk on both. What decides that a close reaches here at all is the handler's
+// ClosedPR derivation, covered by TestHandlerReportsOnlyAMergedPullRequestAsAMerge
+// and TestDeliverRunsCleanupOnlyWhenTheDeliveryClosedAPullRequest.
 func TestCleanupClosedPRRemovesBothWorktreesOnAMergedClose(t *testing.T) {
-	cfg := cleanupConfig(t)
-	gh := &fakeGH{prs: []ghub.PullRequest{closingPRFixture(11, 1)}}
-	spawned := 0
-	deps := newDeps(t, cfg, gh, &spawned)
-
-	issuePath, err := deps.WT.EnsureIssue(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prPath, err := deps.WT.EnsurePR(11, "pr-branch")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := CleanupClosedPR(context.Background(), cfg, deps, 11); err != nil {
-		t.Fatalf("CleanupClosedPR: %v", err)
-	}
-	if _, err := os.Stat(issuePath); !os.IsNotExist(err) {
-		t.Errorf("issue worktree still exists: %v", err)
-	}
-	if _, err := os.Stat(prPath); !os.IsNotExist(err) {
-		t.Errorf("pr worktree still exists: %v", err)
-	}
-}
-
-// An unmerged close removes both worktrees too. The operator declined the
-// alternative (remove only pr-<N> on an unmerged close) in favour of
-// reclaiming the disk; CleanupClosedPR is never told whether the pull
-// request merged, so its behavior here must be identical to the merged case.
-func TestCleanupClosedPRRemovesBothWorktreesOnAnUnmergedClose(t *testing.T) {
 	cfg := cleanupConfig(t)
 	gh := &fakeGH{prs: []ghub.PullRequest{closingPRFixture(11, 1)}}
 	spawned := 0
@@ -275,7 +250,10 @@ func TestCleanupClosedPRIgnoresADeadDispatchRow(t *testing.T) {
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
 	deps.IsAlive = func(int, int64) bool { return false }
-	// A fixed, ancient clock puts every row outside pidGracePeriod.
+	// now is an hour AHEAD, so every row's age exceeds pidGracePeriod and only
+	// isAlive decides. Ahead rather than behind because isLive measures
+	// now.Sub(d.StartedAt), and CreateDispatch stamps StartedAt from the real
+	// wall clock.
 	deps.Now = func() time.Time { return time.Now().Add(time.Hour) }
 
 	issuePath, err := deps.WT.EnsureIssue(1)
