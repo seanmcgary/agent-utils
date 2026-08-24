@@ -57,7 +57,28 @@ func CleanupClosedPR(ctx context.Context, cfg *config.Config, deps Deps, prNumbe
 	if err != nil {
 		return err
 	}
-	issueNumber, hasIssue := engine.ClosesIssue(pr)
+	// The issue link is honoured only for a TRUSTED pull request.
+	//
+	// engine.ClosesIssue deliberately judges no trust -- it answers "which
+	// issue does this delivery concern" and nothing more -- and its comment
+	// records the invariant that makes that safe: every action taken
+	// afterwards re-checks trust on its own. This is the first caller whose
+	// action is DESTRUCTIVE, so it is the first place that invariant has teeth.
+	//
+	// Without the check, anyone who can open a pull request against this
+	// repository -- no write access, a fork head -- could write "Closes #7" in
+	// the body, close their own pull request, and have this daemon delete the
+	// worktree of issue 7. The delivery would be genuine and correctly signed;
+	// the attacker supplies only the number. engine.LinkPR drops an untrusted
+	// pull request for the same reason before anything is tended.
+	//
+	// The pr-<N> worktree is removed either way: that number comes from the
+	// routed delivery, not from body text an outsider controls.
+	var issueNumber int
+	var hasIssue bool
+	if pr.Trusted {
+		issueNumber, hasIssue = engine.ClosesIssue(pr)
+	}
 
 	running, err := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
 	if err != nil {

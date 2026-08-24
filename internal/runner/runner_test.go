@@ -469,3 +469,92 @@ func TestSuperviseTreatsASessionInUseRefusalAsProofTheSessionExists(t *testing.T
 		t.Error("NeedsRetry = false; the failure must schedule the resume")
 	}
 }
+
+// A SUCCESSFUL run whose stderr merely mentions the phrase must not be
+// rewritten to failed.
+//
+// stderr carries megabytes of tool output, and a dev server saying "port 3000
+// is already in use" is not claude refusing a session. Before the pattern was
+// tightened and gated on a non-zero exit, that run's finished work was thrown
+// away and dispatched again.
+func TestSuperviseKeepsASuccessfulRunThatMerelyMentionsSomethingInUse(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"echo 'warning: port 3000 is already in use, retrying' >&2\n" +
+		`echo '{"type":"result","subtype":"success","session_id":"ok1","total_cost_usd":2.5,"is_error":false,"result":"done"}'` + "\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	s := newStore(t)
+	if err := s.BeginDispatch("execution", "o/r", 80, "ok1", false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := s.CreateDispatch(store.Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 80, Kind: store.KindStart, SessionID: "ok1",
+	})
+	d, _ := s.GetDispatch(id)
+
+	cfg := &config.Config{Agent: config.Agent{Model: "opus", Timeout: config.Duration(60e9)}}
+	if err := Supervise(context.Background(), cfg, s, d,
+		Invocation{SessionID: "ok1", Prompt: "go"}, t.TempDir(),
+		filepath.Join(t.TempDir(), "run.jsonl")); err != nil {
+		t.Fatalf("Supervise: %v", err)
+	}
+
+	got, _ := s.GetDispatch(id)
+	if got.Status != store.StatusSucceeded {
+		t.Errorf("Status = %q, want succeeded: finished work must not be discarded "+
+			"because tool output mentioned something being in use", got.Status)
+	}
+	if got.CostUSD != 2.5 {
+		t.Errorf("CostUSD = %v, want 2.5", got.CostUSD)
+	}
+}
+
+// The pattern must match claude's actual line, not the bare phrase.
+func TestSessionInUsePatternMatchesOnlyClaudesRefusal(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"claude's refusal", "Error: Session ID b3b1a9e5-fe9a-4b69-b681-5ed247fe01ff is already in use.", true},
+		{"a dev server", "warning: port 3000 is already in use, retrying", false},
+		{"a lock file", "the file is already in use by another process", false},
+		{"the bare phrase", "is already in use", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionInUse.MatchString(tc.line); got != tc.want {
+				t.Errorf("MatchString(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
+// The refusal arrives in whatever chunks the pipe hands over, so a match split
+// across two writes must still be found.
+func TestPatternWriterFindsAMatchSplitAcrossWrites(t *testing.T) {
+	var sink bytes.Buffer
+	w := newPatternWriter(&sink, sessionInUse)
+
+	for _, chunk := range []string{
+		"tool noise\n",
+		"Error: Session ID b3b1a9e5 ",
+		"is already in use.\n",
+	} {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	if !w.Seen() {
+		t.Error("Seen() = false; the refusal spanned two writes and must still match")
+	}
+	if got := sink.String(); !strings.Contains(got, "Error: Session ID b3b1a9e5 is already in use.") {
+		t.Errorf("stderr was not passed through intact: %q", got)
+	}
+}

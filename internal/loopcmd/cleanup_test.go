@@ -300,3 +300,46 @@ func TestCleanupClosedPRIgnoresADeadDispatchRow(t *testing.T) {
 		t.Errorf("pr worktree still exists: %v", err)
 	}
 }
+
+// An UNTRUSTED pull request must not choose which issue's worktree is deleted.
+//
+// This is the attack the trust gate exists to stop. Anyone who can open a pull
+// request against the repository -- no write access, a fork head, so
+// ghub.convertPR marks it untrusted -- writes "Closes #1" in the body and
+// closes their own pull request. The delivery GitHub sends is genuine and
+// correctly signed; the attacker supplies only the issue number. Without the
+// gate this daemon deletes that issue's worktree, uncommitted work included,
+// in every loop watching the repository, for any number they choose.
+//
+// The pr-<N> worktree is still removed: that number came from the routed
+// delivery, not from body text an outsider controls.
+func TestCleanupClosedPRIgnoresTheIssueLinkOfAnUntrustedPullRequest(t *testing.T) {
+	cfg := cleanupConfig(t)
+	untrusted := closingPRFixture(11, 1)
+	untrusted.Trusted = false
+	untrusted.HeadRepo = "mallory/fork"
+	gh := &fakeGH{prs: []ghub.PullRequest{untrusted}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	issuePath, err := deps.WT.EnsureIssue(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prPath, err := deps.WT.EnsurePR(11, "pr-branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CleanupClosedPR(context.Background(), cfg, deps, 11); err != nil {
+		t.Fatalf("CleanupClosedPR: %v", err)
+	}
+
+	if _, err := os.Stat(issuePath); err != nil {
+		t.Errorf("the issue worktree was removed on an untrusted pull request's "+
+			"say-so; any outside contributor could delete any issue's work: %v", err)
+	}
+	if _, err := os.Stat(prPath); !os.IsNotExist(err) {
+		t.Errorf("the pr worktree should still be removed: %v", err)
+	}
+}

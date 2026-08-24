@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"syscall"
 	"time"
@@ -184,8 +185,8 @@ func Supervise(
 	abandoned := newSentinelWriter(errFile, windDownNotice)
 	// Chained, so one stderr stream is watched for both markers. Each writer
 	// passes every byte through to the next, so the log is unchanged.
-	sessionInUse := newSentinelWriter(abandoned, sessionInUseNotice)
-	cmd.Stderr = sessionInUse
+	inUse := newPatternWriter(abandoned, sessionInUse)
+	cmd.Stderr = inUse
 
 	if err := cmd.Start(); err != nil {
 		return finish(cfg, st, d, store.DispatchResult{
@@ -223,7 +224,7 @@ func Supervise(
 		// whatever happened afterwards -- and so does claude refusing the id as
 		// already in use, which is the only evidence left when the run that
 		// created it was killed before it wrote anything this program parses.
-		SessionStarted: result.SessionID != "" || sessionInUse.Seen(),
+		SessionStarted: result.SessionID != "" || (waitErr != nil && inUse.Seen()),
 	}
 	// pi reports no wall-clock duration in its stream; the runner measures it.
 	if cfg.Agent.Harness == config.HarnessPi {
@@ -231,9 +232,15 @@ func Supervise(
 	}
 
 	switch {
-	case sessionInUse.Seen():
-		// Ahead of waitErr, which is only ever a bare non-zero exit here and
-		// would bury the one line that says what to do about it. The dispatch
+	case waitErr != nil && inUse.Seen():
+		// Gated on waitErr, not checked alone. claude only ever prints this
+		// refusal on a non-zero exit, so a run that exited ZERO with a real
+		// result line saying this somewhere in its stderr is tool output, not a
+		// refusal -- and rewriting that run to "failed" would throw away
+		// finished agent work and dispatch it again.
+		//
+		// It is ordered ahead of the bare waitErr case, which would otherwise
+		// bury the one message that says what to do about it. The dispatch
 		// still FAILS: failing is what marks the issue for retry, and the retry
 		// resumes rather than starting because SessionStarted is set above.
 		res.Status = store.StatusFailed
@@ -365,9 +372,13 @@ func agentEnv() []string {
 // release may extend it.
 const windDownNotice = "Background tasks still running after"
 
-// sessionInUseNotice is what claude writes to stderr when --session-id names a
-// session it already holds. It is matched as a substring: the full line quotes
-// the identifier.
+// sessionInUse matches what claude writes to stderr when --session-id names a
+// session it already holds.
+//
+// It is a pattern, not the bare substring "is already in use". stderr carries
+// megabytes of tool output, and any of it saying "port 3000 is already in use"
+// would otherwise be read as this refusal -- recording a session that never
+// existed, which wedges the loop the same way in the opposite direction.
 //
 // Seeing it is PROOF the session exists, which is the one thing the run that
 // created it may have failed to report -- a killed run writes no result line,
@@ -375,7 +386,7 @@ const windDownNotice = "Background tasks still running after"
 // An issue in that state dispatched a start against its own session id forever,
 // at no cost, so the retry budget never ran down and it never parked. Treating
 // the refusal as evidence lets the next tick resume and the loop heal itself.
-const sessionInUseNotice = "is already in use"
+var sessionInUse = regexp.MustCompile(`Session ID \S+ is already in use`)
 
 // claudeEnv returns the claude-specific environment for one dispatch. It is
 // separate from agentEnv because agentEnv also feeds the detached runner hop,
@@ -430,6 +441,51 @@ func (s *sentinelWriter) Write(p []byte) (int, error) {
 // Seen reports whether the marker has appeared. Call it only after Wait: the
 // writer is used from the goroutine that copies the child's stderr.
 func (s *sentinelWriter) Seen() bool { return s.seen }
+
+// patternWriter passes writes through to w and records whether re holds a
+// match anywhere in the stream.
+//
+// It is sentinelWriter's rule with a regexp instead of a fixed marker, and it
+// keeps the same tail so a match split across two writes is still found: which
+// bytes land in which Write is decided by the pipe, not by the child, and a
+// matcher that depended on that would fail in production and pass in a test
+// that wrote the line whole.
+type patternWriter struct {
+	w    io.Writer
+	re   *regexp.Regexp
+	tail []byte
+	seen bool
+}
+
+// patternTail is how many trailing bytes are carried into the next Write. A
+// regexp has no fixed width, so the tail is a bound rather than a derived
+// length: it must exceed the longest line the pattern can match. claude's
+// refusal is well under 200 bytes.
+const patternTail = 512
+
+func newPatternWriter(w io.Writer, re *regexp.Regexp) *patternWriter {
+	return &patternWriter{w: w, re: re}
+}
+
+func (p *patternWriter) Write(b []byte) (int, error) {
+	if !p.seen {
+		joined := make([]byte, 0, len(p.tail)+len(b))
+		joined = append(append(joined, p.tail...), b...)
+		if p.re.Match(joined) {
+			p.seen = true
+			p.tail = nil
+		} else if len(joined) > patternTail {
+			p.tail = joined[len(joined)-patternTail:]
+		} else {
+			p.tail = joined
+		}
+	}
+	return p.w.Write(b)
+}
+
+// Seen reports whether the pattern has matched. Call it only after Wait: the
+// writer is used from the goroutine that copies the child's stderr.
+func (p *patternWriter) Seen() bool { return p.seen }
 
 func exitCodeOf(err error) int {
 	var ee *exec.ExitError

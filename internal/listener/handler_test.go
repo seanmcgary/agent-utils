@@ -1131,24 +1131,31 @@ func TestAnAcceptedDeliveryLogsTheIssueItNames(t *testing.T) {
 // The handler must report a merge, and must NOT report anything else as one.
 // MergedInto is what arms a repository-wide sweep, so a false positive here is
 // the regression Worker.RunIssue records, reintroduced at the front door.
+//
+// wantClosed covers the OTHER derivation on the same lines. ClosedPR is the
+// front-door gate on loopcmd.CleanupClosedPR, which DELETES worktrees, so a
+// false positive there deletes work for any delivery at all.
 func TestHandlerReportsOnlyAMergedPullRequestAsAMerge(t *testing.T) {
 	cases := []struct {
-		name    string
-		event   string
-		payload string
-		want    string
+		name       string
+		event      string
+		payload    string
+		want       string
+		wantClosed bool
 	}{
 		{
-			name:    "a merged pull request",
-			event:   "pull_request",
-			payload: `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":true,"base":{"ref":"master"}}}`,
-			want:    "master",
+			name:       "a merged pull request",
+			event:      "pull_request",
+			payload:    `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":true,"base":{"ref":"master"}}}`,
+			want:       "master",
+			wantClosed: true,
 		},
 		{
-			name:    "a closed but unmerged pull request",
-			event:   "pull_request",
-			payload: `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":false,"base":{"ref":"master"}}}`,
-			want:    "",
+			name:       "a closed but unmerged pull request",
+			event:      "pull_request",
+			payload:    `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":false,"base":{"ref":"master"}}}`,
+			want:       "",
+			wantClosed: true,
 		},
 		{
 			// GitHub sends merged: true on later pull_request actions too.
@@ -1176,6 +1183,17 @@ func TestHandlerReportsOnlyAMergedPullRequestAsAMerge(t *testing.T) {
 			want:    "",
 		},
 		{
+			// The base ref is attacker-shaped text. ghub.SafeRef rejects a
+			// leading dash, which git would read as an option, and a rejected
+			// ref leaves MergedInto empty so no sweep is armed. The close is
+			// still a close, so ClosedPR stays true.
+			name:       "a merge whose base ref is not a safe git ref",
+			event:      "pull_request",
+			payload:    `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":true,"base":{"ref":"--upload-pack=evil"}}}`,
+			want:       "",
+			wantClosed: true,
+		},
+		{
 			name:    "an issue delivery",
 			event:   "issues",
 			payload: `{"action":"labeled","repository":{"full_name":"o/r"},"issue":{"number":7}}`,
@@ -1199,6 +1217,9 @@ func TestHandlerReportsOnlyAMergedPullRequestAsAMerge(t *testing.T) {
 			got := waitTick(t, tickCh)
 			if got.mergedInto != tc.want {
 				t.Errorf("mergedInto = %q, want %q", got.mergedInto, tc.want)
+			}
+			if got.closedPR != tc.wantClosed {
+				t.Errorf("closedPR = %v, want %v", got.closedPR, tc.wantClosed)
 			}
 			if got.number != 7 {
 				t.Errorf("number = %d, want 7", got.number)
