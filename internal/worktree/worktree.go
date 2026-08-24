@@ -124,15 +124,37 @@ func (m *Manager) Remove(path string) error {
 	return nil
 }
 
+// Dirty reports whether path has uncommitted changes.
+//
+// A path that does not exist is not dirty and not an error: Remove is
+// idempotent on an absent path, and a caller deciding whether removal will
+// destroy something must get the same answer for a worktree that is simply
+// already gone.
+func (m *Manager) Dirty(path string) (bool, error) {
+	if !exists(path) {
+		return false, nil
+	}
+	out, err := m.gitOutput(path, "status", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
 func (m *Manager) git(dir string, args ...string) error {
+	_, err := m.gitOutput(dir, args...)
+	return err
+}
+
+func (m *Manager) gitOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("git %s in %s: %w: %s",
+		return "", fmt.Errorf("git %s in %s: %w: %s",
 			strings.Join(args, " "), dir, err, redact(strings.TrimSpace(string(out))))
 	}
-	return nil
+	return string(out), nil
 }
 
 // credentialInURL matches the userinfo part of a remote URL, and the two GitHub

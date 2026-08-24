@@ -527,6 +527,12 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			mergedInto = body.PullRequest.Base.Ref
 		}
 
+		// closedPR is what arms worktree cleanup, and it is deliberately wider
+		// than mergedInto: the operator's decision (see loopcmd.CleanupClosedPR)
+		// is to remove a closed pull request's worktrees on ANY close, merged
+		// or not, so this checks only the action, not the merged flag.
+		closedPR := event == "pull_request" && body.Action == "closed"
+
 		// 9. GitHub redelivers on timeout and on manual "Redeliver," and the
 		// plaintext hop behind a reverse proxy makes a captured delivery
 		// replayable forever. A repeat is answered 200 without a second Tick.
@@ -625,23 +631,30 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if mergedInto != "" {
 				attrs = append(attrs, "merged_into", safeText(mergedInto))
 			}
+			if closedPR {
+				attrs = append(attrs, "closed_pr", true)
+			}
 			slog.Info("accepted delivery", attrs...)
 
 			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.sem }()
 				defer s.wg.Done()
-				s.Tick(ctx, Delivery{Repo: repo, Number: number, MergedInto: mergedInto})
+				s.Tick(ctx, Delivery{Repo: repo, Number: number, MergedInto: mergedInto, ClosedPR: closedPR})
 			}()
 		default:
-			// merged_into only when the payload carried one, for the reason
-			// the accepted line gives: an empty value would say nothing while
-			// looking like it said something. It is carried at all because a
-			// dropped merge is lost sweep work, not just one lost issue pass.
+			// merged_into and closed_pr only when the payload carried one, for
+			// the reason the accepted line gives: an empty or false value would
+			// say nothing while looking like it said something. Both are
+			// carried because a dropped merge is lost sweep work and a dropped
+			// close is lost worktree cleanup, not just one lost issue pass.
 			dropped := []any{"delivery", safeDeliveryID(deliveryID),
 				"repo", repo, "number", number}
 			if mergedInto != "" {
 				dropped = append(dropped, "merged_into", safeText(mergedInto))
+			}
+			if closedPR {
+				dropped = append(dropped, "closed_pr", true)
 			}
 			slog.Warn("dropping delivery: worker pool full", dropped...)
 		}

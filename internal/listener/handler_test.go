@@ -81,6 +81,7 @@ type tickCall struct {
 	repo       string
 	number     int
 	mergedInto string
+	closedPR   bool
 }
 
 // newServer builds a Server wired to tickCh: the fake Tick sends the repo
@@ -92,7 +93,7 @@ func newServer(t *testing.T, tickCh chan<- tickCall) *Server {
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
 		Tick: func(_ context.Context, d Delivery) {
-			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto}
+			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto, closedPR: d.ClosedPR}
 		},
 	})
 	if err != nil {
@@ -378,7 +379,7 @@ func TestSecretIsReReadPerRequest(t *testing.T) {
 		t.Fatalf("status = %d, want 202: the rotated secret must be picked up without a restart", resp.StatusCode)
 	}
 	if got := waitTick(t, tickCh); got.repo != "octo/hello" {
-		t.Fatalf("Tick repo = %q", got)
+		t.Fatalf("Tick repo = %q", got.repo)
 	}
 
 	// And the old secret is genuinely no longer accepted.

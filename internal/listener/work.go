@@ -158,7 +158,13 @@ type Worker struct {
 	// and nothing more; see RunIssue for the reconcile that was removed and
 	// must not come back.
 	RunTend func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, base string) (loopcmd.Summary, error)
-	Now     func() time.Time
+	// RunCleanup removes the worktree of a pull request that just closed, and
+	// the worktree of the issue it closes, once neither is in use. Production
+	// wires it to loopcmd.CleanupClosedPR. prNumber is the delivery's number:
+	// Delivery.ClosedPR is only set on a pull_request delivery, so the number
+	// IS the pull request's.
+	RunCleanup func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, prNumber int) error
+	Now        func() time.Time
 	// After schedules f. It is a seam: production wires it to time.AfterFunc,
 	// and a test substitutes a controlled clock. Without it the retry tests
 	// would have to sleep for the real delays, which the acceptance forbids.
@@ -201,6 +207,7 @@ func NewWorker(db *store.DB) *Worker {
 		Open:            loopcmd.Open,
 		RunIssue:        loopcmd.TickIssue,
 		RunTend:         loopcmd.TendSweep,
+		RunCleanup:      loopcmd.CleanupClosedPR,
 		Now:             time.Now,
 		After:           time.AfterFunc,
 		OpenRetryDelay:  defaultOpenRetryDelay,
@@ -239,6 +246,13 @@ type Delivery struct {
 	// repository-wide sweep. See Worker.Deliver for the regression that makes
 	// this the important property of this type.
 	MergedInto string
+	// ClosedPR is true when this delivery closed a pull request, merged or
+	// not. It is what arms worktree cleanup: on any close the pr-<N>
+	// worktree (and, when the pull request closes one, the issue-<M>
+	// worktree) is a checkout nothing will push to again. See
+	// loopcmd.CleanupClosedPR for the operator's decision to remove both on
+	// ANY close, not only a merge.
+	ClosedPR bool
 }
 
 // IsMergeInto reports whether this delivery merged a pull request into branch.
@@ -440,6 +454,13 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	if cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch) {
 		w.armTend(ctx, t, cfg.DefaultBranch)
 	}
+
+	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
+	// for the operator's decision -- so it is gated on ClosedPR alone, not on
+	// cfg.TendPR or the merge check above.
+	if d.ClosedPR {
+		w.cleanupPass(ctx, t, d, cfg, deps)
+	}
 }
 
 // issuePass runs the ONE issue this delivery named and decides what the
@@ -563,6 +584,33 @@ func (w *Worker) tendPass(
 			return
 		}
 		slog.Error("tend sweep failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
+	}
+}
+
+// cleanupPass removes the worktrees a closed pull request leaves behind.
+//
+// It runs on every close, merged or not: an unmerged close often means the
+// work continues and a replacement gets pushed, but the operator chose to
+// reclaim the disk rather than guess. See loopcmd.CleanupClosedPR for the
+// live-dispatch guard that keeps this from touching work in progress -- it
+// does not protect uncommitted, unpushed work sitting in an otherwise idle
+// worktree, which is the accepted risk.
+//
+// A failure is logged and dropped, like a failed tend sweep: it schedules no
+// retry, because a retry re-runs the issue pass, and a cleanup failure is not
+// something that pass caused or could fix. The worktree, if it survived,
+// simply waits for this loop's next closed-pull-request delivery.
+func (w *Worker) cleanupPass(
+	ctx context.Context, t Target, d Delivery, cfg *config.Config, deps loopcmd.Deps,
+) {
+	if err := w.RunCleanup(ctx, cfg, deps, d.Number); err != nil {
+		if errors.Is(err, lock.ErrHeld) {
+			slog.Info("skipping worktree cleanup: another tick holds the loop lock",
+				"loop", cfg.Name, "project", t.ProjectName, "pr", d.Number)
+			return
+		}
+		slog.Error("worktree cleanup failed", "loop", cfg.Name, "project", t.ProjectName,
+			"pr", d.Number, "err", err)
 	}
 }
 

@@ -120,6 +120,9 @@ type harness struct {
 	// tendFn decides what the RunTend seam returns. Nil means every sweep
 	// succeeds.
 	tendFn func(cfg *config.Config) error
+	// cleanupFn decides what the RunCleanup seam returns. Nil means every
+	// cleanup succeeds.
+	cleanupFn func(cfg *config.Config) error
 
 	mu           sync.Mutex
 	tokenErr     error
@@ -136,7 +139,10 @@ type harness struct {
 	ranIssues []int
 	// tends records "loop@base" for each sweep RunTend was asked to run, in
 	// order, guarded by mu like ran and ranIssues.
-	tends    []string
+	tends []string
+	// cleaned records "loop@prNumber" for each pull request RunCleanup was
+	// asked to clean up, in order, guarded by mu like tends.
+	cleaned  []string
 	cleanups int
 	backoff  []time.Duration
 	max      int
@@ -165,6 +171,7 @@ func newHarness(db *store.DB) *harness {
 	w.Open = h.open
 	w.RunIssue = h.runIssue
 	w.RunTend = h.runTend
+	w.RunCleanup = h.runCleanup
 	w.Targets = h.targetsSeam
 	w.TargetFor = func(projectID, loop string) (Target, Routing, error) {
 		if h.targetFor != nil {
@@ -294,6 +301,22 @@ func (h *harness) runTend(
 	return loopcmd.Summary{}, nil
 }
 
+// runCleanup is the fake RunCleanup seam. It records "loop@prNumber" for each
+// pull request it was asked to clean up, so a test can prove which loop
+// cleaned up which pull request's worktrees.
+func (h *harness) runCleanup(
+	_ context.Context, cfg *config.Config, _ loopcmd.Deps, prNumber int,
+) error {
+	h.mu.Lock()
+	h.cleaned = append(h.cleaned, fmt.Sprintf("%s@%d", cfg.Name, prNumber))
+	fn := h.cleanupFn
+	h.mu.Unlock()
+	if fn != nil {
+		return fn(cfg)
+	}
+	return nil
+}
+
 // deliveryGH is a ghub.Client that records the numbers it was asked to fetch.
 // Only the issue fetch is exercised here; the scoped tick's own use of the
 // rest is covered in internal/loopcmd.
@@ -376,6 +399,14 @@ func (h *harness) tendedLoops() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]string(nil), h.tends...)
+}
+
+// cleanedPRs returns "loop@prNumber" for each cleanup, in order, like
+// tendedLoops does for sweeps.
+func (h *harness) cleanedPRs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.cleaned...)
 }
 
 // openWorkDB returns an empty canonical state database in a temporary
@@ -1606,6 +1637,78 @@ func TestDeliverDoesNotRetryAFailedTendSweep(t *testing.T) {
 	// The sweep failed. No SECOND timer may exist.
 	if got := h.timers.len(); got != 1 {
 		t.Errorf("armed %d timers after a failed sweep, want 1: a sweep must not schedule a retry", got)
+	}
+	if got := h.pendingLen(); got != 0 {
+		t.Errorf("pending retries = %d, want 0", got)
+	}
+}
+
+// A closed pull request runs cleanup at once -- no timer, unlike a sweep --
+// and only when the delivery reports a close.
+func TestDeliverRunsCleanupOnlyWhenTheDeliveryClosedAPullRequest(t *testing.T) {
+	cases := []struct {
+		name     string
+		delivery Delivery
+		wantRun  bool
+	}{
+		{"a merged close", Delivery{Repo: "o/r", Number: 11, MergedInto: "master", ClosedPR: true}, true},
+		{"an unmerged close", Delivery{Repo: "o/r", Number: 11, ClosedPR: true}, true},
+		{"not a close", Delivery{Repo: "o/r", Number: 11}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(nil)
+			h.targets = []Target{h.target("planning")}
+
+			h.w.Deliver(context.Background(), tc.delivery)
+
+			got := h.cleanedPRs()
+			if tc.wantRun {
+				if len(got) != 1 || got[0] != "planning@11" {
+					t.Errorf("cleaned = %v, want [planning@11]", got)
+				}
+			} else if len(got) != 0 {
+				t.Errorf("cleaned = %v, want none", got)
+			}
+		})
+	}
+}
+
+// Cleanup runs even when the loop does not tend and even when the merge
+// landed on a branch other than the loop's default -- ClosedPR is the only
+// gate, unlike the sweep, which also checks TendPR and IsMergeInto.
+func TestDeliverRunsCleanupRegardlessOfTendPRAndDefaultBranch(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.tendPR = false
+	h.defaultBranch = "master"
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 11, MergedInto: "feature", ClosedPR: true})
+
+	if got := h.cleanedPRs(); len(got) != 1 || got[0] != "planning@11" {
+		t.Errorf("cleaned = %v, want [planning@11]", got)
+	}
+	// No sweep was armed: the merge did not land on this loop's default
+	// branch, and this loop does not tend either way.
+	if got := h.timers.len(); got != 0 {
+		t.Errorf("armed %d timers, want 0", got)
+	}
+}
+
+// A failed cleanup is logged and dropped, exactly like a failed sweep: it
+// must not schedule a retry, because the retry path re-runs the issue pass,
+// which did nothing wrong.
+func TestDeliverDoesNotRetryAFailedCleanup(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.max = 3
+	h.backoff = []time.Duration{0, 0, 0}
+	h.cleanupFn = func(*config.Config) error { return errors.New("cleanup failed") }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 11, ClosedPR: true})
+
+	if got := h.timers.len(); got != 0 {
+		t.Errorf("armed %d timers, want 0: a failed cleanup must not schedule a retry", got)
 	}
 	if got := h.pendingLen(); got != 0 {
 		t.Errorf("pending retries = %d, want 0", got)
