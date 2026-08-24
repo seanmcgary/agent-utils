@@ -321,3 +321,48 @@ func TestCleanupClosedPRIgnoresTheIssueLinkOfAnUntrustedPullRequest(t *testing.T
 		t.Errorf("the pr worktree should still be removed: %v", err)
 	}
 }
+
+// The gate defaults to ON, and an explicit false turns it off without a
+// rebuild. Absent and explicit-false must not be the same thing: a plain bool
+// would read an absent field as false and silently stop cleaning up.
+func TestCleanupClosedPRHonoursTheConfigGate(t *testing.T) {
+	cases := []struct {
+		name       string
+		set        *bool
+		wantRemove bool
+	}{
+		{"absent means on", nil, true},
+		{"explicitly on", boolPtr(true), true},
+		{"explicitly off", boolPtr(false), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := cleanupConfig(t)
+			cfg.CleanupClosedPR = tc.set
+			gh := &fakeGH{prs: []ghub.PullRequest{closingPRFixture(11, 1)}}
+			spawned := 0
+			deps := newDeps(t, cfg, gh, &spawned)
+
+			issuePath, err := deps.WT.EnsureIssue(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := CleanupClosedPR(context.Background(), cfg, deps, 11); err != nil {
+				t.Fatalf("CleanupClosedPR: %v", err)
+			}
+
+			_, statErr := os.Stat(issuePath)
+			removed := os.IsNotExist(statErr)
+			if removed != tc.wantRemove {
+				t.Errorf("worktree removed = %v, want %v", removed, tc.wantRemove)
+			}
+			// A disabled gate must cost no API call either.
+			if !tc.wantRemove && len(gh.fetchedPRs) != 0 {
+				t.Errorf("fetched %d pull requests while disabled, want 0", len(gh.fetchedPRs))
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

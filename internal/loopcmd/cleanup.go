@@ -48,6 +48,12 @@ import (
 // this same delivery (see loopcmd.TickIssue -> subject) already fetched this
 // exact number, so this read is served from that memo.
 func CleanupClosedPR(ctx context.Context, cfg *config.Config, deps Deps, prNumber int) error {
+	// Checked before the lock and before any read, as TendSweep checks TendPR:
+	// a loop that does not clean up must cost nothing, whoever calls.
+	if !cfg.CleanupClosedPREnabled() {
+		return nil
+	}
+
 	l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
 	if err != nil {
 		return err

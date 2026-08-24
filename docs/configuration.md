@@ -198,6 +198,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.timeout` | duration | yes | — |
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
 | `tend_pr` | bool | no | `false` |
+| `cleanup_closed_pr` | bool | no | `true` |
 | `retry.max` | int | no | `0`, meaning never retry |
 | `retry.backoff` | list of duration | yes if `retry.max > 0` | empty |
 | `retry.backoff_ticks` (removed) | — | — | — |
@@ -618,6 +619,33 @@ request population you trust.
 i_understand_bypass_permissions: true
 ```
 
+## `cleanup_closed_pr`
+
+Whether a closed pull request's worktrees are removed. Default `true`.
+
+When GitHub reports a pull request closed — merged or not — the loop removes that pull
+request's `pr-<N>` worktree, and the `issue-<M>` worktree of the issue it closes, as soon as
+neither has a live dispatch. Nothing else in this program removes a worktree, and one of a large
+repository is easily hundreds of megabytes, so a loop left to run would fill the disk.
+
+It defaults on because that is the useful behavior, and it exists as a field because the action
+is destructive and starts from a webhook. An operator who wants the loop without the deletion
+should not have to rebuild to get there.
+
+Two limits apply, and neither is configurable:
+
+- The `Closes #M` link is honoured only for a **trusted** pull request — one whose head is in
+  this repository and whose author is an `OWNER`, `MEMBER`, or `COLLABORATOR`. An outside
+  contributor cannot name someone else's issue and have its work deleted. The `pr-<N>` worktree
+  is removed either way, because that number comes from the delivery rather than from body text.
+- The live-dispatch guard protects work **in progress**, not uncommitted or unpushed work in an
+  idle worktree. That is removed too. The log names any worktree that had uncommitted changes or
+  unpushed commits when it went.
+
+```yaml
+cleanup_closed_pr: false   # keep the worktrees
+```
+
 ## `tend_pr`
 
 Whether the loop rebases stale pull requests. Default `false`.
@@ -661,7 +689,7 @@ per merge, and it dispatches at most ten rebases. If more pull requests are behi
 the rest are named in the log line and wait for the next merge.
 
 **A closed pull request has its worktrees removed.** This is separate from `tend_pr` and is not
-gated by it. When GitHub reports a pull request closed — merged or not — the loop removes that
+gated by it; `cleanup_closed_pr` turns it off. When GitHub reports a pull request closed — merged or not — the loop removes that
 pull request's `pr-<N>` worktree, and the `issue-<M>` worktree of the issue it closes, as soon
 as neither has a live dispatch. A worktree of a large repository is easily hundreds of
 megabytes, and nothing removed one before.
