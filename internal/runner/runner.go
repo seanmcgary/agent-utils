@@ -182,7 +182,10 @@ func Supervise(
 	// of tool noise, and a post-hoc read would have to choose between reading
 	// all of it and reading a tail that the notice may not be in.
 	abandoned := newSentinelWriter(errFile, windDownNotice)
-	cmd.Stderr = abandoned
+	// Chained, so one stderr stream is watched for both markers. Each writer
+	// passes every byte through to the next, so the log is unchanged.
+	sessionInUse := newSentinelWriter(abandoned, sessionInUseNotice)
+	cmd.Stderr = sessionInUse
 
 	if err := cmd.Start(); err != nil {
 		return finish(cfg, st, d, store.DispatchResult{
@@ -217,8 +220,10 @@ func Supervise(
 		DurationMS: result.DurationMS,
 		APIError:   result.APIError,
 		// A session identifier in the stream proves the agent created the session,
-		// whatever happened afterwards.
-		SessionStarted: result.SessionID != "",
+		// whatever happened afterwards -- and so does claude refusing the id as
+		// already in use, which is the only evidence left when the run that
+		// created it was killed before it wrote anything this program parses.
+		SessionStarted: result.SessionID != "" || sessionInUse.Seen(),
 	}
 	// pi reports no wall-clock duration in its stream; the runner measures it.
 	if cfg.Agent.Harness == config.HarnessPi {
@@ -226,6 +231,15 @@ func Supervise(
 	}
 
 	switch {
+	case sessionInUse.Seen():
+		// Ahead of waitErr, which is only ever a bare non-zero exit here and
+		// would bury the one line that says what to do about it. The dispatch
+		// still FAILS: failing is what marks the issue for retry, and the retry
+		// resumes rather than starting because SessionStarted is set above.
+		res.Status = store.StatusFailed
+		res.ExitCode = exitCodeOf(waitErr)
+		res.APIError = "claude refused the session id as already in use; the " +
+			"session is recorded as started, so the next tick resumes it"
 	case waitErr != nil:
 		res.Status = store.StatusFailed
 		res.ExitCode = exitCodeOf(waitErr)
@@ -350,6 +364,18 @@ func agentEnv() []string {
 // full line names a duration that changes with the ceiling, and a future
 // release may extend it.
 const windDownNotice = "Background tasks still running after"
+
+// sessionInUseNotice is what claude writes to stderr when --session-id names a
+// session it already holds. It is matched as a substring: the full line quotes
+// the identifier.
+//
+// Seeing it is PROOF the session exists, which is the one thing the run that
+// created it may have failed to report -- a killed run writes no result line,
+// and before ParseStream harvested the id from the system event, that lost it.
+// An issue in that state dispatched a start against its own session id forever,
+// at no cost, so the retry budget never ran down and it never parked. Treating
+// the refusal as evidence lets the next tick resume and the loop heal itself.
+const sessionInUseNotice = "is already in use"
 
 // claudeEnv returns the claude-specific environment for one dispatch. It is
 // separate from agentEnv because agentEnv also feeds the detached runner hop,
