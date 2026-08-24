@@ -622,7 +622,8 @@ i_understand_bypass_permissions: true
 
 Whether the loop rebases stale pull requests. Default `false`.
 
-When true, on every tick, for each issue carrying `labels.review`:
+When true, for each issue carrying `labels.review`, on every tick and also when a merge sweeps
+the loop (see below):
 
 1. Find the open pull request whose body closes it (`Closes #N`, `Fixes #N`, `Resolves #N`).
 2. Ask the GitHub API how far behind its base it is.
@@ -641,6 +642,27 @@ Three safeguards apply:
   own build agent is committing to.
 - **Tending never changes a label**, and each tend run gets a fresh session, because a rebase
   is idempotent and needs no memory of an earlier one.
+
+**Two things dispatch a tend agent.** A delivery for one issue — the issue carries
+`labels.review`, its linked pull request is behind its base, and the delivery named that issue.
+And a merge into `default_branch`: GitHub sends a `pull_request` delivery with `merged: true`,
+and because the merge is what made every other pull request stale while naming none of them,
+that one delivery sweeps the loop. Every issue carrying `labels.review` whose linked pull
+request targets `default_branch` and is now behind gets a tend dispatch.
+
+A pull request targeting any other branch is left alone. A merge into `master` says nothing
+about a branch based on `release/1.0`.
+
+The sweep dispatches **tend agents only**. It never starts, resumes, or retries an issue agent,
+and it never parks an issue. A merge is a reason to rebase; it is not a reason to start work.
+
+A sweep waits about a minute before it runs, so a merge train produces one sweep rather than one
+per merge, and it dispatches at most ten rebases. If more pull requests are behind than that,
+the rest are named in the log and wait for the next merge.
+
+**A sweep does not replace a periodic tick.** `agent-utils project loop tick` is still the only
+full reconcile: it is what retires a dead runner for an issue no delivery names, and what finds
+a pull request that fell behind for any reason other than a merge. Schedule it.
 
 **Set this `false` for a planning loop.** `plan-feature` opens a design draft pull request
 whose body also says `Closes #N`, so a planning loop with tending on would force-push a draft
