@@ -31,6 +31,12 @@ const (
 	// or a row whose deadline stays in the past would otherwise spin the
 	// wake loop.
 	defaultMinWakeInterval = 30 * time.Second
+	// defaultTendDelay is how long a merge waits before its tend sweep runs,
+	// so a merge train produces one sweep rather than one per merge. The loop
+	// lock only collapses sweeps that OVERLAP; merges a minute apart do not,
+	// and a tend agent that has already finished suppresses nothing, so an
+	// uncoalesced train multiplies by the number of merges in it.
+	defaultTendDelay = time.Minute
 )
 
 // openRetryMax caps the retries for a failure that happened inside
@@ -111,6 +117,12 @@ func (a *attempt) counter(kind retryKind) *int {
 	return &a.n
 }
 
+// tendTimer is one loop's armed tend sweep. It is a pointer so armTend can
+// tell ITS entry from one a later merge registered after this timer fired.
+type tendTimer struct {
+	timer *time.Timer // guarded by Worker.mu
+}
+
 // Worker turns a delivery, or a retry deadline that has passed, into a tick.
 //
 // Every collaborator is a field so the acceptance tests can be written
@@ -142,7 +154,23 @@ type Worker struct {
 	// see loopcmd.Tick -- and running it per delivery burned a token budget on
 	// every open issue of every project watching the repository.
 	RunIssue func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, number int) (loopcmd.Summary, error)
-	Now      func() time.Time
+	// RunTend rebases the stale pull requests of one loop, taking the loop's
+	// lock itself. Production wires it to loopcmd.TendSweep. base is the branch
+	// the merge landed on.
+	//
+	// It runs for ONE delivery -- a pull request merged into the loop's default
+	// branch -- because that is the only event that makes many pull requests
+	// stale at once and names none of them. Every other delivery gets RunIssue
+	// and nothing more; see RunIssue for the reconcile that was removed and
+	// must not come back.
+	RunTend func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, base string) (loopcmd.Summary, error)
+	// RunCleanup removes the worktree of a pull request that just closed, and
+	// the worktree of the issue it closes, once neither is in use. Production
+	// wires it to loopcmd.CleanupClosedPR. prNumber is the delivery's number:
+	// Delivery.ClosedPR is only set on a pull_request delivery, so the number
+	// IS the pull request's.
+	RunCleanup func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, prNumber int) error
+	Now        func() time.Time
 	// After schedules f. It is a seam: production wires it to time.AfterFunc,
 	// and a test substitutes a controlled clock. Without it the retry tests
 	// would have to sleep for the real delays, which the acceptance forbids.
@@ -152,6 +180,7 @@ type Worker struct {
 	OpenRetryDelay  time.Duration // default 1m
 	MinRetryDelay   time.Duration // default 30s
 	MinWakeInterval time.Duration // default 30s
+	TendDelay       time.Duration // default 1m
 
 	mu      sync.Mutex
 	pending map[loopKey]*attempt // guarded by mu
@@ -160,6 +189,13 @@ type Worker struct {
 	// entry is dropped as soon as the loop routes again OR as soon as a wake
 	// cannot tell, so only agreeing observations accumulate.
 	orphans map[loopKey]int // guarded by mu
+	// tends holds the armed tend timer of each loop, guarded by mu. A merge
+	// arriving while one is armed rides it rather than arming a second.
+	//
+	// Named tends, not sweeps: "sweep" already means the full reconcile in
+	// this program (see loopcmd.Tick), and a bare SweepDelay beside
+	// OpenRetryDelay would read as a delay before that.
+	tends map[loopKey]*tendTimer // guarded by mu
 	// unroutable throttles the "cannot route this deadline" warning per
 	// loop; it carries its own lock. See warnUnroutable.
 	unroutable *throttledLog
@@ -180,13 +216,17 @@ func NewWorker(db *store.DB) *Worker {
 		NewClient:       func(token string) ghub.Client { return ghub.New(token) },
 		Open:            loopcmd.Open,
 		RunIssue:        loopcmd.TickIssue,
+		RunTend:         loopcmd.TendSweep,
+		RunCleanup:      loopcmd.CleanupClosedPR,
 		Now:             time.Now,
 		After:           time.AfterFunc,
 		OpenRetryDelay:  defaultOpenRetryDelay,
 		MinRetryDelay:   defaultMinRetryDelay,
 		MinWakeInterval: defaultMinWakeInterval,
+		TendDelay:       defaultTendDelay,
 		pending:         make(map[loopKey]*attempt),
 		orphans:         make(map[loopKey]int),
+		tends:           make(map[loopKey]*tendTimer),
 		unroutable:      newThrottledLog(unroutableLogInterval),
 	}
 	// The throttle reads the Worker's OWN clock, and reads it late: a test
@@ -194,6 +234,44 @@ func NewWorker(db *store.DB) *Worker {
 	// leave it waiting a real ten minutes.
 	w.unroutable.now = func() time.Time { return w.Now() }
 	return w
+}
+
+// Delivery is what one accepted webhook delivery tells the worker.
+//
+// It replaced a bare (repo, number) pair because a merged pull request must
+// start more work than an ordinary delivery, and the handler cannot judge
+// that on its own: the decision needs a loop's default_branch, and one
+// repository may be watched by several loops with different ones.
+type Delivery struct {
+	// Repo is the "owner/name" the delivery named. handleWebhook has already
+	// matched it against repoFullName, so nothing downstream re-validates it.
+	Repo string
+	// Number is the issue or pull request the delivery named. Every accepted
+	// delivery carries one; handleWebhook rejects a delivery without one
+	// rather than answering 202 for work it cannot name.
+	Number int
+	// MergedInto is the base branch of a pull request this delivery reports as
+	// MERGED, and is empty for every other delivery. Empty is the only safe
+	// default: it is what keeps an opened issue or a moved label from arming a
+	// repository-wide sweep. See Worker.Deliver for the regression that makes
+	// this the important property of this type.
+	MergedInto string
+	// ClosedPR is true when this delivery closed a pull request, merged or
+	// not. It is what arms worktree cleanup: on any close the pr-<N>
+	// worktree (and, when the pull request closes one, the issue-<M>
+	// worktree) is a checkout nothing will push to again. See
+	// loopcmd.CleanupClosedPR for the operator's decision to remove both on
+	// ANY close, not only a merge.
+	ClosedPR bool
+}
+
+// IsMergeInto reports whether this delivery merged a pull request into branch.
+//
+// An empty branch never matches, even against an empty MergedInto. A loop with
+// no default_branch names no branch to compare against, so "they are both
+// empty" is not agreement, it is two absent values.
+func (d Delivery) IsMergeInto(branch string) bool {
+	return branch != "" && d.MergedInto == branch
 }
 
 // Deliver evaluates ONE issue of repo in every loop that watches it, and acts
@@ -216,17 +294,17 @@ func NewWorker(db *store.DB) *Worker {
 // each keeps its own state and spends its own budget. The log lines here and in
 // handler.go are what makes the chain delivery -> repository -> issue -> loops
 // readable after the fact.
-func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
-	targets, err := w.Targets(repo)
+func (w *Worker) Deliver(ctx context.Context, d Delivery) {
+	targets, err := w.Targets(d.Repo)
 	if err != nil {
 		// Logged and dropped: the routing failure is machine-wide (the
 		// registry could not be read), so there is no single loop to record
 		// it against and nothing a retry timer could usefully re-run.
-		slog.Error("cannot route delivery", "repo", repo, "err", err)
+		slog.Error("cannot route delivery", "repo", d.Repo, "err", err)
 		return
 	}
 	if len(targets) == 0 {
-		slog.Info("no loop watches this repository", "repo", repo)
+		slog.Info("no loop watches this repository", "repo", d.Repo)
 		return
 	}
 	// The non-zero case is logged too, not only the zero one. Without it the
@@ -246,7 +324,7 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 	// What each loop DECIDED belongs to the per-loop tick line, which carries
 	// a reason now.
 	slog.Info("evaluating this issue in every loop that watches the repository",
-		"repo", repo, "number", number, "loops", loops)
+		"repo", d.Repo, "number", d.Number, "loops", loops)
 
 	// One token read, one client, one memo, for the whole delivery -- created
 	// HERE and dropped when Deliver returns. See access: the lifetime is the
@@ -256,7 +334,7 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 		// Reported once for the delivery rather than once per loop: the token
 		// is machine-wide, so every loop would have failed on the identical
 		// read. No retry is scheduled, for the reason access states.
-		slog.Error("cannot read the github token", "repo", repo, "number", number,
+		slog.Error("cannot read the github token", "repo", d.Repo, "number", d.Number,
 			"loops", loops, "err", err)
 		return
 	}
@@ -265,7 +343,7 @@ func (w *Worker) Deliver(ctx context.Context, repo string, number int) {
 		// Sequential, and one target's failure never returns early: the
 		// loops that share a repository are separate projects with separate
 		// state, and one broken project must not strand the others.
-		w.tickOne(ctx, t, number, acc)
+		w.tickOne(ctx, t, d, acc)
 	}
 }
 
@@ -332,7 +410,11 @@ func (w *Worker) tickFresh(ctx context.Context, t Target, number int) {
 			"project", t.ProjectName, "issue", number, "err", err)
 		return
 	}
-	w.tickOne(ctx, t, number, acc)
+	// A retry re-runs the ISSUE pass only. A retry may fire minutes after the
+	// merge that caused it, and a sweep then is not what that merge asked for:
+	// the base has moved again or has not, and the next merge arms a sweep
+	// either way. MergedInto is left empty here on purpose.
+	w.tickOne(ctx, t, Delivery{Repo: t.Repo, Number: number}, acc)
 }
 
 // tickOne acts on one issue in one loop and decides what the outcome means
@@ -342,7 +424,7 @@ func (w *Worker) tickFresh(ctx context.Context, t Target, number int) {
 // SAME scoped pass rather than widening into a reconcile: a delivery that
 // failed and is retried a minute later must still be about the issue the
 // delivery named.
-func (w *Worker) tickOne(ctx context.Context, t Target, number int, acc *access) {
+func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access) {
 	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
 
 	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
@@ -370,9 +452,33 @@ func (w *Worker) tickOne(ctx context.Context, t Target, number int, acc *access)
 		// retry runs at OpenRetryDelay rather than at some undefined value.
 		slog.Error("cannot open loop", "loop", t.LoopName, "project", t.ProjectName,
 			"config", t.ConfigPath, "err", err)
-		w.schedule(ctx, t, number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		w.schedule(ctx, t, d.Number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
 		return
 	}
+
+	w.issuePass(ctx, t, d, cfg, deps, key)
+
+	// Armed on BOTH paths of the issue pass. The merged pull request's own pass
+	// moves its issue to a terminal state; whether that succeeded says nothing
+	// about the other branches, which are behind because the base moved.
+	if cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch) {
+		w.armTend(ctx, t, cfg.DefaultBranch)
+	}
+
+	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
+	// for the operator's decision -- so it is gated on ClosedPR alone, not on
+	// cfg.TendPR or the merge check above.
+	if d.ClosedPR {
+		w.cleanupPass(ctx, t, d, cfg, deps)
+	}
+}
+
+// issuePass runs the ONE issue this delivery named and decides what the
+// outcome means for the retry schedule.
+func (w *Worker) issuePass(
+	ctx context.Context, t Target, d Delivery, cfg *config.Config, deps loopcmd.Deps, key loopKey,
+) {
+	number := d.Number
 
 	if _, err := w.RunIssue(ctx, cfg, deps, number); err != nil {
 		if errors.Is(err, lock.ErrHeld) {
@@ -395,6 +501,143 @@ func (w *Worker) tickOne(ctx context.Context, t Target, number int, acc *access)
 	}
 
 	w.clear(key)
+}
+
+// armTend schedules the tend sweep a merge calls for, unless one is already
+// armed for this loop.
+//
+// The wait exists because a merge train is normal: several pull requests merge
+// within a few minutes, and each merge leaves every other branch further
+// behind. Sweeping per merge would dispatch up to maxTendPerSweep agents each
+// time, and the loop lock does not prevent it -- the lock only collapses
+// sweeps that OVERLAP, and a sweep whose agents have finished suppresses
+// nothing. Riding the armed timer rather than resetting it bounds the wait, so
+// a long train still gets a sweep every TendDelay rather than none until it
+// stops.
+func (w *Worker) armTend(ctx context.Context, t Target, base string) {
+	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
+
+	w.mu.Lock()
+	if _, armed := w.tends[key]; armed {
+		w.mu.Unlock()
+		slog.Info("a tend sweep is already armed for this loop; riding it",
+			"loop", t.LoopName, "project", t.ProjectName, "base", base)
+		return
+	}
+	// Registered before the timer is built, so a second merge arriving between
+	// these two statements rides this one instead of arming its own.
+	//
+	// The entry is an identity token, not a presence flag. Storing the timer
+	// back below has to know the entry is still THIS arm's: the timer can fire
+	// and delete the entry before the store, a later merge can then register
+	// its own, and a presence check would overwrite that live timer with this
+	// already-fired one -- leaving stopAll stopping a dead timer while a live
+	// one fires after shutdown.
+	ent := &tendTimer{}
+	w.tends[key] = ent
+	w.mu.Unlock()
+
+	timer := w.After(w.TendDelay, func() {
+		w.mu.Lock()
+		if cur, ok := w.tends[key]; ok && cur == ent {
+			delete(w.tends, key)
+		}
+		w.mu.Unlock()
+		// Same rule schedule states: a cancelled context here means the daemon
+		// is shutting down, and a daemon told to stop starts no new agent.
+		if ctx.Err() != nil {
+			return
+		}
+		w.tendFresh(ctx, t, base)
+	})
+
+	w.mu.Lock()
+	if cur, ok := w.tends[key]; ok && cur == ent {
+		cur.timer = timer
+	}
+	w.mu.Unlock()
+
+	slog.Info("armed a tend sweep", "loop", t.LoopName, "project", t.ProjectName,
+		"base", base, "in", w.TendDelay)
+}
+
+// tendFresh reads its own token and opens its own loop, like tickFresh: the
+// access of the delivery that armed the timer is gone with Deliver's frame,
+// and reusing one would decide from labels read a minute ago.
+func (w *Worker) tendFresh(ctx context.Context, t Target, base string) {
+	acc, err := w.access()
+	if err != nil {
+		slog.Error("cannot read the github token for a tend sweep",
+			"loop", t.LoopName, "project", t.ProjectName, "err", err)
+		return
+	}
+	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
+		Token: acc.token, GH: acc.gh, RequireGitHub: true,
+		MigrationPolicy: loopcmd.FailOnUnimported,
+	})
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		slog.Error("cannot open loop for a tend sweep", "loop", t.LoopName,
+			"project", t.ProjectName, "config", t.ConfigPath, "err", err)
+		return
+	}
+	w.tendPass(ctx, t, cfg, deps, base)
+}
+
+// tendPass runs the sweep and decides what its outcome means.
+//
+// Nothing. A failure is logged and dropped, and schedules NO retry: the retry
+// path re-runs the ISSUE pass, so a sweep failure would spend an issue's retry
+// budget on something that issue did not do, and the work is not lost because
+// the next merge arms another sweep.
+func (w *Worker) tendPass(
+	ctx context.Context, t Target, cfg *config.Config, deps loopcmd.Deps, base string,
+) {
+	if _, err := w.RunTend(ctx, cfg, deps, base); err != nil {
+		if errors.Is(err, lock.ErrHeld) {
+			// Re-armed, not dropped. issuePass can drop a delivery that finds
+			// the lock held because the holder decides that same issue a moment
+			// later; TendSweep's own comment records that this reasoning is
+			// FALSE for a sweep, which decides no issue but the ones it tends.
+			// Dropping it here would lose the merge's rebases until another
+			// merge landed. The coalescing map bounds this to one arm in
+			// flight.
+			slog.Info("another tick holds the loop lock; re-arming the tend sweep",
+				"loop", cfg.Name, "project", t.ProjectName)
+			w.armTend(ctx, t, base)
+			return
+		}
+		slog.Error("tend sweep failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
+	}
+}
+
+// cleanupPass removes the worktrees a closed pull request leaves behind.
+//
+// It runs on every close, merged or not: an unmerged close often means the
+// work continues and a replacement gets pushed, but the operator chose to
+// reclaim the disk rather than guess. See loopcmd.CleanupClosedPR for the
+// live-dispatch guard that keeps this from touching work in progress -- it
+// does not protect uncommitted, unpushed work sitting in an otherwise idle
+// worktree, which is the accepted risk.
+//
+// A failure is logged and dropped, like a failed tend sweep: it schedules no
+// retry, because a retry re-runs the issue pass, and a cleanup failure is not
+// something that pass caused or could fix. The worktree, if it survived,
+// simply waits for this loop's next closed-pull-request delivery.
+func (w *Worker) cleanupPass(
+	ctx context.Context, t Target, d Delivery, cfg *config.Config, deps loopcmd.Deps,
+) {
+	if err := w.RunCleanup(ctx, cfg, deps, d.Number); err != nil {
+		if errors.Is(err, lock.ErrHeld) {
+			slog.Info("skipping worktree cleanup: another tick holds the loop lock",
+				"loop", cfg.Name, "project", t.ProjectName, "pr", d.Number)
+			return
+		}
+		slog.Error("worktree cleanup failed", "loop", cfg.Name, "project", t.ProjectName,
+			"pr", d.Number, "err", err)
+	}
 }
 
 // backoffFor returns the wait before retry n (counted from zero) of cfg.
@@ -515,14 +758,22 @@ func (w *Worker) clear(key loopKey) {
 	}
 }
 
-// stopAll stops every pending retry timer, so no ALREADY-ARMED timer fires.
+// stopAll stops every pending retry timer AND every armed tend sweep timer,
+// so no ALREADY-ARMED timer of either kind fires.
+//
+// A sweep timer left out of this would fire after the daemon was told to
+// stop and dispatch up to maxTendPerSweep agents on the way out -- the same
+// hazard an already-armed retry timer would be, for a batch of agents rather
+// than one.
 //
 // It is not, on its own, "a daemon that has been told to stop starts no new
 // agent": it runs when Serve returns, which is drainAndClose step 2, BEFORE
-// the drain in step 3. A tick still draining afterwards can call schedule and
-// arm a NEW timer that this pass never saw. That timer is stopped instead by
-// the shuttingDown gate in cmd/agent-utils/listener.go's instrumentRetries,
-// which is checked when the timer FIRES rather than when it is armed.
+// the drain in step 3. A tick still draining afterwards can call schedule or
+// armTend and arm a NEW timer that this pass never saw. That timer is
+// stopped instead by the shuttingDown gate in cmd/agent-utils/listener.go's
+// instrumentRetries, which wraps Worker.After itself and so is checked when
+// the timer FIRES -- whichever seam armed it -- rather than when it is
+// armed.
 func (w *Worker) stopAll() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -531,6 +782,12 @@ func (w *Worker) stopAll() {
 			a.timer.Stop()
 		}
 		delete(w.pending, key)
+	}
+	for key, ent := range w.tends {
+		if ent != nil && ent.timer != nil {
+			ent.timer.Stop()
+		}
+		delete(w.tends, key)
 	}
 }
 

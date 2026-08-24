@@ -424,7 +424,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			return
 		}
 
-		// 8. Decode and validate the two attacker-controlled values this
+		// 8. Decode and validate the three attacker-controlled values this
 		// daemon passes onward as data (rather than only ever logging a
 		// bounded, shape-checked form of them, as with the delivery id). An
 		// unmatched full_name (empty, the wrong shape, or absurdly long) is
@@ -465,10 +465,18 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				Title  string     `json:"title"`
 				Labels []nameOnly `json:"labels"`
 			} `json:"issue"`
+			// Merged and Base carry the one fact that arms a tend sweep: this
+			// delivery merged a pull request, and into which branch. Both are
+			// decoded here and judged per loop in Worker.tickOne, because
+			// default_branch is loop configuration the handler does not hold.
 			PullRequest struct {
 				Number int        `json:"number"`
 				Title  string     `json:"title"`
 				Labels []nameOnly `json:"labels"`
+				Merged bool       `json:"merged"`
+				Base   struct {
+					Ref string `json:"ref"`
+				} `json:"base"`
 			} `json:"pull_request"`
 			// Who caused this delivery. An operator reading a surprise tick
 			// needs to know whether a human or a bot moved the label.
@@ -499,6 +507,31 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			s.rejected(w, deliveryID, "issue number", http.StatusBadRequest)
 			return
 		}
+
+		// A merged pull request is the only delivery that arms a sweep. The
+		// ACTION is checked as well as the flag: GitHub sends merged: true on
+		// later pull_request actions too (edited, unlabeled), and only the
+		// close is the moment the base branch moved. The event is checked
+		// because pull_request_review, pull_request_review_comment and
+		// issue_comment all carry a pull_request object as well.
+		//
+		// The ref is shape-checked here, not merely bounded at log time, so
+		// this value is validated like the other two rather than only decoded.
+		// It costs nothing real: ghub.convertPR already refuses to trust a pull
+		// request whose base fails SafeRef, so a default_branch that failed it
+		// could never have been tended anyway. Failing the check leaves the
+		// value empty, which arms no sweep.
+		var mergedInto string
+		if event == "pull_request" && body.Action == "closed" && body.PullRequest.Merged &&
+			ghub.SafeRef(body.PullRequest.Base.Ref) {
+			mergedInto = body.PullRequest.Base.Ref
+		}
+
+		// closedPR is what arms worktree cleanup, and it is deliberately wider
+		// than mergedInto: the operator's decision (see loopcmd.CleanupClosedPR)
+		// is to remove a closed pull request's worktrees on ANY close, merged
+		// or not, so this checks only the action, not the merged flag.
+		closedPR := event == "pull_request" && body.Action == "closed"
 
 		// 9. GitHub redelivers on timeout and on manual "Redeliver," and the
 		// plaintext hop behind a reverse proxy makes a captured delivery
@@ -595,17 +628,35 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if labels := names(body.Issue.Labels, body.PullRequest.Labels); len(labels) > 0 {
 				attrs = append(attrs, "labels", safeLabels(labels))
 			}
+			if mergedInto != "" {
+				attrs = append(attrs, "merged_into", safeText(mergedInto))
+			}
+			if closedPR {
+				attrs = append(attrs, "closed_pr", true)
+			}
 			slog.Info("accepted delivery", attrs...)
 
 			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.sem }()
 				defer s.wg.Done()
-				s.Tick(ctx, repo, number)
+				s.Tick(ctx, Delivery{Repo: repo, Number: number, MergedInto: mergedInto, ClosedPR: closedPR})
 			}()
 		default:
-			slog.Warn("dropping delivery: worker pool full",
-				"delivery", safeDeliveryID(deliveryID), "repo", repo, "number", number)
+			// merged_into and closed_pr only when the payload carried one, for
+			// the reason the accepted line gives: an empty or false value would
+			// say nothing while looking like it said something. Both are
+			// carried because a dropped merge is lost sweep work and a dropped
+			// close is lost worktree cleanup, not just one lost issue pass.
+			dropped := []any{"delivery", safeDeliveryID(deliveryID),
+				"repo", repo, "number", number}
+			if mergedInto != "" {
+				dropped = append(dropped, "merged_into", safeText(mergedInto))
+			}
+			if closedPR {
+				dropped = append(dropped, "closed_pr", true)
+			}
+			slog.Warn("dropping delivery: worker pool full", dropped...)
 		}
 		w.WriteHeader(http.StatusAccepted)
 	}

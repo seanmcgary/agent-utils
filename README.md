@@ -371,18 +371,26 @@ Passing `--config` with an absolute path works too and skips discovery entirely.
 
 The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
 request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
-A delivery acts on the issue it names, and on nothing else: it says "something about this
-issue changed, figure out what and dispatch the right executor." The daemon fetches that one
-issue, decides it, and stops — it does not read every open issue and every open pull request
-in the repository, which is what a full reconcile costs in tokens and rate limit on every
-delivery, per project watching that repository. Pull requests share the issue number space, so
-a `pull_request` event is resolved to the issue its pull request closes (`Closes #N` in the
-body); a pull request that closes no issue is a no-op. The `accepted delivery` line in the log
-names the issue, so a delivery can be matched against the dispatch it caused.
+A delivery acts on the issue it names. There are two exceptions, both on a `pull_request`
+delivery. A pull request **merged** into a loop's `default_branch` also sweeps the loop for
+rebases — that merge is what makes every other open pull request stale while naming none of
+them — dispatching tend agents only, capped, and only for loops with `tend_pr: true`. And a pull
+request that **closes**, merged or not, has its `pr-<N>` worktree removed, along with the
+`issue-<M>` worktree of the issue it closes, once neither has a live dispatch. That second one
+deletes files: the live-dispatch guard protects work in progress, not uncommitted or unpushed
+work sitting in an idle worktree, and only a trusted pull request's `Closes #M` is honoured. Otherwise, a delivery says "something about this issue changed, figure out
+what and dispatch the right executor." The daemon fetches that one issue, decides it, and stops —
+it does not read every open issue and every open pull request in the repository, which is what a
+full reconcile costs in tokens and rate limit on every delivery, per project watching that
+repository. Pull requests share the issue number space, so a `pull_request` event is resolved to
+the issue its pull request closes (`Closes #N` in the body); a pull request that closes no issue
+is a no-op. The `accepted delivery` line in the log names the issue, so a delivery can be matched
+against the dispatch it caused.
 
 The daemon is the fast path; cron remains the safety net. A `loop tick` is still a full sweep,
 and it is what catches the work no event names — a pull request that fell behind because
-someone pushed to the default branch (a `push` event, which this daemon does not subscribe to),
+someone pushed to the default branch directly (a `push` event, which this daemon does not
+subscribe to),
 or a retry deadline on an issue nobody touched. Both can run at once: the per-loop lock makes
 an overlapping tick harmless.
 

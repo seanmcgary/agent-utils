@@ -115,7 +115,14 @@ func (m *Manager) Remove(path string) error {
 	}
 	if err := m.git(m.checkoutBaseDir, "worktree", "remove", "--force", path); err != nil {
 		// Fall back to a plain delete plus a prune, so a corrupt registration
-		// cannot strand the directory forever.
+		// cannot strand the directory forever -- but only for something that
+		// really is a worktree. "worktree remove" also fails with "not a
+		// working tree", and recursively deleting whatever happens to sit at
+		// that path on the strength of that error is a much bigger action than
+		// the one being retried.
+		if !exists(filepath.Join(path, ".git")) {
+			return fmt.Errorf("remove worktree %s: %w", path, err)
+		}
 		if rmErr := os.RemoveAll(path); rmErr != nil {
 			return fmt.Errorf("remove worktree %s: %w", path, err)
 		}
@@ -124,15 +131,52 @@ func (m *Manager) Remove(path string) error {
 	return nil
 }
 
+// Dirty reports whether path has uncommitted changes.
+//
+// A path that does not exist is not dirty and not an error: Remove is
+// idempotent on an absent path, and a caller deciding whether removal will
+// destroy something must get the same answer for a worktree that is simply
+// already gone.
+func (m *Manager) Dirty(path string) (bool, error) {
+	if !exists(path) {
+		return false, nil
+	}
+	out, err := m.gitOutput(path, "status", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(out) != "" {
+		return true, nil
+	}
+	// A clean tree can still hold work nobody else has: commits made here and
+	// never pushed. That is the MOST valuable thing a removal can destroy, and
+	// "git status" is silent about it, so a caller warning only on a dirty
+	// tree would delete it without a word.
+	//
+	// No upstream is not an error and not dirty: a detached tend worktree has
+	// none by construction (see EnsurePR), and neither does a branch that was
+	// never pushed -- for which the ahead count below is meaningless anyway.
+	ahead, err := m.gitOutput(path, "rev-list", "--count", "@{upstream}..HEAD")
+	if err != nil {
+		return false, nil
+	}
+	return strings.TrimSpace(ahead) != "0" && strings.TrimSpace(ahead) != "", nil
+}
+
 func (m *Manager) git(dir string, args ...string) error {
+	_, err := m.gitOutput(dir, args...)
+	return err
+}
+
+func (m *Manager) gitOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("git %s in %s: %w: %s",
+		return "", fmt.Errorf("git %s in %s: %w: %s",
 			strings.Join(args, " "), dir, err, redact(strings.TrimSpace(string(out))))
 	}
-	return nil
+	return string(out), nil
 }
 
 // credentialInURL matches the userinfo part of a remote URL, and the two GitHub

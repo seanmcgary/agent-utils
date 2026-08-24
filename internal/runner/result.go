@@ -43,6 +43,18 @@ func ParseStream(r io.Reader) (Result, error) {
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 
 	var last *resultLine
+	// The session id is taken from the FIRST line that carries one, not from
+	// the result line alone.
+	//
+	// claude announces the session in a system event before it does any work,
+	// and every later line repeats it, but a run that is killed never writes a
+	// result line at all. Reading the id only from that line threw it away for
+	// exactly the runs that need it: the caller then recorded "no session was
+	// started", the next tick dispatched a START against the id already on the
+	// issue row, and claude refuses a reused --session-id outright. That wedged
+	// the loop permanently -- every later tick failed the same way, at no cost,
+	// so the retry budget never ran down and the issue never parked.
+	var sessionID string
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 || line[0] != '{' {
@@ -51,6 +63,9 @@ func ParseStream(r io.Reader) (Result, error) {
 		var rl resultLine
 		if err := json.Unmarshal(line, &rl); err != nil {
 			continue
+		}
+		if sessionID == "" {
+			sessionID = rl.SessionID
 		}
 		if rl.Type != "result" {
 			continue
@@ -62,7 +77,9 @@ func ParseStream(r io.Reader) (Result, error) {
 		return Result{}, fmt.Errorf("read stream: %w", err)
 	}
 	if last == nil {
-		return Result{}, ErrNoResult
+		// ErrNoResult, but the session id still travels: Supervise reads it to
+		// decide whether the next dispatch must RESUME rather than start.
+		return Result{SessionID: sessionID}, ErrNoResult
 	}
 
 	out := Result{
@@ -71,6 +88,9 @@ func ParseStream(r io.Reader) (Result, error) {
 		DurationMS: last.DurationMS,
 		IsError:    last.IsError,
 		Text:       last.ResultText,
+	}
+	if out.SessionID == "" {
+		out.SessionID = sessionID
 	}
 	if last.APIErrorStatus != nil {
 		out.APIError = *last.APIErrorStatus
@@ -153,7 +173,9 @@ func ParsePiStream(r io.Reader) (Result, error) {
 		return Result{}, fmt.Errorf("read stream: %w", err)
 	}
 	if last == nil {
-		return Result{}, ErrNoResult
+		// As in ParseStream: the session header proves pi created the session,
+		// so the id travels even though this run produced no message.
+		return Result{SessionID: sessionID}, ErrNoResult
 	}
 
 	out := Result{

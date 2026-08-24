@@ -78,8 +78,10 @@ func subjectPayload(t *testing.T, fullName, subject string, number any) []byte {
 // tickCall is one call to the Server's Tick seam: the repository and the issue
 // number the delivery named.
 type tickCall struct {
-	repo   string
-	number int
+	repo       string
+	number     int
+	mergedInto string
+	closedPR   bool
 }
 
 // newServer builds a Server wired to tickCh: the fake Tick sends the repo
@@ -90,8 +92,8 @@ func newServer(t *testing.T, tickCh chan<- tickCall) *Server {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick: func(_ context.Context, repo string, number int) {
-			tickCh <- tickCall{repo: repo, number: number}
+		Tick: func(_ context.Context, d Delivery) {
+			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto, closedPR: d.ClosedPR}
 		},
 	})
 	if err != nil {
@@ -315,7 +317,7 @@ func TestNewRefusesEmptySecret(t *testing.T) {
 	_, err := New(&Server{
 		Secret: fixedSecret(""),
 		Port:   8080,
-		Tick:   func(context.Context, string, int) {},
+		Tick:   func(context.Context, Delivery) {},
 	})
 	if err == nil {
 		t.Fatal("New with an empty secret must return an error")
@@ -331,7 +333,7 @@ func TestNewRefusesAnUnreadableSecret(t *testing.T) {
 	_, err := New(&Server{
 		Secret: func() (string, error) { return "", errors.New("settings unreadable") },
 		Port:   8080,
-		Tick:   func(context.Context, string, int) {},
+		Tick:   func(context.Context, Delivery) {},
 	})
 	if err == nil {
 		t.Fatal("New with an unreadable secret must return an error")
@@ -354,7 +356,9 @@ func TestSecretIsReReadPerRequest(t *testing.T) {
 			return secret, nil
 		},
 		Port: freePort(t),
-		Tick: func(_ context.Context, repo string, number int) { tickCh <- tickCall{repo: repo, number: number} },
+		Tick: func(_ context.Context, d Delivery) {
+			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto}
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -375,7 +379,7 @@ func TestSecretIsReReadPerRequest(t *testing.T) {
 		t.Fatalf("status = %d, want 202: the rotated secret must be picked up without a restart", resp.StatusCode)
 	}
 	if got := waitTick(t, tickCh); got.repo != "octo/hello" {
-		t.Fatalf("Tick repo = %q", got)
+		t.Fatalf("Tick repo = %q", got.repo)
 	}
 
 	// And the old secret is genuinely no longer accepted.
@@ -633,7 +637,7 @@ func TestTickReceivesDaemonContextNotRequestContext(t *testing.T) {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick: func(ctx context.Context, _ string, _ int) {
+		Tick: func(ctx context.Context, _ Delivery) {
 			<-release
 			ctxErrCh <- ctx.Err()
 		},
@@ -687,7 +691,7 @@ func TestFullPoolDropsWithoutSecondTick(t *testing.T) {
 		Secret:      fixedSecret(testSecret),
 		Port:        freePort(t),
 		MaxInFlight: 1,
-		Tick: func(context.Context, string, int) {
+		Tick: func(context.Context, Delivery) {
 			tickStarted <- struct{}{}
 			<-release
 		},
@@ -747,8 +751,8 @@ func TestAPoolDroppedDeliveryIsRecoverableByRedelivery(t *testing.T) {
 		Secret:      fixedSecret(testSecret),
 		Port:        freePort(t),
 		MaxInFlight: 1,
-		Tick: func(_ context.Context, repo string, _ int) {
-			tickStarted <- repo
+		Tick: func(_ context.Context, d Delivery) {
+			tickStarted <- d.Repo
 			<-release
 		},
 	})
@@ -815,7 +819,7 @@ func TestDrainWaitsForInFlightTickStartedByThePool(t *testing.T) {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick: func(context.Context, string, int) {
+		Tick: func(context.Context, Delivery) {
 			close(tickStarted)
 			<-release
 		},
@@ -868,7 +872,7 @@ func TestDrainReturnsImmediatelyWithNothingInFlight(t *testing.T) {
 	s, err := New(&Server{
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
-		Tick:   func(context.Context, string, int) {},
+		Tick:   func(context.Context, Delivery) {},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1121,5 +1125,105 @@ func TestAnAcceptedDeliveryLogsTheIssueItNames(t *testing.T) {
 	// what a delivery does.
 	if strings.Contains(out, "reconcil") {
 		t.Errorf("an accepted delivery still claims a reconcile:\n%s", out)
+	}
+}
+
+// The handler must report a merge, and must NOT report anything else as one.
+// MergedInto is what arms a repository-wide sweep, so a false positive here is
+// the regression Worker.RunIssue records, reintroduced at the front door.
+//
+// wantClosed covers the OTHER derivation on the same lines. ClosedPR is the
+// front-door gate on loopcmd.CleanupClosedPR, which DELETES worktrees, so a
+// false positive there deletes work for any delivery at all.
+func TestHandlerReportsOnlyAMergedPullRequestAsAMerge(t *testing.T) {
+	cases := []struct {
+		name       string
+		event      string
+		payload    string
+		want       string
+		wantClosed bool
+	}{
+		{
+			name:       "a merged pull request",
+			event:      "pull_request",
+			payload:    `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":true,"base":{"ref":"master"}}}`,
+			want:       "master",
+			wantClosed: true,
+		},
+		{
+			name:       "a closed but unmerged pull request",
+			event:      "pull_request",
+			payload:    `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":false,"base":{"ref":"master"}}}`,
+			want:       "",
+			wantClosed: true,
+		},
+		{
+			// GitHub sends merged: true on later pull_request actions too.
+			// Only the close is the moment the base branch moved.
+			name:    "an edited pull request that was already merged",
+			event:   "pull_request",
+			payload: `{"action":"edited","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":true,"base":{"ref":"master"}}}`,
+			want:    "",
+		},
+		{
+			// issue_comment carries a pull_request object too, and its action
+			// is attacker-shaped text: with a closed action and a merged flag,
+			// only the EVENT check separates this from a real merge.
+			name:    "a comment delivery whose payload claims a closed merge",
+			event:   "issue_comment",
+			payload: `{"action":"closed","repository":{"full_name":"o/r"},"issue":{"number":7},"pull_request":{"number":7,"merged":true,"base":{"ref":"master"}}}`,
+			want:    "",
+		},
+		{
+			// pull_request_review carries a pull_request object as well, and
+			// it is not a merge whatever that object says.
+			name:    "a review on a merged pull request",
+			event:   "pull_request_review",
+			payload: `{"action":"submitted","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":true,"base":{"ref":"master"}}}`,
+			want:    "",
+		},
+		{
+			// The base ref is attacker-shaped text. ghub.SafeRef rejects a
+			// leading dash, which git would read as an option, and a rejected
+			// ref leaves MergedInto empty so no sweep is armed. The close is
+			// still a close, so ClosedPR stays true.
+			name:       "a merge whose base ref is not a safe git ref",
+			event:      "pull_request",
+			payload:    `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":true,"base":{"ref":"--upload-pack=evil"}}}`,
+			want:       "",
+			wantClosed: true,
+		},
+		{
+			name:    "an issue delivery",
+			event:   "issues",
+			payload: `{"action":"labeled","repository":{"full_name":"o/r"},"issue":{"number":7}}`,
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tickCh := make(chan tickCall, 1)
+			s := newServer(t, tickCh)
+			srv := httptest.NewServer(s.Handler(context.Background()))
+			t.Cleanup(srv.Close)
+
+			body := []byte(tc.payload)
+			resp := doRequest(t, srv.URL+"/webhook", body, map[string]string{
+				github.EventTypeHeader:       tc.event,
+				github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+			})
+			defer resp.Body.Close()
+
+			got := waitTick(t, tickCh)
+			if got.mergedInto != tc.want {
+				t.Errorf("mergedInto = %q, want %q", got.mergedInto, tc.want)
+			}
+			if got.closedPR != tc.wantClosed {
+				t.Errorf("closedPR = %v, want %v", got.closedPR, tc.wantClosed)
+			}
+			if got.number != 7 {
+				t.Errorf("number = %d, want 7", got.number)
+			}
+		})
 	}
 }

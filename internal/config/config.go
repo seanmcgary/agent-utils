@@ -26,7 +26,19 @@ type Config struct {
 	Labels Labels `yaml:"labels"`
 	Agent  Agent  `yaml:"agent"`
 	TendPR bool   `yaml:"tend_pr"`
-	Retry  Retry  `yaml:"retry"`
+
+	// CleanupClosedPR removes the worktrees of a closed pull request. It
+	// defaults to ON: nothing else removes a worktree, and one of a large
+	// repository is easily hundreds of megabytes, so a loop that never
+	// cleaned up would fill the disk. It exists because the action is
+	// DESTRUCTIVE and webhook-triggered, and an operator who wants it off
+	// should not have to rebuild to get there.
+	//
+	// A pointer for the tri-state. Absent must mean ON, and a plain bool
+	// cannot tell an absent field from an explicit false.
+	CleanupClosedPR *bool `yaml:"cleanup_closed_pr"`
+
+	Retry Retry `yaml:"retry"`
 
 	// AcknowledgeBypassPermissions must be true to select the
 	// bypassPermissions agent permission mode. See validate.
@@ -116,6 +128,12 @@ const (
 	HarnessClaude = "claude"
 	HarnessPi     = "pi"
 )
+
+// CleanupClosedPREnabled reports whether a closed pull request's worktrees are
+// removed. Absent means enabled; see Config.CleanupClosedPR.
+func (c *Config) CleanupClosedPREnabled() bool {
+	return c.CleanupClosedPR == nil || *c.CleanupClosedPR
+}
 
 // RepoOwner returns the owner part of repo.
 func (c *Config) RepoOwner() string {

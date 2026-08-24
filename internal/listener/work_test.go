@@ -112,7 +112,19 @@ type harness struct {
 	// and visible only in this fake's counters.
 	gh *deliveryGH
 
-	mu           sync.Mutex
+	mu sync.Mutex
+	// These four are set before the first Deliver and then read under mu by
+	// open, runTend and runCleanup, so they sit with the guarded fields rather
+	// than above the mutex with the write-once ones. defaultBranch and tendPR
+	// are the two config fields the open seam builds; both are needed to arm a
+	// sweep, which is gated on cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch).
+	// tendFn and cleanupFn decide what the RunTend and RunCleanup seams
+	// return; nil means success.
+	defaultBranch string                         // guarded by mu
+	tendPR        bool                           // guarded by mu
+	tendFn        func(cfg *config.Config) error // guarded by mu
+	cleanupFn     func(cfg *config.Config) error // guarded by mu
+
 	tokenErr     error
 	openErr      error
 	tokenCalls   int
@@ -125,9 +137,15 @@ type harness struct {
 	// the same order as ran. A delivery decides one issue, so "which loop ran"
 	// is only half of what a test has to be able to assert.
 	ranIssues []int
-	cleanups  int
-	backoff   []time.Duration
-	max       int
+	// tends records "loop@base" for each sweep RunTend was asked to run, in
+	// order, guarded by mu like ran and ranIssues.
+	tends []string
+	// cleaned records "loop@prNumber" for each pull request RunCleanup was
+	// asked to clean up, in order, guarded by mu like tends.
+	cleaned  []string
+	cleanups int
+	backoff  []time.Duration
+	max      int
 }
 
 // newHarness returns a Worker whose seams are all fakes. db may be nil for a
@@ -152,6 +170,8 @@ func newHarness(db *store.DB) *harness {
 	w.Token = h.token
 	w.Open = h.open
 	w.RunIssue = h.runIssue
+	w.RunTend = h.runTend
+	w.RunCleanup = h.runCleanup
 	w.Targets = h.targetsSeam
 	w.TargetFor = func(projectID, loop string) (Target, Routing, error) {
 		if h.targetFor != nil {
@@ -211,6 +231,7 @@ func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (
 	h.mu.Lock()
 	h.opens = append(h.opens, openCall{ref: ref, path: path, opts: o})
 	openErr, backoff, max := h.openErr, h.backoff, h.max
+	branch, tend := h.defaultBranch, h.tendPR
 	h.mu.Unlock()
 
 	if openErr != nil {
@@ -219,7 +240,10 @@ func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (
 		return nil, loopcmd.Deps{}, nil, openErr
 	}
 
-	cfg := &config.Config{Name: loopFromPath(path), Repo: "o/r"}
+	cfg := &config.Config{
+		Name: loopFromPath(path), Repo: "o/r",
+		DefaultBranch: branch, TendPR: tend,
+	}
 	cfg.Retry.Max = max
 	for _, d := range backoff {
 		cfg.Retry.Backoff = append(cfg.Retry.Backoff, config.Duration(d))
@@ -260,6 +284,37 @@ func (h *harness) runIssue(
 		return loopcmd.Summary{}, fn(cfg)
 	}
 	return loopcmd.Summary{}, nil
+}
+
+// runTend is the fake RunTend seam. It records "loop@base" for each sweep,
+// so a test can prove which loop was swept and against which branch.
+func (h *harness) runTend(
+	_ context.Context, cfg *config.Config, _ loopcmd.Deps, base string,
+) (loopcmd.Summary, error) {
+	h.mu.Lock()
+	h.tends = append(h.tends, cfg.Name+"@"+base)
+	fn := h.tendFn
+	h.mu.Unlock()
+	if fn != nil {
+		return loopcmd.Summary{}, fn(cfg)
+	}
+	return loopcmd.Summary{}, nil
+}
+
+// runCleanup is the fake RunCleanup seam. It records "loop@prNumber" for each
+// pull request it was asked to clean up, so a test can prove which loop
+// cleaned up which pull request's worktrees.
+func (h *harness) runCleanup(
+	_ context.Context, cfg *config.Config, _ loopcmd.Deps, prNumber int,
+) error {
+	h.mu.Lock()
+	h.cleaned = append(h.cleaned, fmt.Sprintf("%s@%d", cfg.Name, prNumber))
+	fn := h.cleanupFn
+	h.mu.Unlock()
+	if fn != nil {
+		return fn(cfg)
+	}
+	return nil
 }
 
 // deliveryGH is a ghub.Client that records the numbers it was asked to fetch.
@@ -338,6 +393,22 @@ func (h *harness) pendingLen() int {
 	return len(h.w.pending)
 }
 
+// tendedLoops returns "loop@base" for each sweep, in order, like ranLoops
+// does for issue passes.
+func (h *harness) tendedLoops() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.tends...)
+}
+
+// cleanedPRs returns "loop@prNumber" for each cleanup, in order, like
+// tendedLoops does for sweeps.
+func (h *harness) cleanedPRs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.cleaned...)
+}
+
 // openWorkDB returns an empty canonical state database in a temporary
 // directory.
 func openWorkDB(t *testing.T) *store.DB {
@@ -371,7 +442,7 @@ func TestALockHeldTickSchedulesNoRetry(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.runFn = func(*config.Config) error { return fmt.Errorf("run tick: %w", lock.ErrHeld) }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 0 {
 		t.Errorf("armed %d retry timers, want 0 for a held lock", n)
@@ -391,13 +462,13 @@ func TestALockHeldTickClearsAPendingAttempt(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 	if n := h.pendingLen(); n != 1 {
 		t.Fatalf("pending after a failed tick = %d, want 1", n)
 	}
 
 	h.runFn = func(*config.Config) error { return fmt.Errorf("run tick: %w", lock.ErrHeld) }
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.pendingLen(); n != 0 {
 		t.Errorf("pending after a held lock = %d, want 0", n)
@@ -416,7 +487,7 @@ func TestATickErrorIsRetriedAfterTheConfiguredDelay(t *testing.T) {
 	h.backoff = []time.Duration{45 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 1 {
 		t.Fatalf("armed %d retry timers, want 1", n)
@@ -444,7 +515,7 @@ func TestTheRetryStopsAfterRetryMax(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 	h.timers.at(t, 0).f()
 	h.timers.at(t, 1).f()
 
@@ -472,7 +543,7 @@ func TestRetryMaxZeroSchedulesNothingAndDoesNotPanic(t *testing.T) {
 	h.backoff = nil
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 0 {
 		t.Errorf("armed %d retry timers, want 0 for retry.max = 0", n)
@@ -487,7 +558,7 @@ func TestATokenErrorSchedulesNoRetry(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.tokenErr = errors.New("mode 0644 grants group access")
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	opens, runs, cleanups := h.counts()
 	if opens != 0 || runs != 0 || cleanups != 0 {
@@ -506,7 +577,7 @@ func TestAnOpenErrorSchedulesARetryAtOpenRetryDelay(t *testing.T) {
 	h.targets = []Target{h.target("planning")}
 	h.openErr = errors.New("unimported legacy database")
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 1 {
 		t.Fatalf("armed %d retry timers, want 1 after an Open error", n)
@@ -533,7 +604,7 @@ func TestAZeroBackoffEntryStillWaitsMinRetryDelay(t *testing.T) {
 	h.backoff = []time.Duration{0}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if got := h.timers.at(t, 0).d; got != h.w.MinRetryDelay {
 		t.Errorf("retry delay = %v, want the MinRetryDelay floor %v", got, h.w.MinRetryDelay)
@@ -556,7 +627,7 @@ func TestCleanupRunsExactlyOncePerTick(t *testing.T) {
 			h.targets = []Target{h.target("planning")}
 			h.runFn = tc.run
 
-			h.w.Deliver(context.Background(), "o/r", 7)
+			h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 			if _, _, cleanups := h.counts(); cleanups != 1 {
 				t.Errorf("called cleanup %d times, want exactly 1", cleanups)
@@ -577,7 +648,7 @@ func TestTwoTargetsBothRunWhenTheFirstFails(t *testing.T) {
 		return nil
 	}
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	got := h.ranLoops()
 	if len(got) != 2 || got[0] != "planning" || got[1] != "review" {
@@ -595,7 +666,7 @@ func TestOpenIsCalledWithTheDaemonsOptions(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning")}
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -624,8 +695,8 @@ func TestSchedulingAgainStopsTheOldTimer(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute, 5 * time.Minute, 10 * time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 2 {
 		t.Fatalf("armed %d timers, want 2", n)
@@ -648,7 +719,7 @@ func TestARetryDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
 	h.runFn = func(*config.Config) error { return errBoom }
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h.w.Deliver(ctx, "o/r", 7)
+	h.w.Deliver(ctx, Delivery{Repo: "o/r", Number: 7})
 	cancel()
 	h.timers.at(t, 0).f()
 
@@ -832,7 +903,7 @@ func TestServeStopsEveryPendingTimerOnCancel(t *testing.T) {
 	h.runFn = func(*config.Config) error { return errBoom }
 
 	ctx, cancel := context.WithCancel(context.Background())
-	h.w.Deliver(ctx, "o/r", 7)
+	h.w.Deliver(ctx, Delivery{Repo: "o/r", Number: 7})
 	if n := h.pendingLen(); n != 1 {
 		t.Fatalf("pending = %d before Serve, want 1", n)
 	}
@@ -965,8 +1036,8 @@ func TestOpenFailuresDoNotSpendTheTickRetryBudget(t *testing.T) {
 	h.backoff = []time.Duration{45 * time.Minute}
 	h.openErr = errors.New("unimported legacy database")
 
-	h.w.Deliver(context.Background(), "o/r", 7)
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 	if n := h.timers.len(); n != 2 {
 		t.Fatalf("armed %d timers for two Open failures, want 2", n)
 	}
@@ -978,7 +1049,7 @@ func TestOpenFailuresDoNotSpendTheTickRetryBudget(t *testing.T) {
 	h.mu.Unlock()
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 7)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
 	if n := h.timers.len(); n != 3 {
 		t.Fatalf("armed %d timers, want a third for the tick failure", n)
@@ -1173,7 +1244,7 @@ func TestDeliverLogsTheIssueAndTheLoopsThatWillEvaluateIt(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	out := buf.String()
 	if !strings.Contains(out, "repo=o/r") {
@@ -1210,7 +1281,7 @@ func TestDeliverScopesEveryTargetToTheDeliveredIssue(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	if got := h.ranLoops(); len(got) != 2 {
 		t.Fatalf("ran %v, want both loops", got)
@@ -1231,7 +1302,7 @@ func TestARetryStaysScopedToTheDeliveredIssue(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 	if h.timers.len() != 1 {
 		t.Fatalf("armed %d timers, want 1", h.timers.len())
 	}
@@ -1279,7 +1350,7 @@ func TestOneDeliveryFetchesTheDeliveredIssueOnce(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	if got := h.gh.fetches(); len(got) != 1 || got[0] != 51 {
 		t.Errorf("fetched %v, want exactly [51] for one delivery to two loops", got)
@@ -1301,8 +1372,8 @@ func TestTwoDeliveriesForOneIssueFetchItTwice(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	if got := h.gh.fetches(); len(got) != 2 {
 		t.Errorf("fetched %v, want one fetch per delivery", got)
@@ -1319,7 +1390,7 @@ func TestEveryLoopOfOneDeliveryIsOpenedWithTheSameClient(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	got := h.openedClients()
 	if len(got) != 2 {
@@ -1340,7 +1411,7 @@ func TestTheTokenIsReadOncePerDelivery(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning"), h.target("execution"), h.target("review")}
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1362,7 +1433,7 @@ func TestARetryFetchesAgainInsteadOfReusingTheDeliverysFetch(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute}
 	h.runFn = func(*config.Config) error { return errBoom }
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 	if h.timers.len() != 1 {
 		t.Fatalf("armed %d timers, want 1", h.timers.len())
 	}
@@ -1414,7 +1485,7 @@ func TestASharedFetchFailureIsStillAttributedToEveryLoop(t *testing.T) {
 	h.backoff = []time.Duration{time.Minute}
 	h.gh.err = errors.New("403 rate limit exceeded")
 
-	h.w.Deliver(context.Background(), "o/r", 51)
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
 
 	out := buf.String()
 	for _, loop := range []string{"planning", "execution"} {
@@ -1427,5 +1498,266 @@ func TestASharedFetchFailureIsStillAttributedToEveryLoop(t *testing.T) {
 	}
 	if n := h.pendingLen(); n != 2 {
 		t.Errorf("pending = %d, want a retry for each loop the shared fetch stopped", n)
+	}
+}
+
+// MergedInto is the ONE field that says "the default branch moved." An empty
+// value must never match a branch name, or every ordinary delivery -- an
+// opened issue, a moved label -- would start a repository-wide sweep. That is
+// the regression Worker.RunIssue records.
+func TestIsMergeIntoRequiresAMergedBaseRef(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Delivery
+		arg  string
+		want bool
+	}{
+		{"a merge into the branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, "master", true},
+		{"a merge into another branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "feature"}, "master", false},
+		{"not a merge", Delivery{Repo: "o/r", Number: 7}, "master", false},
+		{"not a merge, and the loop names no branch", Delivery{Repo: "o/r", Number: 7}, "", false},
+		{"a merge, but the loop names no branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.d.IsMergeInto(tc.arg); got != tc.want {
+				t.Errorf("IsMergeInto(%q) = %v, want %v", tc.arg, got, tc.want)
+			}
+		})
+	}
+}
+
+// The sweep is armed for exactly one case, and the issue pass always runs.
+func TestDeliverArmsATendSweepOnlyOnAMergeIntoTheLoopsDefaultBranch(t *testing.T) {
+	cases := []struct {
+		name     string
+		delivery Delivery
+		tendPR   bool
+		wantArm  bool
+	}{
+		{"a merge into the default branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, true, true},
+		{"a merge into a feature branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "feature"}, true, false},
+		{"not a merge", Delivery{Repo: "o/r", Number: 7}, true, false},
+		{"a merge, but the loop does not tend", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(nil)
+			h.targets = []Target{h.target("planning")}
+			h.defaultBranch = "master"
+			h.tendPR = tc.tendPR
+
+			h.w.Deliver(context.Background(), tc.delivery)
+
+			// The merged pull request's own pass moves its issue to a terminal
+			// state, and runs immediately whatever the sweep does.
+			if got := h.ranLoops(); len(got) != 1 {
+				t.Errorf("issue passes = %d, want 1", len(got))
+			}
+			want := 0
+			if tc.wantArm {
+				want = 1
+			}
+			if got := h.timers.len(); got != want {
+				t.Fatalf("armed %d timers, want %d", got, want)
+			}
+			if want == 1 {
+				h.timers.at(t, 0).f()
+				if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
+					t.Errorf("tends = %v, want [planning@master]", got)
+				}
+			}
+		})
+	}
+}
+
+// A merge train is one sweep, not one per merge. Each sweep can dispatch up to
+// maxTendPerSweep agents, and a tend agent that has already finished no longer
+// suppresses anything, so an uncoalesced train multiplies.
+func TestDeliverCoalescesAMergeTrainIntoOneSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	for i := 0; i < 5; i++ {
+		h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7 + i, MergedInto: "master"})
+	}
+
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1: a train must ride the first timer", got)
+	}
+	h.timers.at(t, 0).f()
+	if got := h.tendedLoops(); len(got) != 1 {
+		t.Errorf("tends = %v, want exactly one", got)
+	}
+	// Every merge still got its own issue pass.
+	if got := h.ranLoops(); len(got) != 5 {
+		t.Errorf("issue passes = %d, want 5", len(got))
+	}
+}
+
+// A failing issue pass schedules its retry as before, and the sweep is still
+// armed: the base branch moved whatever happened to that one issue.
+func TestDeliverArmsATendSweepEvenWhenTheIssuePassFails(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+	h.max = 1
+	h.backoff = []time.Duration{0}
+	h.runFn = func(*config.Config) error { return errors.New("boom") }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+
+	// One retry timer and one sweep timer.
+	if got := h.timers.len(); got != 2 {
+		t.Fatalf("armed %d timers, want 2 (one retry, one sweep)", got)
+	}
+}
+
+// A failed sweep is logged and dropped. It must not schedule a retry: the
+// retry path re-runs the ISSUE pass, and re-running it for a sweep failure
+// would spend that issue's retry budget on something the issue did not do.
+func TestDeliverDoesNotRetryAFailedTendSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+	h.max = 3
+	h.backoff = []time.Duration{0, 0, 0}
+	h.tendFn = func(*config.Config) error { return errors.New("sweep failed") }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1 (the sweep)", got)
+	}
+	h.timers.at(t, 0).f()
+
+	// The sweep failed. No SECOND timer may exist.
+	if got := h.timers.len(); got != 1 {
+		t.Errorf("armed %d timers after a failed sweep, want 1: a sweep must not schedule a retry", got)
+	}
+	if got := h.pendingLen(); got != 0 {
+		t.Errorf("pending retries = %d, want 0", got)
+	}
+}
+
+// A closed pull request runs cleanup at once -- no timer, unlike a sweep --
+// and only when the delivery reports a close.
+func TestDeliverRunsCleanupOnlyWhenTheDeliveryClosedAPullRequest(t *testing.T) {
+	cases := []struct {
+		name     string
+		delivery Delivery
+		wantRun  bool
+	}{
+		{"a merged close", Delivery{Repo: "o/r", Number: 11, MergedInto: "master", ClosedPR: true}, true},
+		{"an unmerged close", Delivery{Repo: "o/r", Number: 11, ClosedPR: true}, true},
+		{"not a close", Delivery{Repo: "o/r", Number: 11}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(nil)
+			h.targets = []Target{h.target("planning")}
+
+			h.w.Deliver(context.Background(), tc.delivery)
+
+			got := h.cleanedPRs()
+			if tc.wantRun {
+				if len(got) != 1 || got[0] != "planning@11" {
+					t.Errorf("cleaned = %v, want [planning@11]", got)
+				}
+			} else if len(got) != 0 {
+				t.Errorf("cleaned = %v, want none", got)
+			}
+		})
+	}
+}
+
+// Cleanup runs even when the loop does not tend and even when the merge
+// landed on a branch other than the loop's default -- ClosedPR is the only
+// gate, unlike the sweep, which also checks TendPR and IsMergeInto.
+func TestDeliverRunsCleanupRegardlessOfTendPRAndDefaultBranch(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.tendPR = false
+	h.defaultBranch = "master"
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 11, MergedInto: "feature", ClosedPR: true})
+
+	if got := h.cleanedPRs(); len(got) != 1 || got[0] != "planning@11" {
+		t.Errorf("cleaned = %v, want [planning@11]", got)
+	}
+	// No sweep was armed: the merge did not land on this loop's default
+	// branch, and this loop does not tend either way.
+	if got := h.timers.len(); got != 0 {
+		t.Errorf("armed %d timers, want 0", got)
+	}
+}
+
+// A failed cleanup is logged and dropped, exactly like a failed sweep: it
+// must not schedule a retry, because the retry path re-runs the issue pass,
+// which did nothing wrong.
+func TestDeliverDoesNotRetryAFailedCleanup(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.max = 3
+	h.backoff = []time.Duration{0, 0, 0}
+	h.cleanupFn = func(*config.Config) error { return errors.New("cleanup failed") }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 11, ClosedPR: true})
+
+	if got := h.timers.len(); got != 0 {
+		t.Errorf("armed %d timers, want 0: a failed cleanup must not schedule a retry", got)
+	}
+	if got := h.pendingLen(); got != 0 {
+		t.Errorf("pending retries = %d, want 0", got)
+	}
+}
+
+// A daemon told to stop must not dispatch a batch of rebase agents on the way
+// out. stopAll stops armed tend timers for the same reason it stops retry
+// timers; nothing pinned that, and deleting the loop left the suite green.
+func TestStopAllStopsAnArmedTendSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1", got)
+	}
+
+	h.w.stopAll()
+
+	h.w.mu.Lock()
+	n := len(h.w.tends)
+	h.w.mu.Unlock()
+	if n != 0 {
+		t.Errorf("tends holds %d entries after stopAll, want 0", n)
+	}
+}
+
+// The timer can already be waiting on the mutex when shutdown begins, past
+// anything stopAll could have stopped. The callback re-checks the context for
+// exactly that case, and a daemon told to stop starts no new agent.
+func TestAnArmedTendSweepDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.w.Deliver(ctx, Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1", got)
+	}
+
+	cancel()
+	h.timers.at(t, 0).f()
+
+	if got := h.tendedLoops(); len(got) != 0 {
+		t.Errorf("tends = %v, want none: a cancelled daemon must start no sweep", got)
 	}
 }

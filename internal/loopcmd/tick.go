@@ -59,6 +59,30 @@ func count(n *int, err error) error {
 // condition testing only 0 sends a live agent's row straight to the reaper.
 const pidGracePeriod = 90 * time.Second
 
+// isLive reports whether d's process should be treated as still running.
+//
+// A row whose process has not registered its pid yet is NOT an orphan. The
+// tick writes the pid just after the spawn, so a row younger than
+// pidGracePeriod carrying a non-positive pid is a live agent in that window,
+// not a dead one. Any pid <= 0 counts as unregistered: isAlive rejects all
+// of them, and a spawn can leave a placeholder other than 0 (see
+// pidGracePeriod). Under cron this window was minutes from the next tick;
+// under the webhook daemon deliveries arrive seconds apart, and reaping here
+// retried an issue whose agent was still working.
+//
+// This is the ONE liveness rule reapDead and loopcmd.CleanupClosedPR both
+// use. Reset calls isAlive directly instead, which is correct for Reset --
+// an operator invoking it is not racing a spawn that just happened -- and
+// wrong for the delivery path, where a dispatch row can be seconds old.
+// Copying Reset's rule there would delete a worktree out from under an agent
+// that had just started.
+func isLive(d store.Dispatch, isAlive func(pid int, dispatchID int64) bool, now time.Time) bool {
+	if d.PID <= 0 && now.Sub(d.StartedAt) < pidGracePeriod {
+		return true
+	}
+	return isAlive(d.PID, d.RunnerID())
+}
+
 // Summary reports what one tick did.
 type Summary struct {
 	Started        int  `json:"started"`
@@ -211,19 +235,7 @@ func reapDead(
 ) ([]store.Dispatch, error) {
 	var live []store.Dispatch
 	for _, d := range running {
-		// A row whose process has not registered its pid yet is NOT an orphan.
-		// The tick writes the pid just after the spawn, so a young row with a
-		// non-positive pid is a live agent in that window, not a dead one.
-		// Any pid <= 0 counts as unregistered: proc.IsAlive rejects all of
-		// them, and a spawn can leave a placeholder other than 0 (see
-		// pidGracePeriod). Under cron this window was minutes from the next
-		// tick; under the webhook daemon deliveries arrive seconds apart, and
-		// reaping here retried an issue whose agent was still working.
-		if d.PID <= 0 && now.Sub(d.StartedAt) < pidGracePeriod {
-			live = append(live, d)
-			continue
-		}
-		if deps.IsAlive(d.PID, d.RunnerID()) {
+		if isLive(d, deps.IsAlive, now) {
 			live = append(live, d)
 			continue
 		}

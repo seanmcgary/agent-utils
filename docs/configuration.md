@@ -198,6 +198,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.timeout` | duration | yes | — |
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
 | `tend_pr` | bool | no | `false` |
+| `cleanup_closed_pr` | bool | no | `true` |
 | `retry.max` | int | no | `0`, meaning never retry |
 | `retry.backoff` | list of duration | yes if `retry.max > 0` | empty |
 | `retry.backoff_ticks` (removed) | — | — | — |
@@ -618,11 +619,39 @@ request population you trust.
 i_understand_bypass_permissions: true
 ```
 
+## `cleanup_closed_pr`
+
+Whether a closed pull request's worktrees are removed. Default `true`.
+
+When GitHub reports a pull request closed — merged or not — the loop removes that pull
+request's `pr-<N>` worktree, and the `issue-<M>` worktree of the issue it closes, as soon as
+neither has a live dispatch. Nothing else in this program removes a worktree, and one of a large
+repository is easily hundreds of megabytes, so a loop left to run would fill the disk.
+
+It defaults on because that is the useful behavior, and it exists as a field because the action
+is destructive and starts from a webhook. An operator who wants the loop without the deletion
+should not have to rebuild to get there.
+
+Two limits apply, and neither is configurable:
+
+- The `Closes #M` link is honoured only for a **trusted** pull request — one whose head is in
+  this repository and whose author is an `OWNER`, `MEMBER`, or `COLLABORATOR`. An outside
+  contributor cannot name someone else's issue and have its work deleted. The `pr-<N>` worktree
+  is removed either way, because that number comes from the delivery rather than from body text.
+- The live-dispatch guard protects work **in progress**, not uncommitted or unpushed work in an
+  idle worktree. That is removed too. The log names any worktree that had uncommitted changes or
+  unpushed commits when it went.
+
+```yaml
+cleanup_closed_pr: false   # keep the worktrees
+```
+
 ## `tend_pr`
 
 Whether the loop rebases stale pull requests. Default `false`.
 
-When true, on every tick, for each issue carrying `labels.review`:
+When true, for each issue carrying `labels.review`, on every tick and also when a merge sweeps
+the loop (see below):
 
 1. Find the open pull request whose body closes it (`Closes #N`, `Fixes #N`, `Resolves #N`).
 2. Ask the GitHub API how far behind its base it is.
@@ -641,6 +670,38 @@ Three safeguards apply:
   own build agent is committing to.
 - **Tending never changes a label**, and each tend run gets a fresh session, because a rebase
   is idempotent and needs no memory of an earlier one.
+
+**Two things dispatch a tend agent.** A delivery for one issue — the issue carries
+`labels.review`, its linked pull request is behind its base, and the delivery named that issue.
+And a merge into `default_branch`: GitHub sends a `pull_request` delivery with `merged: true`,
+and because the merge is what made every other pull request stale while naming none of them,
+that one delivery sweeps the loop. Every issue carrying `labels.review` whose linked pull
+request targets `default_branch` and is now behind gets a tend dispatch.
+
+A pull request targeting any other branch is left alone. A merge into `master` says nothing
+about a branch based on `release/1.0`.
+
+The sweep dispatches **tend agents only**. It never starts, resumes, or retries an issue agent,
+and it never parks an issue. A merge is a reason to rebase; it is not a reason to start work.
+
+A sweep waits about a minute before it runs, so a merge train produces one sweep rather than one
+per merge, and it dispatches at most ten rebases. If more pull requests are behind than that,
+the rest are named in the log line and wait for the next merge.
+
+**A closed pull request has its worktrees removed.** This is separate from `tend_pr` and is not
+gated by it; `cleanup_closed_pr` turns it off. When GitHub reports a pull request closed — merged or not — the loop removes that
+pull request's `pr-<N>` worktree, and the `issue-<M>` worktree of the issue it closes, as soon
+as neither has a live dispatch. A worktree of a large repository is easily hundreds of
+megabytes, and nothing removed one before.
+
+Two limits apply. The issue link is honoured only for a trusted pull request, so an outside
+contributor cannot name someone else's issue in a `Closes #M` body and have its work deleted.
+And the live-dispatch guard protects work in progress, not uncommitted or unpushed work in an
+idle worktree — that is removed too, with a warning naming the worktree in the log.
+
+**A sweep does not replace a periodic tick.** `agent-utils project loop tick` is still the only
+full reconcile: it is what retires a dead runner for an issue no delivery names, and what finds
+a pull request that fell behind for any reason other than a merge. Schedule it.
 
 **Set this `false` for a planning loop.** `plan-feature` opens a design draft pull request
 whose body also says `Closes #N`, so a planning loop with tending on would force-push a draft

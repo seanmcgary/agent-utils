@@ -672,17 +672,17 @@ func drainAndClose(
 // decision belongs here.
 func wrapTick(
 	tickCtx context.Context,
-	deliver func(ctx context.Context, repo string, number int),
-) func(context.Context, string, int) {
-	return func(_ context.Context, repo string, number int) {
+	deliver func(ctx context.Context, d listener.Delivery),
+) func(context.Context, listener.Delivery) {
+	return func(_ context.Context, d listener.Delivery) {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("webhook tick panicked; recovered to keep the listener alive",
-					"repo", repo, "number", number,
+					"repo", d.Repo, "number", d.Number,
 					"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
 			}
 		}()
-		deliver(tickCtx, repo, number)
+		deliver(tickCtx, d)
 	}
 }
 

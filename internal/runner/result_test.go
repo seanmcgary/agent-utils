@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -158,5 +159,63 @@ func TestParsePiStreamIgnoresNonAssistant(t *testing.T) {
 	}
 	if got.SessionID != "x" {
 		t.Errorf("SessionID = %q, want x", got.SessionID)
+	}
+}
+
+// A killed run writes no result line, but it DID create a session. The id is
+// on the first line claude emits, and it must survive ErrNoResult.
+//
+// This is the koinos issue-73 wedge, reduced: the run was killed after 16
+// minutes with 960KB of stream and no result line, so the caller recorded "no
+// session started". Every later tick then dispatched a START against the id
+// already on the issue row, claude refused it, and the dispatch failed at no
+// cost -- which spent no retry budget, so the issue never parked and the loop
+// could not leave that state without hand-editing the database.
+func TestParseStreamKeepsTheSessionIDWhenTheRunWasKilled(t *testing.T) {
+	stream := `{"type":"system","subtype":"hook_started","session_id":"b3b1a9e5-fe9a-4b69-b681-5ed247fe01ff"}
+{"type":"assistant","session_id":"b3b1a9e5-fe9a-4b69-b681-5ed247fe01ff"}
+{"type":"system","subtype":"task_progress","session_id":"b3b1a9e5-fe9a-4b69-b681-5ed247fe01ff"}`
+
+	res, err := ParseStream(strings.NewReader(stream))
+
+	if !errors.Is(err, ErrNoResult) {
+		t.Fatalf("err = %v, want ErrNoResult", err)
+	}
+	if res.SessionID != "b3b1a9e5-fe9a-4b69-b681-5ed247fe01ff" {
+		t.Errorf("SessionID = %q, want the id from the system event: a killed run "+
+			"that loses its session id wedges the loop permanently", res.SessionID)
+	}
+}
+
+// The ordinary path must not regress: a completed run still reports the id its
+// result line carries.
+func TestParseStreamStillReadsTheSessionIDFromTheResultLine(t *testing.T) {
+	stream := `{"type":"system","subtype":"init","session_id":"abc"}
+{"type":"result","subtype":"success","session_id":"abc","total_cost_usd":1.5,"is_error":false}`
+
+	res, err := ParseStream(strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("ParseStream: %v", err)
+	}
+	if res.SessionID != "abc" {
+		t.Errorf("SessionID = %q, want abc", res.SessionID)
+	}
+	if res.CostUSD != 1.5 {
+		t.Errorf("CostUSD = %v, want 1.5", res.CostUSD)
+	}
+}
+
+// pi announces its session in a header event and can be killed just the same.
+func TestParsePiStreamKeepsTheSessionIDWhenTheRunWasKilled(t *testing.T) {
+	stream := `{"type":"session","version":3,"id":"11111111-2222-3333-4444-555555555555"}
+{"type":"tool_execution_start"}`
+
+	res, err := ParsePiStream(strings.NewReader(stream))
+
+	if !errors.Is(err, ErrNoResult) {
+		t.Fatalf("err = %v, want ErrNoResult", err)
+	}
+	if res.SessionID != "11111111-2222-3333-4444-555555555555" {
+		t.Errorf("SessionID = %q, want the id from the session header", res.SessionID)
 	}
 }
