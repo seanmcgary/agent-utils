@@ -1599,12 +1599,17 @@ EOF
 
 **Files:**
 - Create: `internal/loopcmd/epicsweep.go`, `internal/loopcmd/epicsweep_test.go`
-- Modify: `internal/loopcmd/tick.go`, `internal/loopcmd/open.go`
+- Modify: `internal/loopcmd/tick.go`, `internal/loopcmd/open.go`,
+  `internal/listener/work.go` (the `access` struct only — `Delivery` and `RunEpic` belong to
+  Task 5)
+- Test: `internal/loopcmd/open_test.go` (Step 1b)
 
 **Interfaces:**
 - Consumes: `ghub.EpicReader`, `ghub.ErrNoParent` (Task 1); `epic.Child`, `epic.Promote`,
   `epic.NeedsBlockers`, `epic.Label` (Task 2); `config.EntryLoop`, `config.ErrNoEntryLoop`,
-  `config.ErrAmbiguousEntryLoop`, `config.DirFromPath` (Task 3); `lock.Acquire`.
+  `config.ErrAmbiguousEntryLoop` (Task 3); plus these pre-existing symbols, pinned in the
+  Verified external API block rather than produced by any task: `config.DirFromPath`,
+  `lock.Acquire`, `deps.GH.ListOpenIssues`.
 - Produces:
   - `Deps.Epic ghub.EpicReader`
   - `Summary.Promoted int`
@@ -3368,10 +3373,10 @@ EOF
 
 | Field   | Value                                                              |
 |---------|--------------------------------------------------------------------|
-| stage   | 2 (plan review)                                                    |
+| stage   | 3 (implementation)                                                 |
 | class   | large (new subsystem + a second non-agent GitHub write authority)  |
 | profile | backend                                                            |
 | branch  | feat/epic-dependency-sweep                                         |
 | pr      | #10                                                                |
-| gate    | pending                                                            |
+| gate    | approved 2026-08-24                                                |
 | round   | 0                                                                  |
