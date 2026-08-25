@@ -544,17 +544,35 @@ func TestEpicSweepIsANoOpWithNoProjectDirectory(t *testing.T) {
 // The cap bounds the whole PASS, not one epic. Anyone with triage can apply the
 // epic label, so a per-epic cap would let the number of epics multiply the
 // write authority.
+//
+// The two epics are sized UNEQUALLY on purpose. Two epics both sized at
+// exactly maxPromotePerSweep cannot exercise the slice inside sweepEpic that
+// enforces the per-pass cap: the first epic alone drains the whole budget to
+// zero, so EpicSweepAll's own "if budget <= 0 { break }" stops the second
+// epic before sweepEpic is ever entered for it, and the cap comparison inside
+// sweepEpic never runs against a partially spent budget. Sizing epic 10 below
+// the cap forces epic 20 to be swept with budget already partly spent, which
+// is the only way to reach that slice.
 func TestEpicSweepAllCapsTheWholePass(t *testing.T) {
 	cfg, deps, f, gh := sweepAllFixture(t)
-	// Two epics, each with more unblocked children than the whole cap allows.
 	gh.issues = []ghub.Issue{epicParent(10), epicParent(20)}
-	for _, parent := range []int{10, 20} {
-		var kids []ghub.Issue
-		for i := 0; i < maxPromotePerSweep; i++ {
-			kids = append(kids, openIssue(parent*1000+i))
-		}
-		f.children[parent] = kids
+
+	// Epic 10: 10 unblocked children, all promotable. Spends 10 of the budget,
+	// leaving 15.
+	const epic10Children = 10
+	var kids10 []ghub.Issue
+	for i := 0; i < epic10Children; i++ {
+		kids10 = append(kids10, openIssue(10*1000+i))
 	}
+	f.children[10] = kids10
+
+	// Epic 20: maxPromotePerSweep unblocked children -- more than the 15
+	// remaining. Only the remaining 15 may be promoted.
+	var kids20 []ghub.Issue
+	for i := 0; i < maxPromotePerSweep; i++ {
+		kids20 = append(kids20, openIssue(20*1000+i))
+	}
+	f.children[20] = kids20
 
 	sum, err := EpicSweepAll(context.Background(), cfg, deps)
 	if err != nil {
@@ -563,6 +581,31 @@ func TestEpicSweepAllCapsTheWholePass(t *testing.T) {
 	if sum.Promoted != maxPromotePerSweep {
 		t.Fatalf("Promoted = %d across two epics, want the pass cap %d",
 			sum.Promoted, maxPromotePerSweep)
+	}
+
+	// Partition the promotions by epic, using the distinct number ranges, so
+	// the test says WHERE the budget was spent and not only how much of it.
+	// Without this, a sweepEpic that promoted all 25 of epic 20 and none of
+	// epic 10 would still sum to 25 and pass the assertion above.
+	var epic10Promoted, epic20Promoted int
+	for _, n := range f.promotedNumbers() {
+		switch {
+		case n >= 10000 && n < 11000:
+			epic10Promoted++
+		case n >= 20000 && n < 21000:
+			epic20Promoted++
+		default:
+			t.Errorf("promoted %d, which belongs to neither fixture epic", n)
+		}
+	}
+	if epic10Promoted != epic10Children {
+		t.Errorf("epic 10 promoted %d, want all %d of its unblocked children",
+			epic10Promoted, epic10Children)
+	}
+	wantEpic20 := maxPromotePerSweep - epic10Children
+	if epic20Promoted != wantEpic20 {
+		t.Errorf("epic 20 promoted %d, want the remaining budget of %d",
+			epic20Promoted, wantEpic20)
 	}
 }
 
