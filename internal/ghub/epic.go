@@ -80,11 +80,11 @@ func (g *GitHubClient) SubIssues(ctx context.Context, owner, repo string, number
 // BlockedBy returns every issue number declares as a blocker, following
 // pagination.
 //
-// A blocker may live in ANOTHER repository. Its state comes back in this same
-// response, and the state is all the sweep reads, so the repository is
-// deliberately not carried into Issue: nothing here would use it, and a field
-// nothing uses invites a caller to filter on it and silently ignore a real
-// cross-repository blocker.
+// A blocker may live in ANOTHER repository, and its state comes back in this
+// same response -- no second call and no second client are needed to read it.
+// Repo is carried through for the same reason it is on every other reader: the
+// sweep ignores a blocker outside its own repository, by the operator's
+// decision, and that filter has nothing to gate on without this field.
 func (g *GitHubClient) BlockedBy(ctx context.Context, owner, repo string, number int) ([]Issue, error) {
 	return g.pagedIssues(ctx,
 		fmt.Sprintf("repos/%s/%s/issues/%d/dependencies/blocked_by",
