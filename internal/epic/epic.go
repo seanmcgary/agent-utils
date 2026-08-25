@@ -31,6 +31,28 @@ const Label = "epic"
 // it alone.
 const StatusPrefix = "status:*"
 
+// Rule is everything Promote needs besides the children themselves.
+//
+// It is a struct rather than positional owner, repo, trigger string
+// arguments because three same-typed strings in a row is exactly the
+// transposition hazard this branch already spent two review rounds
+// guarding against: a caller that swapped owner and trigger would compile
+// and silently label the wrong issue.
+type Rule struct {
+	// Veto holds the loop's veto label rules ("prefix*" supported).
+	Veto []string
+	// Owner and Repo scope the sweep. A blocker outside them is ignored; a
+	// child outside them is never promoted.
+	Owner, Repo string
+	// Trigger is the label a promotion adds. A child already carrying it is
+	// ineligible, which is what makes a re-run promote nothing WITHOUT
+	// depending on Trigger being inside the status: namespace. StatusPrefix
+	// covers the conventional case; this covers every other one -- an
+	// operator whose trigger label does not start with "status:" is still
+	// protected from unbounded re-promotion.
+	Trigger string
+}
+
 // Child is one sub-issue of an epic, with the blockers it declares.
 type Child struct {
 	// Issue is the sub-issue itself, as sub_issues returned it.
@@ -52,28 +74,29 @@ type Child struct {
 //
 // A child is promoted when all of these hold:
 //   - it is open;
-//   - its blocker list was read, and every blocker IN owner/repo is closed;
+//   - its blocker list was read, and every blocker IN r.Owner/r.Repo is closed;
 //   - it carries no status label;
+//   - it does not already carry r.Trigger;
 //   - it carries none of the loop's veto labels.
 //
-// owner and repo scope the whole rule to one repository. See unblocked for what
-// that means for a blocker outside it, and why it is the operator's decision
-// rather than this package's.
+// r.Owner and r.Repo scope the whole rule to one repository. See unblocked for
+// what that means for a blocker outside it, and why it is the operator's
+// decision rather than this package's.
 //
 // The result is ascending so that a capped sweep takes the low-numbered batch
 // every time and the next sweep takes the next one. Without an order the batch
 // identity would depend on GitHub's page order, and the same child could be
 // deferred forever.
-func Promote(children []Child, veto []string, owner, repo string) []int {
+func Promote(children []Child, r Rule) []int {
 	var out []int
 	for _, c := range children {
-		if !NeedsBlockers(c.Issue, veto) {
+		if !NeedsBlockers(c.Issue, r) {
 			continue
 		}
 		if c.BlockersUnknown {
 			continue
 		}
-		if !unblocked(c.Blockers, owner, repo) {
+		if !unblocked(c.Blockers, r.Owner, r.Repo) {
 			continue
 		}
 		out = append(out, c.Issue.Number)
@@ -90,14 +113,25 @@ func Promote(children []Child, veto []string, owner, repo string) []int {
 // optimization, never the decision: Promote tests the same conditions again, so
 // a sweep that passed it a child this would have skipped still gets the right
 // answer. TestNeedsBlockersAgreesWithPromote pins the two together.
-func NeedsBlockers(child ghub.Issue, veto []string) bool {
+func NeedsBlockers(child ghub.Issue, r Rule) bool {
 	if !child.IsOpen() {
 		return false
 	}
 	if child.HasAnyLabel([]string{StatusPrefix}) {
 		return false
 	}
-	return !child.HasAnyLabel(veto)
+	// A child already carrying the trigger label is ineligible. StatusPrefix
+	// covers the conventional case where Trigger lives inside the status:
+	// namespace; this covers every other one, so idempotence does not rest on
+	// an operator's naming convention. Without it, a trigger label outside
+	// status:* would be re-selected by every sweep -- spending budget on an
+	// already-promoted child, and, combined with the retry-cap park removing
+	// a same-namespace blocked label, an unbounded park/re-promote/dispatch
+	// cycle.
+	if child.HasLabel(r.Trigger) {
+		return false
+	}
+	return !child.HasAnyLabel(r.Veto)
 }
 
 // unblocked reports whether every blocker in owner/repo is closed. An empty

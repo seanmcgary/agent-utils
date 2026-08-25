@@ -57,6 +57,14 @@ func EntryLoop(agentUtilsDir, repo string) (string, error) {
 	// be computed from a set that silently lost an edge, and the ambiguity
 	// message would read "planning, planning are all at the front", which tells
 	// an operator nothing.
+	// This rejection is GLOBAL, not scoped to repo: entries here spans every
+	// loop List finds in agentUtilsDir, and Duplicates is asked about all of
+	// them before the repo filter below ever runs. A duplicate name among
+	// another repository's loops therefore stops THIS repository's sweep too,
+	// even though its own loop graph may be fine. That is fail-closed and
+	// deliberate, the same shape of decision as the unloadable-file case just
+	// below: the alternative would let a project's health depend on how names
+	// happen to be spelled in a repository this operator does not administer.
 	if dupes := Duplicates(entries); len(dupes) > 0 {
 		return "", fmt.Errorf("entry loop for %s: duplicate loop names: %s: %w",
 			repo, strings.Join(dupes, ", "), ErrAmbiguousEntryLoop)

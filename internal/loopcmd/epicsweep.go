@@ -32,6 +32,20 @@ import (
 // the next batch.
 const maxPromotePerSweep = 25
 
+// maxBlockerReadsPerSweep bounds the READS one pass may make, as
+// maxPromotePerSweep bounds its writes.
+//
+// The write budget cannot do this job: it decrements only on a successful
+// promotion, so a pass over epics whose children are all blocked or all
+// already promoted -- the steady state -- spends no write budget and would
+// read without limit. The epic label costs one triage permission, and
+// ListOpenIssues paginates to completion, so the read fan-out is otherwise
+// proportional to what any triager cares to label.
+//
+// 300 at the README's 15-minute cron is ~1200 reads/hour against a
+// 5000/hour token shared with every other loop on the machine.
+const maxBlockerReadsPerSweep = 300
+
 // EpicSweep promotes the sub-issues that the closure of one issue unblocked.
 //
 // closed is the issue a delivery reported closed. The sweep starts there, walks
@@ -129,7 +143,8 @@ func EpicSweep(ctx context.Context, cfg *config.Config, deps Deps, closed int) (
 	defer l.Release()
 
 	budget := maxPromotePerSweep
-	return sweepEpic(ctx, cfg, deps, parent.Number, &budget)
+	readBudget := maxBlockerReadsPerSweep
+	return sweepEpic(ctx, cfg, deps, parent.Number, &budget, &readBudget)
 }
 
 // EpicSweepAll runs the sweep for every open epic of the repository.
@@ -169,6 +184,10 @@ func EpicSweepAll(ctx context.Context, cfg *config.Config, deps Deps) (Summary, 
 	// would let the number of epics multiply the write authority, and applying
 	// the epic label costs an attacker one triage permission.
 	budget := maxPromotePerSweep
+	// See maxBlockerReadsPerSweep: the write budget above is not decremented
+	// in the steady state (nothing promotable), so it cannot bound the reads a
+	// pass makes. This one can.
+	readBudget := maxBlockerReadsPerSweep
 	var swept int
 	for _, iss := range issues {
 		if !iss.HasLabel(epic.Label) {
@@ -193,8 +212,13 @@ func EpicSweepAll(ctx context.Context, cfg *config.Config, deps Deps) (Summary, 
 				"loop", cfg.Name, "promoted", sum.Promoted, "epics_swept", swept)
 			break
 		}
+		if readBudget <= 0 {
+			slog.Warn("epic sweep hit its blocker-read cap; the remaining epics wait for the next tick",
+				"loop", cfg.Name, "promoted", sum.Promoted, "epics_swept", swept)
+			break
+		}
 		swept++
-		one, err := sweepEpic(ctx, cfg, deps, iss.Number, &budget)
+		one, err := sweepEpic(ctx, cfg, deps, iss.Number, &budget, &readBudget)
 		sum.Promoted += one.Promoted
 		if err != nil {
 			// One unreadable epic must not abandon the rest. If this returned,
@@ -227,8 +251,14 @@ func EpicSweepAll(ctx context.Context, cfg *config.Config, deps Deps) (Summary, 
 //
 // budget is the number of promotions the whole PASS may still make. It is a
 // pointer because EpicSweepAll spends one budget across many epics.
+//
+// readBudget is the number of blocker reads (BlockedBy calls) the whole PASS
+// may still make, for the same reason and by the same mechanism -- see
+// maxBlockerReadsPerSweep. A child whose blockers could not be read because
+// the budget was already spent is held exactly as one that failed to read for
+// any other reason: BlockersUnknown, never promoted.
 func sweepEpic(
-	ctx context.Context, cfg *config.Config, deps Deps, parent int, budget *int,
+	ctx context.Context, cfg *config.Config, deps Deps, parent int, budget, readBudget *int,
 ) (Summary, error) {
 	var sum Summary
 	owner, repo := cfg.RepoOwner(), cfg.RepoName()
@@ -237,6 +267,8 @@ func sweepEpic(
 	if err != nil {
 		return sum, fmt.Errorf("epic sweep: read sub-issues of #%d: %w", parent, err)
 	}
+
+	rule := epic.Rule{Veto: cfg.Labels.Veto, Owner: owner, Repo: repo, Trigger: cfg.Labels.Trigger}
 
 	children := make([]epic.Child, 0, len(kids))
 	for _, kid := range kids {
@@ -266,10 +298,22 @@ func sweepEpic(
 		// child that cannot be promoted whatever its blockers say. Promote
 		// tests the same conditions again and is the only place the decision is
 		// made. See epic.NeedsBlockers.
-		if !epic.NeedsBlockers(kid, cfg.Labels.Veto) {
+		if !epic.NeedsBlockers(kid, rule) {
 			continue
 		}
 		c := epic.Child{Issue: kid}
+		if *readBudget <= 0 {
+			// The read budget for the whole PASS is spent. Fail closed: a child
+			// whose blockers were never read is UNKNOWN, not "no blockers", so
+			// it is held for a later sweep rather than promoted on a guess. See
+			// maxBlockerReadsPerSweep.
+			slog.Warn("blocker-read cap reached; holding this sub-issue unread",
+				"loop", cfg.Name, "epic", parent, "issue", kid.Number)
+			c.BlockersUnknown = true
+			children = append(children, c)
+			continue
+		}
+		*readBudget--
 		c.Blockers, err = deps.Epic.BlockedBy(ctx, owner, repo, kid.Number)
 		if err != nil {
 			// Held, not dropped and not promoted. An unreadable blocker list
@@ -285,7 +329,7 @@ func sweepEpic(
 		children = append(children, c)
 	}
 
-	promote := epic.Promote(children, cfg.Labels.Veto, owner, repo)
+	promote := epic.Promote(children, rule)
 	if len(promote) == 0 {
 		return sum, nil
 	}

@@ -296,7 +296,11 @@ func TestEpicSweepStopsWhenTheIssueHasNoParent(t *testing.T) {
 
 func TestEpicSweepStopsWhenTheParentIsNotAnEpic(t *testing.T) {
 	cfg, deps, f := sweepFixture(t)
-	f.parents[71] = ghub.Issue{Number: 69, State: "open", Labels: []string{"tracking"}}
+	// Repo is set to "o/r" so this reaches the epic-label guard the test is
+	// named for. Without it, the cross-repository guard (InRepo("o","r") is
+	// false when Repo is empty) stops the sweep first, and this test passes
+	// even if the epic-label early return is deleted entirely.
+	f.parents[71] = ghub.Issue{Number: 69, State: "open", Repo: "o/r", Labels: []string{"tracking"}}
 	f.children[69] = []ghub.Issue{openIssue(73)}
 
 	if _, err := EpicSweep(context.Background(), cfg, deps, 71); err != nil {
@@ -487,6 +491,52 @@ func TestEpicSweepCapsOneSweepAndTakesTheLowBatch(t *testing.T) {
 	got := f.promotedNumbers()
 	if got[0] != 100 || got[len(got)-1] != 100+maxPromotePerSweep-1 {
 		t.Errorf("capped batch = %v, want the low-numbered %d", got, maxPromotePerSweep)
+	}
+}
+
+// The read budget bounds blocker reads INDEPENDENTLY of the write budget: a
+// child whose blockers were never read must be held, not promoted, even when
+// the write budget still has plenty of room. This is the steady-state case
+// maxBlockerReadsPerSweep exists for -- see its doc comment -- and it is
+// deliberately built so the write cap (25) is nowhere near spent: every one
+// of the first maxBlockerReadsPerSweep children is BLOCKED, so promoting them
+// spends only read budget, never write budget.
+func TestEpicSweepBoundsBlockerReadsAndHoldsWhatItDidNotRead(t *testing.T) {
+	cfg, deps, f := sweepFixture(t)
+	f.parents[1] = epicParent(69)
+
+	kids := []ghub.Issue{closedIssue(1)}
+	blocker := openIssue(999)
+	for n := 100; n < 100+maxBlockerReadsPerSweep; n++ {
+		kids = append(kids, openIssue(n))
+		f.blockers[n] = []ghub.Issue{blocker}
+	}
+	// One more child, past the read cap, that IS trivially unblocked -- it
+	// declares no blockers at all, so it would be promoted if only its
+	// blocker list were read.
+	heldChild := 100 + maxBlockerReadsPerSweep
+	kids = append(kids, openIssue(heldChild))
+	f.children[69] = kids
+
+	sum, err := EpicSweep(context.Background(), cfg, deps, 1)
+	if err != nil {
+		t.Fatalf("EpicSweep: %v", err)
+	}
+	if sum.Promoted != 0 {
+		t.Fatalf("Promoted = %d, want 0: every one of the first %d children is blocked",
+			sum.Promoted, maxBlockerReadsPerSweep)
+	}
+	if len(f.blockedByCalls) != maxBlockerReadsPerSweep {
+		t.Fatalf("blocked_by calls = %d, want exactly the read cap %d",
+			len(f.blockedByCalls), maxBlockerReadsPerSweep)
+	}
+	for _, n := range f.blockedByCalls {
+		if n == heldChild {
+			t.Error("read blockers for the child past the read cap")
+		}
+	}
+	if _, ok := f.added[heldChild]; ok {
+		t.Error("promoted a child whose blockers were never read; an unread blocker list must hold, not promote")
 	}
 }
 
@@ -715,5 +765,32 @@ func TestEpicSweepAllTakesNoLockBecauseItsCallerHoldsIt(t *testing.T) {
 	}
 	if got := f.promotedNumbers(); len(got) != 1 || got[0] != 73 {
 		t.Errorf("promoted %v, want [73]", got)
+	}
+}
+
+// The mirror of TestEpicSweepAllTakesNoLockBecauseItsCallerHoldsIt: EpicSweep
+// (the webhook path) DOES take the loop lock itself, unlike EpicSweepAll.
+// Holding it before calling EpicSweep must be refused, not silently promote
+// nothing -- a mistaken removal of the lock.Acquire in EpicSweep would leave
+// this whole suite green, since every other test here calls EpicSweep with
+// the lock free.
+func TestEpicSweepRefusesWhenTheLoopLockIsHeld(t *testing.T) {
+	cfg, deps, f := sweepFixture(t)
+	f.parents[71] = epicParent(69)
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
+
+	l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
+	if err != nil {
+		t.Fatalf("lock.Acquire: %v", err)
+	}
+	defer l.Release()
+
+	_, err = EpicSweep(context.Background(), cfg, deps, 71)
+	if !errors.Is(err, lock.ErrHeld) {
+		t.Fatalf("EpicSweep error = %v, want one wrapping lock.ErrHeld", err)
+	}
+	if got := f.promotedNumbers(); len(got) != 0 {
+		t.Errorf("promoted %v while the loop lock was held, want none", got)
 	}
 }

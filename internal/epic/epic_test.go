@@ -21,6 +21,14 @@ func closed(n int, labels ...string) ghub.Issue {
 // The reference loop's veto list. blocked:* is a prefix rule.
 var veto = []string{"blocked:*"}
 
+// rule is the reference loop's promotion rule: its trigger IS inside the
+// status: namespace, so StatusPrefix alone would suppress a re-promotion of a
+// child carrying it. TestPromoteWithoutStatusPrefixTrigger and
+// TestNeedsBlockersWithoutStatusPrefixTrigger use a Rule whose Trigger is NOT
+// in that namespace, to prove the Trigger check in NeedsBlockers is what
+// suppresses re-promotion there -- not an unenforced naming convention.
+var rule = Rule{Veto: veto, Owner: "o", Repo: "r", Trigger: "status:ready-for-spec"}
+
 func TestPromote(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -156,7 +164,7 @@ func TestPromote(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := Promote(c.children, veto, "o", "r")
+			got := Promote(c.children, rule)
 			if len(got) == 0 && len(c.want) == 0 {
 				return
 			}
@@ -164,6 +172,25 @@ func TestPromote(t *testing.T) {
 				t.Errorf("Promote = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// The idempotence property must hold even when the operator's trigger label is
+// NOT inside the status: namespace, so it cannot rely on StatusPrefix alone.
+// Without the Trigger check in NeedsBlockers this would re-promote the child
+// every sweep -- see the epic sweep's package doc for the unbounded
+// park/re-promote/dispatch cycle that follows from that.
+func TestPromoteWithoutStatusPrefixTrigger(t *testing.T) {
+	r := Rule{Veto: veto, Owner: "o", Repo: "r", Trigger: "trigger"}
+
+	already := Child{Issue: open(74, "trigger"), Blockers: []ghub.Issue{closed(73)}}
+	if got := Promote([]Child{already}, r); len(got) != 0 {
+		t.Errorf("Promote = %v, want none: a child already carrying the trigger label must not be re-promoted", got)
+	}
+
+	fresh := Child{Issue: open(75), Blockers: []ghub.Issue{closed(73)}}
+	if got := Promote([]Child{fresh}, r); len(got) != 1 || got[0] != 75 {
+		t.Errorf("Promote = %v, want [75]: an unblocked child with no trigger label must still be promoted", got)
 	}
 }
 
@@ -184,14 +211,14 @@ func TestNeedsBlockersAgreesWithPromote(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := NeedsBlockers(c.issue, veto); got != c.want {
+			if got := NeedsBlockers(c.issue, rule); got != c.want {
 				t.Errorf("NeedsBlockers(%d, %v) = %v, want %v", c.issue.Number, c.issue.Labels, got, c.want)
 			}
 
 			// A child with no blockers is promoted exactly when the rule says
 			// it may be. If NeedsBlockers says "skip the call" for a child
 			// Promote would have promoted, the sweep loses a promotion.
-			promoted := len(Promote([]Child{{Issue: c.issue}}, veto, "o", "r")) == 1
+			promoted := len(Promote([]Child{{Issue: c.issue}}, rule)) == 1
 			if promoted != c.want {
 				t.Errorf("Promote treated issue %d %v as %v, want %v",
 					c.issue.Number, c.issue.Labels,
@@ -199,5 +226,21 @@ func TestNeedsBlockersAgreesWithPromote(t *testing.T) {
 					map[bool]string{true: "promoted", false: "declined"}[c.want])
 			}
 		})
+	}
+}
+
+// The mirror of TestPromoteWithoutStatusPrefixTrigger, for the optimization
+// filter: it must agree with Promote even when Trigger is outside status:*.
+func TestNeedsBlockersWithoutStatusPrefixTrigger(t *testing.T) {
+	r := Rule{Veto: veto, Owner: "o", Repo: "r", Trigger: "trigger"}
+
+	already := open(74, "trigger")
+	if got := NeedsBlockers(already, r); got {
+		t.Error("NeedsBlockers = true for a child already carrying the trigger label, want false")
+	}
+
+	fresh := open(75)
+	if got := NeedsBlockers(fresh, r); !got {
+		t.Error("NeedsBlockers = false for a child with no trigger label, want true")
 	}
 }

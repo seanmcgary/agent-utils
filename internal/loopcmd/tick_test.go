@@ -42,10 +42,26 @@ type fakeGH struct {
 	// PullRequest). A test asserting "the comparison was never made" needs
 	// this counter, not that one.
 	compared []int
+
+	// listIssuesErr makes ListOpenIssues fail from the call numbered
+	// failListIssuesFrom onward (1-indexed against listedIssues, after it is
+	// incremented). 0 means never fail.
+	//
+	// It is call-numbered, not a flat toggle, because one Tick makes TWO
+	// ListOpenIssues calls against the same fake: its own snapshot read
+	// (call 1), and EpicSweepAll's listing (call 2). A test that wants to
+	// prove the sweep's error genuinely reaches Tick's error branch must fail
+	// only call 2 -- failing call 1 as well would make Tick return before its
+	// own dispatch work ran, which is a different, uninteresting failure.
+	listIssuesErr      error
+	failListIssuesFrom int
 }
 
 func (f *fakeGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
 	f.listedIssues++
+	if f.listIssuesErr != nil && f.failListIssuesFrom > 0 && f.listedIssues >= f.failListIssuesFrom {
+		return nil, f.listIssuesErr
+	}
 	return f.issues, nil
 }
 func (f *fakeGH) ListOpenPullRequests(context.Context, string, string) ([]ghub.PullRequest, error) {
@@ -677,16 +693,24 @@ func TestRunTickRunsTheEpicSweepWithoutDeadlocking(t *testing.T) {
 // A sweep that cannot read GitHub must not cost the tick its dispatch work.
 // The tick's job is dispatch; a failed sweep says nothing about that.
 //
-// The failure is injected at SubIssues, not at BlockedBy: a failed blocker read
-// is handled inside sweepEpic (it holds the child and returns nil), so it never
-// reaches Tick's error branch and would test nothing here.
+// The failure is injected by failing the fake's SECOND ListOpenIssues call --
+// EpicSweepAll's own listing, not Tick's own snapshot read (call 1, which must
+// succeed for the tick's dispatch work to run at all) -- so the error
+// genuinely reaches EpicSweepAll and Tick's handling of it, rather than
+// stopping Tick before it does anything.
+//
+// It is deliberately NOT injected at SubIssues or BlockedBy: both of those are
+// handled INSIDE sweepEpic (a failed SubIssues logs and continues to the next
+// epic per TestEpicSweepAllContinuesPastAFailedEpic; a failed BlockedBy holds
+// the child and returns nil), so neither ever reaches EpicSweepAll's own
+// error return and would test nothing about Tick's handling of THAT.
 func TestTickSurvivesAFailedEpicSweep(t *testing.T) {
-	cfg, deps, f, gh := sweepAllFixture(t)
+	cfg, deps, _, gh := sweepAllFixture(t)
 	gh.issues = []ghub.Issue{
-		epicParent(69),
 		openIssue(1, cfg.Labels.Trigger),
 	}
-	f.subErr[69] = errors.New("502 bad gateway")
+	gh.listIssuesErr = errors.New("502 bad gateway")
+	gh.failListIssuesFrom = 2
 
 	sum, err := Tick(context.Background(), cfg, deps)
 	if err != nil {
