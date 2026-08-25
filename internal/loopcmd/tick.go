@@ -24,8 +24,12 @@ type Deps struct {
 	Store *store.Store
 	// ProjectID owns every row this loop writes. The detached runner is given it
 	// explicitly, because it resolves no project of its own.
-	ProjectID  string
-	GH         ghub.Client
+	ProjectID string
+	GH        ghub.Client
+	// Epic reads sub-issues and issue dependencies for the epic sweep. It is
+	// narrow on purpose -- see ghub.EpicReader -- so a test of any OTHER pass
+	// does not have to grow three methods it never calls.
+	Epic       ghub.EpicReader
 	WT         *worktree.Manager
 	SelfPath   string
 	ConfigPath string
@@ -89,6 +93,7 @@ type Summary struct {
 	Resumed        int  `json:"resumed"`
 	Retried        int  `json:"retried"`
 	Tended         int  `json:"tended"`
+	Promoted       int  `json:"promoted"`
 	Parked         int  `json:"parked"`
 	Live           int  `json:"live"`
 	Orphans        int  `json:"orphans"`

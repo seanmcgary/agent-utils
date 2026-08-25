@@ -256,3 +256,51 @@ func TestOpen_RelativeDirWithNoProjectRootIsAnError(t *testing.T) {
 		t.Errorf("err = %v, want it to name checkout_base_dir", err)
 	}
 }
+
+// The daemon's client is a *ghub.DeliveryCache, which implements ghub.Client
+// and NOT ghub.EpicReader. Open must still produce a usable Deps.Epic, or the
+// epic sweep is dead on the webhook path -- its primary driver -- while every
+// test that injects its own reader stays green.
+func TestOpenCarriesTheEpicReaderPastTheDeliveryCache(t *testing.T) {
+	// The premise. If DeliveryCache ever grows the three methods, the explicit
+	// Options.Epic field can go -- but until then, asserting on GH is a trap
+	// that fails only in production.
+	if _, ok := any((*ghub.DeliveryCache)(nil)).(ghub.EpicReader); ok {
+		t.Fatal("DeliveryCache now implements EpicReader; this test's premise is stale")
+	}
+
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeOpenConfig(t)
+
+	real := ghub.New("")
+	_, deps, cleanup, err := Open(ProjectRef{}, path, Options{
+		// Exactly what listener.access builds: the cache for GH, the
+		// un-wrapped client for Epic.
+		GH:   ghub.NewDeliveryCache(real),
+		Epic: real,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+
+	if deps.Epic == nil {
+		t.Fatal("deps.Epic is nil; the epic sweep is dead on the webhook path")
+	}
+}
+
+// The CLI path supplies neither, and must still get a reader.
+func TestOpenBuildsAnEpicReaderWhenTheCallerSuppliesNone(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeOpenConfig(t)
+
+	_, deps, cleanup, err := Open(ProjectRef{}, path, Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+
+	if deps.Epic == nil {
+		t.Fatal("deps.Epic is nil on the CLI path")
+	}
+}

@@ -379,6 +379,12 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 type access struct {
 	token string
 	gh    ghub.Client
+	// epic is the SAME authenticated client as gh, before the DeliveryCache
+	// wrapper. The cache exists to collapse the repeated single-issue fetch a
+	// fan-out makes; the epic reads are made once per delivery and have nothing
+	// to collapse, so they bypass it rather than teaching it three more methods
+	// it would only ever pass through.
+	epic ghub.EpicReader
 }
 
 // access reads the token and builds the pass's client and memo.
@@ -392,7 +398,14 @@ func (w *Worker) access() (*access, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &access{token: tok, gh: ghub.NewDeliveryCache(w.NewClient(tok))}, nil
+	c := w.NewClient(tok)
+	acc := &access{token: tok, gh: ghub.NewDeliveryCache(c)}
+	// A test's fake client may implement ghub.Client only. Leaving epic nil
+	// there is correct: EpicSweep refuses rather than panicking.
+	if er, ok := c.(ghub.EpicReader); ok {
+		acc.epic = er
+	}
+	return acc, nil
 }
 
 // tickFresh ticks one loop with GitHub access of its OWN.
@@ -433,6 +446,7 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 		// delivered issue from one fetch. Open builds its own only when this
 		// is nil, which is what keeps `project loop tick` unchanged.
 		GH:            acc.gh,
+		Epic:          acc.epic,
 		RequireGitHub: true,
 		// The write path. A tick against a database missing this loop's rows
 		// would re-dispatch every open issue and start a second agent in a
