@@ -66,6 +66,17 @@ type Options struct {
 	// stay with the caller: a client cached any longer would decide from stale
 	// LABELS.
 	GH ghub.Client
+	// Epic reads sub-issues and issue dependencies. Nil means "build one from
+	// Token", like GH.
+	//
+	// It is a SEPARATE field from GH rather than an assertion on it, because
+	// the daemon's GH is a *ghub.DeliveryCache: that type memoises single-issue
+	// fetches for one delivery and implements ghub.Client only. Asserting
+	// GH.(ghub.EpicReader) therefore succeeds for every CLI command and fails
+	// for every webhook delivery -- which is the epic sweep's main driver, so
+	// the feature would be dead exactly where it matters and nowhere a test
+	// injecting its own reader would notice.
+	Epic ghub.EpicReader
 }
 
 // Open resolves a project's loop configuration and builds everything one tick
@@ -131,6 +142,16 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		gh = ghub.New(token)
 	}
 
+	// Falls back to the same client when the caller supplied none. The
+	// concrete *ghub.GitHubClient satisfies both interfaces; only the
+	// DeliveryCache wrapper does not, and the daemon passes Epic explicitly.
+	epicReader := opts.Epic
+	if epicReader == nil {
+		if er, ok := gh.(ghub.EpicReader); ok {
+			epicReader = er
+		}
+	}
+
 	if _, err := home.EnsureDir(); err != nil {
 		return nil, Deps{}, nil, err
 	}
@@ -185,6 +206,7 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		Store:      db.Project(ref.ID),
 		ProjectID:  ref.ID,
 		GH:         gh,
+		Epic:       epicReader,
 		WT:         wt,
 		SelfPath:   self,
 		ConfigPath: abs,

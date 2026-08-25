@@ -170,7 +170,15 @@ type Worker struct {
 	// Delivery.ClosedPR is only set on a pull_request delivery, so the number
 	// IS the pull request's.
 	RunCleanup func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, prNumber int) error
-	Now        func() time.Time
+	// RunEpic promotes the sub-issues that a closed issue unblocked. Production
+	// wires it to loopcmd.EpicSweep, which takes the loop's lock itself.
+	//
+	// It runs for ONE delivery -- an issue closing -- because that is the only
+	// event that unblocks anything. It dispatches no agent: its whole output is
+	// label writes, which is what makes it safe for a delivery to act on more
+	// than the issue it names. See loopcmd.EpicSweep.
+	RunEpic func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, closed int) (loopcmd.Summary, error)
+	Now     func() time.Time
 	// After schedules f. It is a seam: production wires it to time.AfterFunc,
 	// and a test substitutes a controlled clock. Without it the retry tests
 	// would have to sleep for the real delays, which the acceptance forbids.
@@ -218,6 +226,7 @@ func NewWorker(db *store.DB) *Worker {
 		RunIssue:        loopcmd.TickIssue,
 		RunTend:         loopcmd.TendSweep,
 		RunCleanup:      loopcmd.CleanupClosedPR,
+		RunEpic:         loopcmd.EpicSweep,
 		Now:             time.Now,
 		After:           time.AfterFunc,
 		OpenRetryDelay:  defaultOpenRetryDelay,
@@ -263,6 +272,14 @@ type Delivery struct {
 	// loopcmd.CleanupClosedPR for the operator's decision to remove both on
 	// ANY close, not only a merge.
 	ClosedPR bool
+	// ClosedIssue is true when this delivery closed an ISSUE, not a pull
+	// request. It is what arms the epic sweep.
+	//
+	// It is deliberately narrower than ClosedPR's counterpart: issues and pull
+	// requests share a number space, so a pull_request delivery that set this
+	// would sweep the epic of whichever issue happens to carry that number.
+	// The event is checked as well as the action.
+	ClosedIssue bool
 }
 
 // IsMergeInto reports whether this delivery merged a pull request into branch.
@@ -379,6 +396,12 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 type access struct {
 	token string
 	gh    ghub.Client
+	// epic is the SAME authenticated client as gh, before the DeliveryCache
+	// wrapper. The cache exists to collapse the repeated single-issue fetch a
+	// fan-out makes; the epic reads are made once per delivery and have nothing
+	// to collapse, so they bypass it rather than teaching it three more methods
+	// it would only ever pass through.
+	epic ghub.EpicReader
 }
 
 // access reads the token and builds the pass's client and memo.
@@ -392,7 +415,14 @@ func (w *Worker) access() (*access, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &access{token: tok, gh: ghub.NewDeliveryCache(w.NewClient(tok))}, nil
+	c := w.NewClient(tok)
+	acc := &access{token: tok, gh: ghub.NewDeliveryCache(c)}
+	// A test's fake client may implement ghub.Client only. Leaving epic nil
+	// there is correct: EpicSweep refuses rather than panicking.
+	if er, ok := c.(ghub.EpicReader); ok {
+		acc.epic = er
+	}
+	return acc, nil
 }
 
 // tickFresh ticks one loop with GitHub access of its OWN.
@@ -433,6 +463,7 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 		// delivered issue from one fetch. Open builds its own only when this
 		// is nil, which is what keeps `project loop tick` unchanged.
 		GH:            acc.gh,
+		Epic:          acc.epic,
 		RequireGitHub: true,
 		// The write path. A tick against a database missing this loop's rows
 		// would re-dispatch every open issue and start a second agent in a
@@ -463,6 +494,18 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	// about the other branches, which are behind because the base moved.
 	if cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch) {
 		w.armTend(ctx, t, cfg.DefaultBranch)
+	}
+
+	// Runs after the issue's own pass, and independently of whether that pass
+	// succeeded: the closed issue's pass moves ITS labels, and that says
+	// nothing about the siblings it unblocked.
+	//
+	// It is NOT armed on a timer the way tending is. A tend sweep is delayed to
+	// collapse a merge train into one batch of agents; this writes labels, so a
+	// burst costs a few more API calls and nothing else. A delay would only
+	// postpone the promotion.
+	if d.ClosedIssue {
+		w.epicPass(ctx, t, d, cfg, deps)
 	}
 
 	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
@@ -610,6 +653,31 @@ func (w *Worker) tendPass(
 			return
 		}
 		slog.Error("tend sweep failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
+	}
+}
+
+// epicPass promotes the sub-issues the delivery's closed issue unblocked.
+//
+// A failure is logged and dropped. It schedules NO retry, for the same reason
+// the cleanup pass does not: the cron sweep re-derives this from scratch on its
+// next tick, so a missed promotion is recovered without any state kept here.
+func (w *Worker) epicPass(
+	ctx context.Context, t Target, d Delivery, cfg *config.Config, deps loopcmd.Deps,
+) {
+	sum, err := w.RunEpic(ctx, cfg, deps, d.Number)
+	if err != nil {
+		if errors.Is(err, lock.ErrHeld) {
+			slog.Info("skipping epic sweep: another tick holds the loop lock",
+				"loop", cfg.Name, "project", t.ProjectName, "issue", d.Number)
+			return
+		}
+		slog.Error("epic sweep failed", "loop", cfg.Name, "project", t.ProjectName,
+			"issue", d.Number, "err", err)
+		return
+	}
+	if sum.Promoted > 0 {
+		slog.Info("epic sweep promoted sub-issues", "loop", cfg.Name,
+			"project", t.ProjectName, "issue", d.Number, "promoted", sum.Promoted)
 	}
 }
 

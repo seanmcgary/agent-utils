@@ -12,6 +12,38 @@ type Issue struct {
 	Title     string
 	Labels    []string
 	UpdatedAt time.Time
+	// State is "open" or "closed", as GitHub spells it.
+	//
+	// Every caller before the epic sweep listed OPEN issues only, so this was
+	// not needed and was not carried. The sweep reads sub-issues and blockers,
+	// and both lists mix open and closed, so the state has to survive the
+	// conversion. Compare it with IsOpen rather than by ==: GitHub's spelling
+	// is stable, but nothing here forces the case.
+	State string
+	// Repo is the "owner/name" this issue lives in, or "" when the response did
+	// not say.
+	//
+	// It exists because sub-issue, parent and dependency relations may CROSS
+	// repositories, and the epic sweep writes a label by NUMBER against one
+	// loop's owner/repo. A foreign sub-issue carried through without this field
+	// would label whichever local issue happens to share its number -- the same
+	// class of bug as answering a pull_request delivery as an issue, which
+	// handler.go guards against by checking the event.
+	//
+	// Empty is NOT "local". It is "unknown", and InRepo answers false for it.
+	Repo string
+}
+
+// IsOpen reports whether the issue is open. The comparison ignores case.
+func (i Issue) IsOpen() bool { return strings.EqualFold(i.State, "open") }
+
+// InRepo reports whether the issue lives in owner/repo.
+//
+// An issue whose Repo is empty answers false. The field is empty only when the
+// response did not name a repository, which is "unknown", and the sweep's write
+// is by number: guessing "local" there is how a foreign issue gets labelled.
+func (i Issue) InRepo(owner, repo string) bool {
+	return i.Repo != "" && strings.EqualFold(i.Repo, owner+"/"+repo)
 }
 
 // HasLabel reports whether the issue carries name. The comparison ignores case.

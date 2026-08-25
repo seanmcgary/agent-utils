@@ -533,6 +533,14 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// or not, so this checks only the action, not the merged flag.
 		closedPR := event == "pull_request" && body.Action == "closed"
 
+		// The counterpart of closedPR, and deliberately not merged with it. An
+		// issue and a pull request share a number space, so a pull_request
+		// delivery answered as an issue close would sweep the epic of whichever
+		// issue carries the pull request's number. The event is what tells them
+		// apart, and it is checked here rather than downstream because this is
+		// the only layer that has it.
+		closedIssue := event == "issues" && body.Action == "closed"
+
 		// 9. GitHub redelivers on timeout and on manual "Redeliver," and the
 		// plaintext hop behind a reverse proxy makes a captured delivery
 		// replayable forever. A repeat is answered 200 without a second Tick.
@@ -634,13 +642,19 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if closedPR {
 				attrs = append(attrs, "closed_pr", true)
 			}
+			if closedIssue {
+				attrs = append(attrs, "closed_issue", true)
+			}
 			slog.Info("accepted delivery", attrs...)
 
 			s.wg.Add(1)
 			go func() {
 				defer func() { <-s.sem }()
 				defer s.wg.Done()
-				s.Tick(ctx, Delivery{Repo: repo, Number: number, MergedInto: mergedInto, ClosedPR: closedPR})
+				s.Tick(ctx, Delivery{
+					Repo: repo, Number: number, MergedInto: mergedInto,
+					ClosedPR: closedPR, ClosedIssue: closedIssue,
+				})
 			}()
 		default:
 			// merged_into and closed_pr only when the payload carried one, for

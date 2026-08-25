@@ -126,8 +126,7 @@ func hookRequest(h HookSpec) (*github.Hook, error) {
 // operator as "the repository does not exist" and sends them down the wrong
 // path entirely.
 func missingScopeErr(owner, repo string, err error) error {
-	var ge *github.ErrorResponse
-	if errors.As(err, &ge) && ge.Response != nil && ge.Response.StatusCode == 404 {
+	if isNotFound(err) {
 		// ErrHookNotFound is joined in so a caller can branch on the 404
 		// without parsing the message, while the message still names the
 		// scope: the two causes are indistinguishable from the response
@@ -136,4 +135,15 @@ func missingScopeErr(owner, repo string, err error) error {
 			owner, repo, errors.Join(ErrHookNotFound, err))
 	}
 	return fmt.Errorf("hooks %s/%s: %w", owner, repo, err)
+}
+
+// isNotFound reports whether err is GitHub's 404.
+//
+// One copy, two callers: missingScopeErr reads it as "no such hook, or no
+// admin:repo_hook scope", and Parent reads it as "this issue has no parent".
+// The two READINGS differ and that is fine; the test must not, or one of them
+// silently stops recognising a 404.
+func isNotFound(err error) bool {
+	var ge *github.ErrorResponse
+	return errors.As(err, &ge) && ge.Response != nil && ge.Response.StatusCode == 404
 }

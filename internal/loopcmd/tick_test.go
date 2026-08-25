@@ -2,6 +2,7 @@ package loopcmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -41,10 +42,26 @@ type fakeGH struct {
 	// PullRequest). A test asserting "the comparison was never made" needs
 	// this counter, not that one.
 	compared []int
+
+	// listIssuesErr makes ListOpenIssues fail from the call numbered
+	// failListIssuesFrom onward (1-indexed against listedIssues, after it is
+	// incremented). 0 means never fail.
+	//
+	// It is call-numbered, not a flat toggle, because one Tick makes TWO
+	// ListOpenIssues calls against the same fake: its own snapshot read
+	// (call 1), and EpicSweepAll's listing (call 2). A test that wants to
+	// prove the sweep's error genuinely reaches Tick's error branch must fail
+	// only call 2 -- failing call 1 as well would make Tick return before its
+	// own dispatch work ran, which is a different, uninteresting failure.
+	listIssuesErr      error
+	failListIssuesFrom int
 }
 
 func (f *fakeGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
 	f.listedIssues++
+	if f.listIssuesErr != nil && f.failListIssuesFrom > 0 && f.listedIssues >= f.failListIssuesFrom {
+		return nil, f.listIssuesErr
+	}
 	return f.issues, nil
 }
 func (f *fakeGH) ListOpenPullRequests(context.Context, string, string) ([]ghub.PullRequest, error) {
@@ -628,5 +645,81 @@ func TestAnOldDispatchWithANonPositivePidIsStillReaped(t *testing.T) {
 	}
 	if sum.Orphans != 1 {
 		t.Errorf("Orphans = %d, want 1: a runner that never registered is dead", sum.Orphans)
+	}
+}
+
+// The cron tick is the backstop for a delivery the daemon never saw.
+func TestTickRunsTheEpicSweep(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	// Built with the helpers, which set Repo. A bare ghub.Issue literal has an
+	// empty Repo, and InRepo answers false for that, so the sweep would skip
+	// every one of them and this test would fail for a reason that has nothing
+	// to do with what it is testing.
+	gh.issues = []ghub.Issue{epicParent(69), openIssue(73)}
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if sum.Promoted != 1 {
+		t.Fatalf("Summary.Promoted = %d, want 1", sum.Promoted)
+	}
+	if got := f.promotedNumbers(); len(got) != 1 || got[0] != 73 {
+		t.Errorf("promoted %v, want [73]", got)
+	}
+}
+
+// The self-deadlock regression. RunTick holds the loop lock and then calls
+// Tick, so anything Tick calls that acquires the SAME lock gets ErrHeld and
+// promotes nothing, forever. Calling Tick directly cannot catch that; this
+// calls RunTick, which is what cron runs.
+func TestRunTickRunsTheEpicSweepWithoutDeadlocking(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	gh.issues = []ghub.Issue{epicParent(69)}
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
+
+	sum, err := RunTick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	if sum.Promoted != 1 {
+		t.Fatalf("Promoted = %d, want 1; a sweep that self-deadlocks reports 0", sum.Promoted)
+	}
+}
+
+// A sweep that cannot read GitHub must not cost the tick its dispatch work.
+// The tick's job is dispatch; a failed sweep says nothing about that.
+//
+// The failure is injected by failing the fake's SECOND ListOpenIssues call --
+// EpicSweepAll's own listing, not Tick's own snapshot read (call 1, which must
+// succeed for the tick's dispatch work to run at all) -- so the error
+// genuinely reaches EpicSweepAll and Tick's handling of it, rather than
+// stopping Tick before it does anything.
+//
+// It is deliberately NOT injected at SubIssues or BlockedBy: both of those are
+// handled INSIDE sweepEpic (a failed SubIssues logs and continues to the next
+// epic per TestEpicSweepAllContinuesPastAFailedEpic; a failed BlockedBy holds
+// the child and returns nil), so neither ever reaches EpicSweepAll's own
+// error return and would test nothing about Tick's handling of THAT.
+func TestTickSurvivesAFailedEpicSweep(t *testing.T) {
+	cfg, deps, _, gh := sweepAllFixture(t)
+	gh.issues = []ghub.Issue{
+		openIssue(1, cfg.Labels.Trigger),
+	}
+	gh.listIssuesErr = errors.New("502 bad gateway")
+	gh.failListIssuesFrom = 2
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("Tick must not fail because a sweep did: %v", err)
+	}
+	if sum.Started != 1 {
+		t.Errorf("Started = %d, want 1; the tick's own work must still happen", sum.Started)
+	}
+	if sum.Promoted != 0 {
+		t.Errorf("Promoted = %d, want 0", sum.Promoted)
 	}
 }

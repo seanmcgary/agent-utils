@@ -1761,3 +1761,88 @@ func TestAnArmedTendSweepDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
 		t.Errorf("tends = %v, want none: a cancelled daemon must start no sweep", got)
 	}
 }
+
+// sweptNumbers wires RunEpic to record the issues it was asked to sweep. The
+// slice is guarded to match every other accessor in this file, though Deliver
+// ticks its targets sequentially (see Worker.Deliver), not concurrently.
+func sweptNumbers(h *harness) (*[]int, *sync.Mutex) {
+	var mu sync.Mutex
+	var swept []int
+	h.w.RunEpic = func(_ context.Context, _ *config.Config, _ loopcmd.Deps, closed int) (loopcmd.Summary, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		swept = append(swept, closed)
+		return loopcmd.Summary{}, nil
+	}
+	return &swept, &mu
+}
+
+// An issue closing is what unblocks its siblings. It is the ONLY event that
+// starts an epic sweep.
+func TestClosedIssueRunsTheEpicSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	swept, mu := sweptNumbers(h)
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 71, ClosedIssue: true})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*swept) != 1 || (*swept)[0] != 71 {
+		t.Fatalf("epic sweep ran for %v, want [71]", *swept)
+	}
+}
+
+func TestANonCloseDeliveryRunsNoEpicSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	swept, mu := sweptNumbers(h)
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 71})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*swept) != 0 {
+		t.Fatalf("epic sweep ran for %v; only a closed issue starts one", *swept)
+	}
+}
+
+// A merged pull request is not an issue close. ClosedPR arms the worktree
+// cleanup and the tend sweep; it must arm nothing here.
+func TestAMergedPullRequestRunsNoEpicSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	swept, mu := sweptNumbers(h)
+
+	h.w.Deliver(context.Background(), Delivery{
+		Repo: "o/r", Number: 71, MergedInto: "master", ClosedPR: true,
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*swept) != 0 {
+		t.Fatalf("epic sweep ran for %v on a pull request delivery", *swept)
+	}
+}
+
+// The closed issue's own pass is what moves ITS labels. The sweep is extra
+// work, not a replacement, and a failing sweep must not cost the issue its
+// pass.
+func TestTheClosedIssuesOwnPassStillRuns(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.w.RunEpic = func(context.Context, *config.Config, loopcmd.Deps, int) (loopcmd.Summary, error) {
+		return loopcmd.Summary{}, errBoom
+	}
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 71, ClosedIssue: true})
+
+	if got := h.ranNumbers(); len(got) != 1 || got[0] != 71 {
+		t.Fatalf("the issue pass ran for %v, want [71]", got)
+	}
+	// A failed sweep schedules NO retry: the cron sweep re-derives the whole
+	// thing from scratch, so there is nothing here for a retry to recover.
+	if n := h.timers.len(); n != 0 {
+		t.Errorf("armed %d retry timers for a failed sweep, want 0", n)
+	}
+}
