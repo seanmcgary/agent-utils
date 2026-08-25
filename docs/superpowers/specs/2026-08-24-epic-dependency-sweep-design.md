@@ -64,19 +64,20 @@ sub-issues of a parent carrying the `epic` label, and the order is exactly the `
 Building that graph needs `triage`, and anyone holding `triage` can apply `status:ready-for-spec`
 by hand in one click. For that actor the sweep is a slower path to a thing they can already do.
 
-**The moment of promotion is not always theirs.** Two actors outside that set can decide *when* a
-promotion fires:
+**The moment of promotion is not always theirs.** One actor outside that set can decide *when* a
+promotion fires: the **author** of a sub-issue can close their own issue on GitHub without holding
+`triage`. An outside contributor whose issue a maintainer adopted into an epic can therefore
+release its siblings. Closing as `not planned` counts, because the rule reads `state` and not
+`state_reason` — a blocker that will never be done blocks nothing.
 
-- The **author** of a sub-issue can close their own issue on GitHub without holding `triage`. An
-  outside contributor whose issue a maintainer adopted into an epic can therefore release its
-  siblings. Closing as `not planned` counts: the rule reads `state`, not `state_reason`, because a
-  blocker that will never be done blocks nothing.
-- A **blocker in another repository** is closed by whoever controls that repository, who may hold
-  nothing here.
-
-Neither chooses *which* issues move, or *where* they move to. Both only advance a schedule a
+They do not choose *which* issues move, or *where* they move to. They only advance a schedule a
 maintainer already published. That is the honest statement of the delegation, and it is weaker
 than "no new authority" — which was the first draft of this section and was wrong.
+
+A second actor — whoever controls a repository holding a foreign blocker — was in that list until
+the sweep stopped honoring foreign blockers. Scoping the rule to one repository removed them from
+the trust surface entirely, which is a second reason for that decision beyond the ones given under
+*Foreign blockers*.
 
 The governing rule is unchanged and is the one in `README.md`: point a loop only at a repository
 whose issue population you trust.
@@ -88,8 +89,8 @@ from the issue that names it. A parent may hold up to 100 sub-issues, nested up 
 
 This splits three ways, and getting it wrong labels an unrelated issue:
 
-- A **blocker** elsewhere is honored. Only its `state` is read, and that arrives in the same
-  response. No second call and no second client.
+- A **blocker** elsewhere is **ignored**. It cannot hold a child back. See *Foreign blockers*
+  below; this is the operator's decision and it is the one fail-open rule in the design.
 - A **sub-issue** elsewhere is skipped. The promotion is a label write addressed by *number*
   against this loop's `owner/repo`, so a foreign child's number names a different local issue.
 - A **parent** elsewhere is skipped, for the same reason: its children would be read as though
@@ -98,6 +99,31 @@ This splits three ways, and getting it wrong labels an unrelated issue:
 An issue whose response did not name a repository is treated as unknown and skipped, not assumed
 local. This is the same class of hazard as answering a `pull_request` delivery as an issue, which
 the handler already guards by checking the event rather than trusting the number.
+
+#### Foreign blockers
+
+A `blocked_by` entry outside the loop's repository is **ignored**: it is skipped before the
+open-or-closed test, so it cannot hold a child back.
+
+This is the operator's decision, taken after the alternative was put to them, and it is the one
+**fail-open** rule in this design. The cost is real and is stated here rather than buried: a
+sub-issue whose only remaining blocker lives in another repository is promoted while that blocker
+is still open, and planning starts on work whose prerequisite is not done.
+
+The reasoning for accepting it:
+
+- A loop watches one repository. Its labels mean nothing outside that repository, and it can
+  neither see a foreign issue change nor act on it.
+- Honoring such a dependency would make the sweep's behavior depend on a repository nobody
+  administering this loop controls.
+- It removes a failure the design could not otherwise detect. A blocker in a repository the token
+  cannot read may be **omitted** from the response rather than reported, and an omitted blocker is
+  indistinguishable from one that was never declared — there is no total in the response to
+  compare against. Every such blocker is foreign by definition, so ignoring foreign blockers turns
+  a silent, undetectable case into a decided one.
+
+The operational rule that follows: **keep a dependency inside the repository if you want the sweep
+to wait for it.** A cross-repository dependency is documentation, not a gate.
 
 ### Third finding: a naive rule would skip the planning stage
 
@@ -204,8 +230,9 @@ no state.
 A child is promoted when **all** of these are true:
 
 - the child's state is `open`;
-- every issue in the child's `blocked_by` list has state `closed`, where an empty list satisfies
-  this;
+- every issue in the child's `blocked_by` list **that lives in this repository** has state
+  `closed`, where an empty list satisfies this. A blocker in another repository is skipped
+  entirely — see *Foreign blockers*;
 - the child carries **no** label matching `status:*`;
 - the child carries no label matching the entry loop's `labels.veto` rules.
 
@@ -279,14 +306,10 @@ a pass that exhausts it stops and says which epics it did not reach.
   A child whose blockers could not be read is **not** promoted. Failing closed is correct here:
   the alternative promotes an issue whose blockers may be open.
 
-  **A known limit.** This guards a *failed* read, not a *short* one. If a blocker lives in a
-  repository the token cannot see, GitHub may omit it from the list rather than fail, and an
-  omitted blocker is indistinguishable from one that was never declared. Nothing in the response
-  gives a total to compare against, so the sweep cannot detect it. The mitigation is
-  operational, not technical: the token is the operator's own and sees what the operator sees, so
-  this only arises for a dependency deliberately pointed at a repository the loop cannot read.
-  Recorded here so a later reader does not mistake the `BlockersUnknown` guard for complete
-  coverage.
+  This guards a *failed* read of the whole list. A *short* list — one from which GitHub omitted a
+  blocker the token cannot see — is not detectable, because nothing in the response gives a total
+  to compare against. It is also no longer a hazard: an unreadable blocker is a blocker in another
+  repository, and those are ignored by rule. See *Foreign blockers*.
 - A failed `EditLabels` for one child logs an error and the sweep continues. The next close
   delivery, or the next cron tick, promotes it.
 - A failed parent read that is not a `404` is logged and stops this sweep. It says nothing about
@@ -311,7 +334,9 @@ Cases to pin, in `internal/epic`:
 - A child carrying a veto label is not promoted.
 - A closed child is not promoted.
 - A diamond: two blockers of one child close in the same sweep, and the child is promoted once.
-- A blocker in another repository is honored by its state, not by its repository.
+- An OPEN blocker in another repository is ignored, and the child is promoted.
+- A blocker naming no repository is ignored the same way.
+- A local open blocker still holds a child when a foreign blocker is ignored alongside it.
 
 Cases to pin, in `internal/loopcmd`:
 

@@ -783,7 +783,7 @@ EOF
   - `const epic.StatusPrefix = "status:*"`
   - `const epic.Label = "epic"`
   - `type epic.Child struct { Issue ghub.Issue; Blockers []ghub.Issue; BlockersUnknown bool }`
-  - `func epic.Promote(children []Child, veto []string) []int`
+  - `func epic.Promote(children []Child, veto []string, owner, repo string) []int`
   - `func epic.NeedsBlockers(child ghub.Issue, veto []string) bool`
 
 This package is pure. It opens no socket, reads no clock, and keeps no state. Every rule the
@@ -815,12 +815,15 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 )
 
+// Every helper below lives in "o/r", the repository the rule is scoped to. A
+// blocker with no Repo is FOREIGN, not local, so omitting it here would quietly
+// turn a blocking case into an ignored one.
 func open(n int, labels ...string) ghub.Issue {
-	return ghub.Issue{Number: n, State: "open", Labels: labels}
+	return ghub.Issue{Number: n, State: "open", Repo: "o/r", Labels: labels}
 }
 
 func closed(n int, labels ...string) ghub.Issue {
-	return ghub.Issue{Number: n, State: "closed", Labels: labels}
+	return ghub.Issue{Number: n, State: "closed", Repo: "o/r", Labels: labels}
 }
 
 // The reference loop's veto list. blocked:* is a prefix rule.
@@ -898,14 +901,38 @@ func TestPromote(t *testing.T) {
 			want: nil,
 		},
 		{
-			// A foreign blocker is honored by its STATE. Nothing about the
-			// repository it lives in reaches this function, by design.
-			name: "a blocker in another repository is honored by state",
+			// The operator's decision: this sweep is scoped to one repository
+			// entirely, so a blocker outside it cannot hold a child back. This
+			// is fail-OPEN and is the one place in this package that is.
+			name: "an OPEN blocker in another repository is ignored",
+			children: []Child{{
+				Issue:    open(74),
+				Blockers: []ghub.Issue{{Number: 9, State: "open", Repo: "other/repo"}},
+			}},
+			want: []int{74},
+		},
+		{
+			// The mixed case is the one that matters: the foreign blocker is
+			// skipped, and the local one still decides.
+			name: "a local open blocker still holds it when a foreign one is ignored",
+			children: []Child{{
+				Issue: open(74),
+				Blockers: []ghub.Issue{
+					{Number: 9, State: "closed", Repo: "other/repo"},
+					open(73),
+				},
+			}},
+			want: nil,
+		},
+		{
+			// Repo empty means the response did not say. It is not this
+			// repository, so it is ignored like any other foreign blocker.
+			name: "a blocker naming no repository is ignored",
 			children: []Child{{
 				Issue:    open(74),
 				Blockers: []ghub.Issue{{Number: 9, State: "open"}},
 			}},
-			want: nil,
+			want: []int{74},
 		},
 		{
 			// The diamond. Two blockers of one child close in the same sweep,
@@ -937,7 +964,7 @@ func TestPromote(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := Promote(c.children, veto)
+			got := Promote(c.children, veto, "o", "r")
 			if len(got) == 0 && len(c.want) == 0 {
 				return
 			}
@@ -963,7 +990,7 @@ func TestNeedsBlockersAgreesWithPromote(t *testing.T) {
 		// A child with no blockers is promoted exactly when the rule says it
 		// may be. If NeedsBlockers says "skip the call" for a child Promote
 		// would have promoted, the sweep loses a promotion.
-		promoted := len(Promote([]Child{{Issue: iss}}, veto)) == 1
+		promoted := len(Promote([]Child{{Issue: iss}}, veto, "o", "r")) == 1
 		if got := NeedsBlockers(iss, veto); got != promoted {
 			t.Errorf("issue %d %v: NeedsBlockers = %v, but Promote %v it",
 				iss.Number, iss.Labels, got,
@@ -1035,15 +1062,19 @@ type Child struct {
 //
 // A child is promoted when all of these hold:
 //   - it is open;
-//   - its blocker list was read, and every blocker in it is closed;
+//   - its blocker list was read, and every blocker IN owner/repo is closed;
 //   - it carries no status label;
 //   - it carries none of the loop's veto labels.
+//
+// owner and repo scope the whole rule to one repository. See unblocked for what
+// that means for a blocker outside it, and why it is the operator's decision
+// rather than this package's.
 //
 // The result is ascending so that a capped sweep takes the low-numbered batch
 // every time and the next sweep takes the next one. Without an order the batch
 // identity would depend on GitHub's page order, and the same child could be
 // deferred forever.
-func Promote(children []Child, veto []string) []int {
+func Promote(children []Child, veto []string, owner, repo string) []int {
 	var out []int
 	for _, c := range children {
 		if !NeedsBlockers(c.Issue, veto) {
@@ -1052,7 +1083,7 @@ func Promote(children []Child, veto []string) []int {
 		if c.BlockersUnknown {
 			continue
 		}
-		if !unblocked(c.Blockers) {
+		if !unblocked(c.Blockers, owner, repo) {
 			continue
 		}
 		out = append(out, c.Issue.Number)
@@ -1079,10 +1110,36 @@ func NeedsBlockers(child ghub.Issue, veto []string) bool {
 	return !child.HasAnyLabel(veto)
 }
 
-// unblocked reports whether every blocker is closed. An empty list is
-// unblocked: an issue that declares no dependency is waiting for nothing.
-func unblocked(blockers []ghub.Issue) bool {
+// unblocked reports whether every blocker in owner/repo is closed. An empty
+// list is unblocked: an issue that declares no dependency is waiting for
+// nothing.
+//
+// # A blocker outside owner/repo is IGNORED, not honored
+//
+// GitHub lets an issue declare a blocker in another repository. This sweep
+// scopes itself to one repository entirely, so such a blocker is skipped and
+// cannot hold a child back.
+//
+// This is the operator's decision, and it is deliberately fail-OPEN, which is
+// the opposite of what this package does everywhere else. The cost is real and
+// worth stating plainly: a child whose only remaining blocker lives in another
+// repository is promoted while that blocker is still open, and planning starts
+// on work whose prerequisite is not done. The reasoning for accepting it is
+// that a loop watches one repository, its labels mean nothing outside that
+// repository, and honoring a dependency the loop can neither see change nor
+// act on makes the sweep's behavior depend on a repository nobody here
+// administers.
+//
+// It also removes a failure this design could not otherwise detect: a blocker
+// in a repository the token cannot read may be OMITTED from the response
+// rather than reported, and an omitted blocker is indistinguishable from one
+// that was never declared. Every such blocker is foreign by definition, so
+// ignoring foreign blockers makes that case decided rather than silent.
+func unblocked(blockers []ghub.Issue, owner, repo string) bool {
 	for _, b := range blockers {
+		if !b.InRepo(owner, repo) {
+			continue
+		}
 		if b.IsOpen() {
 			return false
 		}
@@ -1105,6 +1162,10 @@ revert it.
    Expected: `a child already in the pipeline is left alone` FAILS.
 2. In `Promote`, change `if c.BlockersUnknown { continue }` to `if false { continue }`.
    Expected: `an unreadable blocker list holds it` FAILS.
+3. In `unblocked`, delete the `if !b.InRepo(owner, repo) { continue }` skip.
+   Expected: `an OPEN blocker in another repository is ignored` and `a blocker naming no
+   repository is ignored` both FAIL. This is the one fail-OPEN rule in the package, so its test
+   must be the thing holding it in place.
 
 Revert both. If either change leaves the tests green, the test is not pinning the property and
 must be fixed before moving on.
@@ -2608,7 +2669,7 @@ func sweepEpic(
 		children = append(children, c)
 	}
 
-	promote := epic.Promote(children, cfg.Labels.Veto)
+	promote := epic.Promote(children, cfg.Labels.Veto, owner, repo)
 	if len(promote) == 0 {
 		return sum, nil
 	}
@@ -3244,11 +3305,12 @@ nothing the second time.
 second GitHub write in this program that no agent makes; the first is the retry-cap park, which
 `docs/configuration.md` documents under `retry.max`.
 
-**What it will not do.** A sub-issue in another repository is skipped, and so is an epic whose
-parent lives in another repository. GitHub permits both relations, but the promotion is a label
-write addressed by issue number against one repository, and a foreign number names a different
-issue here. A *blocker* in another repository is honoured normally — only its open-or-closed state
-is read, and that is in the same response.
+**It is scoped to one repository, end to end.** A sub-issue in another repository is skipped, and
+so is an epic whose parent lives in another repository: the promotion is a label write addressed
+by issue number, and a foreign number names a different issue here. A *blocker* in another
+repository is **ignored** — it cannot hold a sub-issue back. That last one is a deliberate
+trade: a sub-issue whose only remaining blocker is out-of-repo gets promoted while that blocker
+is still open. Keep a dependency inside the repository if you want the sweep to wait for it.
 
 **Who this trusts.** The sweep acts on relations a person with `triage` on the repository built:
 the `epic` label, the sub-issue links, and the `blocked_by` edges. Anyone who can create those can
