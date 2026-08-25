@@ -371,7 +371,7 @@ every tick and reconstructs its view from them, so it survives a restart with no
 **The loop writes a label in two situations**, and never in any other. It applies `blocked` when
 an issue exhausts its retry budget — see `retry.max`. And it applies `trigger` to a sub-issue of
 an epic that a closing sibling unblocked — see [Epics](../README.md#epics), which also explains
-why only one loop of a repository ever does that. Everything else is the agent's to apply.
+why only one loop of a project ever does that. Everything else is the agent's to apply.
 
 ### `labels.trigger` — required
 
@@ -725,8 +725,8 @@ outcome, or if `claude` exits non-zero, or if its stream reports an API error.
 
 How many times one issue may be retried before the loop gives up. `0` means never retry.
 
-**At the cap the loop performs its one and only GitHub write.** It posts a comment saying the
-retries are exhausted, then removes `in_flight` and `trigger` and applies `blocked`.
+**At the cap the loop makes one of its two non-agent GitHub writes.** It posts a comment saying
+the retries are exhausted, then removes `in_flight` and `trigger` and applies `blocked`.
 
 It removes `trigger` deliberately: leaving it would let the next tick resume the issue
 immediately and the park would stop nothing. Re-apply `trigger` yourself to resume, which

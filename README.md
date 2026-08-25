@@ -372,18 +372,25 @@ Passing `--config` with an absolute path works too and skips discovery entirely.
 
 The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
 request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
-A delivery acts on the issue it names. There are two exceptions, both on a `pull_request`
+A delivery acts on the issue it names. There are three exceptions. Two are on a `pull_request`
 delivery. A pull request **merged** into a loop's `default_branch` also sweeps the loop for
 rebases — that merge is what makes every other open pull request stale while naming none of
 them — dispatching tend agents only, capped, and only for loops with `tend_pr: true`. And a pull
 request that **closes**, merged or not, has its `pr-<N>` worktree removed, along with the
 `issue-<M>` worktree of the issue it closes, once neither has a live dispatch. That second one
 deletes files: the live-dispatch guard protects work in progress, not uncommitted or unpushed
-work sitting in an idle worktree, and only a trusted pull request's `Closes #M` is honoured. Otherwise, a delivery says "something about this issue changed, figure out
-what and dispatch the right executor." The daemon fetches that one issue, decides it, and stops —
-it does not read every open issue and every open pull request in the repository, which is what a
-full reconcile costs in tokens and rate limit on every delivery, per project watching that
-repository. Pull requests share the issue number space, so a `pull_request` event is resolved to
+work sitting in an idle worktree, and only a trusted pull request's `Closes #M` is honoured.
+
+The third is on an `issues` delivery reporting a **close**: when the closed issue is a sub-issue
+of an epic, the delivery also sweeps that epic, promoting sibling sub-issues the delivery never
+names — see [Epics](#epics).
+
+Otherwise, a delivery says "something about this issue changed, figure out
+what and dispatch the right executor." The daemon fetches that issue and decides it — the epic
+sweep above is the one case where deciding it means reading further, into the epic's other
+children — but it does not read every open issue and every open pull request in the repository,
+which is what a full reconcile costs in tokens and rate limit on every delivery, per project
+watching that repository. Pull requests share the issue number space, so a `pull_request` event is resolved to
 the issue its pull request closes (`Closes #N` in the body); a pull request that closes no issue
 is a no-op. The `accepted delivery` line in the log names the issue, so a delivery can be matched
 against the dispatch it caused.
@@ -551,14 +558,17 @@ this machine is not already trusted network-wide.
 ## Epics
 
 An epic is an issue carrying the `epic` label whose sub-issues are the work. When a sub-issue
-closes, the loop promotes every sibling that closure unblocked: it adds the pipeline's first
-trigger label — `status:ready-for-spec` in the reference setup — and nothing else.
+closes, the loop promotes every sibling that closure unblocked, up to 25 per sweep: it adds the
+pipeline's first trigger label — `status:ready-for-spec` in the reference setup — and nothing
+else. Anything past the cap waits for the next sweep, which logs the numbers it deferred.
 
 It reads GitHub's own relations, so there is nothing to write in an issue body. A sub-issue is a
 sub-issue, and a dependency is `blocked_by`. A sibling is promoted when it is open, every issue in
-its `blocked_by` list is closed, and it carries no `status:` label of its own. That last condition
-is what leaves work already in flight alone, and it is why running the sweep twice promotes
-nothing the second time.
+its `blocked_by` list is closed and readable, it carries no `status:` label of its own, and it
+carries none of the loop's veto labels. The `status:` condition is what leaves work already in
+flight alone, and it is why running the sweep twice promotes nothing the second time. A blocker
+list that failed to read holds the child rather than promoting or skipping it outright, so a
+transient GitHub error never wrongly advances or wrongly blocks an issue.
 
 **No agent runs.** The sweep is deterministic Go and its whole output is label writes. It is the
 second GitHub write in this program that no agent makes; the first is the retry-cap park, which
@@ -582,8 +592,9 @@ and declared the dependency. Point a loop only at a repository whose issue popul
 see [Security](#security).
 
 **There is nothing to configure.** The `epic` label on the parent is the only switch. One loop per
-repository does the promoting — the one at the front of the pipeline, which is the loop whose
-trigger label is no other loop's terminal or review label. In the reference pair that is
+project does the promoting — the one at the front of the pipeline, which is the loop whose
+trigger label is no other loop's terminal or review label. Two projects watching the same
+repository each resolve their own entry loop and each sweep. In the reference pair that is
 `planning`, because `planning`'s terminal label is `execution`'s trigger. If that cannot be
 resolved to exactly one loop, no loop sweeps and the reason is logged.
 
