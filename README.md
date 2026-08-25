@@ -6,8 +6,9 @@ the loop sets `agent.harness: pi`, so a loop can drive a model that claude does 
 
 It replaces the LLM orchestrator in an issue-driven planning loop and execution loop. Go owns
 the deterministic decisions — selecting issues by label, session and worktree bookkeeping,
-retries, backoff, the circuit breaker. The agent owns every judgement and every GitHub write
-but one (see [Security](#security)). Cron does the scheduling; the engine has no timer.
+retries, backoff, the circuit breaker. The agent owns every judgement and every GitHub write but
+two: the retry-cap park, and the epic sweep's promotion (see [Epics](#epics)). Cron does the
+scheduling; the engine has no timer.
 
 The load-bearing property is session continuity: an issue keeps one `claude` session across a
 park and its answer, so a resumed run continues the conversation instead of re-deriving its
@@ -546,6 +547,53 @@ is the one that is not: it prints nothing and takes effect on the next `listener
 the endpoint it widens is the one that starts agents. Treat it the way you would treat any
 other change that opens a port to the LAN — deliberately, and behind your own firewall rule if
 this machine is not already trusted network-wide.
+
+## Epics
+
+An epic is an issue carrying the `epic` label whose sub-issues are the work. When a sub-issue
+closes, the loop promotes every sibling that closure unblocked: it adds the pipeline's first
+trigger label — `status:ready-for-spec` in the reference setup — and nothing else.
+
+It reads GitHub's own relations, so there is nothing to write in an issue body. A sub-issue is a
+sub-issue, and a dependency is `blocked_by`. A sibling is promoted when it is open, every issue in
+its `blocked_by` list is closed, and it carries no `status:` label of its own. That last condition
+is what leaves work already in flight alone, and it is why running the sweep twice promotes
+nothing the second time.
+
+**No agent runs.** The sweep is deterministic Go and its whole output is label writes. It is the
+second GitHub write in this program that no agent makes; the first is the retry-cap park, which
+`docs/configuration.md` documents under `retry.max`.
+
+**It is scoped to one repository, end to end.** A sub-issue in another repository is skipped, and
+so is an epic whose parent lives in another repository: the promotion is a label write addressed
+by issue number, and a foreign number names a different issue here. A *blocker* in another
+repository is **ignored** — it cannot hold a sub-issue back. That last one is a deliberate
+trade: a sub-issue whose only remaining blocker is out-of-repo gets promoted while that blocker
+is still open. Keep a dependency inside the repository if you want the sweep to wait for it.
+
+**Who this trusts.** The sweep acts on relations a person with `triage` on the repository built:
+the `epic` label, the sub-issue links, and the `blocked_by` edges. Anyone who can create those can
+already apply `status:ready-for-spec` by hand, so the sweep adds no authority they did not have —
+with one honest exception. The *author* of a sub-issue can close their own issue without holding
+`triage`, and a blocker in another repository is closed by whoever controls that repository. In
+both cases someone outside this repository chooses the *moment* a promotion happens. They do not
+choose *which* issues are promoted: that was fixed when a maintainer put those issues in the epic
+and declared the dependency. Point a loop only at a repository whose issue population you trust —
+see [Security](#security).
+
+**There is nothing to configure.** The `epic` label on the parent is the only switch. One loop per
+repository does the promoting — the one at the front of the pipeline, which is the loop whose
+trigger label is no other loop's terminal or review label. In the reference pair that is
+`planning`, because `planning`'s terminal label is `execution`'s trigger. If that cannot be
+resolved to exactly one loop, no loop sweeps and the reason is logged.
+
+Two things drive it: an `issues` delivery reporting a close, and `loop tick` under cron, which
+walks every open epic. The delivery is the fast path and cron is the backstop for a delivery that
+never arrived.
+
+The sweep never removes a label, never comments, never closes an issue, and never writes a
+dependency. Entering an epic's graph is a human's job, or an agent's, and both use the GitHub UI
+or its API.
 
 ## Upgrading
 

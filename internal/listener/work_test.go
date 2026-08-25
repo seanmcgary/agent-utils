@@ -1763,7 +1763,8 @@ func TestAnArmedTendSweepDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
 }
 
 // sweptNumbers wires RunEpic to record the issues it was asked to sweep. The
-// slice is guarded because Deliver fans out per target.
+// slice is guarded to match every other accessor in this file, though Deliver
+// ticks its targets sequentially (see Worker.Deliver), not concurrently.
 func sweptNumbers(h *harness) (*[]int, *sync.Mutex) {
 	var mu sync.Mutex
 	var swept []int
@@ -1826,7 +1827,7 @@ func TestAMergedPullRequestRunsNoEpicSweep(t *testing.T) {
 
 // The closed issue's own pass is what moves ITS labels. The sweep is extra
 // work, not a replacement, and a failing sweep must not cost the issue its
-// pass. The order matters too: the pass runs first.
+// pass.
 func TestTheClosedIssuesOwnPassStillRuns(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning")}

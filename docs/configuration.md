@@ -368,13 +368,16 @@ default_branch: master
 Labels are the entire interface between you, the agent, and the loop. The loop reads them
 every tick and reconstructs its view from them, so it survives a restart with no memory.
 
-**The loop writes a label exactly once**, in one situation: when an issue exhausts its retry
-budget. Everything else is the agent's to apply. See `retry.max`.
+**The loop writes a label in two situations**, and never in any other. It applies `blocked` when
+an issue exhausts its retry budget — see `retry.max`. And it applies `trigger` to a sub-issue of
+an epic that a closing sibling unblocked — see [Epics](../README.md#epics), which also explains
+why only one loop of a repository ever does that. Everything else is the agent's to apply.
 
 ### `labels.trigger` — required
 
-The "go" signal. **You** apply it. It means both "start this" and "resume this", and it never
-means "approved".
+The "go" signal. **You** apply it — and so does the epic sweep, for the loop at the front of the
+pipeline, when a sub-issue's blockers all close. It means both "start this" and "resume this",
+and it never means "approved".
 
 The loop starts an issue that carries it, and the agent's first act is to remove it and apply
 `in_flight`. Re-applying it later resumes the issue's original session, so the agent still
