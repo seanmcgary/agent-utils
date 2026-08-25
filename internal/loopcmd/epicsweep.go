@@ -56,11 +56,22 @@ const maxPromotePerSweep = 25
 //
 // # Where the lock is taken
 //
-// This function TAKES the loop lock, around the writes only. The reads happen
-// before it, for the reason TendSweep documents at length: Worker.issuePass
-// drops a delivery that finds the lock held, with no retry, so every second
-// this pass holds it is a second in which a labelled issue can be dropped and
-// never picked up.
+// This function TAKES the loop lock, before calling sweepEpic. Only the
+// Parent read above happens outside it -- everything sweepEpic does,
+// including SubIssues and one BlockedBy call per candidate child, runs WHILE
+// the lock is held. The hold is therefore O(children) network round-trips,
+// not O(1), and Worker.issuePass drops a delivery that finds the lock held,
+// with no retry -- so every one of those round-trips is a window in which a
+// labelled issue can be dropped and never picked up.
+//
+// That cost is accepted rather than hoisting the reads out, because sweepEpic
+// is SHARED with the cron path: EpicSweepAll's caller (RunTick) already holds
+// this lock across the whole of Tick, reads included. Splitting sweepEpic so
+// the webhook path reads before locking and the cron path reads after would
+// buy the webhook path a shorter hold at the cost of two code paths that read
+// GitHub state in different places relative to the lock -- which is exactly
+// the kind of divergence the "both share sweepEpic" design exists to rule
+// out. One hold shape, paid by both callers, is the simpler and safer trade.
 //
 // EpicSweepAll does NOT take it, because its caller already holds it. See that
 // function.
@@ -133,12 +144,12 @@ func EpicSweep(ctx context.Context, cfg *config.Config, deps Deps, closed int) (
 //
 // # It does NOT take the loop lock
 //
-// Its only caller is Tick, and Tick's production caller RunTick already holds
-// that lock (internal/loopcmd/open.go:205). flock is per open-file-description,
-// so acquiring it again in the same process returns ErrHeld -- which would make
-// this backstop silently promote nothing, forever, which is precisely the
-// failure it exists to prevent. This is the same reason Tick itself takes no
-// lock and TendSweep does: TendSweep's caller does not hold one.
+// Its only caller is Tick, and Tick's production caller, RunTick in open.go,
+// already holds that lock. flock is per open-file-description, so acquiring
+// it again in the same process returns ErrHeld -- which would make this
+// backstop silently promote nothing, forever, which is precisely the failure
+// it exists to prevent. This is the same reason Tick itself takes no lock and
+// TendSweep does: TendSweep's caller does not hold one.
 func EpicSweepAll(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	var sum Summary
 	if deps.Epic == nil {
@@ -170,9 +181,10 @@ func EpicSweepAll(ctx context.Context, cfg *config.Config, deps Deps) (Summary, 
 		// It does couple this path to ConvertIssues carrying Repo for the LIST
 		// endpoint, not only the three epic ones. GitHub populates
 		// repository_url on GET /repos/{o}/{r}/issues, so this holds -- and
-		// TestListOpenIssuesCarriesTheRepository below pins it, because if it
-		// ever stopped holding, this backstop would promote nothing and say
-		// nothing, which is the failure this whole design is built to avoid.
+		// TestListOpenIssuesCarriesTheRepository in internal/ghub/epic_test.go
+		// pins it, because if it ever stopped holding, this backstop would
+		// promote nothing and say nothing, which is the failure this whole
+		// design is built to avoid.
 		if !iss.InRepo(owner, repo) {
 			continue
 		}

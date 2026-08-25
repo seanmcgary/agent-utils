@@ -12,6 +12,7 @@ import (
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/lock"
 )
 
 // fakeEpic is a ghub.EpicReader. It is narrow -- four methods -- which is the
@@ -372,6 +373,34 @@ func TestEpicSweepSkipsAChildWithNoRepository(t *testing.T) {
 	}
 }
 
+// A number GitHub could not have. The write below is by NUMBER, so a child
+// carrying one must be refused before it is looked up or written, not merely
+// before it is written -- otherwise a malformed response could still cost a
+// blocked_by call for a target that was never going to be promoted.
+func TestEpicSweepSkipsAChildWithAnImpossibleNumber(t *testing.T) {
+	cfg, deps, f := sweepFixture(t)
+	f.parents[71] = epicParent(69)
+	f.children[69] = []ghub.Issue{
+		closedIssue(71),
+		{Number: 0, State: "open", Repo: "o/r"},
+	}
+
+	if _, err := EpicSweep(context.Background(), cfg, deps, 71); err != nil {
+		t.Fatalf("EpicSweep: %v", err)
+	}
+	if got := f.promotedNumbers(); len(got) != 0 {
+		t.Errorf("promoted %v; a child with an impossible number must never be a write target", got)
+	}
+	for _, n := range f.blockedByCalls {
+		if n == 0 {
+			t.Error("looked up blockers for a child with an impossible number")
+		}
+	}
+	if _, ok := f.added[0]; ok {
+		t.Error("wrote a label to issue #0")
+	}
+}
+
 // A child that cannot be promoted whatever its blockers say must not cost a
 // call. This is the filter epic.NeedsBlockers exists for.
 func TestEpicSweepSkipsTheBlockerLookupItDoesNotNeed(t *testing.T) {
@@ -655,6 +684,34 @@ func TestEpicSweepAllWalksEveryOpenEpic(t *testing.T) {
 	}
 	if sum.Promoted != 1 {
 		t.Fatalf("Promoted = %d, want 1", sum.Promoted)
+	}
+	if got := f.promotedNumbers(); len(got) != 1 || got[0] != 73 {
+		t.Errorf("promoted %v, want [73]", got)
+	}
+}
+
+// EpicSweepAll must acquire NO lock: RunTick already holds it. flock is per
+// open file description, so a second acquire in-process returns ErrHeld and
+// the backstop would silently promote nothing, forever. Holding the lock here
+// reproduces exactly the state Tick runs in.
+func TestEpicSweepAllTakesNoLockBecauseItsCallerHoldsIt(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	gh.issues = []ghub.Issue{epicParent(69)}
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
+
+	l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
+	if err != nil {
+		t.Fatalf("lock.Acquire: %v", err)
+	}
+	defer l.Release()
+
+	sum, err := EpicSweepAll(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("EpicSweepAll: %v", err)
+	}
+	if sum.Promoted != 1 {
+		t.Fatalf("Promoted = %d, want 1; EpicSweepAll must run under the caller's lock", sum.Promoted)
 	}
 	if got := f.promotedNumbers(); len(got) != 1 || got[0] != 73 {
 		t.Errorf("promoted %v, want [73]", got)
