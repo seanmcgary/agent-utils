@@ -56,9 +56,36 @@ func ConvertIssues(in []*github.Issue) []Issue {
 			Title:     gi.GetTitle(),
 			Labels:    labels,
 			UpdatedAt: gi.GetUpdatedAt().Time,
+			State:     gi.GetState(),
+			Repo:      issueRepo(gi),
 		})
 	}
 	return out
+}
+
+// issueRepo returns the "owner/name" an issue belongs to.
+//
+// Two sources, because the three endpoints do not agree. blocked_by returns a
+// full repository object; parent and sub_issues return repository_url. Reading
+// only one of them would leave Repo empty for two endpoints out of three, and
+// an empty Repo blocks every write -- a silent, total failure rather than a
+// loud one.
+func issueRepo(gi *github.Issue) string {
+	if full := gi.GetRepository().GetFullName(); full != "" {
+		return full
+	}
+	// repository_url is "https://api.github.com/repos/{owner}/{name}". Take the
+	// last two path elements rather than trimming a hard-coded host prefix:
+	// GitHub Enterprise serves a different base URL.
+	u := gi.GetRepositoryURL()
+	if u == "" {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2] + "/" + parts[len(parts)-1]
 }
 
 // convertPR maps one go-github pull request onto the engine type and decides
