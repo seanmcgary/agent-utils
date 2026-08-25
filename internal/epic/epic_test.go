@@ -171,22 +171,33 @@ func TestPromote(t *testing.T) {
 // with the rule, or it saves a call by dropping a child that should have been
 // promoted.
 func TestNeedsBlockersAgreesWithPromote(t *testing.T) {
-	cases := []ghub.Issue{
-		open(78),
-		open(74, "status:plan-ready-for-review"),
-		open(74, "blocked:legal"),
-		closed(71),
-		open(70, "enhancement"),
+	cases := []struct {
+		name  string
+		issue ghub.Issue
+		want  bool
+	}{
+		{name: "open, no status, no veto", issue: open(78), want: true},
+		{name: "open but already in the pipeline", issue: open(74, "status:plan-ready-for-review"), want: false},
+		{name: "open but vetoed", issue: open(74, "blocked:legal"), want: false},
+		{name: "closed", issue: closed(71), want: false},
+		{name: "open with an unrelated label", issue: open(70, "enhancement"), want: true},
 	}
-	for _, iss := range cases {
-		// A child with no blockers is promoted exactly when the rule says it
-		// may be. If NeedsBlockers says "skip the call" for a child Promote
-		// would have promoted, the sweep loses a promotion.
-		promoted := len(Promote([]Child{{Issue: iss}}, veto, "o", "r")) == 1
-		if got := NeedsBlockers(iss, veto); got != promoted {
-			t.Errorf("issue %d %v: NeedsBlockers = %v, but Promote %v it",
-				iss.Number, iss.Labels, got,
-				map[bool]string{true: "promoted", false: "declined"}[promoted])
-		}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := NeedsBlockers(c.issue, veto); got != c.want {
+				t.Errorf("NeedsBlockers(%d, %v) = %v, want %v", c.issue.Number, c.issue.Labels, got, c.want)
+			}
+
+			// A child with no blockers is promoted exactly when the rule says
+			// it may be. If NeedsBlockers says "skip the call" for a child
+			// Promote would have promoted, the sweep loses a promotion.
+			promoted := len(Promote([]Child{{Issue: c.issue}}, veto, "o", "r")) == 1
+			if promoted != c.want {
+				t.Errorf("Promote treated issue %d %v as %v, want %v",
+					c.issue.Number, c.issue.Labels,
+					map[bool]string{true: "promoted", false: "declined"}[promoted],
+					map[bool]string{true: "promoted", false: "declined"}[c.want])
+			}
+		})
 	}
 }
