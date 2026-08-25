@@ -78,10 +78,11 @@ func subjectPayload(t *testing.T, fullName, subject string, number any) []byte {
 // tickCall is one call to the Server's Tick seam: the repository and the issue
 // number the delivery named.
 type tickCall struct {
-	repo       string
-	number     int
-	mergedInto string
-	closedPR   bool
+	repo        string
+	number      int
+	mergedInto  string
+	closedPR    bool
+	closedIssue bool
 }
 
 // newServer builds a Server wired to tickCh: the fake Tick sends the repo
@@ -93,7 +94,8 @@ func newServer(t *testing.T, tickCh chan<- tickCall) *Server {
 		Secret: fixedSecret(testSecret),
 		Port:   freePort(t),
 		Tick: func(_ context.Context, d Delivery) {
-			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto, closedPR: d.ClosedPR}
+			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto,
+				closedPR: d.ClosedPR, closedIssue: d.ClosedIssue}
 		},
 	})
 	if err != nil {
@@ -1220,6 +1222,78 @@ func TestHandlerReportsOnlyAMergedPullRequestAsAMerge(t *testing.T) {
 			}
 			if got.closedPR != tc.wantClosed {
 				t.Errorf("closedPR = %v, want %v", got.closedPR, tc.wantClosed)
+			}
+			if got.number != 7 {
+				t.Errorf("number = %d, want 7", got.number)
+			}
+		})
+	}
+}
+
+// The handler decides only WHAT the delivery is. It holds no GitHub client, so
+// it cannot look up a parent and does not try: it sets one boolean and the
+// sweep decides the rest.
+func TestClosedIssueIsDerivedFromTheEventAndAction(t *testing.T) {
+	cases := []struct {
+		name    string
+		event   string
+		payload string
+		want    bool
+	}{
+		{
+			name:    "an issue closing",
+			event:   "issues",
+			payload: `{"action":"closed","repository":{"full_name":"o/r"},"issue":{"number":7}}`,
+			want:    true,
+		},
+		{
+			name:    "an issue opening",
+			event:   "issues",
+			payload: `{"action":"opened","repository":{"full_name":"o/r"},"issue":{"number":7}}`,
+			want:    false,
+		},
+		{
+			name:    "a label moving on an issue",
+			event:   "issues",
+			payload: `{"action":"labeled","repository":{"full_name":"o/r"},"issue":{"number":7}}`,
+			want:    false,
+		},
+		{
+			// Issues and pull requests share a number space. A pull_request
+			// delivery answered as an issue close would sweep the epic of
+			// whichever ISSUE happens to carry the pull request's number.
+			name:    "a pull request closing",
+			event:   "pull_request",
+			payload: `{"action":"closed","repository":{"full_name":"o/r"},"pull_request":{"number":7,"merged":true,"base":{"ref":"master"}}}`,
+			want:    false,
+		},
+		{
+			// issue_comment carries an issue object, and its action is
+			// attacker-shaped text. Only the EVENT check separates this from a
+			// real close.
+			name:    "a comment whose payload claims a closed action",
+			event:   "issue_comment",
+			payload: `{"action":"closed","repository":{"full_name":"o/r"},"issue":{"number":7}}`,
+			want:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tickCh := make(chan tickCall, 1)
+			s := newServer(t, tickCh)
+			srv := httptest.NewServer(s.Handler(context.Background()))
+			t.Cleanup(srv.Close)
+
+			body := []byte(tc.payload)
+			resp := doRequest(t, srv.URL+"/webhook", body, map[string]string{
+				github.EventTypeHeader:       tc.event,
+				github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+			})
+			defer resp.Body.Close()
+
+			got := waitTick(t, tickCh)
+			if got.closedIssue != tc.want {
+				t.Errorf("closedIssue = %v, want %v", got.closedIssue, tc.want)
 			}
 			if got.number != 7 {
 				t.Errorf("number = %d, want 7", got.number)

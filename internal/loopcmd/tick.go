@@ -213,6 +213,27 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 		}
 	}
 
+	// The backstop. A webhook delivery can be missed -- the daemon down, the
+	// proxy down, a delivery dropped -- and a missed close leaves a sub-issue
+	// waiting forever with nothing to show that anything is wrong. This finds
+	// it. A failure is logged and does not fail the tick: the tick's own work
+	// is dispatch, and a sweep that could not read GitHub says nothing about
+	// that.
+	//
+	// It runs AFTER the dispatch pass above, so an issue promoted here is
+	// dispatched by the NEXT tick, not this one. That is deliberate: dispatch
+	// decides from a snapshot read at the top of this function, and promoting
+	// into that snapshot would mean deciding from a repository state that no
+	// single read ever saw. One tick of latency on the backstop path costs
+	// nothing -- the webhook path has none.
+	//
+	// EpicSweepAll takes NO lock. RunTick already holds it; see that function.
+	if epicSum, err := EpicSweepAll(ctx, cfg, deps); err != nil {
+		slog.Warn("epic sweep failed", "loop", cfg.Name, "err", err)
+	} else {
+		sum.Promoted += epicSum.Promoted
+	}
+
 	body, _ := json.Marshal(sum)
 	if _, err := deps.Store.RecordTick(cfg.Name, plan.BreakerTripped, string(body)); err != nil {
 		return sum, err

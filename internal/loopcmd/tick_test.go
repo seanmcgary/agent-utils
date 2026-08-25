@@ -2,6 +2,7 @@ package loopcmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -628,5 +629,73 @@ func TestAnOldDispatchWithANonPositivePidIsStillReaped(t *testing.T) {
 	}
 	if sum.Orphans != 1 {
 		t.Errorf("Orphans = %d, want 1: a runner that never registered is dead", sum.Orphans)
+	}
+}
+
+// The cron tick is the backstop for a delivery the daemon never saw.
+func TestTickRunsTheEpicSweep(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	// Built with the helpers, which set Repo. A bare ghub.Issue literal has an
+	// empty Repo, and InRepo answers false for that, so the sweep would skip
+	// every one of them and this test would fail for a reason that has nothing
+	// to do with what it is testing.
+	gh.issues = []ghub.Issue{epicParent(69), openIssue(73)}
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if sum.Promoted != 1 {
+		t.Fatalf("Summary.Promoted = %d, want 1", sum.Promoted)
+	}
+	if got := f.promotedNumbers(); len(got) != 1 || got[0] != 73 {
+		t.Errorf("promoted %v, want [73]", got)
+	}
+}
+
+// The self-deadlock regression. RunTick holds the loop lock and then calls
+// Tick, so anything Tick calls that acquires the SAME lock gets ErrHeld and
+// promotes nothing, forever. Calling Tick directly cannot catch that; this
+// calls RunTick, which is what cron runs.
+func TestRunTickRunsTheEpicSweepWithoutDeadlocking(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	gh.issues = []ghub.Issue{epicParent(69)}
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
+
+	sum, err := RunTick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	if sum.Promoted != 1 {
+		t.Fatalf("Promoted = %d, want 1; a sweep that self-deadlocks reports 0", sum.Promoted)
+	}
+}
+
+// A sweep that cannot read GitHub must not cost the tick its dispatch work.
+// The tick's job is dispatch; a failed sweep says nothing about that.
+//
+// The failure is injected at SubIssues, not at BlockedBy: a failed blocker read
+// is handled inside sweepEpic (it holds the child and returns nil), so it never
+// reaches Tick's error branch and would test nothing here.
+func TestTickSurvivesAFailedEpicSweep(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	gh.issues = []ghub.Issue{
+		epicParent(69),
+		openIssue(1, cfg.Labels.Trigger),
+	}
+	f.subErr[69] = errors.New("502 bad gateway")
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("Tick must not fail because a sweep did: %v", err)
+	}
+	if sum.Started != 1 {
+		t.Errorf("Started = %d, want 1; the tick's own work must still happen", sum.Started)
+	}
+	if sum.Promoted != 0 {
+		t.Errorf("Promoted = %d, want 0", sum.Promoted)
 	}
 }
