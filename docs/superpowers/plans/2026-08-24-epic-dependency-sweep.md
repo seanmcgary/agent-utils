@@ -190,7 +190,10 @@ unrelated local issue.
 
 - [ ] **Step 1: Write the failing tests for `State`, `Repo`, and their accessors**
 
-Add to `internal/ghub/ghub_test.go`:
+Add to `internal/ghub/ghub_test.go` — **except `TestListOpenIssuesCarriesTheRepository`**, which
+uses `httptest` and belongs in the new `internal/ghub/epic_test.go` created in Step 5.
+`ghub_test.go` imports only `testing` and `github`, and the other three tests here need nothing
+more.
 
 ```go
 func TestConvertIssuesCarriesState(t *testing.T) {
@@ -234,6 +237,36 @@ func TestConvertIssuesCarriesTheRepository(t *testing.T) {
 	}
 	if got[2].InRepo("o", "r") {
 		t.Error("an issue naming no repository must not read as local")
+	}
+}
+
+// EpicSweepAll gates every epic on InRepo, so the LIST endpoint has to carry
+// the repository too -- not only the three epic endpoints. GitHub populates
+// repository_url there, and this pins it: if it ever stopped, the cron backstop
+// would promote nothing and log nothing, which is the silent failure this
+// design exists to avoid.
+func TestListOpenIssuesCarriesTheRepository(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/issues", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+		  {"number":69,"state":"open","labels":[{"name":"epic"}],
+		   "repository_url":"https://api.github.com/repos/o/r"}
+		]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	got, err := newTestClient(t, srv).ListOpenIssues(context.Background(), "o", "r")
+	if err != nil {
+		t.Fatalf("ListOpenIssues: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListOpenIssues returned %d, want 1", len(got))
+	}
+	if !got[0].InRepo("o", "r") {
+		t.Errorf("Repo = %q; the epic sweep's cron path gates every epic on this",
+			got[0].Repo)
 	}
 }
 
@@ -2468,6 +2501,13 @@ func EpicSweepAll(ctx context.Context, cfg *config.Config, deps Deps) (Summary, 
 		// ListOpenIssues returns this repository's issues, so InRepo is
 		// redundant here today. It is checked anyway, because the write below
 		// is by number and the guard must not depend on which listing fed it.
+		//
+		// It does couple this path to ConvertIssues carrying Repo for the LIST
+		// endpoint, not only the three epic ones. GitHub populates
+		// repository_url on GET /repos/{o}/{r}/issues, so this holds -- and
+		// TestListOpenIssuesCarriesTheRepository below pins it, because if it
+		// ever stopped holding, this backstop would promote nothing and say
+		// nothing, which is the failure this whole design is built to avoid.
 		if !iss.InRepo(owner, repo) {
 			continue
 		}
@@ -3042,15 +3082,13 @@ In `internal/loopcmd/tick_test.go`:
 // The cron tick is the backstop for a delivery the daemon never saw.
 func TestTickRunsTheEpicSweep(t *testing.T) {
 	cfg, deps, f, gh := sweepAllFixture(t)
-	gh.issues = []ghub.Issue{
-		{Number: 69, State: "open", Labels: []string{"epic"}},
-		{Number: 73, State: "open"},
-	}
-	f.children[69] = []ghub.Issue{
-		{Number: 71, State: "closed"},
-		{Number: 73, State: "open"},
-	}
-	f.blockers[73] = []ghub.Issue{{Number: 71, State: "closed"}}
+	// Built with the helpers, which set Repo. A bare ghub.Issue literal has an
+	// empty Repo, and InRepo answers false for that, so the sweep would skip
+	// every one of them and this test would fail for a reason that has nothing
+	// to do with what it is testing.
+	gh.issues = []ghub.Issue{epicParent(69), openIssue(73)}
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
 
 	sum, err := Tick(context.Background(), cfg, deps)
 	if err != nil {
