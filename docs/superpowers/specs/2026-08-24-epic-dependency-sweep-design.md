@@ -53,18 +53,51 @@ pass that was removed:
    costs at most eleven reads.
 4. It writes **one label, to a statelessly-selected issue**, and removes none.
 
-### Second finding: the sweep grants no new authority
+### Second finding: what authority the sweep actually grants
 
 The sweep adds `status:ready-for-spec` to an issue with no human in the loop. That label starts a
-planning agent on issue text this repository treats as untrusted (`README.md`, Security).
+planning agent on issue text this repository treats as untrusted (`README.md`, Security). So the
+question is who gains what.
 
-The sweep does **not** widen that exposure. Anyone who can make the sweep act — by setting the
-`epic` label on a parent, or by adding a sub-issue, or by closing an issue — already holds the
-`triage` permission that lets them apply `status:ready-for-spec` to the issue directly, in one
-click, with no sweep involved. The sweep is a slower path to a thing its actor can already do.
+**Which issues can be promoted is fixed by a maintainer, in advance.** The set is exactly the
+sub-issues of a parent carrying the `epic` label, and the order is exactly the `blocked_by` edges.
+Building that graph needs `triage`, and anyone holding `triage` can apply `status:ready-for-spec`
+by hand in one click. For that actor the sweep is a slower path to a thing they can already do.
 
-The rule that governs both remains the one in `README.md`: point a loop only at a repository whose
-issue population you trust.
+**The moment of promotion is not always theirs.** Two actors outside that set can decide *when* a
+promotion fires:
+
+- The **author** of a sub-issue can close their own issue on GitHub without holding `triage`. An
+  outside contributor whose issue a maintainer adopted into an epic can therefore release its
+  siblings. Closing as `not planned` counts: the rule reads `state`, not `state_reason`, because a
+  blocker that will never be done blocks nothing.
+- A **blocker in another repository** is closed by whoever controls that repository, who may hold
+  nothing here.
+
+Neither chooses *which* issues move, or *where* they move to. Both only advance a schedule a
+maintainer already published. That is the honest statement of the delegation, and it is weaker
+than "no new authority" — which was the first draft of this section and was wrong.
+
+The governing rule is unchanged and is the one in `README.md`: point a loop only at a repository
+whose issue population you trust.
+
+### Fourth finding: every relation can cross repositories
+
+GitHub permits a sub-issue, a parent, and a `blocked_by` entry to live in a different repository
+from the issue that names it. A parent may hold up to 100 sub-issues, nested up to 8 levels.
+
+This splits three ways, and getting it wrong labels an unrelated issue:
+
+- A **blocker** elsewhere is honored. Only its `state` is read, and that arrives in the same
+  response. No second call and no second client.
+- A **sub-issue** elsewhere is skipped. The promotion is a label write addressed by *number*
+  against this loop's `owner/repo`, so a foreign child's number names a different local issue.
+- A **parent** elsewhere is skipped, for the same reason: its children would be read as though
+  they were this repository's.
+
+An issue whose response did not name a repository is treated as unknown and skipped, not assumed
+local. This is the same class of hazard as answering a `pull_request` delivery as an issue, which
+the handler already guards by checking the event rather than trusting the number.
 
 ### Third finding: a naive rule would skip the planning stage
 
@@ -209,6 +242,13 @@ The lock is taken for the writes only, not for the reads. `TendSweep` documents 
 the lock is held is a second in which a labelled issue can be dropped by a concurrent delivery,
 and holding it across a paginated listing would hold it for tens of seconds.
 
+**The cron driver takes no lock, and must not.** `RunTick` acquires the loop lock and *then* calls
+`Tick`, so a sweep called from inside `Tick` that acquired the same lock would fail against its
+own caller — `flock` is per open file description, so the second acquire in one process returns
+`ErrHeld`. The cron backstop would then promote nothing, silently, forever. This is the same
+division that already exists in the package: `Tick` takes no lock because its caller holds one,
+and `TendSweep` takes one because its caller does not.
+
 The cron driver enters at step 2 instead: `loopcmd.Tick` lists open issues, keeps those with the
 `epic` label, and runs steps 2 to 6 for each. This is the safety net for a delivery the daemon
 never saw. The daemon is the fast path; cron is the backstop. Both share every step after the
@@ -216,21 +256,37 @@ entry.
 
 ### Caps
 
-`maxPromotePerSweep` bounds one sweep, in the same way and for the same reason as
+`maxPromotePerSweep` bounds one **pass**, in the same way and for the same reason as
 `maxTendPerSweep`. Promotions are ordered by issue number, so a capped sweep takes the
-low-numbered batch and the next sweep takes the next. What is left over is logged and named, never
-dropped silently.
+low-numbered batch and the next sweep takes the next. What is left over is logged and named
+(truncated to ten, with a total), never dropped silently.
 
 The value is **25**. It is higher than `maxTendPerSweep`, which is 10, because a promotion is a
 label write and not an agent: the cost of the batch is 25 API calls, where tending's is 10 agent
 processes. It is a constant, not a configuration field, and it is promoted to a field only when an
 operator needs a different value.
 
+**The budget spans every epic in one pass, not each epic separately.** The cron driver walks every
+open issue carrying the `epic` label, and applying that label costs one `triage` permission. A cap
+applied per epic would let the number of epics multiply the write authority — twenty epics would
+authorise five hundred writes on one tick — which is the unbounded repository-wide fan-out this
+design otherwise avoids. The remaining budget is therefore threaded through the per-epic pass, and
+a pass that exhausts it stops and says which epics it did not reach.
+
 ### Error handling
 
 - A failed `blocked_by` read for one child logs a warning and the sweep continues with the rest.
   A child whose blockers could not be read is **not** promoted. Failing closed is correct here:
   the alternative promotes an issue whose blockers may be open.
+
+  **A known limit.** This guards a *failed* read, not a *short* one. If a blocker lives in a
+  repository the token cannot see, GitHub may omit it from the list rather than fail, and an
+  omitted blocker is indistinguishable from one that was never declared. Nothing in the response
+  gives a total to compare against, so the sweep cannot detect it. The mitigation is
+  operational, not technical: the token is the operator's own and sees what the operator sees, so
+  this only arises for a dependency deliberately pointed at a repository the loop cannot read.
+  Recorded here so a later reader does not mistake the `BlockersUnknown` guard for complete
+  coverage.
 - A failed `EditLabels` for one child logs an error and the sweep continues. The next close
   delivery, or the next cron tick, promotes it.
 - A failed parent read that is not a `404` is logged and stops this sweep. It says nothing about
@@ -262,9 +318,21 @@ Cases to pin, in `internal/loopcmd`:
 - An issue with no parent stops the sweep after one call.
 - A parent without the `epic` label stops the sweep after one call.
 - A child that needs no blocker lookup does not get one.
-- A failed `blocked_by` read for one child leaves the other children promoted.
+- A failed `blocked_by` read for one child leaves the other children promoted, and that child
+  is **not** promoted.
 - A failed `EditLabels` for one child leaves the other children promoted.
+- A sub-issue in another repository is skipped, and costs no `blocked_by` call.
+- A sub-issue whose repository the response did not name is skipped.
+- A parent in another repository stops the sweep before the sub-issue listing.
 - A sweep beyond the cap promotes the low-numbered batch and names the rest.
+- Two epics in one pass share one budget: the pass promotes at most the cap in total.
+- One epic that cannot be read leaves the other epics of the pass swept.
+- **`RunTick` — not `Tick` — promotes.** The cron path runs under a lock its caller already
+  holds, so a sweep that acquired the loop lock itself would deadlock and report zero. A test
+  that calls `Tick` directly cannot see this, so the test must call `RunTick`.
+- `Open` returns a usable `Deps.Epic` when the caller passes a `*ghub.DeliveryCache` as its
+  client, which is what the daemon does. A type assertion on the client alone fails there, so
+  this is the test that separates a working webhook path from a dead one.
 - Zero entry loops resolved: nothing sweeps, and the reason is logged.
 - Two entry loops resolved: nothing sweeps, and both are named.
 - A loop file that fails to load: nothing sweeps.

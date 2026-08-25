@@ -50,18 +50,45 @@ Read from source and probed live on 2026-08-24. Do not re-check these.
 | `GET /repos/{o}/{r}/issues/{n}/sub_issues` | array of issue objects with `number`, `state`, `labels` | `per_page` max 100, `page` |
 | `GET /repos/{o}/{r}/issues/{n}/dependencies/blocked_by` | array of issue objects with `number`, `state`, `labels`, and a full `repository` | `per_page` max 100, `page` |
 
-A `blocked_by` entry can live in **another repository**. Its `state` is in the same response, so
-no second call and no second client is needed.
+**Every one of these three relations can cross repositories.** GitHub allows a sub-issue, a
+parent, and a `blocked_by` entry to live in a different repository from the issue that names it.
+The documented limits are **100 sub-issues per parent** and **8 levels of nesting**.
+
+This is the single most important fact in this block, and it splits three ways:
+
+- A **blocker** in another repository is fine and is honored. Its `state` is in the same
+  response, so no second call and no second client is needed, and the state is all the rule
+  reads.
+- A **sub-issue** in another repository is NOT fine. The sweep writes a label by number, against
+  the loop's own `owner/repo`. A foreign child's number would label whichever LOCAL issue happens
+  to carry it. Task 4 filters these out; see `Issue.Repo`.
+- A **parent** in another repository is NOT fine, for the same reason: its children would be read
+  as if they were this repository's.
+
+Every issue object carries `repository_url` (`https://api.github.com/repos/{owner}/{repo}`), and
+`blocked_by` additionally carries a full `repository` object. `repository_url` is the field to
+use, because it is present on all three responses.
 
 **go-github v77 coverage.**
 
-- `SubIssueService.ListByIssue(ctx, owner, repo string, issueNumber int64, opts *IssueListOptions) ([]*SubIssue, *Response, error)`
-  exists. `github.SubIssue` is an alias of `github.Issue`.
+- `SubIssueService.ListByIssue(...)` exists, but this plan does **not** use it: it returns
+  `[]*SubIssue`, and `github.SubIssue` is a **defined type** (`type SubIssue Issue`,
+  `sub_issue.go:27`), not an alias, so feeding it to `ConvertIssues` needs an element-by-element
+  conversion. All three endpoints are therefore read the same way, by hand, which also means one
+  pagination helper instead of two.
 - There is **no** dependencies service and **no** parent accessor. Both need
   `g.c.NewRequest("GET", url, nil)` then `g.c.Do(ctx, req, &v)`.
+- **`github.AddOptions` DOES NOT EXIST.** The helper is unexported (`addOptions`,
+  `github/github.go:312`). Build the query string by hand. Getting this wrong does not compile.
+- `github.Response.NextPage` is populated from the `Link` header for any request made through
+  `Do`, including a hand-built one, so pagination works without the helper.
 - `github.ErrorResponse` carries `Response.StatusCode`. Match a 404 with
   `errors.As(err, &ge) && ge.Response != nil && ge.Response.StatusCode == 404`, as
-  `internal/ghub/hooks.go:129` does.
+  `internal/ghub/hooks.go`'s `missingScopeErr` does. **Do not write a third copy of that
+  predicate** — Task 1 extracts the one `missingScopeErr` already contains.
+- `internal/ghub/ghub.go:111` — `ErrNotAnIssue` already exists, for "this number names a pull
+  request, not an issue". It is the right sentinel for a parent that converts to nothing; it is
+  NOT the same condition as a 404.
 
 **This repository.**
 
@@ -87,6 +114,22 @@ no second call and no second client is needed.
 - `internal/loopcmd/tendsweep.go:70` — `TendSweep(ctx, cfg, deps, base) (Summary, error)` is the
   shape to copy: reads first, lock second, cap, then log what was deferred.
 - `internal/lock/lock.go:31` — `Acquire` is non-blocking and returns `ErrHeld` at once.
+- **`internal/loopcmd/open.go:205` — `RunTick` ALREADY HOLDS the loop lock before it calls
+  `Tick`.** `flock` is per open-file-description, so a second `Acquire` on the same path in the
+  same process returns `ErrHeld`. This is why `Tick` takes no lock of its own and `TendSweep`
+  does: `TendSweep`'s caller does not hold one, and `Tick`'s does. Anything called from inside
+  `Tick` must NOT acquire the loop lock. Getting this wrong makes the cron path fail silently and
+  forever.
+- **`internal/ghub/deliverycache.go` — `*DeliveryCache` implements `ghub.Client` ONLY**, and
+  `internal/listener/work.go:395` wraps every delivery's client in it. So on the webhook path
+  `Options.GH` is a `*DeliveryCache`, and a type assertion to `ghub.EpicReader` FAILS. The reader
+  must be threaded through `Options` explicitly; see Task 5.
+- `internal/listener/work_test.go:383` — `ranNumbers()` already reports the issue numbers the
+  harness's `runIssue` seam saw. Do not add a second accessor for the same data.
+- `Makefile` — `check: fmtcheck vet lint test`. **`-race` is NOT part of `make check`**; it is
+  the separate `test/race` target, run before a release and in CI.
+- `internal/config/discover.go:223` — `Duplicates` exists because "Two loops sharing a name is
+  never benign." Loop name is therefore not a safe identity.
 - `internal/listener/work.go:266` — `Delivery{Repo, Number, MergedInto, ClosedPR}`.
 - `internal/listener/work.go:427` — `tickOne` runs `issuePass`, then arms tend, then cleanup.
 - `internal/listener/handler.go:525` — where `mergedInto` and `closedPR` are derived from the
@@ -124,21 +167,28 @@ no second call and no second client is needed.
 - Modify: `internal/ghub/types.go`, `internal/ghub/ghub.go`
 
 **Interfaces:**
-- Consumes: `github.Client` from go-github v77; the package's existing `Issue` type and
-  `newTestClient` test helper.
+- Consumes: `github.Client` from go-github v77; the package's existing `Issue` type,
+  `ErrNotAnIssue`, `missingScopeErr`'s 404 predicate, and the `newTestClient` test helper
+  (which lives in `internal/ghub/hooks_test.go:20`, not in `single_test.go`).
 - Produces:
   - `ghub.Issue.State string` and `func (i Issue) IsOpen() bool`
+  - `ghub.Issue.Repo string` and `func (i Issue) InRepo(owner, repo string) bool`
   - `var ghub.ErrNoParent error`
   - `type ghub.EpicReader interface { Parent; SubIssues; BlockedBy; EditLabels }`
   - `func (g *GitHubClient) Parent(ctx context.Context, owner, repo string, number int) (Issue, error)`
   - `func (g *GitHubClient) SubIssues(ctx context.Context, owner, repo string, number int) ([]Issue, error)`
   - `func (g *GitHubClient) BlockedBy(ctx context.Context, owner, repo string, number int) ([]Issue, error)`
 
-`Issue` gains `State` rather than a second issue type being introduced. A second type would need
-its own copy of `HasLabel` and `HasAnyLabel`, and two label matchers that could disagree is the
-exact hazard `convertPR`'s comment warns about.
+`Issue` gains `State` and `Repo` rather than a second issue type being introduced. A second type
+would need its own copy of `HasLabel` and `HasAnyLabel`, and two label matchers that could
+disagree is the exact hazard `convertPR`'s comment warns about.
 
-- [ ] **Step 1: Write the failing test for `State` and `IsOpen`**
+`Repo` is what makes the sweep safe across repositories, and it is the field this task exists to
+add as much as the three methods are. See the Verified external API block: a sub-issue or a parent
+in another repository, written back by NUMBER against this loop's `owner/repo`, labels an
+unrelated local issue.
+
+- [ ] **Step 1: Write the failing tests for `State`, `Repo`, and their accessors**
 
 Add to `internal/ghub/ghub_test.go`:
 
@@ -158,16 +208,54 @@ func TestConvertIssuesCarriesState(t *testing.T) {
 		t.Errorf("issue 2 State = %q, want it to read as closed", got[1].State)
 	}
 }
+
+// The repository an issue lives in decides whether the sweep may write to it by
+// number. A sub-issue may live in ANOTHER repository, and its number means
+// nothing here.
+func TestConvertIssuesCarriesTheRepository(t *testing.T) {
+	got := ConvertIssues([]*github.Issue{
+		{Number: github.Ptr(1), RepositoryURL: github.Ptr("https://api.github.com/repos/o/r")},
+		{Number: github.Ptr(2), Repository: &github.Repository{FullName: github.Ptr("other/repo")}},
+		{Number: github.Ptr(3)},
+	})
+	if len(got) != 3 {
+		t.Fatalf("ConvertIssues returned %d issues, want 3", len(got))
+	}
+	if got[0].Repo != "o/r" {
+		t.Errorf("Repo from repository_url = %q, want o/r", got[0].Repo)
+	}
+	if got[1].Repo != "other/repo" {
+		t.Errorf("Repo from repository object = %q, want other/repo", got[1].Repo)
+	}
+	// An issue that names no repository must NOT be assumed local. InRepo is
+	// what the sweep gates its write on, and the safe answer to "unknown" is no.
+	if got[2].Repo != "" {
+		t.Errorf("Repo = %q for an issue naming none, want empty", got[2].Repo)
+	}
+	if got[2].InRepo("o", "r") {
+		t.Error("an issue naming no repository must not read as local")
+	}
+}
+
+func TestInRepoFoldsCase(t *testing.T) {
+	i := Issue{Repo: "McGaryLabs/Koinos"}
+	if !i.InRepo("mcgarylabs", "koinos") {
+		t.Error("InRepo must fold case, as HasLabel does")
+	}
+	if i.InRepo("mcgarylabs", "other") {
+		t.Error("InRepo matched the wrong repository")
+	}
+}
 ```
 
-- [ ] **Step 2: Run it and confirm it fails**
+- [ ] **Step 2: Run them and confirm they fail**
 
-Run: `go test ./internal/ghub/ -run TestConvertIssuesCarriesState`
+Run: `go test ./internal/ghub/ -run 'TestConvertIssuesCarries|TestInRepo'`
 Expected: FAIL — `got[0].IsOpen undefined`.
 
-- [ ] **Step 3: Add `State` and `IsOpen`**
+- [ ] **Step 3: Add `State`, `Repo`, and the accessors**
 
-In `internal/ghub/types.go`, add the field to `Issue` after `Labels`:
+In `internal/ghub/types.go`, add both fields to `Issue` after `Labels`:
 
 ```go
 	// State is "open" or "closed", as GitHub spells it.
@@ -178,20 +266,69 @@ In `internal/ghub/types.go`, add the field to `Issue` after `Labels`:
 	// conversion. Compare it with IsOpen rather than by ==: GitHub's spelling
 	// is stable, but nothing here forces the case.
 	State string
+	// Repo is the "owner/name" this issue lives in, or "" when the response did
+	// not say.
+	//
+	// It exists because sub-issue, parent and dependency relations may CROSS
+	// repositories, and the epic sweep writes a label by NUMBER against one
+	// loop's owner/repo. A foreign sub-issue carried through without this field
+	// would label whichever local issue happens to share its number -- the same
+	// class of bug as answering a pull_request delivery as an issue, which
+	// handler.go guards against by checking the event.
+	//
+	// Empty is NOT "local". It is "unknown", and InRepo answers false for it.
+	Repo string
 ```
 
-And the accessor, beside `HasLabel`:
+And the accessors, beside `HasLabel`:
 
 ```go
 // IsOpen reports whether the issue is open. The comparison ignores case.
 func (i Issue) IsOpen() bool { return strings.EqualFold(i.State, "open") }
+
+// InRepo reports whether the issue lives in owner/repo.
+//
+// An issue whose Repo is empty answers false. The field is empty only when the
+// response did not name a repository, which is "unknown", and the sweep's write
+// is by number: guessing "local" there is how a foreign issue gets labelled.
+func (i Issue) InRepo(owner, repo string) bool {
+	return i.Repo != "" && strings.EqualFold(i.Repo, owner+"/"+repo)
+}
 ```
 
-In `internal/ghub/ghub.go`, inside `ConvertIssues`'s append, add `State: gi.GetState(),`.
+In `internal/ghub/ghub.go`, inside `ConvertIssues`'s append, add `State: gi.GetState(),` and
+`Repo: issueRepo(gi),`, plus the helper:
 
-- [ ] **Step 4: Run it and confirm it passes**
+```go
+// issueRepo returns the "owner/name" an issue belongs to.
+//
+// Two sources, because the three endpoints do not agree. blocked_by returns a
+// full repository object; parent and sub_issues return repository_url. Reading
+// only one of them would leave Repo empty for two endpoints out of three, and
+// an empty Repo blocks every write -- a silent, total failure rather than a
+// loud one.
+func issueRepo(gi *github.Issue) string {
+	if full := gi.GetRepository().GetFullName(); full != "" {
+		return full
+	}
+	// repository_url is "https://api.github.com/repos/{owner}/{name}". Take the
+	// last two path elements rather than trimming a hard-coded host prefix:
+	// GitHub Enterprise serves a different base URL.
+	u := gi.GetRepositoryURL()
+	if u == "" {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2] + "/" + parts[len(parts)-1]
+}
+```
 
-Run: `go test ./internal/ghub/ -run TestConvertIssuesCarriesState`
+- [ ] **Step 4: Run them and confirm they pass**
+
+Run: `go test ./internal/ghub/ -run 'TestConvertIssuesCarries|TestInRepo'`
 Expected: PASS.
 
 - [ ] **Step 5: Write the failing tests for the three reads**
@@ -284,6 +421,53 @@ func TestSubIssuesCarriesStateAndLabels(t *testing.T) {
 	}
 	if !got[1].HasLabel("status:plan-ready-for-review") {
 		t.Errorf("74 lost its labels: %v", got[1].Labels)
+	}
+}
+
+// A sub-issue may live in ANOTHER repository. Its number means nothing in this
+// one, and the sweep writes by number, so the repository must survive the read.
+func TestSubIssuesCarriesAForeignChildsRepository(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/issues/69/sub_issues", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+		  {"number":73,"state":"open","labels":[],
+		   "repository_url":"https://api.github.com/repos/o/r"},
+		  {"number":74,"state":"open","labels":[],
+		   "repository_url":"https://api.github.com/repos/other/repo"}
+		]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	got, err := newTestClient(t, srv).SubIssues(context.Background(), "o", "r", 69)
+	if err != nil {
+		t.Fatalf("SubIssues: %v", err)
+	}
+	if !got[0].InRepo("o", "r") {
+		t.Errorf("73 Repo = %q, want it to read as local", got[0].Repo)
+	}
+	if got[1].InRepo("o", "r") {
+		t.Errorf("74 Repo = %q read as local; it lives in other/repo", got[1].Repo)
+	}
+}
+
+// A server that always reports a next page must not spin a webhook handler
+// forever.
+func TestPagedIssuesRefusesAPaginationThatDoesNotAdvance(t *testing.T) {
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/issues/69/sub_issues", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// rel="next" pointing at page 1, forever.
+		w.Header().Set("Link", `<`+srv.URL+`/repos/o/r/issues/69/sub_issues?page=1>; rel="next"`)
+		_, _ = w.Write([]byte(`[{"number":71,"state":"closed","labels":[]}]`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	if _, err := newTestClient(t, srv).SubIssues(context.Background(), "o", "r", 69); err == nil {
+		t.Fatal("want an error when pagination does not advance, got nil")
 	}
 }
 
@@ -432,12 +616,16 @@ func (g *GitHubClient) Parent(ctx context.Context, owner, repo string, number in
 		}
 		return Issue{}, fmt.Errorf("parent %s/%s#%d: %w", owner, repo, number, err)
 	}
-	// ConvertIssues drops pull requests, and a parent is never one. Passing
-	// through it anyway keeps ONE mapping from a GitHub issue to this type, so
-	// a field added there is carried by every reader.
+	// ConvertIssues drops pull requests. Passing through it keeps ONE mapping
+	// from a GitHub issue to this type, so a field added there is carried by
+	// every reader.
 	out := ConvertIssues([]*github.Issue{&gi})
 	if len(out) == 0 {
-		return Issue{}, fmt.Errorf("parent %s/%s#%d: %w", owner, repo, number, ErrNoParent)
+		// NOT ErrNoParent. A 404 means "this issue has no parent", which is
+		// ordinary; landing here means a parent was returned and it was a pull
+		// request. Those have different fixes, so they get different sentinels
+		// -- the rule internal/config/discover.go:20 states for its own.
+		return Issue{}, fmt.Errorf("parent %s/%s#%d: %w", owner, repo, number, ErrNotAnIssue)
 	}
 	return out[0], nil
 }
@@ -472,36 +660,60 @@ func (g *GitHubClient) BlockedBy(ctx context.Context, owner, repo string, number
 // That failure is invisible -- a 40-child epic would simply promote nothing for
 // its tail.
 func (g *GitHubClient) pagedIssues(ctx context.Context, path, what string) ([]Issue, error) {
-	opts := &github.ListOptions{PerPage: 100}
+	// The query is built by hand because go-github's addOptions is unexported.
+	// Do not reach for github.AddOptions; there is no such symbol.
+	page := 1
 	var all []Issue
 	for {
-		u, err := github.AddOptions(path, opts)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", what, err)
-		}
+		u := fmt.Sprintf("%s?per_page=100&page=%d", path, page)
 		req, err := g.c.NewRequest("GET", u, nil)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", what, err)
 		}
-		var page []*github.Issue
-		resp, err := g.c.Do(ctx, req, &page)
+		var got []*github.Issue
+		resp, err := g.c.Do(ctx, req, &got)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", what, err)
 		}
-		all = append(all, ConvertIssues(page)...)
+		all = append(all, ConvertIssues(got)...)
+		// NextPage is filled from the Link header for a hand-built request too,
+		// so this needs no helper. A response with no Link header leaves it 0
+		// and ends the loop.
 		if resp == nil || resp.NextPage == 0 {
 			return all, nil
 		}
-		opts.Page = resp.NextPage
+		// GitHub caps a parent at 100 sub-issues, so this loop is bounded in
+		// practice at one or two pages. The guard is here anyway: this reads a
+		// remote server's pagination cursor, and a server that always reports a
+		// next page would otherwise spin forever inside a webhook handler.
+		if resp.NextPage <= page {
+			return all, fmt.Errorf("%s: pagination did not advance past page %d", what, page)
+		}
+		page = resp.NextPage
 	}
 }
+```
 
+`isNotFound` is NOT written here. `missingScopeErr` in `internal/ghub/hooks.go` already contains
+that exact predicate, and this codebase single-sources a rule and says so — see `isLive` in
+`internal/loopcmd/tick.go:62`, "the ONE liveness rule". Extract it from `missingScopeErr` into a
+package-level helper and call it from both:
+
+```go
 // isNotFound reports whether err is GitHub's 404.
+//
+// One copy, two callers: missingScopeErr reads it as "no such hook, or no
+// admin:repo_hook scope", and Parent reads it as "this issue has no parent".
+// The two READINGS differ and that is fine; the test must not, or one of them
+// silently stops recognising a 404.
 func isNotFound(err error) bool {
 	var ge *github.ErrorResponse
 	return errors.As(err, &ge) && ge.Response != nil && ge.Response.StatusCode == 404
 }
 ```
+
+Then rewrite `missingScopeErr`'s condition to `if isNotFound(err) {`. Run
+`go test ./internal/ghub/` afterwards — the hooks tests cover that path and must stay green.
 
 - [ ] **Step 8: Run them and confirm they pass**
 
@@ -543,6 +755,18 @@ EOF
 
 This package is pure. It opens no socket, reads no clock, and keeps no state. Every rule the
 sweep applies lives here, and the sweep applies none of its own.
+
+**Why a new package and not `internal/engine`.** `engine.Decide` is also pure and also consumes
+`ghub.Issue` and `config.Labels`, so the question is fair. They are separated because they answer
+different questions from different state. `Decide` answers "which agent must this tick dispatch",
+and to do it, it reads stored issue state, running dispatches, retry deadlines and the circuit
+breaker; its output is a `Plan` of `Decision`s that `act` turns into processes. `Promote` answers
+"which issues did a closure unblock", reads nothing but the issues themselves, and its output is
+a list of numbers to label. Putting it in `engine` would mean either a `Decision` kind that
+dispatches nothing — which every consumer of `Plan.Decisions` would then have to learn to skip,
+including `TendSweep`, which filters by kind — or a second exported function in `engine` that
+shares none of `Decide`'s inputs. Neither is cheaper than a package whose whole surface is one
+rule.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1023,6 +1247,25 @@ func TestEntryLoopRefusesWhenALoopFileIsBroken(t *testing.T) {
 	}
 }
 
+// Two files declaring one name. Each would exclude the other as "itself", so
+// the graph would lose an edge and the message would name one loop twice.
+func TestEntryLoopRefusesDuplicateLoopNames(t *testing.T) {
+	dir := writeLoops(t, map[string]string{
+		"a.yaml": loopYAML("planning", "o/r",
+			"status:ready-for-spec", "status:plan-ready-for-review", "status:ready-for-execution"),
+		"b.yaml": loopYAML("planning", "o/r",
+			"status:ready-for-execution", "status:ready-for-review", ""),
+	})
+
+	_, err := EntryLoop(dir, "o/r")
+	if !errors.Is(err, ErrAmbiguousEntryLoop) {
+		t.Fatalf("EntryLoop error = %v, want ErrAmbiguousEntryLoop", err)
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error does not say the names are duplicated: %v", err)
+	}
+}
+
 // A loop watching another repository is not part of this repository's pipeline
 // and must not make its trigger look downstream.
 func TestEntryLoopIgnoresAnotherRepositorysLoops(t *testing.T) {
@@ -1133,7 +1376,18 @@ var (
 func EntryLoop(agentUtilsDir, repo string) (string, error) {
 	entries, err := List(agentUtilsDir)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("entry loop for %s: %w", repo, err)
+	}
+	// Two loops sharing a name is never benign -- Duplicates exists to say so.
+	// It matters more here than anywhere else: the derivation below asks "is
+	// any OTHER loop's terminal label my trigger", and with a duplicated name
+	// the two copies would each exclude the other as "itself". The graph would
+	// be computed from a set that silently lost an edge, and the ambiguity
+	// message would read "planning, planning are all at the front", which tells
+	// an operator nothing.
+	if dupes := Duplicates(entries); len(dupes) > 0 {
+		return "", fmt.Errorf("entry loop for %s: duplicate loop names: %s: %w",
+			repo, strings.Join(dupes, ", "), ErrAmbiguousEntryLoop)
 	}
 
 	type loop struct {
@@ -1168,10 +1422,13 @@ func EntryLoop(agentUtilsDir, repo string) (string, error) {
 	}
 
 	var entry []string
-	for _, l := range loops {
+	for i, l := range loops {
 		downstream := false
-		for _, other := range loops {
-			if other.name == l.name {
+		for j, other := range loops {
+			// Compared by INDEX, not by name. Duplicates is rejected above, so
+			// names are unique by the time this runs -- but identity that does
+			// not depend on that invariant cannot be broken by relaxing it.
+			if i == j {
 				continue
 			}
 			// Terminal is optional -- the execution loop omits it -- and an
@@ -1198,6 +1455,14 @@ func EntryLoop(agentUtilsDir, repo string) (string, error) {
 	case 1:
 		return entry[0], nil
 	case 0:
+		// Two quite different conditions, and an operator's fix differs for
+		// each: there is no loop watching this repository at all, or there are
+		// loops and every one of them is downstream of another. A single
+		// message covering both would name neither fix.
+		if len(loops) == 0 {
+			return "", fmt.Errorf("entry loop for %s: no loop in %s watches this repository: %w",
+				repo, agentUtilsDir, ErrNoEntryLoop)
+		}
 		return "", fmt.Errorf("entry loop for %s: every loop's trigger is another's terminal or review label: %w",
 			repo, ErrNoEntryLoop)
 	default:
@@ -1269,21 +1534,136 @@ And to `Summary`, after `Tended`:
 	Promoted int `json:"promoted"`
 ```
 
-In `internal/loopcmd/open.go`, wherever `Deps.GH` is populated from the real client, populate
-`Epic` from the same value. `*ghub.GitHubClient` satisfies both interfaces, so this is one extra
-assignment and no new construction. Where `Options.GH` is supplied by the caller (the listener's
-shared client), set `Epic` from it with a type assertion that leaves `Epic` nil when the value
-does not implement `EpicReader`:
+**Populating `Deps.Epic` — read this carefully, the obvious version does not work.**
+
+`internal/loopcmd/open.go` has exactly ONE `gh` variable (line 129, typed `ghub.Client` from
+`opts.GH`) and ONE `Deps` literal (lines 183-194). There are not two sites.
+
+A type assertion on that variable is **not** sufficient, and this is the trap:
+
+- On the CLI path, `opts.GH` is nil and `Open` builds a `*ghub.GitHubClient`, which does satisfy
+  `EpicReader`. An assertion would work.
+- On the WEBHOOK path — the sweep's primary driver — `listener.access` wraps the client in
+  `ghub.NewDeliveryCache(...)` (`internal/listener/work.go:395`) and passes the
+  `*ghub.DeliveryCache` as `opts.GH`. `DeliveryCache` implements the seven `ghub.Client` methods
+  and nothing else. The assertion fails, `Deps.Epic` stays nil, and every close delivery logs
+  `no EpicReader` at ERROR while promoting nothing.
+
+So the reader is threaded through `Options` explicitly. Add to `Options`, after `GH`:
 
 ```go
-	// The listener hands in one shared client per delivery. It is a
-	// *ghub.GitHubClient in production and satisfies EpicReader, but Options.GH
-	// is typed as the narrower ghub.Client, so the assertion is what carries it
-	// through. A fake that does not implement EpicReader leaves this nil, and
-	// EpicSweep refuses to run rather than panicking.
-	if er, ok := deps.GH.(ghub.EpicReader); ok {
-		deps.Epic = er
+	// Epic reads sub-issues and issue dependencies. Nil means "build one from
+	// Token", like GH.
+	//
+	// It is a SEPARATE field from GH rather than an assertion on it, because
+	// the daemon's GH is a *ghub.DeliveryCache: that type memoises single-issue
+	// fetches for one delivery and implements ghub.Client only. Asserting
+	// GH.(ghub.EpicReader) therefore succeeds for every CLI command and fails
+	// for every webhook delivery -- which is the epic sweep's main driver, so
+	// the feature would be dead exactly where it matters and nowhere a test
+	// injecting its own reader would notice.
+	Epic ghub.EpicReader
+```
+
+In `Open`, beside where `gh` is resolved:
+
+```go
+	// Falls back to the same client when the caller supplied none. The
+	// concrete *ghub.GitHubClient satisfies both interfaces; only the
+	// DeliveryCache wrapper does not, and the daemon passes Epic explicitly.
+	epicReader := opts.Epic
+	if epicReader == nil {
+		if er, ok := gh.(ghub.EpicReader); ok {
+			epicReader = er
+		}
 	}
+```
+
+and set `Epic: epicReader` in the `Deps` literal.
+
+Then in `internal/listener/work.go`, carry the un-wrapped client on `access` beside `gh`:
+
+```go
+type access struct {
+	token string
+	gh    ghub.Client
+	// epic is the SAME authenticated client as gh, before the DeliveryCache
+	// wrapper. The cache exists to collapse the repeated single-issue fetch a
+	// fan-out makes; the epic reads are made once per delivery and have nothing
+	// to collapse, so they bypass it rather than teaching it three more methods
+	// it would only ever pass through.
+	epic ghub.EpicReader
+}
+```
+
+In `Worker.access`, build it once:
+
+```go
+	c := w.NewClient(tok)
+	acc := &access{token: tok, gh: ghub.NewDeliveryCache(c)}
+	// A test's fake client may implement ghub.Client only. Leaving epic nil
+	// there is correct: EpicSweep refuses rather than panicking.
+	if er, ok := c.(ghub.EpicReader); ok {
+		acc.epic = er
+	}
+	return acc, nil
+```
+
+And in `tickOne`, pass it through: `Epic: acc.epic,` in the `loopcmd.Options` literal.
+
+- [ ] **Step 1b: Pin the wiring with a test that would have caught the nil**
+
+The tests below inject `fakeEpic` directly into `Deps`, so none of them exercises the wiring
+above. Add one that does, in `internal/loopcmd/open_test.go`:
+
+```go
+// The daemon's client is a *ghub.DeliveryCache, which implements ghub.Client
+// and NOT ghub.EpicReader. Open must still produce a usable Deps.Epic, or the
+// epic sweep is dead on the webhook path -- its primary driver -- while every
+// test that injects its own reader stays green.
+func TestOpenCarriesTheEpicReaderPastTheDeliveryCache(t *testing.T) {
+	// The premise. If DeliveryCache ever grows the three methods, the explicit
+	// Options.Epic field can go -- but until then, asserting on GH is a trap
+	// that fails only in production.
+	if _, ok := any((*ghub.DeliveryCache)(nil)).(ghub.EpicReader); ok {
+		t.Fatal("DeliveryCache now implements EpicReader; this test's premise is stale")
+	}
+
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeOpenConfig(t)
+
+	real := ghub.New("")
+	_, deps, cleanup, err := Open(ProjectRef{}, path, Options{
+		// Exactly what listener.access builds: the cache for GH, the
+		// un-wrapped client for Epic.
+		GH:   ghub.NewDeliveryCache(real),
+		Epic: real,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+
+	if deps.Epic == nil {
+		t.Fatal("deps.Epic is nil; the epic sweep is dead on the webhook path")
+	}
+}
+
+// The CLI path supplies neither, and must still get a reader.
+func TestOpenBuildsAnEpicReaderWhenTheCallerSuppliesNone(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeOpenConfig(t)
+
+	_, deps, cleanup, err := Open(ProjectRef{}, path, Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+
+	if deps.Epic == nil {
+		t.Fatal("deps.Epic is nil on the CLI path")
+	}
+}
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -1325,6 +1705,14 @@ type fakeEpic struct {
 	added map[int][]string
 	// blockedByCalls counts the lookups, so a test can prove a call was saved.
 	blockedByCalls []int
+	// subIssuesCalls counts the sub-issue listings. It is separate from
+	// blockedByCalls because "the sweep stopped at the parent" and "the sweep
+	// looked up no blockers" are different claims, and a test that asserts the
+	// first against the second proves nothing.
+	subIssuesCalls []int
+	// subErr makes SubIssues fail for one parent, so the caller's
+	// error-handling branch is reachable.
+	subErr map[int]error
 }
 
 func newFakeEpic() *fakeEpic {
@@ -1335,6 +1723,7 @@ func newFakeEpic() *fakeEpic {
 		blockerErr: map[int]error{},
 		labelErr:   map[int]error{},
 		added:      map[int][]string{},
+		subErr:     map[int]error{},
 	}
 }
 
@@ -1351,6 +1740,10 @@ func (f *fakeEpic) Parent(_ context.Context, _, _ string, n int) (ghub.Issue, er
 func (f *fakeEpic) SubIssues(_ context.Context, _, _ string, n int) ([]ghub.Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.subIssuesCalls = append(f.subIssuesCalls, n)
+	if err := f.subErr[n]; err != nil {
+		return nil, err
+	}
 	return f.children[n], nil
 }
 
@@ -1385,52 +1778,68 @@ func (f *fakeEpic) promotedNumbers() []int {
 	return out
 }
 
+// The fixtures below all live in "o/r", which is tickConfig's repo. An issue
+// with no Repo would be skipped by the sweep's cross-repository guard, so
+// omitting it here would make every promotion test pass for the wrong reason.
 func openIssue(n int, labels ...string) ghub.Issue {
-	return ghub.Issue{Number: n, State: "open", Labels: labels}
+	return ghub.Issue{Number: n, State: "open", Repo: "o/r", Labels: labels}
 }
 
 func closedIssue(n int, labels ...string) ghub.Issue {
-	return ghub.Issue{Number: n, State: "closed", Labels: labels}
+	return ghub.Issue{Number: n, State: "closed", Repo: "o/r", Labels: labels}
+}
+
+// foreignIssue is an open sub-issue that lives in ANOTHER repository.
+func foreignIssue(n int, labels ...string) ghub.Issue {
+	return ghub.Issue{Number: n, State: "open", Repo: "other/repo", Labels: labels}
 }
 
 // epicParent is a parent issue carrying the epic label.
 func epicParent(n int) ghub.Issue {
-	return ghub.Issue{Number: n, State: "open", Labels: []string{"epic"}}
+	return ghub.Issue{Number: n, State: "open", Repo: "o/r", Labels: []string{"epic"}}
 }
 
-// writeLoopFiles creates a .agent-utils/configs directory holding a planning
-// and an execution loop file, and returns the path of the one named `loop`.
+// loopFile renders one loop configuration. The fields Load requires are all
+// present; only the parts EntryLoop reads vary between cases.
+func loopFile(name, trigger, review, terminal string) string {
+	s := "name: " + name + "\nrepo: o/r\n" +
+		"checkout_base_dir: /tmp/checkout\nworktree_dir: /tmp/worktrees\n" +
+		"state_dir: /tmp/state\ndefault_branch: master\nlabels:\n" +
+		"  trigger: " + trigger + "\n" +
+		"  in_flight: status:in-flight-" + name + "\n" +
+		"  blocked: status:blocked-" + name + "\n" +
+		"  review: " + review + "\n"
+	if terminal != "" {
+		s += "  terminal: " + terminal + "\n"
+	}
+	return s + "agent: {model: opus, worktree: per_issue, timeout: 1h}\n" +
+		"retry: {max: 1, backoff: [0s], breaker: {orphan_threshold: 2, cooldown: 1m}}\n" +
+		"prompt: p\nresume_prompt: rp\n"
+}
+
+// referenceLoopFiles is the planning/execution pair. planning's terminal label
+// IS execution's trigger, so execution is downstream and planning is the entry.
+func referenceLoopFiles() map[string]string {
+	return map[string]string{
+		"planning.yaml": loopFile("planning",
+			"status:ready-for-spec", "status:plan-ready-for-review", "status:ready-for-execution"),
+		"execution.yaml": loopFile("execution",
+			"status:ready-for-execution", "status:ready-for-review", ""),
+	}
+}
+
+// writeLoopFiles creates a .agent-utils/configs directory holding files, and
+// returns the path of the one named `loop`.
 //
 // The files are REAL, because EpicSweep derives the entry loop by loading them.
 // A fixture that faked the derivation would not test the guard that stops the
 // execution loop promoting past the planning stage.
-func writeLoopFiles(t *testing.T, loop string) string {
+func writeLoopFiles(t *testing.T, loop string, files map[string]string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), config.DirName)
 	cfgDir := config.ConfigsDir(dir)
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
-	}
-	body := func(name, trigger, review, terminal string) string {
-		s := "name: " + name + "\nrepo: o/r\n" +
-			"checkout_base_dir: /tmp/checkout\nworktree_dir: /tmp/worktrees\n" +
-			"state_dir: /tmp/state\ndefault_branch: master\nlabels:\n" +
-			"  trigger: " + trigger + "\n" +
-			"  in_flight: status:in-flight-" + name + "\n" +
-			"  blocked: status:blocked-" + name + "\n" +
-			"  review: " + review + "\n"
-		if terminal != "" {
-			s += "  terminal: " + terminal + "\n"
-		}
-		return s + "agent: {model: opus, worktree: per_issue, timeout: 1h}\n" +
-			"retry: {max: 1, backoff: [0s], breaker: {orphan_threshold: 2, cooldown: 1m}}\n" +
-			"prompt: p\nresume_prompt: rp\n"
-	}
-	files := map[string]string{
-		"planning.yaml": body("planning",
-			"status:ready-for-spec", "status:plan-ready-for-review", "status:ready-for-execution"),
-		"execution.yaml": body("execution",
-			"status:ready-for-execution", "status:ready-for-review", ""),
 	}
 	for name, b := range files {
 		if err := os.WriteFile(filepath.Join(cfgDir, name), []byte(b), 0o644); err != nil {
@@ -1441,12 +1850,21 @@ func writeLoopFiles(t *testing.T, loop string) string {
 }
 
 // fixtureFor builds the config and deps for one loop of the reference pair.
+func fixtureFor(t *testing.T, loop string) (*config.Config, Deps, *fakeEpic, *fakeGH) {
+	t.Helper()
+	return fixtureWithFiles(t, loop, referenceLoopFiles())
+}
+
+// fixtureWithFiles is fixtureFor with the loop files chosen by the caller, so a
+// test can arrange an unresolvable derivation.
 //
 // It reuses tickConfig and newDeps from tick_test.go rather than inventing a
-// second fixture shape for this package. Only the three things the sweep reads
-// are overridden: the labels, the config path (the entry-loop derivation walks
-// up from it), and the reader.
-func fixtureFor(t *testing.T, loop string) (*config.Config, Deps, *fakeEpic, *fakeGH) {
+// second fixture shape for this package. Only the things the sweep reads are
+// overridden: the labels, the config path (the entry-loop derivation walks up
+// from it), and the reader.
+func fixtureWithFiles(
+	t *testing.T, loop string, files map[string]string,
+) (*config.Config, Deps, *fakeEpic, *fakeGH) {
 	t.Helper()
 	cfg := tickConfig(t)
 	cfg.Name = loop
@@ -1467,7 +1885,7 @@ func fixtureFor(t *testing.T, loop string) (*config.Config, Deps, *fakeEpic, *fa
 	gh := &fakeGH{}
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
-	deps.ConfigPath = writeLoopFiles(t, loop)
+	deps.ConfigPath = writeLoopFiles(t, loop, files)
 
 	f := newFakeEpic()
 	deps.Epic = f
@@ -1537,9 +1955,11 @@ func TestEpicSweepStopsWhenTheIssueHasNoParent(t *testing.T) {
 	if got := f.promotedNumbers(); len(got) != 0 {
 		t.Errorf("promoted %v, want none", got)
 	}
-	if len(f.blockedByCalls) != 0 {
-		t.Errorf("looked up blockers %v; an issue with no parent must cost one call",
-			f.blockedByCalls)
+	// Asserted against subIssuesCalls, which is what "stopped at the parent"
+	// actually means. blockedByCalls would be empty either way.
+	if len(f.subIssuesCalls) != 0 {
+		t.Errorf("listed sub-issues of %v; an issue with no parent must cost one call",
+			f.subIssuesCalls)
 	}
 }
 
@@ -1554,8 +1974,71 @@ func TestEpicSweepStopsWhenTheParentIsNotAnEpic(t *testing.T) {
 	if got := f.promotedNumbers(); len(got) != 0 {
 		t.Errorf("promoted %v, want none", got)
 	}
-	if len(f.blockedByCalls) != 0 {
-		t.Errorf("read sub-issues of a parent that is not an epic: %v", f.blockedByCalls)
+	if len(f.subIssuesCalls) != 0 {
+		t.Errorf("read sub-issues of a parent that is not an epic: %v", f.subIssuesCalls)
+	}
+}
+
+// A parent in ANOTHER repository is not this loop's epic. Its children would be
+// read from, and written to, the wrong repository by number.
+func TestEpicSweepStopsWhenTheParentIsInAnotherRepository(t *testing.T) {
+	cfg, deps, f := sweepFixture(t)
+	f.parents[71] = ghub.Issue{
+		Number: 69, State: "open", Repo: "other/repo", Labels: []string{"epic"},
+	}
+	f.children[69] = []ghub.Issue{openIssue(73)}
+
+	if _, err := EpicSweep(context.Background(), cfg, deps, 71); err != nil {
+		t.Fatalf("EpicSweep: %v", err)
+	}
+	if got := f.promotedNumbers(); len(got) != 0 {
+		t.Errorf("promoted %v for a foreign epic, want none", got)
+	}
+	if len(f.subIssuesCalls) != 0 {
+		t.Errorf("read sub-issues of a foreign parent: %v", f.subIssuesCalls)
+	}
+}
+
+// The write is by NUMBER against this loop's owner/repo. A foreign child's
+// number names a different issue here, so it must never be promoted.
+func TestEpicSweepSkipsAChildInAnotherRepository(t *testing.T) {
+	cfg, deps, f := sweepFixture(t)
+	f.parents[71] = epicParent(69)
+	f.children[69] = []ghub.Issue{
+		closedIssue(71),
+		foreignIssue(73),
+		openIssue(74),
+	}
+	f.blockers[74] = []ghub.Issue{closedIssue(71)}
+
+	if _, err := EpicSweep(context.Background(), cfg, deps, 71); err != nil {
+		t.Fatalf("EpicSweep: %v", err)
+	}
+	got := f.promotedNumbers()
+	if len(got) != 1 || got[0] != 74 {
+		t.Fatalf("promoted %v, want [74] only; 73 lives in another repository", got)
+	}
+	for _, n := range f.blockedByCalls {
+		if n == 73 {
+			t.Error("looked up blockers for a foreign sub-issue")
+		}
+	}
+}
+
+// Repo empty means "the response did not say", not "local".
+func TestEpicSweepSkipsAChildWithNoRepository(t *testing.T) {
+	cfg, deps, f := sweepFixture(t)
+	f.parents[71] = epicParent(69)
+	f.children[69] = []ghub.Issue{
+		closedIssue(71),
+		{Number: 73, State: "open"},
+	}
+
+	if _, err := EpicSweep(context.Background(), cfg, deps, 71); err != nil {
+		t.Fatalf("EpicSweep: %v", err)
+	}
+	if got := f.promotedNumbers(); len(got) != 0 {
+		t.Errorf("promoted %v; an issue naming no repository must not read as local", got)
 	}
 }
 
@@ -1595,6 +2078,12 @@ func TestEpicSweepContinuesPastAFailedBlockerRead(t *testing.T) {
 	got := f.promotedNumbers()
 	if len(got) != 1 || got[0] != 74 {
 		t.Fatalf("promoted %v, want [74] only", got)
+	}
+	// The point of the test, stated as its own assertion: the child whose
+	// blockers could not be read is HELD, not promoted. Without this line the
+	// test passes even if BlockersUnknown is ignored entirely.
+	if _, ok := f.added[73]; ok {
+		t.Error("promoted 73 whose blocker list could not be read; it must be held")
 	}
 }
 
@@ -1657,6 +2146,113 @@ func TestEpicSweepRefusesWhenThisLoopIsNotTheEntry(t *testing.T) {
 	}
 }
 
+// An unresolvable derivation is a no-op, NOT an error. It is a permanent
+// misconfiguration: returning an error would schedule retries of something no
+// retry can fix. Three ways it can be unresolvable, all of them a quiet skip.
+func TestEpicSweepIsANoOpWhenTheEntryLoopCannotBeResolved(t *testing.T) {
+	cases := []struct {
+		name  string
+		files map[string]string
+	}{
+		{
+			// Every loop downstream of another: a cycle.
+			name: "no entry loop",
+			files: map[string]string{
+				"planning.yaml":  loopFile("planning", "status:x", "status:review-a", "status:y"),
+				"execution.yaml": loopFile("execution", "status:y", "status:review-b", "status:x"),
+			},
+		},
+		{
+			name: "two entry loops",
+			files: map[string]string{
+				"planning.yaml":  loopFile("planning", "status:ready-for-spec", "status:review-a", ""),
+				"execution.yaml": loopFile("execution", "status:ready-for-other", "status:review-b", ""),
+			},
+		},
+		{
+			name: "a loop file that does not load",
+			files: map[string]string{
+				"planning.yaml": loopFile("planning",
+					"status:ready-for-spec", "status:plan-ready-for-review", "status:ready-for-execution"),
+				"broken.yaml": "name: broken\nrepo: o/r\nthis is not: [valid",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, deps, f, _ := fixtureWithFiles(t, "planning", tc.files)
+			f.parents[71] = epicParent(69)
+			f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+
+			if _, err := EpicSweep(context.Background(), cfg, deps, 71); err != nil {
+				t.Fatalf("an unresolvable derivation must not be an error: %v", err)
+			}
+			if got := f.promotedNumbers(); len(got) != 0 {
+				t.Fatalf("promoted %v with no resolvable entry loop", got)
+			}
+		})
+	}
+}
+
+// A config path outside a .agent-utils directory leaves DirFromPath empty. This
+// is live in production, not hypothetical: tick_test.go's newDeps defaults
+// ConfigPath to /tmp/loop.yaml.
+func TestEpicSweepIsANoOpWithNoProjectDirectory(t *testing.T) {
+	cfg, deps, f := sweepFixture(t)
+	deps.ConfigPath = "/tmp/loop.yaml"
+	f.parents[71] = epicParent(69)
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+
+	if _, err := EpicSweep(context.Background(), cfg, deps, 71); err != nil {
+		t.Fatalf("EpicSweep: %v", err)
+	}
+	if got := f.promotedNumbers(); len(got) != 0 {
+		t.Fatalf("promoted %v with no locatable project directory", got)
+	}
+}
+
+// The cap bounds the whole PASS, not one epic. Anyone with triage can apply the
+// epic label, so a per-epic cap would let the number of epics multiply the
+// write authority.
+func TestEpicSweepAllCapsTheWholePass(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	// Two epics, each with more unblocked children than the whole cap allows.
+	gh.issues = []ghub.Issue{epicParent(10), epicParent(20)}
+	for _, parent := range []int{10, 20} {
+		var kids []ghub.Issue
+		for i := 0; i < maxPromotePerSweep; i++ {
+			kids = append(kids, openIssue(parent*1000+i))
+		}
+		f.children[parent] = kids
+	}
+
+	sum, err := EpicSweepAll(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("EpicSweepAll: %v", err)
+	}
+	if sum.Promoted != maxPromotePerSweep {
+		t.Fatalf("Promoted = %d across two epics, want the pass cap %d",
+			sum.Promoted, maxPromotePerSweep)
+	}
+}
+
+// One unreadable epic must not abandon the rest of the pass.
+func TestEpicSweepAllContinuesPastAFailedEpic(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	gh.issues = []ghub.Issue{epicParent(10), epicParent(20)}
+	f.subErr[10] = errors.New("502 bad gateway")
+	f.children[20] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
+
+	sum, err := EpicSweepAll(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("EpicSweepAll: %v", err)
+	}
+	if sum.Promoted != 1 {
+		t.Fatalf("Promoted = %d, want 1 from the epic that could be read", sum.Promoted)
+	}
+}
+
 // A nil reader is what a fake Client that does not implement EpicReader leaves
 // behind. Refusing beats panicking inside a daemon.
 func TestEpicSweepRefusesWithNoReader(t *testing.T) {
@@ -1708,7 +2304,6 @@ package loopcmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1726,6 +2321,12 @@ import (
 // things. A tend decision is an agent process in a git worktree with permission
 // prompts disabled; a promotion is one label write. The cost of this batch is
 // 25 API calls, and the cost of tending's is 10 agents.
+//
+// It bounds the whole PASS, not one epic. EpicSweepAll walks every open issue
+// carrying the epic label, and anyone with triage can apply that label: a cap
+// applied per epic would let N epics authorise 25 x N writes on one tick, which
+// is the unbounded repository-wide fan-out this design exists to avoid. The
+// budget is therefore threaded through, not re-read.
 //
 // It is a constant rather than a configuration field for the reason
 // maxTendPerSweep is: no operator has needed a different value. What is left
@@ -1757,10 +2358,26 @@ const maxPromotePerSweep = 25
 //
 // # Where the lock is taken
 //
-// The GitHub reads happen BEFORE the lock and the writes happen under it, for
-// the reason TendSweep documents at length: Worker.issuePass drops a delivery
-// that finds the lock held, with no retry, so every second this pass holds it
-// is a second in which a labelled issue can be dropped and never picked up.
+// This function TAKES the loop lock, around the writes only. The reads happen
+// before it, for the reason TendSweep documents at length: Worker.issuePass
+// drops a delivery that finds the lock held, with no retry, so every second
+// this pass holds it is a second in which a labelled issue can be dropped and
+// never picked up.
+//
+// EpicSweepAll does NOT take it, because its caller already holds it. See that
+// function.
+//
+// # Why a GitHub-only write needs the LOOP lock at all
+//
+// Nothing local is written here, so the lock is not protecting a file or a
+// database row. It is protecting an ORDERING. The label this pass adds is the
+// trigger label, and the next tick to see it dispatches an agent. A tick
+// running concurrently with this pass would read the issue list either side of
+// the write and, in the "before" case, decide nothing for an issue that is
+// about to become dispatchable -- harmless -- or, worse, race a park that is
+// removing the same label. Taking the lock makes the promotion and the
+// dispatch decision serial, which is the property the rest of this package
+// already relies on.
 func EpicSweep(ctx context.Context, cfg *config.Config, deps Deps, closed int) (Summary, error) {
 	var sum Summary
 	if deps.Epic == nil {
@@ -1786,8 +2403,24 @@ func EpicSweep(ctx context.Context, cfg *config.Config, deps Deps, closed int) (
 	if !parent.HasLabel(epic.Label) {
 		return sum, nil
 	}
+	// A parent in ANOTHER repository is not this loop's epic. Its children are
+	// read from, and written to, this loop's owner/repo, so a foreign parent
+	// would expand whichever LOCAL issue shares its number. GitHub permits a
+	// cross-repository parent, so this is reachable, not theoretical.
+	if !parent.InRepo(owner, repo) {
+		slog.Info("epic sweep skipped: the parent lives in another repository",
+			"loop", cfg.Name, "issue", closed, "parent", parent.Number, "parent_repo", parent.Repo)
+		return sum, nil
+	}
 
-	return sweepEpic(ctx, cfg, deps, parent.Number)
+	l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
+	if err != nil {
+		return sum, fmt.Errorf("epic sweep: lock loop %s: %w", cfg.Name, err)
+	}
+	defer l.Release()
+
+	budget := maxPromotePerSweep
+	return sweepEpic(ctx, cfg, deps, parent.Number, &budget)
 }
 
 // EpicSweepAll runs the sweep for every open epic of the repository.
@@ -1799,6 +2432,15 @@ func EpicSweep(ctx context.Context, cfg *config.Config, deps Deps, closed int) (
 //
 // It enters at the epic instead of at a closed child. Every step after the
 // entry is shared with EpicSweep, so the two cannot decide differently.
+//
+// # It does NOT take the loop lock
+//
+// Its only caller is Tick, and Tick's production caller RunTick already holds
+// that lock (internal/loopcmd/open.go:205). flock is per open-file-description,
+// so acquiring it again in the same process returns ErrHeld -- which would make
+// this backstop silently promote nothing, forever, which is precisely the
+// failure it exists to prevent. This is the same reason Tick itself takes no
+// lock and TendSweep does: TendSweep's caller does not hold one.
 func EpicSweepAll(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	var sum Summary
 	if deps.Epic == nil {
@@ -1808,31 +2450,69 @@ func EpicSweepAll(ctx context.Context, cfg *config.Config, deps Deps) (Summary, 
 		return sum, nil
 	}
 
-	issues, err := deps.GH.ListOpenIssues(ctx, cfg.RepoOwner(), cfg.RepoName())
+	owner, repo := cfg.RepoOwner(), cfg.RepoName()
+	issues, err := deps.GH.ListOpenIssues(ctx, owner, repo)
 	if err != nil {
 		return sum, fmt.Errorf("epic sweep: list open issues: %w", err)
 	}
+
+	// One budget for the whole pass. See maxPromotePerSweep: a per-epic cap
+	// would let the number of epics multiply the write authority, and applying
+	// the epic label costs an attacker one triage permission.
+	budget := maxPromotePerSweep
+	var swept int
 	for _, iss := range issues {
 		if !iss.HasLabel(epic.Label) {
 			continue
 		}
-		one, err := sweepEpic(ctx, cfg, deps, iss.Number)
+		// ListOpenIssues returns this repository's issues, so InRepo is
+		// redundant here today. It is checked anyway, because the write below
+		// is by number and the guard must not depend on which listing fed it.
+		if !iss.InRepo(owner, repo) {
+			continue
+		}
+		if budget <= 0 {
+			slog.Warn("epic sweep hit its per-pass cap; the remaining epics wait for the next tick",
+				"loop", cfg.Name, "promoted", sum.Promoted, "epics_swept", swept)
+			break
+		}
+		swept++
+		one, err := sweepEpic(ctx, cfg, deps, iss.Number, &budget)
+		sum.Promoted += one.Promoted
 		if err != nil {
 			// One unreadable epic must not abandon the rest. If this returned,
 			// anyone able to label an issue `epic` could stall every promotion
 			// the loop would otherwise make.
+			//
+			// ErrHeld is not a failure, and must not be logged as one: the spec
+			// states it is a skip. It cannot arise on this path today -- the
+			// caller holds the lock and this function takes none -- but a bare
+			// Warn here would be wrong the moment that changes.
+			if errors.Is(err, lock.ErrHeld) {
+				slog.Info("epic sweep skipped: another tick holds the loop lock",
+					"loop", cfg.Name, "epic", iss.Number)
+				continue
+			}
 			slog.Warn("epic sweep failed for one epic; continuing",
 				"loop", cfg.Name, "epic", iss.Number, "err", err)
 			continue
 		}
-		sum.Promoted += one.Promoted
 	}
 	return sum, nil
 }
 
 // sweepEpic considers the children of one epic and promotes what it may.
 // Both drivers call it, so neither can decide differently from the other.
-func sweepEpic(ctx context.Context, cfg *config.Config, deps Deps, parent int) (Summary, error) {
+//
+// The CALLER holds the loop lock. sweepEpic takes none: EpicSweep acquires it
+// and Tick's caller already holds it, so acquiring here would deadlock the cron
+// path against its own caller.
+//
+// budget is the number of promotions the whole PASS may still make. It is a
+// pointer because EpicSweepAll spends one budget across many epics.
+func sweepEpic(
+	ctx context.Context, cfg *config.Config, deps Deps, parent int, budget *int,
+) (Summary, error) {
 	var sum Summary
 	owner, repo := cfg.RepoOwner(), cfg.RepoName()
 
@@ -1843,6 +2523,28 @@ func sweepEpic(ctx context.Context, cfg *config.Config, deps Deps, parent int) (
 
 	children := make([]epic.Child, 0, len(kids))
 	for _, kid := range kids {
+		// A child in ANOTHER repository is skipped before anything else. The
+		// promotion below writes a label by NUMBER against this loop's
+		// owner/repo, so a foreign child's number would label whichever LOCAL
+		// issue happens to carry it -- an unrelated issue, moved into the
+		// pipeline by a relation someone created in a repository this operator
+		// may not control. GitHub permits a cross-repository sub-issue, so this
+		// is reachable. An issue whose repository the response did not name is
+		// also skipped: InRepo answers false for "unknown", which is the safe
+		// direction when the alternative is labelling the wrong issue.
+		if !kid.InRepo(owner, repo) {
+			slog.Info("skipping a sub-issue outside this repository",
+				"loop", cfg.Name, "epic", parent, "issue", kid.Number, "issue_repo", kid.Repo)
+			continue
+		}
+		// A number GitHub could not have. The handler validates the identically
+		// sourced value on the way in; this is the same check on the way out,
+		// because this one is a WRITE target.
+		if kid.Number <= 0 {
+			slog.Warn("skipping a sub-issue with an impossible number",
+				"loop", cfg.Name, "epic", parent, "number", kid.Number)
+			continue
+		}
 		// The filter is an OPTIMIZATION, not the rule: it saves a call for a
 		// child that cannot be promoted whatever its blockers say. Promote
 		// tests the same conditions again and is the only place the decision is
@@ -1872,17 +2574,10 @@ func sweepEpic(ctx context.Context, cfg *config.Config, deps Deps, parent int) (
 	}
 
 	var deferred []int
-	if len(promote) > maxPromotePerSweep {
-		deferred = promote[maxPromotePerSweep:]
-		promote = promote[:maxPromotePerSweep]
+	if len(promote) > *budget {
+		deferred = promote[*budget:]
+		promote = promote[:*budget]
 	}
-
-	// The lock covers the WRITES only. See the function comment above.
-	l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
-	if err != nil {
-		return sum, err
-	}
-	defer l.Release()
 
 	for _, n := range promote {
 		if err := deps.Epic.EditLabels(ctx, owner, repo, n,
@@ -1895,6 +2590,7 @@ func sweepEpic(ctx context.Context, cfg *config.Config, deps Deps, parent int) (
 			continue
 		}
 		sum.Promoted++
+		*budget--
 		// One line per promotion, naming the label. This is a GitHub write made
 		// with no human and no agent in the loop, and the log is the only
 		// record of it that lives on this machine.
@@ -1905,14 +2601,30 @@ func sweepEpic(ctx context.Context, cfg *config.Config, deps Deps, parent int) (
 	if len(deferred) > 0 {
 		// Never silent. A capped sweep that said nothing would read as "every
 		// unblocked sub-issue was promoted", which is the opposite of the
-		// truth. NAMED, not counted, so an operator can see which work waits.
-		slog.Warn("epic sweep hit its per-sweep cap; the rest wait for the next sweep",
-			"loop", cfg.Name, "epic", parent, "promoted", sum.Promoted, "deferred", deferred)
+		// truth. NAMED, not counted, so an operator can see which work waits --
+		// but TRUNCATED, because the length is the child count of an epic
+		// anyone with triage can grow. handler.go's safeLabels sets the shape:
+		// at most a few, and a count of what did not fit.
+		slog.Warn("epic sweep hit its cap; the rest wait for the next sweep",
+			"loop", cfg.Name, "epic", parent, "promoted", sum.Promoted,
+			"deferred", loggedNumbers(deferred), "deferred_total", len(deferred))
 	}
-
-	body, _ := json.Marshal(sum)
-	slog.Info("epic sweep complete", "loop", cfg.Name, "epic", parent, "summary", string(body))
 	return sum, nil
+}
+
+// maxLoggedNumbers bounds an issue-number list carried into a log line.
+const maxLoggedNumbers = 10
+
+// loggedNumbers returns at most maxLoggedNumbers of ns.
+//
+// The caller logs len(ns) beside it, so nothing is hidden by the truncation --
+// only moved from the line to a count, which is what handler.go's safeLabels
+// does for a label list of attacker-controlled length.
+func loggedNumbers(ns []int) []int {
+	if len(ns) <= maxLoggedNumbers {
+		return ns
+	}
+	return ns[:maxLoggedNumbers]
 }
 
 // isEntryLoop reports whether cfg is the one loop allowed to promote.
@@ -1926,7 +2638,7 @@ func isEntryLoop(cfg *config.Config, deps Deps) bool {
 	dir := config.DirFromPath(deps.ConfigPath)
 	if dir == "" {
 		slog.Warn("epic sweep skipped: cannot locate the project directory",
-			"loop", cfg.Name, "config", deps.ConfigPath)
+			"loop", cfg.Name, "path", deps.ConfigPath)
 		return false
 	}
 	name, err := config.EntryLoop(dir, cfg.Repo)
@@ -1950,12 +2662,19 @@ Make each change, run the tests, see a FAIL, revert.
 
 1. In `EpicSweep`, delete the `if !isEntryLoop(cfg, deps) { return sum, nil }` guard.
    Expected: `TestEpicSweepRefusesWhenThisLoopIsNotTheEntry` FAILS.
-2. In `sweepEpic`, change the failed-`BlockedBy` branch to `continue` instead of setting
-   `BlockersUnknown`.
-   Expected: `TestEpicSweepContinuesPastAFailedBlockerRead` still passes — so ALSO add a case
-   asserting the failed child is absent from `promotedNumbers()`, and confirm that one fails.
+2. In `sweepEpic`, delete the `BlockersUnknown = true` assignment, leaving the warning.
+   Expected: `TestEpicSweepContinuesPastAFailedBlockerRead` FAILS on its "must be held"
+   assertion. (That assertion is shipped in Step 2, not added here — a guard this plan does
+   not pin before the mutation check is a guard the suite does not protect.)
 3. In `sweepEpic`, move `sum.Promoted++` above the `EditLabels` error check.
    Expected: `TestEpicSweepContinuesPastAFailedLabelWrite` FAILS on the count.
+4. In `sweepEpic`, delete the `if !kid.InRepo(owner, repo)` guard.
+   Expected: `TestEpicSweepSkipsAChildInAnotherRepository` and
+   `TestEpicSweepSkipsAChildWithNoRepository` FAIL.
+5. In `EpicSweep`, delete the `if !parent.InRepo(owner, repo)` guard.
+   Expected: `TestEpicSweepStopsWhenTheParentIsInAnotherRepository` FAILS.
+6. In `sweepEpic`, change `*budget` back to `maxPromotePerSweep` in the cap comparison.
+   Expected: `TestEpicSweepAllCapsTheWholePass` FAILS with 50 promotions instead of 25.
 
 - [ ] **Step 7: Run the gates and commit**
 
@@ -2070,7 +2789,7 @@ func TestTheClosedIssuesOwnPassStillRuns(t *testing.T) {
 
 	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 71, ClosedIssue: true})
 
-	if got := h.runCalls(); len(got) != 1 || got[0] != 71 {
+	if got := h.ranNumbers(); len(got) != 1 || got[0] != 71 {
 		t.Fatalf("the issue pass ran for %v, want [71]", got)
 	}
 	// A failed sweep schedules NO retry: the cron sweep re-derives the whole
@@ -2081,10 +2800,11 @@ func TestTheClosedIssuesOwnPassStillRuns(t *testing.T) {
 }
 ```
 
-**Note:** `h.runCalls()` is named here for the issue numbers the harness's `runIssue` seam saw.
-If the harness has no such accessor, add one beside `pendingLen()` — a mutex-guarded slice
-appended to in `h.runIssue`. Do not read the field directly; `Deliver` fans out on goroutines
-and `-race` is part of `make check`.
+**Note:** `ranNumbers()` already exists (`internal/listener/work_test.go:383`) and reports the
+issue numbers the harness's `runIssue` seam saw, mutex-guarded. Do not add a second accessor for
+the same data, and do not read `h.ranIssues` directly — `Deliver` fans out on goroutines, and
+although `-race` is not part of `make check` (it is the separate `test/race` target, run before a
+release and in CI), an unguarded read still fails there.
 
 In `internal/listener/handler_test.go`, first add the field to `tickCall` (line 80) and to the
 `newServer` seam (line 96), so a test can see it:
@@ -2298,6 +3018,15 @@ In `internal/loopcmd/tick.go`, at the end of `Tick`, before the summary is recor
 	// it. A failure is logged and does not fail the tick: the tick's own work
 	// is dispatch, and a sweep that could not read GitHub says nothing about
 	// that.
+	//
+	// It runs AFTER the dispatch pass above, so an issue promoted here is
+	// dispatched by the NEXT tick, not this one. That is deliberate: dispatch
+	// decides from a snapshot read at the top of this function, and promoting
+	// into that snapshot would mean deciding from a repository state that no
+	// single read ever saw. One tick of latency on the backstop path costs
+	// nothing -- the webhook path has none.
+	//
+	// EpicSweepAll takes NO lock. RunTick already holds it; see that function.
 	if epicSum, err := EpicSweepAll(ctx, cfg, deps); err != nil {
 		slog.Warn("epic sweep failed", "loop", cfg.Name, "err", err)
 	} else {
@@ -2335,16 +3064,38 @@ func TestTickRunsTheEpicSweep(t *testing.T) {
 	}
 }
 
+// The self-deadlock regression. RunTick holds the loop lock and then calls
+// Tick, so anything Tick calls that acquires the SAME lock gets ErrHeld and
+// promotes nothing, forever. Calling Tick directly cannot catch that; this
+// calls RunTick, which is what cron runs.
+func TestRunTickRunsTheEpicSweepWithoutDeadlocking(t *testing.T) {
+	cfg, deps, f, gh := sweepAllFixture(t)
+	gh.issues = []ghub.Issue{epicParent(69)}
+	f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
+	f.blockers[73] = []ghub.Issue{closedIssue(71)}
+
+	sum, err := RunTick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	if sum.Promoted != 1 {
+		t.Fatalf("Promoted = %d, want 1; a sweep that self-deadlocks reports 0", sum.Promoted)
+	}
+}
+
 // A sweep that cannot read GitHub must not cost the tick its dispatch work.
 // The tick's job is dispatch; a failed sweep says nothing about that.
+//
+// The failure is injected at SubIssues, not at BlockedBy: a failed blocker read
+// is handled inside sweepEpic (it holds the child and returns nil), so it never
+// reaches Tick's error branch and would test nothing here.
 func TestTickSurvivesAFailedEpicSweep(t *testing.T) {
 	cfg, deps, f, gh := sweepAllFixture(t)
 	gh.issues = []ghub.Issue{
-		{Number: 69, State: "open", Labels: []string{"epic"}},
-		{Number: 1, State: "open", Labels: []string{cfg.Labels.Trigger}},
+		epicParent(69),
+		openIssue(1, cfg.Labels.Trigger),
 	}
-	f.children[69] = []ghub.Issue{{Number: 73, State: "open"}}
-	f.blockerErr[73] = errors.New("502 bad gateway")
+	f.subErr[69] = errors.New("502 bad gateway")
 
 	sum, err := Tick(context.Background(), cfg, deps)
 	if err != nil {
@@ -2359,8 +3110,12 @@ func TestTickSurvivesAFailedEpicSweep(t *testing.T) {
 }
 ```
 
-`sweepAllFixture` sets `cfg.Labels.Trigger` to `status:ready-for-spec`, so the second test's
-issue 1 carries that label rather than `tickConfig`'s bare `trigger`.
+Two notes for the implementer:
+
+- `sweepAllFixture` sets `cfg.Labels.Trigger` to `status:ready-for-spec`, so the second test's
+  issue 1 carries that label rather than `tickConfig`'s bare `trigger`.
+- `internal/loopcmd/tick_test.go` currently imports `context`, `fmt`, `path/filepath`, `strings`,
+  `testing`, `time`, plus `config`, `ghub`, `store`, and `worktree`. **Add `errors`.**
 
 - [ ] **Step 8: Run the full suite**
 
@@ -2373,7 +3128,7 @@ changes an existing signature.
 ```bash
 git add internal/listener/ internal/loopcmd/
 git commit -m "$(cat <<'EOF'
-feat(listener): sweep an epic when one of its sub-issues closes
+feat: sweep an epic when one of its sub-issues closes
 
 The handler sets ClosedIssue on an `issues` delivery with action closed,
 checking the event as well as the action because issues and pull requests
@@ -2395,7 +3150,42 @@ EOF
 **Interfaces:**
 - Consumes: everything above. Produces no code.
 
-- [ ] **Step 1: Add a README section**
+**This change makes three existing statements false.** Correcting them is the point of this task;
+the new section is the smaller half. Commit `7c1ca40` exists because a previous change added a
+second case to a documented "exactly one" and did not correct the sentence.
+
+- [ ] **Step 1: Correct the three statements that this change falsifies**
+
+`README.md:9` — "The agent owns every judgement and every GitHub write but one (see
+[Security](#security))." There are now two. Replace with:
+
+```markdown
+retries, backoff, the circuit breaker. The agent owns every judgement and every GitHub write but
+two: the retry-cap park, and the epic sweep's promotion (see [Epics](#epics)). Cron does the
+scheduling; the engine has no timer.
+```
+
+`docs/configuration.md:370-371` — "**The loop writes a label exactly once**, in one situation:
+when an issue exhausts its retry budget. Everything else is the agent's to apply. See
+`retry.max`." Replace with:
+
+```markdown
+**The loop writes a label in two situations**, and never in any other. It applies `blocked` when
+an issue exhausts its retry budget — see `retry.max`. And it applies `trigger` to a sub-issue of
+an epic that a closing sibling unblocked — see [Epics](../README.md#epics), which also explains
+why only one loop of a repository ever does that. Everything else is the agent's to apply.
+```
+
+`docs/configuration.md:374-380` — `### labels.trigger — required` says "The 'go' signal. **You**
+apply it." Amend that line to:
+
+```markdown
+The "go" signal. **You** apply it — and so does the epic sweep, for the loop at the front of the
+pipeline, when a sub-issue's blockers all close. It means both "start this" and "resume this",
+and it never means "approved".
+```
+
+- [ ] **Step 2: Add a README section**
 
 Add after the `Webhooks` section, before `Upgrading`:
 
@@ -2413,8 +3203,24 @@ is what leaves work already in flight alone, and it is why running the sweep twi
 nothing the second time.
 
 **No agent runs.** The sweep is deterministic Go and its whole output is label writes. It is the
-second GitHub write in this program that no agent makes; the first is the retry-cap park (see
-[Security](#security)).
+second GitHub write in this program that no agent makes; the first is the retry-cap park, which
+`docs/configuration.md` documents under `retry.max`.
+
+**What it will not do.** A sub-issue in another repository is skipped, and so is an epic whose
+parent lives in another repository. GitHub permits both relations, but the promotion is a label
+write addressed by issue number against one repository, and a foreign number names a different
+issue here. A *blocker* in another repository is honoured normally — only its open-or-closed state
+is read, and that is in the same response.
+
+**Who this trusts.** The sweep acts on relations a person with `triage` on the repository built:
+the `epic` label, the sub-issue links, and the `blocked_by` edges. Anyone who can create those can
+already apply `status:ready-for-spec` by hand, so the sweep adds no authority they did not have —
+with one honest exception. The *author* of a sub-issue can close their own issue without holding
+`triage`, and a blocker in another repository is closed by whoever controls that repository. In
+both cases someone outside this repository chooses the *moment* a promotion happens. They do not
+choose *which* issues are promoted: that was fixed when a maintainer put those issues in the epic
+and declared the dependency. Point a loop only at a repository whose issue population you trust —
+see [Security](#security).
 
 **There is nothing to configure.** The `epic` label on the parent is the only switch. One loop per
 repository does the promoting — the one at the front of the pipeline, which is the loop whose
@@ -2431,21 +3237,12 @@ dependency. Entering an epic's graph is a human's job, or an agent's, and both u
 or its API.
 ```
 
-- [ ] **Step 2: Add the `docs/configuration.md` note**
-
-Under the `labels` reference, add:
-
-```markdown
-`labels.trigger` has a second reader. The epic sweep promotes an unblocked sub-issue by adding
-this label, but only for the loop at the FRONT of the pipeline — the one whose `trigger` is no
-other loop's `terminal` or `review`. Nothing enables this and nothing disables it; the `epic`
-label on a parent issue is the only switch. See [Epics](../README.md#epics).
-```
-
 - [ ] **Step 3: Run the docs test**
 
-`internal/config/docs_test.go` checks that documented fields exist. Run:
-`go test ./internal/config/`
+`internal/config/docs_test.go`'s `TestEveryConfigFieldIsDocumented` reflects over `Config`'s yaml
+tags and fails when a dotted field path is missing from `docs/configuration.md` in backticks.
+This change adds **no** yaml field, so the test is unaffected — but it must still be run, because
+Step 1 edits that file. Run: `go test ./internal/config/`
 Expected: PASS.
 
 - [ ] **Step 4: Run the gates and commit**
@@ -2454,7 +3251,11 @@ Expected: PASS.
 make check
 git add README.md docs/configuration.md
 git commit -m "$(cat <<'EOF'
-docs: record when an epic sweep runs and what it writes
+docs: record the epic sweep, and the second label the loop writes
+
+README and docs/configuration.md both claimed the loop writes a label in
+exactly one situation. The epic sweep is the second, so both statements
+were false the moment it landed. Corrected alongside the new section.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 EOF
