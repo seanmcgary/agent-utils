@@ -1,0 +1,128 @@
+name: pr-review
+repo: mcgarylabs/lawndominator-monorepo
+
+checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+worktree_dir: .agent-utils/worktrees
+# state_dir is optional. When omitted it defaults to
+# <project>/.agent-utils/state/<name>, which keeps this loop's tick
+# lock and its logs beside the project. Loop state itself lives in
+# one database at ~/.agent-utils/state.db, keyed by project, so it
+# is not affected by this. Set it only to override that.
+default_branch: master
+
+labels:
+  trigger:   status:ready-for-pr-review
+  in_flight: status:pr-reviewing
+  blocked:   status:needs-review-input
+  review:    status:ready-for-review
+  # No terminal label. This loop's last act is to hand a green pull request to
+  # the human by applying labels.review; merging is the human's decision and
+  # there is no later state for this loop to approve.
+  veto:
+    - "blocked:*"
+
+agent:
+  # The point of this loop is a REVIEWER stronger than whatever wrote the code.
+  # An execution loop may run a cheap model, or pi with a third-party provider,
+  # by configuration or by a model:/harness: label. This one runs the strongest
+  # model at the highest effort, always.
+  model: opus
+  effort: high
+  permission_mode: bypassPermissions
+  worktree: per_issue
+  max_budget_usd: 50
+  timeout: 4h
+
+i_understand_bypass_permissions: true
+
+# Tending is an EXECUTION-loop duty, and this loop must never do it.
+# reviewing-commits rebases the branch itself (--fixup plus --autosquash), so a
+# tend agent rebasing the same branch would race the review's own force-push.
+# Once this loop finishes it applies labels.review, and the execution loop's
+# tend sweep -- which targets that label -- takes the pull request back over.
+tend_pr: false
+
+retry:
+  max: 3
+  backoff: [0s, 15m, 30m]
+  breaker:
+    orphan_threshold: 2
+    cooldown: 30m
+
+prompt: |
+  Run the /reviewing-commits skill against the open pull request for GitHub
+  issue #{{.Issue.Number}}, repo {{.Repo}}. The issue carries
+  {{.Labels.Trigger}}: an execution agent has finished and its branch is ready
+  to be reviewed. Follow reviewing-commits EXACTLY, with these overrides.
+
+  YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
+  {{.Labels.InFlight}}.
+
+  RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so {{.PR.Number}}
+  and {{.PR.HeadRef}} are EMPTY here and you must not use them. Read the
+  "## Pipeline State" block in the issue's plan comment and take its `pr` field,
+  then confirm it with `gh pr view <n> --json number,headRefName,baseRefName,state`.
+  The pull request must be OPEN and must close this issue. If Pipeline State
+  names no pull request, or the one it names is closed or belongs to another
+  issue, PARK: that is a broken handoff, not something to guess your way past.
+
+  WORKTREE. You run in an isolated git worktree, checked out detached at the
+  default branch. `git fetch origin`, then check out the pull request's head ref
+  before anything else. Every gate and every reviewer reads THAT branch.
+
+  A FRESH WORKTREE HAS NO node_modules. Run `pnpm install` before any Node gate.
+
+  YOU FIX WHAT YOU FIND. reviewing-commits is not a report: run the mechanical
+  gates, commit their fixes, dispatch the reviewers, then triage every finding
+  as Fix, Reject or Defer and APPLY the fixes as commits on the branch. Do not
+  post findings for someone else to act on, and do not park because a fix is
+  large or structural. Reject and Defer are decisions you make and justify in
+  the table, not questions for the human.
+
+  PUSHING. Folding fixes in with --fixup and `git rebase --autosquash` REWRITES
+  the branch, so the push is
+  `git push --force-with-lease origin HEAD:refs/heads/<head ref>`.
+  Use --force-with-lease, never plain --force. If the lease check REJECTS the
+  push, another run touched the branch while you worked: change nothing, push
+  nothing, and PARK saying so. Push at the END of every phase and before every
+  park; your worktree may be removed before your next dispatch, so unpushed work
+  is lost.
+
+  HEADLESS. Never ask the human through the CLI and never block on a reply. All
+  human interaction is issue and pull request comments plus label transitions.
+
+  ON COMPLETION. Post the findings-disposition table as a pull request comment --
+  every finding, including the ones you Rejected and Deferred, with the one-line
+  reason for each. That table is the whole record of what this run decided, and
+  it is what the human reads instead of re-reviewing the diff. @-mention
+  @seanmcgary. Then remove {{.Labels.InFlight}} and add {{.Labels.Review}}.
+
+  PARKING. Park only when you cannot proceed: a gate still red after your fixes,
+  a rebase that conflicts (`git rebase --abort` first), a rejected lease, or a
+  pull request that cannot be resolved from Pipeline State. PARK means: commit
+  and push what is safe to push, post a comment stating exactly what you need,
+  remove {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment
+  with: "To proceed: comment your decision and re-add the {{.Labels.Trigger}}
+  label."
+
+  NEVER MERGE. You never merge or close the pull request, and you never mark a
+  draft ready. Merging is the human's decision, at every stage, without exception.
+
+resume_prompt: |
+  Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
+  in the SAME session you used before, so you already know which pull request you
+  were reviewing and what you had found. Remove {{.Labels.Trigger}} and add
+  {{.Labels.InFlight}} as your first action.
+
+  Read the comments added since your last message. They answer the blocker you
+  parked on, or they ask for another pass on a branch you already reviewed.
+
+  Re-check out the pull request's head ref and `git fetch origin` before you
+  continue: the branch may have moved since your last dispatch. Resume from where
+  your findings table left off rather than re-reviewing what you already
+  dispositioned. All other rules from your original instructions still apply,
+  including that you fix what you find, that pushes use --force-with-lease, and
+  that you never merge.
+
+tend_prompt: |
+  Tending is disabled for the pr-review loop. This template is never rendered.

@@ -325,8 +325,10 @@ logs.
 
 `agent-utils project loop new` writes a loop file for you, by asking; **[`docs/configuration.md`](docs/configuration.md)
 remains the reference for editing one by hand** — what each field means, what reads it, and
-what happens if you get it wrong. `examples/planning.yaml` and `examples/execution.yaml` are
-complete working files, ported from the reference planning and execution orchestrators.
+what happens if you get it wrong. `examples/planning.yaml`, `examples/execution.yaml` and
+`examples/pr-review.yaml` are complete working files — the first two ported from the reference
+planning and execution orchestrators, the third a review loop that runs the strongest model over
+whatever the execution loop's produced, fixing what it finds rather than reporting it.
 
 A label on an issue can also override, for that issue alone, which model, harness, or effort
 level a dispatch uses: `model:<value>`, `harness:<value>`, `effort:<value>`. These are always

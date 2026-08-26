@@ -13,14 +13,14 @@ import (
 // examples/*.yaml at run time would fail for every real user; go:embed bakes
 // the content into the binary at build time instead.
 //
-//go:embed templates/planning.yaml templates/execution.yaml
+//go:embed templates/planning.yaml templates/execution.yaml templates/pr-review.yaml
 var templateFS embed.FS
 
 // templateNames lists the embedded templates, in the order Templates and the
 // wizard's own template question offer them. It is kept in sync with the
 // file list embedded into templateFS above by templates_test.go, which loads
 // every one of them through config.Load.
-var templateNames = []string{"planning", "execution"}
+var templateNames = []string{"planning", "execution", "pr-review"}
 
 // Template supplies the prompt bodies and the label and tend defaults that go
 // with them.
