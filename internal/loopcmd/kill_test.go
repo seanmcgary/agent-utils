@@ -193,18 +193,67 @@ func TestKillerOneSendsNoSignalWhenMarkStoppedFails(t *testing.T) {
 	}
 }
 
-func TestKillerOneTendDispatchSkipsTheIssueFlag(t *testing.T) {
+func TestKillerOneThrowawaySessionTendSkipsTheIssueFlag(t *testing.T) {
 	log := &callLog{}
 	k := noopKiller(log)
 	w := baseWork()
 	w.Dispatch.Kind = store.KindTend
+	// Its own session, shared with nothing: the exempt case.
+	w.Dispatch.SessionID = "throwaway"
+	w.IssueSessionID = "sess-1"
 
 	if res := k.one(w, KillOptions{Timeout: time.Second}); res.Err != nil {
 		t.Fatalf("one: %v", res.Err)
 	}
 	for _, c := range log.calls {
 		if c == "markStopped" {
-			t.Fatalf("markStopped was called for a tend dispatch, which holds no issue state: %v", log.calls)
+			t.Fatalf("markStopped was called for a throwaway-session tend, which holds no issue state: %v", log.calls)
+		}
+	}
+}
+
+// A tend that INHERITED the issue's session is that issue's own conversation,
+// so killing it must hold the issue. Without this the next tick would dispatch
+// straight back into the session just killed. Decide draws the same line by
+// comparing identifiers rather than testing the kind (internal/engine).
+func TestKillerOneInheritedSessionTendHoldsTheIssue(t *testing.T) {
+	log := &callLog{}
+	k := noopKiller(log)
+	w := baseWork()
+	w.Dispatch.Kind = store.KindTend
+	w.Dispatch.SessionID = "sess-1"
+	w.IssueSessionID = "sess-1"
+
+	if res := k.one(w, KillOptions{Timeout: time.Second}); res.Err != nil {
+		t.Fatalf("one: %v", res.Err)
+	}
+	var stopped bool
+	for _, c := range log.calls {
+		if c == "markStopped" {
+			stopped = true
+		}
+	}
+	if !stopped {
+		t.Fatalf("markStopped was not called for a tend carrying the issue's own session: %v", log.calls)
+	}
+}
+
+// An issue with no started session cannot have been inherited from, so a tend
+// there is still the exempt case even if both identifiers happen to be empty.
+func TestKillerOneTendWithNoIssueSessionSkipsTheIssueFlag(t *testing.T) {
+	log := &callLog{}
+	k := noopKiller(log)
+	w := baseWork()
+	w.Dispatch.Kind = store.KindTend
+	w.Dispatch.SessionID = ""
+	w.IssueSessionID = ""
+
+	if res := k.one(w, KillOptions{Timeout: time.Second}); res.Err != nil {
+		t.Fatalf("one: %v", res.Err)
+	}
+	for _, c := range log.calls {
+		if c == "markStopped" {
+			t.Fatalf("markStopped was called for a tend on an issue with no session: %v", log.calls)
 		}
 	}
 }

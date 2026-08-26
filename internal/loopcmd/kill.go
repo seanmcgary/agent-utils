@@ -133,6 +133,31 @@ type work struct {
 	Target   Target
 	Repo     string
 	Dispatch store.Dispatch
+	// IssueSessionID is the session the ISSUE owns, which a tend dispatch may
+	// now have inherited. It is what tells an inherited-session tend from a
+	// throwaway one; see killer.one.
+	IssueSessionID string
+}
+
+// holdsIssueState reports whether stopping this dispatch must also hold its
+// issue.
+//
+// It compares session IDENTIFIERS rather than testing the kind alone, exactly
+// as Decide does when it decides whether a live tend blocks its issue
+// (internal/engine/engine.go). A tend used to be unconditionally exempt here,
+// on the grounds that a rebase keeps no memory and touches no issue state --
+// but a tend now INHERITS the issue's session when one was started, so killing
+// it is killing the issue's own conversation. Leaving such an issue unheld
+// would let the next tick dispatch straight back into the session just killed,
+// which is the whole failure `sessions kill` exists to prevent.
+//
+// A tend carrying its own throwaway session still shares nothing and holds
+// nothing, so it stays exempt.
+func (w work) holdsIssueState() bool {
+	if w.Dispatch.Kind != store.KindTend {
+		return true
+	}
+	return w.IssueSessionID != "" && w.Dispatch.SessionID == w.IssueSessionID
 }
 
 // Action is the outcome recorded for one target.
@@ -232,8 +257,9 @@ var killedResult = store.DispatchResult{
 func (k killer) one(w work, opts KillOptions) Result {
 	res := Result{Target: w.Target}
 
-	// A tend dispatch holds no issue state, so there is no flag to set.
-	if w.Dispatch.Kind != store.KindTend {
+	// See work.holdsIssueState: a tend is exempt only while it carries its own
+	// throwaway session, not when it inherited the issue's.
+	if w.holdsIssueState() {
 		// This write happens BEFORE any signal. A tick that starts in the
 		// window between the agent dying and the flag landing would see the
 		// trigger label and no live dispatch, and start a second agent. A
@@ -847,7 +873,17 @@ func Kill(opts KillOptions) ([]Result, error) {
 			// Killing nothing is not an error: report it and move on.
 			return Result{Target: t, Action: ActionAlreadyGone}
 		}
-		return productionKiller(cfg, st).one(work{Target: t, Repo: cfg.Repo, Dispatch: d}, opts)
+		// Read the issue's own session so a tend that INHERITED it is held
+		// like any other dispatch. A read failure must not silently downgrade
+		// that to the exempt case, so it is reported.
+		is, err := st.IssueState(cfg.Name, cfg.Repo, t.Issue)
+		if err != nil {
+			return Result{Target: t, Action: ActionFailed,
+				Err: fmt.Errorf("read issue #%d state: %w", t.Issue, err)}
+		}
+		return productionKiller(cfg, st).one(work{
+			Target: t, Repo: cfg.Repo, Dispatch: d, IssueSessionID: is.SessionID,
+		}, opts)
 	})
 	return results, nil
 }
