@@ -69,7 +69,7 @@ func TestParseOverridesRejectsBadValues(t *testing.T) {
 		{"empty value", []string{"model:"}},
 		{"whitespace", []string{"model:claude opus"}},
 		{"leading dash", []string{"model:-opus"}},
-		{"zero-width space", []string{"model:claude​opus"}},
+		{"zero-width space", []string{"model:claude" + "\u200b" + "opus"}},
 		{"duplicate prefix", []string{"model:a", "model:b"}},
 		{"bad harness", []string{"harness:gpt"}},
 		{"bad effort", []string{"effort:bogus"}},

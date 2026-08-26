@@ -27,7 +27,7 @@ func VerifyRunner(pid int, dispatchID int64) error {
 	if err != nil {
 		// Fail CLOSED, the opposite of IsAlive: an unreadable command line is
 		// not evidence the process is ours.
-		return fmt.Errorf("%w: %v", ErrNotRunner, err)
+		return fmt.Errorf("%w: %w", ErrNotRunner, err)
 	}
 	if !matchesDispatch(cmdline, dispatchID) {
 		return ErrNotRunner
