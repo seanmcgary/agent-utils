@@ -49,6 +49,12 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 
 	var decisions []Decision
 	var parks []Decision
+	// stops holds every KindStop decision. It is kept OUT of decisions,
+	// exactly like parks, because the breaker branch below drops every
+	// entry of decisions and rewrites its skip reason (engine.go:159-168).
+	// A stop is the refusal to dispatch, not a dispatch, so it must survive
+	// a tripped breaker with its own reason intact.
+	var stops []Decision
 	decided := make(map[int]bool)
 	// skips records why each examined issue got no decision. Entries are
 	// removed at the end for every issue that turned out to have one, so an
@@ -77,6 +83,36 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 
 		state := st.Issues[iss.Number]
 
+		// An operator-stopped issue must never dispatch again until
+		// `agent-utils sessions resume` clears the flag. This check sits
+		// ABOVE the NeedsRetry branch: a killed dispatch always records a
+		// failure, so a stopped issue almost always also carries the retry
+		// flag, and if the retry path won here the loop would redispatch the
+		// very issue it was told to stop.
+		//
+		// decided MUST be set here. tendDecisions skips only decided issues
+		// (engine.go:259), and a stopped issue awaiting review with a behind
+		// pull request would otherwise get a tend agent force-pushing the
+		// branch of the session the operator just killed.
+		if state.Stopped {
+			decided[iss.Number] = true
+			skips[iss.Number] = fmt.Sprintf(
+				"%s; clear it with `agent-utils sessions resume`", state.StoppedReason)
+			continue
+		}
+
+		// Parse ONCE, here, above the retry path. retryDecision receives no
+		// labels, so a parse below it could never reach a retry decision and
+		// every retry would silently fall back to the configured model.
+		//
+		// The result is not ACTED on here. An invalid label must stop only a
+		// DISPATCH; it must never block KindClearRetry or
+		// KindParkRetryExhausted, which are repair actions.
+		ov, ovErr := config.ParseOverrides(iss.Labels)
+		if ovErr == nil {
+			ovErr = validateOverrides(cfg, ov)
+		}
+
 		// FAILURE PATH. NeedsRetry is durable state written when a dispatch died
 		// or exited non-zero. It covers both a dead runner and a clean non-zero
 		// exit, so a failing dispatch can never redispatch without a cap.
@@ -102,6 +138,22 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				continue
 			}
 			d, eligible, skip := retryDecision(cfg, iss.Number, state, now)
+			// Convert to a stop BEFORE counting toward the breaker. A retry
+			// that becomes a stop never dispatches, so counting it would let
+			// a label push the circuit breaker over its threshold and drop
+			// every other issue's dispatches for the whole cooldown. The
+			// park kind is exempt: the retry cap is a fact about the issue,
+			// not its labels, and must not be blocked by an invalid one.
+			if d != nil && d.Kind != KindParkRetryExhausted && ovErr != nil {
+				decided[iss.Number] = true
+				stops = append(stops, Decision{
+					Kind:  KindStop,
+					Issue: iss.Number,
+					Reason: fmt.Sprintf(
+						"%s; clear it with `agent-utils sessions resume`", ovErr.Error()),
+				})
+				continue
+			}
 			if eligible {
 				eligibleRetries++
 			}
@@ -110,6 +162,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				if d.Kind == KindParkRetryExhausted {
 					parks = append(parks, *d)
 				} else {
+					d.Overrides = ov
 					decisions = append(decisions, *d)
 				}
 			} else {
@@ -129,6 +182,15 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		}
 
 		decided[iss.Number] = true
+		if ovErr != nil {
+			stops = append(stops, Decision{
+				Kind:  KindStop,
+				Issue: iss.Number,
+				Reason: fmt.Sprintf(
+					"%s; clear it with `agent-utils sessions resume`", ovErr.Error()),
+			})
+			continue
+		}
 		if state.SessionID != "" && state.SessionStarted {
 			decisions = append(decisions, Decision{
 				Kind:      KindResume,
@@ -136,6 +198,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				Title:     iss.Title,
 				SessionID: state.SessionID,
 				Reason:    "trigger label present and a started session exists",
+				Overrides: ov,
 			})
 			continue
 		}
@@ -145,6 +208,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			Title:     iss.Title,
 			SessionID: state.SessionID,
 			Reason:    "trigger label present and no started session exists",
+			Overrides: ov,
 		})
 	}
 
@@ -171,7 +235,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			skips[d.Issue] = "the circuit breaker tripped this tick and every dispatch was dropped"
 		}
 		return finish(Plan{
-			Decisions:      parks,
+			Decisions:      append(stops, parks...),
 			Skips:          skips,
 			BreakerTripped: true,
 			CooldownUntil:  now.Add(cfg.Retry.Breaker.Cooldown.Std()),
@@ -179,6 +243,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	}
 
 	decisions = append(decisions, parks...)
+	decisions = append(decisions, stops...)
 
 	if cfg.TendPR {
 		decisions = append(decisions, tendDecisions(cfg, issues, snap, st.Issues, liveTendPRs, decided, skips)...)
@@ -245,6 +310,46 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, now t
 		SessionID: "",
 		Reason:    fmt.Sprintf("retry %d/%d with a new session; the previous attempt never started one", state.RetryCount+1, cfg.Retry.Max),
 	}, true, ""
+}
+
+// validateOverrides refuses a harness: override that would drop a safety
+// setting the loop configured. config.validate forbids agent.permission_mode
+// together with harness: pi (config.go:218), and PiBuildArgs emits neither a
+// permission mode nor a cost ceiling (args.go:60) -- so on a loop configured
+// with a restrictive agent.permission_mode or a non-zero
+// agent.max_budget_usd, a harness:pi label would run the dispatch with
+// NEITHER, silently dropping both bounds that exist because the agent reads
+// third-party issue text.
+//
+// An empty configured harness is treated as claude: config.Load normalises
+// it at config.go:165, but Decide must not depend on being handed a
+// normalised config.
+//
+// There is deliberately no "pi requires a model" rule: agent.model is
+// required for every harness (config.go:261), so such a rule could never
+// fire.
+func validateOverrides(cfg *config.Config, ov config.Overrides) error {
+	if ov.Harness == "" {
+		return nil
+	}
+	configured := cfg.Agent.Harness
+	if configured == "" {
+		configured = config.HarnessClaude
+	}
+	if ov.Harness == configured {
+		return nil
+	}
+	if cfg.Agent.PermissionMode != "" {
+		return fmt.Errorf(
+			"harness override %q would drop agent.permission_mode %q",
+			ov.Harness, cfg.Agent.PermissionMode)
+	}
+	if cfg.Agent.MaxBudgetUSD != 0 {
+		return fmt.Errorf(
+			"harness override %q would drop the agent.max_budget_usd %.2f ceiling",
+			ov.Harness, cfg.Agent.MaxBudgetUSD)
+	}
+	return nil
 }
 
 // tendDecisions selects stale pull requests for issues awaiting review.

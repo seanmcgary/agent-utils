@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -570,5 +571,224 @@ func TestLiveTendOnItsOwnSessionDoesNotSuppressResume(t *testing.T) {
 	p := Decide(cfg, snap, st, time.Now())
 	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindResume {
 		t.Fatalf("decisions = %v, want one resume", kinds(p))
+	}
+}
+
+// --- Task 2: stopped issues and label overrides ---
+
+func TestStoppedIssueProducesNoDecision(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, Stopped: true, StoppedReason: "operator killed the session"},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none for a stopped issue", kinds(p))
+	}
+	reason := p.NoDecisionReason(1)
+	if !strings.Contains(reason, "operator killed the session") {
+		t.Errorf("NoDecisionReason = %q, want it to carry the stopped reason", reason)
+	}
+}
+
+// tendDecisions skips only issues marked decided (engine.go:259). Without
+// the stopped branch setting decided, a tend agent would force-push the
+// branch of the session the operator just killed.
+func TestStoppedIssueAwaitingReviewProducesNoTend(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, Stopped: true, StoppedReason: "operator killed the session"},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none: a stopped issue must not be tended", kinds(p))
+	}
+}
+
+// A killed dispatch always records a failure, so a stopped issue almost
+// always also carries NeedsRetry. The stop check must sit above the retry
+// path, or the loop would redispatch the issue it was told to stop.
+func TestStoppedIssueWithNeedsRetryProducesNothing(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, Stopped: true, StoppedReason: "operator killed the session",
+			NeedsRetry: true, SessionID: "s", SessionStarted: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none: stop must win over retry", kinds(p))
+	}
+}
+
+func TestOverrideReachesStartDecision(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "model:claude-opus-5")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStart {
+		t.Fatalf("decisions = %v, want one start", kinds(p))
+	}
+	if p.Decisions[0].Overrides.Model != "claude-opus-5" {
+		t.Errorf("Overrides.Model = %q, want claude-opus-5", p.Decisions[0].Overrides.Model)
+	}
+}
+
+// retryDecision receives no labels (engine.go:199), so this is the test that
+// catches every retry silently reverting to the configured model.
+func TestOverrideReachesRetryDecision(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight, "model:claude-opus-5")}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, NeedsRetry: true, SessionID: "s", SessionStarted: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryResume {
+		t.Fatalf("decisions = %v, want one retry_resume", kinds(p))
+	}
+	if p.Decisions[0].Overrides.Model != "claude-opus-5" {
+		t.Errorf("Overrides.Model = %q, want claude-opus-5", p.Decisions[0].Overrides.Model)
+	}
+}
+
+func TestInvalidHarnessLabelStopsTheIssue(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:gpt")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStop {
+		t.Fatalf("decisions = %v, want one stop", kinds(p))
+	}
+	if p.Decisions[0].Reason == "" {
+		t.Error("Reason must carry the parse error")
+	}
+}
+
+func TestHarnessOverrideRefusedWhenItDropsPermissionMode(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.PermissionMode = "plan"
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:pi")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStop {
+		t.Fatalf("decisions = %v, want one stop: harness:pi would drop permission_mode", kinds(p))
+	}
+}
+
+func TestHarnessOverrideRefusedWhenItDropsBudgetCeiling(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.MaxBudgetUSD = 5
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:pi")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStop {
+		t.Fatalf("decisions = %v, want one stop: harness:pi would drop max_budget_usd", kinds(p))
+	}
+}
+
+func TestHarnessOverrideAllowedWithNeitherSafetySetting(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:pi")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStart {
+		t.Fatalf("decisions = %v, want one start", kinds(p))
+	}
+	if p.Decisions[0].Overrides.Harness != "pi" {
+		t.Errorf("Overrides.Harness = %q, want pi", p.Decisions[0].Overrides.Harness)
+	}
+}
+
+func TestInvalidLabelWithNoTriggerProducesNothing(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, "harness:gpt")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none: no trigger label means nothing to stop", kinds(p))
+	}
+}
+
+// KindClearRetry is the only thing that retires an unreachable retry flag;
+// blocking it on a bad label strands the issue forever.
+func TestInvalidLabelDoesNotBlockClearRetry(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, "harness:gpt")}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, NeedsRetry: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindClearRetry {
+		t.Fatalf("decisions = %v, want one clear_retry", kinds(p))
+	}
+}
+
+// The retry cap is a fact about the issue, not its labels, so an invalid
+// label must not block the park.
+func TestInvalidLabelDoesNotBlockParkAtRetryCap(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight, "harness:gpt")}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, RetryCount: 3, NeedsRetry: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindParkRetryExhausted {
+		t.Fatalf("decisions = %v, want one park", kinds(p))
+	}
+}
+
+func TestStopSurvivesTrippedBreakerWithReasonIntact(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{
+		issue(1, cfg.Labels.InFlight),
+		issue(2, cfg.Labels.InFlight),
+		issue(3, cfg.Labels.Trigger, "harness:gpt"),
+	}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, NeedsRetry: true},
+		2: {Number: 2, NeedsRetry: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if !p.BreakerTripped {
+		t.Fatal("BreakerTripped = false, want true with two eligible retries")
+	}
+	var stop *Decision
+	for i := range p.Decisions {
+		if p.Decisions[i].Kind == KindStop {
+			stop = &p.Decisions[i]
+		}
+	}
+	if stop == nil {
+		t.Fatalf("decisions = %v, want the stop to survive the breaker", kinds(p))
+	}
+	if stop.Reason == "" {
+		t.Error("Reason must survive the breaker intact")
+	}
+}
+
+// A retry converted to a stop by an invalid label must not count toward the
+// breaker threshold -- otherwise a label could trip the breaker and drop
+// every other issue's dispatches for the whole cooldown.
+func TestStoppedRetryDoesNotTripTheBreaker(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{
+		issue(1, cfg.Labels.InFlight, "harness:gpt"),
+		issue(2, cfg.Labels.InFlight, "harness:gpt"),
+	}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, NeedsRetry: true},
+		2: {Number: 2, NeedsRetry: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if p.BreakerTripped {
+		t.Fatal("BreakerTripped = true, want false: a stopped retry must not count")
+	}
+	if len(p.Decisions) != 2 {
+		t.Fatalf("decisions = %v, want two stops", kinds(p))
+	}
+	for _, d := range p.Decisions {
+		if d.Kind != KindStop {
+			t.Errorf("kind = %v, want stop", d.Kind)
+		}
 	}
 }
