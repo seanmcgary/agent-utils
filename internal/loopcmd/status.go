@@ -145,7 +145,11 @@ func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) 
 		sort.Ints(stoppedNumbers)
 		fmt.Fprintln(&b, "\nstopped issues:")
 		for _, number := range stoppedNumbers {
-			fmt.Fprintf(&b, "  #%d: %s\n", number, states[number].StoppedReason)
+			reason := states[number].StoppedReason
+			if reason == "" {
+				reason = "(no reason recorded)"
+			}
+			fmt.Fprintf(&b, "  #%d: %s\n", number, reason)
 		}
 		fmt.Fprintln(&b, "clear with: agent-utils sessions resume")
 	}

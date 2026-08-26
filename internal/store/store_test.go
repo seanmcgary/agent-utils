@@ -395,9 +395,9 @@ func TestStoppedSurvivesBeginDispatchMarkSucceededAndPutIssueState(t *testing.T)
 	}
 }
 
-// Store.StoppedIssues is scoped to one project; DB.StoppedIssues spans every
-// project. Two projects each hold an issue 7 in a loop with the same name, so
-// a read that forgot the project would merge them.
+// DB.StoppedIssues spans every project. Two projects each hold an issue 7 in
+// a loop with the same name, so a read that forgot the project would merge
+// them.
 func TestStoppedIssuesScoping(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "state.db"))
@@ -417,14 +417,6 @@ func TestStoppedIssuesScoping(t *testing.T) {
 	}
 	if err := sB.MarkStopped("loopname", "o/r", 7, "reason B", now); err != nil {
 		t.Fatal(err)
-	}
-
-	scoped, err := sA.StoppedIssues("loopname", "o/r")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(scoped) != 1 || scoped[0].StoppedReason != "reason A" {
-		t.Fatalf("Store.StoppedIssues scoped = %+v", scoped)
 	}
 
 	all, err := db.StoppedIssues()

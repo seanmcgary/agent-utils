@@ -574,7 +574,7 @@ func TestLiveTendOnItsOwnSessionDoesNotSuppressResume(t *testing.T) {
 	}
 }
 
-// --- Task 2: stopped issues and label overrides ---
+// --- stopped issues and label overrides ---
 
 func TestStoppedIssueProducesNoDecision(t *testing.T) {
 	cfg := testConfig()
@@ -589,6 +589,24 @@ func TestStoppedIssueProducesNoDecision(t *testing.T) {
 	reason := p.NoDecisionReason(1)
 	if !strings.Contains(reason, "operator killed the session") {
 		t.Errorf("NoDecisionReason = %q, want it to carry the stopped reason", reason)
+	}
+}
+
+// C5: an empty StoppedReason (a hand-edited database, or a row predating
+// this field) must not render as a sentence starting with a semicolon.
+func TestStoppedIssueWithNoReasonDoesNotRenderALeadingSemicolon(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, Stopped: true, StoppedReason: ""},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	reason := p.NoDecisionReason(1)
+	if strings.HasPrefix(strings.TrimSpace(reason), ";") {
+		t.Errorf("NoDecisionReason = %q, want no leading semicolon for an empty StoppedReason", reason)
+	}
+	if !strings.Contains(reason, "sessions resume") {
+		t.Errorf("NoDecisionReason = %q, want it to still name the resume command", reason)
 	}
 }
 

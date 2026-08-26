@@ -96,8 +96,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// branch of the session the operator just killed.
 		if state.Stopped {
 			decided[iss.Number] = true
-			skips[iss.Number] = fmt.Sprintf(
-				"%s; clear it with `agent-utils sessions resume`", state.StoppedReason)
+			skips[iss.Number] = stoppedSkipReason(state.StoppedReason)
 			continue
 		}
 
@@ -310,6 +309,16 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, now t
 		SessionID: "",
 		Reason:    fmt.Sprintf("retry %d/%d with a new session; the previous attempt never started one", state.RetryCount+1, cfg.Retry.Max),
 	}, true, ""
+}
+
+// stoppedSkipReason renders the skip reason for a stopped issue. An empty
+// StoppedReason (a hand-edited database, or a row from before this field
+// existed) must not render as a sentence starting with a semicolon.
+func stoppedSkipReason(reason string) string {
+	if reason == "" {
+		return "clear it with `agent-utils sessions resume`"
+	}
+	return fmt.Sprintf("%s; clear it with `agent-utils sessions resume`", reason)
 }
 
 // validateOverrides refuses a harness: override that would drop a safety

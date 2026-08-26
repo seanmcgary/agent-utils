@@ -691,29 +691,6 @@ func (s *Store) ClearStopped(loop, repo string, number int, now time.Time) (bool
 	return n > 0, nil
 }
 
-// StoppedIssues returns every stopped issue in one loop.
-func (s *Store) StoppedIssues(loop, repo string) ([]IssueState, error) {
-	rows, err := s.db.Query(`
-		SELECT number, stopped_reason
-		FROM issues
-		WHERE project_id = ? AND loop = ? AND repo = ? AND stopped = 1`,
-		s.projectID, loop, repo)
-	if err != nil {
-		return nil, fmt.Errorf("query stopped issues: %w", err)
-	}
-	defer rows.Close()
-
-	var out []IssueState
-	for rows.Next() {
-		st := IssueState{ProjectID: s.projectID, Loop: loop, Repo: repo, Stopped: true}
-		if err := rows.Scan(&st.Number, &st.StoppedReason); err != nil {
-			return nil, fmt.Errorf("scan stopped issue: %w", err)
-		}
-		out = append(out, st)
-	}
-	return out, rows.Err()
-}
-
 // BeginDispatch records the issue state a dispatch owns, just before the agent
 // is spawned: the session it will run under, a cleared park and failure flag,
 // and the retry budget this attempt spends.
@@ -1174,7 +1151,8 @@ func (d *DB) RunningDispatches() ([]Dispatch, error) {
 func (d *DB) StoppedIssues() ([]StoppedIssue, error) {
 	rows, err := d.db.Query(`
 		SELECT project_id, loop, repo, number, stopped_reason
-		FROM issues WHERE stopped = 1`)
+		FROM issues WHERE stopped = 1
+		ORDER BY project_id, loop, repo, number`)
 	if err != nil {
 		return nil, fmt.Errorf("query stopped issues: %w", err)
 	}

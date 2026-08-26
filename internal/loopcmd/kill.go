@@ -44,6 +44,9 @@ type Selector struct {
 // commands) calls it before opening any state, so a mistyped command fails
 // before it touches the database.
 func (s Selector) Validate() error {
+	if s.Issue < 0 {
+		return fmt.Errorf("--issue must be a positive issue number, got %d", s.Issue)
+	}
 	n := 0
 	if s.Session != "" {
 		n++
@@ -226,7 +229,7 @@ var killedResult = store.DispatchResult{
 
 // one runs the kill procedure for one target that has a live dispatch row,
 // in the order spec section 4.2 specifies.
-func (k killer) one(w work, opts KillOptions) (Result, error) {
+func (k killer) one(w work, opts KillOptions) Result {
 	res := Result{Target: w.Target}
 
 	// A tend dispatch holds no issue state, so there is no flag to set.
@@ -239,7 +242,7 @@ func (k killer) one(w work, opts KillOptions) (Result, error) {
 		if err := k.markStopped(w); err != nil {
 			res.Action = ActionFailed
 			res.Err = fmt.Errorf("mark issue #%d stopped: %w", w.Target.Issue, err)
-			return res, res.Err
+			return res
 		}
 	}
 
@@ -251,10 +254,10 @@ func (k killer) one(w work, opts KillOptions) (Result, error) {
 	return k.gracefulOne(w, res, verifyErr, opts.Timeout)
 }
 
-func (k killer) gracefulOne(w work, res Result, verifyErr error, timeout time.Duration) (Result, error) {
+func (k killer) gracefulOne(w work, res Result, verifyErr error, timeout time.Duration) Result {
 	if verifyErr != nil {
 		if couldNotVerifyResult, ok := k.couldNotVerify(w, res, verifyErr); ok {
-			return couldNotVerifyResult, nil
+			return couldNotVerifyResult
 		}
 		// Confirmed not this dispatch's live runner (or the pid is not even
 		// positive): nothing to signal. Record the outcome ourselves.
@@ -263,7 +266,7 @@ func (k killer) gracefulOne(w work, res Result, verifyErr error, timeout time.Du
 
 	if err := k.signal(w.Dispatch.PID, w.Dispatch.RunnerID(), syscall.SIGTERM); err != nil {
 		if couldNotVerifyResult, ok := k.couldNotVerify(w, res, err); ok {
-			return couldNotVerifyResult, nil
+			return couldNotVerifyResult
 		}
 		if errors.Is(err, proc.ErrNotRunner) {
 			return k.recordIfNeeded(w, res, ActionAlreadyGone)
@@ -274,7 +277,7 @@ func (k killer) gracefulOne(w work, res Result, verifyErr error, timeout time.Du
 		// alive, and the report must say so plainly.
 		res.Action = ActionFailed
 		res.Err = fmt.Errorf("signal runner for dispatch %d: %w", w.Dispatch.ID, err)
-		return res, res.Err
+		return res
 	}
 
 	if timeout <= 0 {
@@ -285,7 +288,7 @@ func (k killer) gracefulOne(w work, res Result, verifyErr error, timeout time.Du
 		res.Err = fmt.Errorf(
 			"dispatch %d (issue #%d) did not exit within %s; the issue stays stopped, retry with --force",
 			w.Dispatch.ID, w.Target.Issue, timeout)
-		return res, nil
+		return res
 	}
 
 	return k.recordIfNeeded(w, res, ActionSignalled)
@@ -309,10 +312,10 @@ func (k killer) couldNotVerify(w work, res Result, err error) (Result, bool) {
 	return res, true
 }
 
-func (k killer) forceOne(w work, res Result, verifyErr error) (Result, error) {
+func (k killer) forceOne(w work, res Result, verifyErr error) Result {
 	if verifyErr != nil {
 		if couldNotVerifyResult, ok := k.couldNotVerify(w, res, verifyErr); ok {
-			return couldNotVerifyResult, nil
+			return couldNotVerifyResult
 		}
 		// --force must NOT group-kill when the runner is unverified.
 		// agent_pid is written once and never cleared, so a dead-runner row
@@ -329,13 +332,13 @@ func (k killer) forceOne(w work, res Result, verifyErr error) (Result, error) {
 		if err := k.killAgent(w.Dispatch.AgentPID); err != nil {
 			res.Action = ActionFailed
 			res.Err = fmt.Errorf("kill agent process group %d: %w", w.Dispatch.AgentPID, err)
-			return res, res.Err
+			return res
 		}
 	}
 	if err := k.killRunner(w.Dispatch.PID, w.Dispatch.RunnerID()); err != nil {
 		res.Action = ActionFailed
 		res.Err = fmt.Errorf("kill runner for dispatch %d: %w", w.Dispatch.ID, err)
-		return res, res.Err
+		return res
 	}
 
 	// No process survives to write the outcome, so this always writes it --
@@ -344,10 +347,10 @@ func (k killer) forceOne(w work, res Result, verifyErr error) (Result, error) {
 	if err := k.finish(w.Dispatch.ID, killedResult); err != nil {
 		res.Action = ActionFailed
 		res.Err = err
-		return res, res.Err
+		return res
 	}
 	res.Action = ActionForced
-	return res, nil
+	return res
 }
 
 // recordIfNeeded re-reads the dispatch row and writes the killed outcome only
@@ -360,22 +363,22 @@ func (k killer) forceOne(w work, res Result, verifyErr error) (Result, error) {
 // MarkNeedsRetry, and tick.go warns against skipping that call in the
 // ordinary failure path -- but here arming a retry is exactly wrong, because
 // the issue is stopped and a retry must not race a later `sessions resume`.
-func (k killer) recordIfNeeded(w work, res Result, action Action) (Result, error) {
+func (k killer) recordIfNeeded(w work, res Result, action Action) Result {
 	d, err := k.reread(w.Dispatch.ID)
 	if err != nil {
 		res.Action = ActionFailed
 		res.Err = fmt.Errorf("re-read dispatch %d: %w", w.Dispatch.ID, err)
-		return res, res.Err
+		return res
 	}
 	if d.Status == store.StatusRunning {
 		if err := k.finish(w.Dispatch.ID, killedResult); err != nil {
 			res.Action = ActionFailed
 			res.Err = err
-			return res, res.Err
+			return res
 		}
 	}
 	res.Action = action
-	return res, nil
+	return res
 }
 
 // narrowByLoop resolves an --issue selector's candidates (one per loop in the
@@ -844,8 +847,7 @@ func Kill(opts KillOptions) ([]Result, error) {
 			// Killing nothing is not an error: report it and move on.
 			return Result{Target: t, Action: ActionAlreadyGone}
 		}
-		res, _ := productionKiller(cfg, st).one(work{Target: t, Repo: cfg.Repo, Dispatch: d}, opts)
-		return res
+		return productionKiller(cfg, st).one(work{Target: t, Repo: cfg.Repo, Dispatch: d}, opts)
 	})
 	return results, nil
 }
@@ -904,7 +906,7 @@ func resumeTarget(cfg *config.Config, st *store.Store, t Target) Result {
 func RenderResults(verb string, rs []Result) string {
 	var b strings.Builder
 	if len(rs) == 0 {
-		fmt.Fprintf(&b, "nothing matched\n")
+		fmt.Fprint(&b, "nothing matched\n")
 		return b.String()
 	}
 	for _, r := range rs {

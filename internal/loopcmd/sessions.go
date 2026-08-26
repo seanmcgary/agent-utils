@@ -290,18 +290,34 @@ func stoppedSet(all []store.StoppedIssue, projectID string) map[stoppedKey]bool 
 	return out
 }
 
-// applyStopped marks each session Stopped when its {ProjectID, Loop, Issue}
-// key appears in stopped. It is a separate pass over sessionsFrom's output,
-// not a parameter threaded through sessionsFrom itself: sessionsFrom groups
-// dispatches into sessions and has no reason to know about the issues
-// table's stopped flag, and threading it through would touch every existing
-// caller and test of sessionsFrom for a fact only the renderers need.
+// applyStopped marks only the MOST RECENT session for a stopped issue's
+// {ProjectID, Loop, Issue} key. It is a separate pass over sessionsFrom's
+// output, not a parameter threaded through sessionsFrom itself: sessionsFrom
+// groups dispatches into sessions and has no reason to know about the
+// issues table's stopped flag, and threading it through would touch every
+// existing caller and test of sessionsFrom for a fact only the renderers
+// need.
+//
+// Live and Orphaned are per-dispatch facts, but Stopped is a fact about the
+// ISSUE, and an issue can accumulate several sessions over its history (a
+// resume after a park, for example, starts a new one). Marking every
+// session sharing the key would show a column of STOPPED rows for runs that
+// finished long before the issue was ever stopped; only the session that
+// was actually running (or most recently ran) when the operator stopped it
+// should read STOPPED.
 func applyStopped(sessions []Session, stopped map[stoppedKey]bool) {
+	latest := map[stoppedKey]int{}
 	for i := range sessions {
 		key := stoppedKey{ProjectID: sessions[i].ProjectID, Loop: sessions[i].Loop, Number: sessions[i].Issue}
-		if stopped[key] {
-			sessions[i].Stopped = true
+		if !stopped[key] {
+			continue
 		}
+		if j, ok := latest[key]; !ok || sessions[i].Last.After(sessions[j].Last) {
+			latest[key] = i
+		}
+	}
+	for _, i := range latest {
+		sessions[i].Stopped = true
 	}
 }
 

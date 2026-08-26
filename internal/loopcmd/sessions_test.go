@@ -49,6 +49,47 @@ func TestApplyStoppedKeysByProjectLoopAndNumber(t *testing.T) {
 	}
 }
 
+// C4: an issue can accumulate several sessions over its history (a resume
+// after a park starts a new one). Stopped is a fact about the issue, but
+// only the MOST RECENT session should read STOPPED -- older, already
+// finished sessions must not.
+func TestApplyStoppedMarksOnlyTheMostRecentSession(t *testing.T) {
+	older := time.Now().UTC().Add(-time.Hour)
+	newer := time.Now().UTC()
+	ds := []store.Dispatch{
+		{
+			ID: 1, ProjectID: projectA, Loop: "planning", Number: 7,
+			SessionID: "old-session", Status: store.StatusSucceeded, StartedAt: older,
+		},
+		{
+			ID: 2, ProjectID: projectA, Loop: "planning", Number: 7,
+			SessionID: "new-session", Status: store.StatusFailed, StartedAt: newer,
+		},
+	}
+	sessions := sessionsFrom(ds, "")
+
+	stopped := stoppedSet([]store.StoppedIssue{
+		{ProjectID: projectA, Loop: "planning", Number: 7, Reason: "killed by operator"},
+	}, "")
+	applyStopped(sessions, stopped)
+
+	var old, new_ Session
+	for _, s := range sessions {
+		switch s.ID {
+		case "old-session":
+			old = s
+		case "new-session":
+			new_ = s
+		}
+	}
+	if old.Stopped {
+		t.Errorf("the older, already-finished session must NOT read Stopped: %+v", old)
+	}
+	if !new_.Stopped {
+		t.Errorf("the most recent session must read Stopped: %+v", new_)
+	}
+}
+
 // stoppedSet narrows to one project when given one, and spans every project
 // when given none -- the shape Sessions and AllSessions each need.
 func TestStoppedSetNarrowsToOneProject(t *testing.T) {

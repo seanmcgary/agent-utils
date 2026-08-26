@@ -525,7 +525,7 @@ func sessionsKillRun(args killArgs) error {
 	}
 	fmt.Print(loopcmd.RenderResults("kill", results))
 	if allFailed(results) {
-		return fmt.Errorf("every target failed to kill")
+		return errors.New("every target failed to kill")
 	}
 	return nil
 }
@@ -548,7 +548,7 @@ func sessionsResumeRun(args killArgs) error {
 	}
 	fmt.Print(loopcmd.RenderResults("resume", results))
 	if allFailed(results) {
-		return fmt.Errorf("every target failed to resume")
+		return errors.New("every target failed to resume")
 	}
 	return nil
 }

@@ -491,15 +491,20 @@ Each has a default, so no backfill is needed.
 An empty override column means "no override". It does not mean "the empty
 model".
 
-### 7.1.1 Two reads, because there are two scopes
+### 7.1.1 One machine-wide read
 
-`Store.StoppedIssues(loop, repo)` answers a project-scoped resume.
-
-`DB.StoppedIssues()` is new and answers the machine-wide report. It returns
+`DB.StoppedIssues()` answers the machine-wide report. It returns
 `{ProjectID, Loop, Repo, Number, Reason}`. It has to exist: every `Store` read
 is project-scoped, and `sessions list` spans the machine, so there is no way
 to label a machine-wide table from a scoped read. `DB.RunningDispatches`
 (`internal/store/store.go:1038`) is the precedent for the pair.
+
+An earlier draft of this design also added `Store.StoppedIssues(loop, repo)`
+for a project-scoped resume. It was never called: `resolveByIssue` and
+`resolveAll` both resolve their candidates from `DB`-level reads (or from the
+loop's configuration), and neither `sessions kill` nor `sessions resume` ever
+needed a project-scoped read of this table on its own. It was removed as
+dead code.
 
 A stopped issue is keyed by `{ProjectID, Loop, Number}` wherever it is joined
 to a session. A key of loop and number alone collides across projects, which

@@ -35,6 +35,7 @@ func TestSelectorValidate(t *testing.T) {
 		{"session and all", Selector{Session: "s1", All: true}, false},
 		{"issue and all", Selector{Issue: 7, All: true}, false},
 		{"all three", Selector{Session: "s1", Issue: 7, All: true}, false},
+		{"negative issue", Selector{Issue: -1}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -157,8 +158,9 @@ func noopKiller(log *callLog) killer {
 func TestKillerOneWritesTheStoppedFlagBeforeAnySignal(t *testing.T) {
 	log := &callLog{}
 	k := noopKiller(log)
-	if _, err := k.one(baseWork(), KillOptions{Timeout: time.Second}); err != nil {
-		t.Fatalf("one: %v", err)
+	res := k.one(baseWork(), KillOptions{Timeout: time.Second})
+	if res.Err != nil {
+		t.Fatalf("one: %v", res.Err)
 	}
 	if len(log.calls) < 2 || log.calls[0] != "markStopped" {
 		t.Fatalf("call order = %v, want markStopped first", log.calls)
@@ -179,8 +181,8 @@ func TestKillerOneSendsNoSignalWhenMarkStoppedFails(t *testing.T) {
 	k := noopKiller(log)
 	k.markStopped = func(w work) error { log.add("markStopped"); return errors.New("disk full") }
 
-	res, err := k.one(baseWork(), KillOptions{Timeout: time.Second})
-	if err == nil {
+	res := k.one(baseWork(), KillOptions{Timeout: time.Second})
+	if res.Err == nil {
 		t.Fatal("want an error when markStopped fails")
 	}
 	if res.Action != ActionFailed {
@@ -197,8 +199,8 @@ func TestKillerOneTendDispatchSkipsTheIssueFlag(t *testing.T) {
 	w := baseWork()
 	w.Dispatch.Kind = store.KindTend
 
-	if _, err := k.one(w, KillOptions{Timeout: time.Second}); err != nil {
-		t.Fatalf("one: %v", err)
+	if res := k.one(w, KillOptions{Timeout: time.Second}); res.Err != nil {
+		t.Fatalf("one: %v", res.Err)
 	}
 	for _, c := range log.calls {
 		if c == "markStopped" {
@@ -212,9 +214,9 @@ func TestKillerOneUnverifiableRunnerIsAlreadyGoneAndSendsNoSignal(t *testing.T) 
 	k := noopKiller(log)
 	k.verify = func(pid int, id int64) error { log.add("verify"); return proc.ErrNotRunner }
 
-	res, err := k.one(baseWork(), KillOptions{Timeout: time.Second})
-	if err != nil {
-		t.Fatalf("one: %v", err)
+	res := k.one(baseWork(), KillOptions{Timeout: time.Second})
+	if res.Err != nil {
+		t.Fatalf("one: %v", res.Err)
 	}
 	if res.Action != ActionAlreadyGone {
 		t.Errorf("Action = %q, want %q", res.Action, ActionAlreadyGone)
@@ -242,8 +244,8 @@ func TestKillerOneRealSignalFailureIsReportedAsFailed(t *testing.T) {
 		return errors.New("operation not permitted")
 	}
 
-	res, err := k.one(baseWork(), KillOptions{Timeout: time.Second})
-	if err == nil {
+	res := k.one(baseWork(), KillOptions{Timeout: time.Second})
+	if res.Err == nil {
 		t.Fatal("want an error on a real signal failure")
 	}
 	if res.Action != ActionFailed {
@@ -256,7 +258,7 @@ func TestKillerOneStillAliveNamesForce(t *testing.T) {
 	k := noopKiller(log)
 	k.waitGone = func(pid int, id int64, timeout time.Duration) bool { return false }
 
-	res, _ := k.one(baseWork(), KillOptions{Timeout: time.Second})
+	res := k.one(baseWork(), KillOptions{Timeout: time.Second})
 	if res.Action != ActionStillAlive {
 		t.Errorf("Action = %q, want %q", res.Action, ActionStillAlive)
 	}
@@ -280,9 +282,9 @@ func TestKillerOneDoesNotDoubleRecordWhenTheRunnerAlreadyDidSo(t *testing.T) {
 		return store.Dispatch{ID: id, Status: store.StatusFailed}, nil
 	}
 
-	res, err := k.one(baseWork(), KillOptions{Timeout: time.Second})
-	if err != nil {
-		t.Fatalf("one: %v", err)
+	res := k.one(baseWork(), KillOptions{Timeout: time.Second})
+	if res.Err != nil {
+		t.Fatalf("one: %v", res.Err)
 	}
 	if res.Action != ActionSignalled {
 		t.Errorf("Action = %q, want %q", res.Action, ActionSignalled)
@@ -298,9 +300,9 @@ func TestKillerOneForceKillsAgentThenRunnerThenRecords(t *testing.T) {
 	log := &callLog{}
 	k := noopKiller(log)
 
-	res, err := k.one(baseWork(), KillOptions{Force: true})
-	if err != nil {
-		t.Fatalf("one: %v", err)
+	res := k.one(baseWork(), KillOptions{Force: true})
+	if res.Err != nil {
+		t.Fatalf("one: %v", res.Err)
 	}
 	if res.Action != ActionForced {
 		t.Errorf("Action = %q, want %q", res.Action, ActionForced)
@@ -321,9 +323,9 @@ func TestKillerOneForceDoesNotGroupKillAnUnverifiedRunner(t *testing.T) {
 	k := noopKiller(log)
 	k.verify = func(pid int, id int64) error { log.add("verify"); return proc.ErrNotRunner }
 
-	res, err := k.one(baseWork(), KillOptions{Force: true})
-	if err != nil {
-		t.Fatalf("one: %v", err)
+	res := k.one(baseWork(), KillOptions{Force: true})
+	if res.Err != nil {
+		t.Fatalf("one: %v", res.Err)
 	}
 	if res.Action != ActionAlreadyGone {
 		t.Errorf("Action = %q, want %q", res.Action, ActionAlreadyGone)
@@ -420,10 +422,7 @@ func TestKillerOneCouldNotVerifyRunnerLeavesTheRowAlone(t *testing.T) {
 		return fmt.Errorf("%w: ps: signal: no such process", proc.ErrVerifyFailed)
 	}
 
-	res, err := k.one(baseWork(), KillOptions{Timeout: time.Second})
-	if err != nil {
-		t.Fatalf("one: %v", err)
-	}
+	res := k.one(baseWork(), KillOptions{Timeout: time.Second})
 	if res.Action != ActionCouldNotVerify {
 		t.Errorf("Action = %q, want %q", res.Action, ActionCouldNotVerify)
 	}
@@ -445,10 +444,7 @@ func TestKillerOneForceCouldNotVerifyRunnerLeavesTheRowAlone(t *testing.T) {
 		return fmt.Errorf("%w: ps: signal: no such process", proc.ErrVerifyFailed)
 	}
 
-	res, err := k.one(baseWork(), KillOptions{Force: true})
-	if err != nil {
-		t.Fatalf("one: %v", err)
-	}
+	res := k.one(baseWork(), KillOptions{Force: true})
 	if res.Action != ActionCouldNotVerify {
 		t.Errorf("Action = %q, want %q", res.Action, ActionCouldNotVerify)
 	}
