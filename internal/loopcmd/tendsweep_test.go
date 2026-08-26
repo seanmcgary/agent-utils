@@ -352,3 +352,145 @@ func TestTendSweepObeysAnExistingCooldown(t *testing.T) {
 			sum.Tended, spawned)
 	}
 }
+
+// seedStartedSession gives an issue the session state an execution agent would
+// have left behind: an identifier claude actually created.
+func seedStartedSession(t *testing.T, deps Deps, cfg *config.Config, number int, id string) {
+	t.Helper()
+	if err := deps.Store.PutIssueState(store.IssueState{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: number,
+		SessionID: id, SessionStarted: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The whole point of the change: a rebase agent resumes the session that built
+// the branch instead of meeting it cold.
+func TestTendDispatchInheritsTheIssuesSession(t *testing.T) {
+	cfg := sweepConfig(t)
+	gh := &fakeGH{
+		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
+		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
+		behind: map[int]int{11: 3},
+	}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+	seedStartedSession(t, deps, cfg, 1, "sess-1")
+
+	if _, err := TendSweep(context.Background(), cfg, deps, "master"); err != nil {
+		t.Fatalf("TendSweep: %v", err)
+	}
+
+	running, _ := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
+	if len(running) != 1 {
+		t.Fatalf("running dispatches = %d, want 1", len(running))
+	}
+	if got := running[0].SessionID; got != "sess-1" {
+		t.Errorf("dispatch session = %q, want the issue's session %q", got, "sess-1")
+	}
+}
+
+// A tend must never write the issue's session row. It borrows the session; it
+// does not own it, and a tend that stamped one would let a rebase decide how
+// the issue's own next dispatch behaves.
+func TestTendDispatchLeavesTheIssueSessionRowAlone(t *testing.T) {
+	cfg := sweepConfig(t)
+	gh := &fakeGH{
+		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
+		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
+		behind: map[int]int{11: 3},
+	}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+	seedStartedSession(t, deps, cfg, 1, "sess-1")
+
+	if _, err := TendSweep(context.Background(), cfg, deps, "master"); err != nil {
+		t.Fatalf("TendSweep: %v", err)
+	}
+
+	states, _ := deps.Store.IssueStates(cfg.Name, cfg.Repo)
+	if got := states[1].SessionID; got != "sess-1" {
+		t.Errorf("issue session = %q, want it untouched at %q", got, "sess-1")
+	}
+	if states[1].RetryCount != 0 {
+		t.Errorf("RetryCount = %d, want 0: a tend must not spend the issue's retry budget",
+			states[1].RetryCount)
+	}
+}
+
+// An issue whose session never started still gets a rebase, on a fresh
+// identifier. Passing the unstarted one would make "-r" fail every time.
+func TestTendDispatchMintsASessionWhenNoneStarted(t *testing.T) {
+	cfg := sweepConfig(t)
+	gh := &fakeGH{
+		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
+		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
+		behind: map[int]int{11: 3},
+	}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	if _, err := TendSweep(context.Background(), cfg, deps, "master"); err != nil {
+		t.Fatalf("TendSweep: %v", err)
+	}
+
+	running, _ := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
+	if len(running) != 1 {
+		t.Fatalf("running dispatches = %d, want 1", len(running))
+	}
+	if running[0].SessionID == "" {
+		t.Error("a tend with no session to inherit must still carry an identifier")
+	}
+}
+
+// tendResumes is what the detached runner asks to choose "-r" over
+// --session-id. It runs in another process with only the dispatch row, so it
+// re-derives the answer rather than being told.
+func TestTendResumesOnlyAnInheritedStartedSession(t *testing.T) {
+	const id = "sess-1"
+	cases := []struct {
+		name  string
+		d     store.Dispatch
+		state store.IssueState
+		want  bool
+	}{
+		{
+			name:  "inherited and started",
+			d:     store.Dispatch{Kind: store.KindTend, SessionID: id},
+			state: store.IssueState{SessionID: id, SessionStarted: true},
+			want:  true,
+		},
+		{
+			name:  "inherited but never started",
+			d:     store.Dispatch{Kind: store.KindTend, SessionID: id},
+			state: store.IssueState{SessionID: id, SessionStarted: false},
+			want:  false,
+		},
+		{
+			name:  "tend minted its own",
+			d:     store.Dispatch{Kind: store.KindTend, SessionID: "throwaway"},
+			state: store.IssueState{SessionID: id, SessionStarted: true},
+			want:  false,
+		},
+		{
+			name:  "issue has no session at all",
+			d:     store.Dispatch{Kind: store.KindTend, SessionID: ""},
+			state: store.IssueState{},
+			want:  false,
+		},
+		{
+			name:  "not a tend",
+			d:     store.Dispatch{Kind: store.KindResume, SessionID: id},
+			state: store.IssueState{SessionID: id, SessionStarted: true},
+			want:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tendResumes(tc.d, tc.state); got != tc.want {
+				t.Errorf("tendResumes = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

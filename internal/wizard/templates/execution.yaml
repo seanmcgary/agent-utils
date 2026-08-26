@@ -97,7 +97,10 @@ tend_prompt: |
   Do not change any label unless you park.
 
   You run in an isolated git worktree checked out detached at
-  origin/{{.PR.HeadRef}}.
+  origin/{{.PR.HeadRef}}. Its path is {{.Worktree}}, and it is NOT the worktree
+  you built this branch in. You are resuming the session that did that work, so
+  your memory holds the old path: use the one named here and re-read any file
+  before you act on what you remember of it.
 
   1. `git fetch origin`, then rebase onto origin/{{.PR.BaseRef}}.
   2. If the rebase is clean, push with
