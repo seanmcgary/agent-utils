@@ -233,6 +233,19 @@ func Supervise(
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 
+	// Clear agent_pid now that cmd.Wait has returned: this runner OUTLIVES its
+	// agent child (it still drains the stream, calls finish, and MarkNeedsRetry
+	// below), so from here on the pid this row named no longer identifies a
+	// live process at all, let alone this dispatch's agent. Left in place, a
+	// `--force` kill racing this window would read a pid the kernel may already
+	// have reissued to an unrelated process and SIGKILL that process's group
+	// instead. Logged and ignored on failure, for the same reason the initial
+	// write is: a bookkeeping failure here must not abandon recording the run's
+	// real outcome below.
+	if err := st.SetDispatchAgentPID(d.ID, 0); err != nil {
+		slog.Error("clear agent pid", "dispatch", d.ID, "err", err)
+	}
+
 	res := store.DispatchResult{
 		Status:     store.StatusSucceeded,
 		CostUSD:    result.CostUSD,

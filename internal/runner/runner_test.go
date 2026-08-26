@@ -78,6 +78,14 @@ func TestSuperviseRecordsSuccess(t *testing.T) {
 	if _, err := os.Stat(logPath); err != nil {
 		t.Errorf("log file was not written: %v", err)
 	}
+	// The runner outlives its agent child: it still calls finish, and
+	// MarkNeedsRetry on a failure, after cmd.Wait returns. agent_pid must be
+	// cleared back to 0 in that window, or a `--force` kill racing it would
+	// read a pid the kernel may have reissued to an unrelated process and
+	// SIGKILL that process's group (kill.go:291).
+	if got.AgentPID != 0 {
+		t.Errorf("AgentPID = %d, want 0 after Supervise returns", got.AgentPID)
+	}
 }
 
 func TestSuperviseRecordsFailureOnNonZeroExit(t *testing.T) {

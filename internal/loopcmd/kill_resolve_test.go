@@ -170,3 +170,87 @@ func TestKillOnUnresolvableConfigReportsAFailedResultNotAFatalError(t *testing.T
 		t.Errorf("ran = %v, want only the resolvable target's fn to run", ran)
 	}
 }
+
+// TestResolveByIssueIsNotAmbiguousWhenTheIssueExistsInOnlyOneLoop is spec B9:
+// a project with two loop configs must not be treated as ambiguous for an
+// issue that only actually exists in one of them. The old resolveByIssue
+// enumerated config.List's loop configs rather than rows, so any project
+// with 2+ loop configs was rejected as ambiguous regardless of where the
+// issue lived -- contradicting spec section 4.1.1 and README.md's promise
+// that --loop is needed only when the number matches more than one loop.
+func TestResolveByIssueIsNotAmbiguousWhenTheIssueExistsInOnlyOneLoop(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	root := t.TempDir()
+	dir := filepath.Join(root, ".agent-utils")
+	configs := filepath.Join(dir, "configs")
+	if err := os.MkdirAll(configs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, loop := range []string{"planning", "building"} {
+		state := filepath.Join(dir, "state", loop)
+		body := fmt.Sprintf(killTestYAML, loop, root, filepath.Join(root, "wt", loop), state)
+		if err := os.WriteFile(filepath.Join(configs, loop+".yaml"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := registry.Register(dir, "proj-a", "demo-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.Open(mustHomeDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := db.Project("proj-a")
+	// Issue 7 exists only in the "planning" loop; "building" has no row for
+	// it at all.
+	if _, err := st.CreateDispatch(store.Dispatch{
+		Loop: "planning", Repo: "o/r", Number: 7, Kind: store.KindStart,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	targets, err := resolve(Selector{Issue: 7, Project: "demo-a"}, false)
+	if err != nil {
+		t.Fatalf("resolve: %v, want it to resolve unambiguously to the planning loop", err)
+	}
+	if len(targets) != 1 || targets[0].Loop != "planning" {
+		t.Fatalf("targets = %+v, want exactly one target in the planning loop", targets)
+	}
+}
+
+// TestKillWithNoRunningDispatchStillMarksTheIssueStopped is spec B3: a
+// runner that has already crashed leaves no running dispatch row, but the
+// trigger label may still be set on GitHub. Kill must set the stopped flag
+// in that case too -- not just report ActionAlreadyGone and move on -- or a
+// tick racing the crash reads the trigger label with no live dispatch and
+// starts a second agent, the exact race the write-before-signal ordering in
+// killer.one exists to close for the ordinary path.
+func TestKillWithNoRunningDispatchStillMarksTheIssueStopped(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	registerResolveProject(t, "proj-a", "demo-a", "planning")
+
+	// No dispatch row at all: the ordinary "the runner already crashed" case.
+	results, err := Kill(KillOptions{Selector: Selector{Issue: 7, Project: "demo-a"}})
+	if err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if len(results) != 1 || results[0].Action != ActionAlreadyGone {
+		t.Fatalf("results = %+v, want a single ActionAlreadyGone", results)
+	}
+
+	db, err := store.Open(mustHomeDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	st := db.Project("proj-a")
+	got, err := st.IssueState("planning", "o/r", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Stopped {
+		t.Error("issue must be marked stopped even though no running dispatch was found")
+	}
+}

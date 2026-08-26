@@ -300,8 +300,12 @@ func TestMarkStoppedAndClearStopped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.ClearStopped("planning", "o/r", 1, now); err != nil {
+	cleared, err := s.ClearStopped("planning", "o/r", 1, now)
+	if err != nil {
 		t.Fatalf("ClearStopped: %v", err)
+	}
+	if !cleared {
+		t.Fatal("ClearStopped must report true for an issue that was actually stopped")
 	}
 	got, err = s.IssueState("planning", "o/r", 1)
 	if err != nil {
@@ -315,6 +319,36 @@ func TestMarkStoppedAndClearStopped(t *testing.T) {
 	}
 	if !got.Parked {
 		t.Fatalf("ClearStopped must NOT clear parked: %+v", got)
+	}
+}
+
+// ClearStopped must not touch an issue that is not actually stopped: an
+// --issue/--session resume target is resolved from config or the registry,
+// not from the stopped table, so it can legitimately name an issue that
+// merely sits in retry backoff. Without the `stopped = 1` predicate this
+// would silently discard that backoff.
+func TestClearStoppedIsANoOpForAnIssueThatIsNotStopped(t *testing.T) {
+	s := openTemp(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if err := s.MarkNeedsRetry("planning", "o/r", 1, now, []time.Duration{time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+
+	cleared, err := s.ClearStopped("planning", "o/r", 1, now)
+	if err != nil {
+		t.Fatalf("ClearStopped: %v", err)
+	}
+	if cleared {
+		t.Fatal("ClearStopped must report false for an issue that was never stopped")
+	}
+
+	got, err := s.IssueState("planning", "o/r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.NeedsRetry || got.RetryAfter.IsZero() {
+		t.Fatalf("ClearStopped must leave retry state alone for an issue that was not stopped: %+v", got)
 	}
 }
 

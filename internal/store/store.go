@@ -659,7 +659,14 @@ func (s *Store) MarkStopped(loop, repo string, number int, reason string, now ti
 	return nil
 }
 
-// ClearStopped resumes a stopped issue.
+// ClearStopped resumes a stopped issue. It reports whether the issue was
+// actually stopped: a target `--issue`/`--session` resolves from config or
+// the registry, not from the stopped table, so a resume can legitimately
+// name an issue that merely sits in retry backoff. Without the `stopped = 1`
+// predicate this would clear needs_retry/retry_after on such an issue
+// unconditionally, discarding the escalating backoff MarkNeedsRetry exists
+// to enforce; the caller uses the return value to report that case as a
+// no-op instead of a silent mutation.
 //
 // It also clears needs_retry and retry_after, but leaves parked alone. A
 // killed runner's dispatch is recorded FAILED, and the runner's own finish
@@ -667,17 +674,21 @@ func (s *Store) MarkStopped(loop, repo string, number int, reason string, now ti
 // happens whether or not an operator meant to resume it, so a resumed issue
 // must not carry a failure it did not earn. parked is a fact about the
 // retry budget, unrelated to why the issue was stopped, so it is untouched.
-func (s *Store) ClearStopped(loop, repo string, number int, now time.Time) error {
-	_, err := s.db.Exec(`
+func (s *Store) ClearStopped(loop, repo string, number int, now time.Time) (bool, error) {
+	res, err := s.db.Exec(`
 		UPDATE issues
 		SET stopped = 0, stopped_reason = '', needs_retry = 0, retry_after = 0,
 		    updated_at = ?
-		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
+		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ? AND stopped = 1`,
 		now.UTC(), s.projectID, loop, repo, number)
 	if err != nil {
-		return fmt.Errorf("clear stopped: %w", err)
+		return false, fmt.Errorf("clear stopped: %w", err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("clear stopped: %w", err)
+	}
+	return n > 0, nil
 }
 
 // StoppedIssues returns every stopped issue in one loop.

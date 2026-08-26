@@ -155,6 +155,16 @@ const (
 	// ActionRefused means Resume declined to act because the runner still
 	// verifies as live.
 	ActionRefused Action = "refused"
+	// ActionNotStopped means Resume found this target not actually stopped --
+	// spec section 8's "resume finds no stopped issue" case, reported as a
+	// no-op rather than silently touching retry state that was never the
+	// stopped flag's to begin with.
+	ActionNotStopped Action = "not stopped"
+	// ActionCouldNotVerify means the runner's identity could not be confirmed
+	// at all (a `ps` failure, not a mismatch), so no signal was sent and the
+	// row was left exactly as it was: distinct from "already gone", which
+	// asserts the runner IS gone.
+	ActionCouldNotVerify Action = "could not verify"
 	// ActionFailed means an operation that was attempted did not succeed --
 	// a signal EPERM'd, a write failed -- distinct from "already gone", which
 	// means nothing was attempted at all.
@@ -243,12 +253,18 @@ func (k killer) one(w work, opts KillOptions) (Result, error) {
 
 func (k killer) gracefulOne(w work, res Result, verifyErr error, timeout time.Duration) (Result, error) {
 	if verifyErr != nil {
-		// Not this dispatch's live runner (or the pid is not even positive):
-		// nothing to signal. Record the outcome ourselves.
+		if couldNotVerifyResult, ok := k.couldNotVerify(w, res, verifyErr); ok {
+			return couldNotVerifyResult, nil
+		}
+		// Confirmed not this dispatch's live runner (or the pid is not even
+		// positive): nothing to signal. Record the outcome ourselves.
 		return k.recordIfNeeded(w, res, ActionAlreadyGone)
 	}
 
 	if err := k.signal(w.Dispatch.PID, w.Dispatch.RunnerID(), syscall.SIGTERM); err != nil {
+		if couldNotVerifyResult, ok := k.couldNotVerify(w, res, err); ok {
+			return couldNotVerifyResult, nil
+		}
 		if errors.Is(err, proc.ErrNotRunner) {
 			return k.recordIfNeeded(w, res, ActionAlreadyGone)
 		}
@@ -275,8 +291,29 @@ func (k killer) gracefulOne(w work, res Result, verifyErr error, timeout time.Du
 	return k.recordIfNeeded(w, res, ActionSignalled)
 }
 
+// couldNotVerify reports whether err is proc.ErrVerifyFailed -- ps itself
+// failed, rather than confirming the pid is not this dispatch's runner -- and
+// if so returns the Result to report for it. This is NOT evidence the runner
+// is gone (that is ErrNotRunner), so unlike ActionAlreadyGone it must not call
+// recordIfNeeded: failing closed should suppress the SIGNAL, not also assert
+// death and retire a `running` row the runner may still be about to finish
+// itself.
+func (k killer) couldNotVerify(w work, res Result, err error) (Result, bool) {
+	if !errors.Is(err, proc.ErrVerifyFailed) {
+		return Result{}, false
+	}
+	res.Action = ActionCouldNotVerify
+	res.Err = fmt.Errorf(
+		"could not verify the runner for dispatch %d (issue #%d): %w; the issue stays stopped, but the row was left alone",
+		w.Dispatch.ID, w.Target.Issue, err)
+	return res, true
+}
+
 func (k killer) forceOne(w work, res Result, verifyErr error) (Result, error) {
 	if verifyErr != nil {
+		if couldNotVerifyResult, ok := k.couldNotVerify(w, res, verifyErr); ok {
+			return couldNotVerifyResult, nil
+		}
 		// --force must NOT group-kill when the runner is unverified.
 		// agent_pid is written once and never cleared, so a dead-runner row
 		// carries a STALE pid, and after a reboot that number leads an
@@ -383,7 +420,7 @@ func resolve(sel Selector, forResume bool) ([]Target, error) {
 	case sel.Session != "":
 		return resolveBySession(sel)
 	case sel.Issue != 0:
-		return resolveByIssue(sel)
+		return resolveByIssue(sel, forResume)
 	case sel.All:
 		return resolveAll(sel, forResume)
 	}
@@ -421,11 +458,107 @@ func resolveBySession(sel Selector) ([]Target, error) {
 	return nil, fmt.Errorf("no session %q found", sel.Session)
 }
 
-func resolveByIssue(sel Selector) ([]Target, error) {
+// resolveByIssue narrows an --issue selector to the loop(s) that actually
+// name this issue, reading real rows rather than enumerating every loop
+// CONFIG in the project. An issue number is unique within a loop, not within
+// a project, so a project with several loop configs is not automatically
+// ambiguous for a given issue -- only a project where the issue genuinely
+// appears in more than one loop's rows is. Enumerating configs made every
+// multi-loop project ambiguous regardless of where the issue actually lived,
+// contradicting spec section 4.1.1 and README.md's promise that --loop is
+// needed only when the number matches more than one loop.
+func resolveByIssue(sel Selector, forResume bool) ([]Target, error) {
 	p, err := resolveRegistryProject(sel.Project)
 	if err != nil {
 		return nil, err
 	}
+
+	loops, err := loopsNamingIssue(p.ID, sel.Issue, forResume)
+	if err != nil {
+		return nil, err
+	}
+	if len(loops) == 0 {
+		// No row names this issue at all: a runner that already crashed
+		// leaves no running dispatch row (kill's B3 fix still needs to mark
+		// the issue stopped), or a resume is being asked about an issue that
+		// merely sits in retry backoff with no stopped row (spec section 8's
+		// "resume finds no stopped issue" no-op). Fall back to every
+		// configured loop, exactly as before this fix, so a single-loop
+		// project still resolves and a genuinely ambiguous one still asks
+		// for --loop.
+		return resolveByIssueFromConfigs(p, sel)
+	}
+
+	entries, err := config.List(p.AgentUtilsDir)
+	if err != nil {
+		return nil, err
+	}
+	pathByLoop := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if e.Err == nil {
+			pathByLoop[e.Name] = e.Path
+		}
+	}
+
+	var candidates []Target
+	for _, loop := range loops {
+		candidates = append(candidates, Target{
+			ProjectID: p.ID, Project: p.Name, Dir: p.AgentUtilsDir,
+			Loop: loop, Issue: sel.Issue, ConfigPath: pathByLoop[loop],
+		})
+	}
+	return narrowByLoop(candidates, sel.Loop)
+}
+
+// loopsNamingIssue returns the distinct loop names, in this project, that
+// have a row for this issue number: running dispatches for Kill, stopped
+// issues for Resume -- the same machine-wide tables resolveAll already reads
+// for --all.
+func loopsNamingIssue(projectID string, issue int, forResume bool) ([]string, error) {
+	db, err := openCanonical()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	seen := map[string]bool{}
+	var loops []string
+	add := func(loop string) {
+		if !seen[loop] {
+			seen[loop] = true
+			loops = append(loops, loop)
+		}
+	}
+
+	if forResume {
+		stopped, err := db.StoppedIssues()
+		if err != nil {
+			return nil, err
+		}
+		for _, si := range stopped {
+			if si.ProjectID == projectID && si.Number == issue {
+				add(si.Loop)
+			}
+		}
+		return loops, nil
+	}
+
+	running, err := db.RunningDispatches()
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range running {
+		if d.ProjectID == projectID && d.Number == issue {
+			add(d.Loop)
+		}
+	}
+	return loops, nil
+}
+
+// resolveByIssueFromConfigs is the pre-B9 fallback: it enumerates every loop
+// configuration in the project, for the case where no row names this issue
+// at all and there is therefore nothing more specific to narrow by.
+func resolveByIssueFromConfigs(p registry.Project, sel Selector) ([]Target, error) {
 	entries, err := config.List(p.AgentUtilsDir)
 	if err != nil {
 		return nil, err
@@ -620,6 +753,28 @@ func matchDispatch(running []store.Dispatch, t Target) (store.Dispatch, bool) {
 	return store.Dispatch{}, false
 }
 
+// newWaitGone builds a killer's waitGone hook around a liveness check. It is
+// separated from productionKiller so a test can inject a fake liveness
+// function and assert the polling semantics without exec'ing a real process,
+// and so production always wires proc.IsAlive here -- never proc.VerifyRunner,
+// whose opposite (fail-closed) bias belongs to the pre-signal identity gate,
+// not to a liveness poll. See productionKiller's comment for why the two must
+// not be swapped.
+func newWaitGone(isAlive func(pid int, dispatchID int64) bool) func(pid int, dispatchID int64, timeout time.Duration) bool {
+	return func(pid int, dispatchID int64, timeout time.Duration) bool {
+		deadline := time.Now().Add(timeout)
+		for {
+			if !isAlive(pid, dispatchID) {
+				return true
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+}
+
 // productionKiller wires killer's function fields to the real internal/proc
 // signal helpers and internal/store methods.
 func productionKiller(cfg *config.Config, st *store.Store) killer {
@@ -629,20 +784,21 @@ func productionKiller(cfg *config.Config, st *store.Store) killer {
 		},
 		verify: proc.VerifyRunner,
 		signal: proc.Signal,
-		waitGone: func(pid int, dispatchID int64, timeout time.Duration) bool {
-			deadline := time.Now().Add(timeout)
-			for {
-				if err := proc.VerifyRunner(pid, dispatchID); err != nil {
-					return true
-				}
-				if time.Now().After(deadline) {
-					return false
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-		},
-		reread: st.GetDispatch,
-		finish: st.FinishDispatch,
+		// IsAlive, not VerifyRunner: the two want opposite biases, and this is
+		// a liveness poll, not the pre-signal identity gate. VerifyRunner fails
+		// CLOSED on any ps error, by design (signal.go), because a caller about
+		// to send a signal must not act on an inconclusive answer. Reusing that
+		// bias HERE would invert it: a transient ps failure (EAGAIN under
+		// load) would make this report "gone", and recordIfNeeded would then
+		// write "killed by operator" onto a dispatch whose runner is still
+		// alive -- the real runner's own finish would hit ErrDispatchNotRunning
+		// and never record its true outcome, and the operator would be told
+		// "signalled" while the agent still writes to the worktree. IsAlive
+		// fails OPEN on the same ps error (proc.go:36-46), which is the correct
+		// bias for a poll deciding whether to keep waiting.
+		waitGone: newWaitGone(proc.IsAlive),
+		reread:   st.GetDispatch,
+		finish:   st.FinishDispatch,
 		killAgent: func(pid int) error {
 			return proc.SignalGroup(pid, syscall.SIGKILL)
 		},
@@ -673,6 +829,18 @@ func Kill(opts KillOptions) ([]Result, error) {
 		}
 		d, ok := matchDispatch(running, t)
 		if !ok {
+			// Killing nothing is not an error, but the trigger label may still
+			// be set on GitHub: set the stopped flag anyway, so a tick racing
+			// this moment (a runner that just crashed) reads it and does not
+			// start a fresh agent -- exactly the race the write-before-signal
+			// ordering in killer.one exists to close for the ordinary path.
+			// killer.one's own tend exception does not apply here: this
+			// target names an ISSUE the selector was asked to stop, and there
+			// is no dispatch row at all to say it was a tend run instead.
+			if err := st.MarkStopped(cfg.Name, cfg.Repo, t.Issue, killedByOperatorReason, time.Now()); err != nil {
+				return Result{Target: t, Action: ActionFailed,
+					Err: fmt.Errorf("mark issue #%d stopped: %w", t.Issue, err)}
+			}
 			// Killing nothing is not an error: report it and move on.
 			return Result{Target: t, Action: ActionAlreadyGone}
 		}
@@ -717,8 +885,16 @@ func resumeTarget(cfg *config.Config, st *store.Store, t Target) Result {
 				d.ID, t.Issue)}
 		}
 	}
-	if err := st.ClearStopped(cfg.Name, cfg.Repo, t.Issue, time.Now()); err != nil {
+	cleared, err := st.ClearStopped(cfg.Name, cfg.Repo, t.Issue, time.Now())
+	if err != nil {
 		return Result{Target: t, Action: ActionFailed, Err: err}
+	}
+	if !cleared {
+		// Not actually stopped: --issue/--session resolve from config or the
+		// registry, not from the stopped table, so this target can legitimately
+		// name an issue that merely sits in retry backoff. Report it as a
+		// no-op instead of having silently cleared needs_retry/retry_after.
+		return Result{Target: t, Action: ActionNotStopped}
 	}
 	return Result{Target: t, Action: ActionResumed}
 }
@@ -738,6 +914,8 @@ func RenderResults(verb string, rs []Result) string {
 		case ActionStillAlive:
 			fmt.Fprintf(&b, "%s %s: still alive after the timeout; retry with --force\n",
 				verb, r.Target.describeLine())
+		case ActionCouldNotVerify:
+			fmt.Fprintf(&b, "%s %s: %v\n", verb, r.Target.describeLine(), r.Err)
 		default:
 			fmt.Fprintf(&b, "%s %s: %s\n", verb, r.Target.describeLine(), r.Action)
 		}

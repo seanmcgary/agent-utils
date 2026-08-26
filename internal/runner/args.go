@@ -43,6 +43,18 @@ type Settings struct {
 // older binary, and internal/store/legacy.go writes the dispatches table by a
 // second path. Effective is the last line of defence before a value becomes
 // an argv element.
+//
+// It uses the PARSED, normalised value ParseOverrides returns, never the raw
+// ov field: ParseOverrides lowercases harness and effort (overrides.go:88,
+// 108), so a row carrying harness "PI" (an older binary, or a hand-edited
+// database) must resolve to the lowercase form the harness switch in
+// Supervise compares against -- otherwise it fails that comparison silently
+// and launches claude with the pi model and claudeEnv.
+//
+// The harness-safety rule (config.Overrides.ValidateHarnessSafety) is
+// re-applied here too, for the same reason: a row can reach RunAgent by a
+// path this function is the only guard for. A harness override that fails it
+// is DROPPED, exactly like a syntactically invalid value.
 func Effective(cfg *config.Config, ov config.Overrides) Settings {
 	s := Settings{
 		Harness: cfg.Agent.Harness,
@@ -50,20 +62,35 @@ func Effective(cfg *config.Config, ov config.Overrides) Settings {
 		Effort:  cfg.Agent.Effort,
 	}
 
+	var parsed config.Overrides
 	if ov.Model != "" {
-		if _, err := config.ParseOverrides([]string{config.OverrideModelPrefix + ov.Model}); err == nil {
-			s.Model = ov.Model
+		if p, err := config.ParseOverrides([]string{config.OverrideModelPrefix + ov.Model}); err == nil {
+			parsed.Model = p.Model
 		}
 	}
 	if ov.Harness != "" {
-		if _, err := config.ParseOverrides([]string{config.OverrideHarnessPrefix + ov.Harness}); err == nil {
-			s.Harness = ov.Harness
+		if p, err := config.ParseOverrides([]string{config.OverrideHarnessPrefix + ov.Harness}); err == nil {
+			parsed.Harness = p.Harness
 		}
 	}
 	if ov.Effort != "" {
-		if _, err := config.ParseOverrides([]string{config.OverrideEffortPrefix + ov.Effort}); err == nil {
-			s.Effort = ov.Effort
+		if p, err := config.ParseOverrides([]string{config.OverrideEffortPrefix + ov.Effort}); err == nil {
+			parsed.Effort = p.Effort
 		}
+	}
+
+	if parsed.Harness != "" && parsed.ValidateHarnessSafety(cfg) != nil {
+		parsed.Harness = ""
+	}
+
+	if parsed.Model != "" {
+		s.Model = parsed.Model
+	}
+	if parsed.Harness != "" {
+		s.Harness = parsed.Harness
+	}
+	if parsed.Effort != "" {
+		s.Effort = parsed.Effort
 	}
 	return s
 }

@@ -335,6 +335,130 @@ func TestKillerOneForceDoesNotGroupKillAnUnverifiedRunner(t *testing.T) {
 	}
 }
 
+// --- newWaitGone: B1's IsAlive-not-VerifyRunner bias ---
+
+// TestNewWaitGoneFailsOpenWhileTheLivenessCheckReportsAlive proves the
+// fail-OPEN bias newWaitGone requires: a liveness check that never reports
+// "not alive" within the timeout must report "still alive" (false), never
+// "gone" (true). This is the bias proc.IsAlive has and proc.VerifyRunner does
+// not -- wiring VerifyRunner here (as productionKiller used to) would report
+// "gone" on the FIRST ps failure instead of waiting out the timeout.
+func TestNewWaitGoneFailsOpenWhileTheLivenessCheckReportsAlive(t *testing.T) {
+	calls := 0
+	alwaysAlive := func(pid int, id int64) bool { calls++; return true }
+	wg := newWaitGone(alwaysAlive)
+	if wg(1, 1, 50*time.Millisecond) {
+		t.Fatal("waitGone = true (gone), want false (still alive) when the liveness check never says otherwise")
+	}
+	if calls == 0 {
+		t.Fatal("the injected liveness check was never called")
+	}
+}
+
+func TestNewWaitGoneReportsGoneAsSoonAsTheLivenessCheckSaysSo(t *testing.T) {
+	wg := newWaitGone(func(pid int, id int64) bool { return false })
+	if !wg(1, 1, time.Second) {
+		t.Fatal("waitGone = false, want true (gone) as soon as the liveness check reports not alive")
+	}
+}
+
+// startReapableFakeRunnerProcess is like startFakeRunnerProcess, but returns
+// the *exec.Cmd so a test can kill AND reap it itself, mid-test, rather than
+// only at t.Cleanup -- proving a liveness check transitions from "alive" to
+// "gone" needs the pid fully released, not merely signalled.
+func startReapableFakeRunnerProcess(t *testing.T, dispatchID int64) (cmd *exec.Cmd, pid int) {
+	t.Helper()
+	cmd = exec.Command(os.Args[0],
+		"-test.run=^TestKillFakeRunnerHelperProcess$", "--",
+		proc.DispatchFlag, strconv.FormatInt(dispatchID, 10))
+	cmd.Env = append(os.Environ(), "AGENT_UTILS_KILL_HELPER=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fake runner: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cmdline, err := proc.CommandLine(cmd.Process.Pid); err == nil && cmdline != "" {
+			return cmd, cmd.Process.Pid
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("fake runner pid %d never became visible to ps", cmd.Process.Pid)
+	return nil, 0
+}
+
+// TestProductionKillerWaitGoneReportsGoneOnceTheRealProcessExits is a
+// regression check that productionKiller's real wiring (proc.IsAlive) still
+// tracks an actual process's lifetime correctly.
+func TestProductionKillerWaitGoneReportsGoneOnceTheRealProcessExits(t *testing.T) {
+	k := productionKiller(&config.Config{Name: "planning", Repo: "o/r"}, nil)
+	cmd, pid := startReapableFakeRunnerProcess(t, 999)
+
+	if k.waitGone(pid, 999, 300*time.Millisecond) {
+		t.Fatal("waitGone = true (gone) while the fake runner is still alive")
+	}
+
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill fake runner: %v", err)
+	}
+	_, _ = cmd.Process.Wait() // reap, so the pid is fully released
+
+	if !k.waitGone(pid, 999, 3*time.Second) {
+		t.Fatal("waitGone = false (still alive) after the fake runner was killed and reaped")
+	}
+}
+
+// TestKillerOneCouldNotVerifyRunnerLeavesTheRowAlone proves B2: a ps FAILURE
+// (proc.ErrVerifyFailed) is not evidence the runner is gone, unlike
+// proc.ErrNotRunner. It must not be treated as "already gone" -- no signal, no
+// recordIfNeeded/finish, and a distinct action so the operator is told the
+// runner could not be reached rather than that it is dead.
+func TestKillerOneCouldNotVerifyRunnerLeavesTheRowAlone(t *testing.T) {
+	log := &callLog{}
+	k := noopKiller(log)
+	k.verify = func(pid int, id int64) error {
+		log.add("verify")
+		return fmt.Errorf("%w: ps: signal: no such process", proc.ErrVerifyFailed)
+	}
+
+	res, err := k.one(baseWork(), KillOptions{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("one: %v", err)
+	}
+	if res.Action != ActionCouldNotVerify {
+		t.Errorf("Action = %q, want %q", res.Action, ActionCouldNotVerify)
+	}
+	if res.Err == nil {
+		t.Error("want a non-nil Err explaining the row was left alone")
+	}
+	for _, c := range log.calls {
+		if c == "signal" || c == "killAgent" || c == "killRunner" || c == "reread" || c == "finish" {
+			t.Fatalf("an inconclusive verify must not signal or record anything: %v", log.calls)
+		}
+	}
+}
+
+func TestKillerOneForceCouldNotVerifyRunnerLeavesTheRowAlone(t *testing.T) {
+	log := &callLog{}
+	k := noopKiller(log)
+	k.verify = func(pid int, id int64) error {
+		log.add("verify")
+		return fmt.Errorf("%w: ps: signal: no such process", proc.ErrVerifyFailed)
+	}
+
+	res, err := k.one(baseWork(), KillOptions{Force: true})
+	if err != nil {
+		t.Fatalf("one: %v", err)
+	}
+	if res.Action != ActionCouldNotVerify {
+		t.Errorf("Action = %q, want %q", res.Action, ActionCouldNotVerify)
+	}
+	for _, c := range log.calls {
+		if c == "killAgent" || c == "killRunner" || c == "reread" || c == "finish" {
+			t.Fatalf("--force must not group-kill or record on an inconclusive verify: %v", log.calls)
+		}
+	}
+}
+
 // --- RenderResults ---
 
 func TestRenderResultsReportsNothingMatched(t *testing.T) {

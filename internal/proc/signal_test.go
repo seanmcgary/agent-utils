@@ -153,10 +153,17 @@ func TestVerifyRunner(t *testing.T) {
 func TestVerifyRunnerFailsClosedOnAPsError(t *testing.T) {
 	// A pid this improbably high is not a live process on any test machine,
 	// so CommandLine fails; VerifyRunner must refuse rather than assume the
-	// process is ours (the opposite bias from IsAlive, which fails open).
+	// process is ours (the opposite bias from IsAlive, which fails open). The
+	// error is ErrVerifyFailed, not ErrNotRunner: a ps failure is NOT evidence
+	// the process is gone (see kill.go's gracefulOne/forceOne, which must not
+	// treat the two the same).
 	const implausiblePid = 1 << 30
-	if err := VerifyRunner(implausiblePid, 7); !errors.Is(err, ErrNotRunner) {
-		t.Fatalf("VerifyRunner on an implausible pid = %v, want ErrNotRunner", err)
+	err := VerifyRunner(implausiblePid, 7)
+	if !errors.Is(err, ErrVerifyFailed) {
+		t.Fatalf("VerifyRunner on an implausible pid = %v, want ErrVerifyFailed", err)
+	}
+	if errors.Is(err, ErrNotRunner) {
+		t.Fatalf("VerifyRunner on an implausible pid = %v, want it NOT to also be ErrNotRunner", err)
 	}
 }
 

@@ -6,9 +6,18 @@ import (
 	"syscall"
 )
 
-// ErrNotRunner reports that a pid could not be confirmed as the runner for a
-// dispatch, so no signal may be sent to it.
+// ErrNotRunner reports that pid was CONFIRMED not to be dispatchID's runner:
+// either pid is not positive, or ps successfully read a command line that
+// does not name this dispatch. Both are safe to treat as "gone" -- a signal
+// correctly finds nothing to send, and a caller may retire the dispatch row.
 var ErrNotRunner = errors.New("not this dispatch's runner")
+
+// ErrVerifyFailed reports that pid's identity could NOT be confirmed at all:
+// ps itself failed (EAGAIN under load, for example). This is NOT evidence the
+// process is gone -- unlike ErrNotRunner, the safe action is to refuse the
+// signal without asserting death or touching any row the caller might retire
+// on the strength of "gone".
+var ErrVerifyFailed = errors.New("could not verify pid")
 
 // VerifyRunner reports an error unless pid is CONFIRMED to be the runner for
 // dispatchID.
@@ -19,6 +28,12 @@ var ErrNotRunner = errors.New("not this dispatch's runner")
 // duplicate dispatch. For signalling it is inverted -- a ps that fails means
 // the process was never confirmed to be ours, and the safe answer is to
 // refuse, not to send a signal to whatever pid happens to be there.
+//
+// The two failure modes are distinguished so a caller can tell "definitely
+// gone" from "could not tell": pid <= 0 and a command line that does not
+// match are both conclusive (ErrNotRunner), but a ps failure proves nothing
+// either way (ErrVerifyFailed) -- see kill.go's gracefulOne/forceOne, which
+// must not record a killed outcome on the strength of an inconclusive ps.
 func VerifyRunner(pid int, dispatchID int64) error {
 	if pid <= 0 {
 		return fmt.Errorf("%w: pid %d is not positive", ErrNotRunner, pid)
@@ -26,8 +41,9 @@ func VerifyRunner(pid int, dispatchID int64) error {
 	cmdline, err := CommandLine(pid)
 	if err != nil {
 		// Fail CLOSED, the opposite of IsAlive: an unreadable command line is
-		// not evidence the process is ours.
-		return fmt.Errorf("%w: %w", ErrNotRunner, err)
+		// not evidence the process is ours, but it is also not evidence the
+		// process is gone.
+		return fmt.Errorf("%w: %w", ErrVerifyFailed, err)
 	}
 	if !matchesDispatch(cmdline, dispatchID) {
 		return ErrNotRunner

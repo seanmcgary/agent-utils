@@ -103,9 +103,11 @@ type Dispatch struct {
 	// Supervise starts it. It is distinct from PID, the RUNNER's process --
 	// the runner is spawned Setsid and the agent child Setpgid into its own
 	// group, so a signal to one does not reach the other, and killing an
-	// agent needs its own pid. It is never cleared once set, so it is STALE
-	// on any row whose runner has already died; a caller must verify the
-	// runner before trusting it.
+	// agent needs its own pid. Supervise clears it back to 0 once cmd.Wait
+	// returns, because the runner OUTLIVES its agent child; a row whose
+	// runner then dies or is killed before recording anything still carries
+	// whatever value was last written, so a caller must verify the runner is
+	// still alive before trusting a non-zero value here.
 	AgentPID int
 	// Model, Harness, and Effort are the label overrides in effect for this
 	// dispatch, empty when none applied. An empty column means "no

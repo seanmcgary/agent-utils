@@ -700,6 +700,28 @@ func TestHarnessOverrideAllowedWithNeitherSafetySetting(t *testing.T) {
 	}
 }
 
+// TestHarnessOverrideToClaudeIsNeverRefusedOnAPiLoop is spec B6: the hazard
+// is directional. A pi-configured loop with agent.max_budget_usd set is a
+// legal configuration -- config.validate accepts it, PiBuildArgs silently
+// ignores it -- and switching TO claude only ever ADDS the ceiling
+// BuildArgs enforces, never drops one. The old rule keyed off "the harness
+// changed" rather than "the effective harness would be pi", so it wrongly
+// refused this exact case with a message claiming the override "would drop
+// the ceiling" when the opposite is true.
+func TestHarnessOverrideToClaudeIsNeverRefusedOnAPiLoop(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessPi
+	cfg.Agent.MaxBudgetUSD = 5
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:claude")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStart {
+		t.Fatalf("decisions = %v, want one start: switching to claude never drops a bound", kinds(p))
+	}
+	if p.Decisions[0].Overrides.Harness != "claude" {
+		t.Errorf("Overrides.Harness = %q, want claude", p.Decisions[0].Overrides.Harness)
+	}
+}
+
 func TestInvalidLabelWithNoTriggerProducesNothing(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{issue(1, "harness:gpt")}}

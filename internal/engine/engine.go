@@ -313,43 +313,15 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, now t
 }
 
 // validateOverrides refuses a harness: override that would drop a safety
-// setting the loop configured. config.validate forbids agent.permission_mode
-// together with harness: pi (config.go:218), and PiBuildArgs emits neither a
-// permission mode nor a cost ceiling (args.go:60) -- so on a loop configured
-// with a restrictive agent.permission_mode or a non-zero
-// agent.max_budget_usd, a harness:pi label would run the dispatch with
-// NEITHER, silently dropping both bounds that exist because the agent reads
-// third-party issue text.
-//
-// An empty configured harness is treated as claude: config.Load normalises
-// it at config.go:165, but Decide must not depend on being handed a
-// normalised config.
+// setting the loop configured. The rule itself lives on config.Overrides
+// (ValidateHarnessSafety), shared with runner.Effective, so a row reaching
+// RunAgent by any path other than this tick still gets it enforced.
 //
 // There is deliberately no "pi requires a model" rule: agent.model is
 // required for every harness (config.go:261), so such a rule could never
 // fire.
 func validateOverrides(cfg *config.Config, ov config.Overrides) error {
-	if ov.Harness == "" {
-		return nil
-	}
-	configured := cfg.Agent.Harness
-	if configured == "" {
-		configured = config.HarnessClaude
-	}
-	if ov.Harness == configured {
-		return nil
-	}
-	if cfg.Agent.PermissionMode != "" {
-		return fmt.Errorf(
-			"harness override %q would drop agent.permission_mode %q",
-			ov.Harness, cfg.Agent.PermissionMode)
-	}
-	if cfg.Agent.MaxBudgetUSD != 0 {
-		return fmt.Errorf(
-			"harness override %q would drop the agent.max_budget_usd %.2f ceiling",
-			ov.Harness, cfg.Agent.MaxBudgetUSD)
-	}
-	return nil
+	return ov.ValidateHarnessSafety(cfg)
 }
 
 // tendDecisions selects stale pull requests for issues awaiting review.
