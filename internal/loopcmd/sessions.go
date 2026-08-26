@@ -49,6 +49,12 @@ type Session struct {
 	Live bool
 	// Orphaned reports a dispatch still marked running whose process is gone.
 	Orphaned bool
+	// Stopped reports that the issue this session belongs to is stopped --
+	// by an operator's `sessions kill`, or by an invalid override label. It
+	// is filled in by applyStopped, a separate pass over sessionsFrom's
+	// output, because sessionsFrom groups dispatches and knows nothing about
+	// the issues table a stopped flag lives in.
+	Stopped bool
 }
 
 // Sessions returns every session in a project, newest activity first.
@@ -70,6 +76,17 @@ func Sessions(p *Project, loopFilter string) ([]Session, error) {
 		return nil, err
 	}
 	out := sessionsFrom(ds, loopFilter)
+
+	// DB.StoppedIssues(), not the scoped Store.StoppedIssues: the latter
+	// needs a repo, and this function is handed a *Project with no loop
+	// filter to pick one repo from -- p.Config.ID alone is what scopes the
+	// machine-wide read back down to this project.
+	stopped, err := db.StoppedIssues()
+	if err != nil {
+		return nil, err
+	}
+	applyStopped(out, stoppedSet(stopped, p.Config.ID))
+
 	// Stable, because sessionsFrom returns the rows in the query's id DESC
 	// order. Two sessions can share a Last timestamp -- a resume dispatched
 	// in the same second, or a legacy source imported with a coarse clock --
@@ -222,6 +239,15 @@ func AllSessions(f SessionFilter) ([]Session, error) {
 			kept = append(kept, s)
 		}
 	}
+
+	// DB.StoppedIssues() is the machine-wide read; projectID is "" unless
+	// --project narrowed it, and stoppedSet treats "" as every project.
+	stopped, err := db.StoppedIssues()
+	if err != nil {
+		return nil, err
+	}
+	applyStopped(kept, stoppedSet(stopped, projectID))
+
 	nameProjects(kept, names)
 	// Stable, for the reason Sessions is: sessionsFrom returns the rows in the
 	// query's id DESC order, and two sessions can share a Last timestamp, so
@@ -237,6 +263,46 @@ func AllSessions(f SessionFilter) ([]Session, error) {
 type sessionKey struct {
 	ProjectID string
 	SessionID string
+}
+
+// stoppedKey identifies one issue for the stopped lookup. It carries the
+// project for the same reason sessionKey does: loop and number alone collide
+// across projects, and a stopped set keyed on just those two would mark one
+// project's issue 7 STOPPED because another project's issue 7 was killed.
+type stoppedKey struct {
+	ProjectID string
+	Loop      string
+	Number    int
+}
+
+// stoppedSet builds the lookup applyStopped uses, from DB.StoppedIssues().
+// projectID narrows the set to one project -- Sessions' case, which reports
+// one project and has no loop filter of its own to scope by -- and an empty
+// projectID keeps every project, for AllSessions' machine-wide report.
+func stoppedSet(all []store.StoppedIssue, projectID string) map[stoppedKey]bool {
+	out := make(map[stoppedKey]bool, len(all))
+	for _, si := range all {
+		if projectID != "" && si.ProjectID != projectID {
+			continue
+		}
+		out[stoppedKey{ProjectID: si.ProjectID, Loop: si.Loop, Number: si.Number}] = true
+	}
+	return out
+}
+
+// applyStopped marks each session Stopped when its {ProjectID, Loop, Issue}
+// key appears in stopped. It is a separate pass over sessionsFrom's output,
+// not a parameter threaded through sessionsFrom itself: sessionsFrom groups
+// dispatches into sessions and has no reason to know about the issues
+// table's stopped flag, and threading it through would touch every existing
+// caller and test of sessionsFrom for a fact only the renderers need.
+func applyStopped(sessions []Session, stopped map[stoppedKey]bool) {
+	for i := range sessions {
+		key := stoppedKey{ProjectID: sessions[i].ProjectID, Loop: sessions[i].Loop, Number: sessions[i].Issue}
+		if stopped[key] {
+			sessions[i].Stopped = true
+		}
+	}
 }
 
 // sessionsFrom groups dispatches into sessions. The rows arrive newest first, so
@@ -311,6 +377,13 @@ func RenderSessions(p *Project, sessions []Session) string {
 		switch {
 		case s.Live:
 			state = "running"
+		case s.Stopped:
+			// Above ORPHANED, below running: a stopped session's runner is
+			// gone BY DESIGN (a kill sets the flag before it ever signals),
+			// so calling it an orphan would send the operator hunting a
+			// crash that did not happen. A live agent still outranks the
+			// flag -- see the Live case above, which is checked first.
+			state = "STOPPED"
 		case s.Orphaned:
 			state = "ORPHANED"
 		}
@@ -356,6 +429,10 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 		switch {
 		case s.Live:
 			state = "running"
+		case s.Stopped:
+			// Same ordering as RenderSessions: above ORPHANED, below
+			// running. See that renderer's comment for why.
+			state = "STOPPED"
 		case s.Orphaned:
 			state = "ORPHANED"
 		}
