@@ -89,12 +89,16 @@ func isLive(d store.Dispatch, isAlive func(pid int, dispatchID int64) bool, now 
 
 // Summary reports what one tick did.
 type Summary struct {
-	Started        int  `json:"started"`
-	Resumed        int  `json:"resumed"`
-	Retried        int  `json:"retried"`
-	Tended         int  `json:"tended"`
-	Promoted       int  `json:"promoted"`
-	Parked         int  `json:"parked"`
+	Started  int `json:"started"`
+	Resumed  int `json:"resumed"`
+	Retried  int `json:"retried"`
+	Tended   int `json:"tended"`
+	Promoted int `json:"promoted"`
+	Parked   int `json:"parked"`
+	// Stopped counts KindStop decisions applied this tick: an operator's
+	// `sessions kill`, or an invalid label override. Either way nothing was
+	// dispatched and nothing was written to GitHub.
+	Stopped        int  `json:"stopped"`
 	Live           int  `json:"live"`
 	Orphans        int  `json:"orphans"`
 	BreakerTripped bool `json:"breaker_tripped"`
@@ -357,6 +361,14 @@ func act(
 	sum *Summary,
 ) error {
 	switch d.Kind {
+	case engine.KindStop:
+		// Not a dispatch, and not a GitHub write: parkRetryExhausted stays
+		// the only one this program performs. The write is LOCAL only --
+		// MarkStopped -- so an operator kill or an invalid label is visible
+		// in `loop status` and `sessions list` without ever touching the
+		// issue on GitHub.
+		slog.Info("stopping issue", "loop", cfg.Name, "issue", d.Issue, "reason", d.Reason)
+		return count(&sum.Stopped, deps.Store.MarkStopped(cfg.Name, cfg.Repo, d.Issue, d.Reason, now))
 	case engine.KindClearRetry:
 		// Not a dispatch. Clear a failure flag that no retry can act on, so the
 		// issue is not stranded outside the loop forever.
@@ -434,6 +446,12 @@ func dispatch(
 	dispatchID, err := deps.Store.CreateDispatch(store.Dispatch{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: d.Issue, Kind: kind,
 		SessionID: sessionID, LogPath: logPath, PRNumber: d.PR, Title: d.Title,
+		// A tend decision carries no Overrides -- engine.Decide never sets
+		// them for KindTend -- so this needs no extra branch: the zero value
+		// already matches spec section 6.7.
+		Model:   d.Overrides.Model,
+		Harness: d.Overrides.Harness,
+		Effort:  d.Overrides.Effort,
 	})
 	if err != nil {
 		return err
@@ -645,8 +663,14 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		return err
 	}
 
+	// Overrides come from THE ROW, not from a snapshot the tick took: this
+	// detached process never saw the tick's decision, and the labels it was
+	// parsed from may since have changed on GitHub.
 	return runner.Supervise(ctx, cfg, deps.Store, d,
-		runner.Invocation{SessionID: d.SessionID, Prompt: prompt, Resume: resume},
+		runner.Invocation{
+			SessionID: d.SessionID, Prompt: prompt, Resume: resume,
+			Overrides: config.Overrides{Model: d.Model, Harness: d.Harness, Effort: d.Effort},
+		},
 		workDir, d.LogPath)
 }
 

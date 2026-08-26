@@ -160,3 +160,73 @@ func TestRenderPromptRejectsUnknownField(t *testing.T) {
 		t.Fatal("want an error for an unknown template field")
 	}
 }
+
+func TestEffectiveOverrideReplacesConfiguredValue(t *testing.T) {
+	s := Effective(cfg(), config.Overrides{Model: "claude-opus-5", Effort: "xhigh"})
+	if s.Model != "claude-opus-5" {
+		t.Errorf("Model = %q, want override", s.Model)
+	}
+	if s.Effort != "xhigh" {
+		t.Errorf("Effort = %q, want override", s.Effort)
+	}
+	// Harness was not overridden, so the configured value (empty here) survives.
+	if s.Harness != "" {
+		t.Errorf("Harness = %q, want unset (no override, no configured harness)", s.Harness)
+	}
+}
+
+func TestEffectiveUnsetOverrideKeepsConfiguredValue(t *testing.T) {
+	s := Effective(cfg(), config.Overrides{})
+	if s.Model != "opus" {
+		t.Errorf("Model = %q, want configured %q", s.Model, "opus")
+	}
+	if s.Effort != "high" {
+		t.Errorf("Effort = %q, want configured %q", s.Effort, "high")
+	}
+}
+
+func TestEffectiveNeverMutatesTheConfiguration(t *testing.T) {
+	c := cfg()
+	_ = Effective(c, config.Overrides{Model: "gpt-5", Harness: config.HarnessPi, Effort: "low"})
+	if c.Agent.Model != "opus" || c.Agent.Effort != "high" || c.Agent.Harness != "" {
+		t.Fatalf("Effective mutated cfg.Agent: %+v", c.Agent)
+	}
+}
+
+func TestEffectiveDropsAFlagShapedOverride(t *testing.T) {
+	// A row value did not pass through this process's own ParseOverrides --
+	// the tick wrote it, possibly under an older binary, and
+	// internal/store/legacy.go writes the dispatches table by a second path.
+	// Effective re-validates and drops anything that would not have parsed.
+	s := Effective(cfg(), config.Overrides{Model: "--dangerously-skip-permissions"})
+	if s.Model != "opus" {
+		t.Errorf("Model = %q, want the configured value with the bad override dropped", s.Model)
+	}
+}
+
+func TestEffectiveDropsAnInvalidHarnessOverride(t *testing.T) {
+	s := Effective(cfg(), config.Overrides{Harness: "gpt"})
+	if s.Harness != "" {
+		t.Errorf("Harness = %q, want the invalid override dropped", s.Harness)
+	}
+}
+
+func TestBuildArgsUsesTheEffectiveOverride(t *testing.T) {
+	j := joined(BuildArgs(cfg(), Invocation{
+		SessionID: "s", Prompt: "p",
+		Overrides: config.Overrides{Model: "claude-opus-5"},
+	}))
+	if !strings.Contains(j, "--model claude-opus-5") {
+		t.Errorf("missing overridden model: %s", j)
+	}
+}
+
+func TestPiBuildArgsUsesTheEffectiveOverride(t *testing.T) {
+	j := joined(PiBuildArgs(piCfg(), Invocation{
+		SessionID: "s", Prompt: "p",
+		Overrides: config.Overrides{Model: "openai/gpt-5"},
+	}))
+	if !strings.Contains(j, "--model openai/gpt-5") {
+		t.Errorf("missing overridden model: %s", j)
+	}
+}

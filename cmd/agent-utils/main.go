@@ -696,6 +696,14 @@ func internalCommand() *cli.Command {
 					&cli.StringFlag{Name: "project", Usage: "project id", Required: true},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
+					// Install the signal handler so an operator's `sessions kill`
+					// (which SIGTERMs this process) cancels the context Supervise
+					// runs the agent under, instead of leaving the agent behind
+					// with no supervisor left to record its outcome or sweep its
+					// process group.
+					ctx, cancel := runAgentContext(ctx)
+					defer cancel()
+
 					configPath := c.String("config")
 					ref := loopcmd.ProjectRef{
 						ID: c.String("project"),

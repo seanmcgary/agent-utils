@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -196,6 +197,108 @@ func TestAgentEnvExcludesCredentials(t *testing.T) {
 	}
 	if !sawHome {
 		t.Error("HOME must be preserved; the agent needs it to run git and gh")
+	}
+}
+
+// stubLiveClaude writes a fake claude onto PATH that prints one stream-json
+// line, records its own pid to pidFile, and then sleeps for a long time. It is
+// `exec`ed as the last step so the recorded pid stays the process group
+// leader's pid -- the same one cmd.Cancel and the SIGKILL sweep signal.
+func stubLiveClaude(t *testing.T, pidFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"cat <<'EOF'\n" +
+		`{"type":"result","subtype":"success","session_id":"abc","total_cost_usd":0.1,"duration_ms":10,"is_error":false,"result":"ok"}` +
+		"\nEOF\n" +
+		"echo $$ > " + pidFile + "\n" +
+		"exec sleep 60\n"
+	p := filepath.Join(dir, "claude")
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestSuperviseUnderCancellationKillsTheAgentAndRecordsAnOutcome proves the
+// SIGTERM path end to end: cancelling the context Supervise runs under, while
+// a live agent is running, must make Supervise return, retire the dispatch
+// row out of "running", and leave no agent process behind. That last
+// assertion is the one proving the SIGKILL sweep (runner.go:211-216) actually
+// reaches the agent's process group -- a killed-but-unreaped child still
+// answers kill(pid, 0), so this polls a deadline rather than checking once.
+func TestSuperviseUnderCancellationKillsTheAgentAndRecordsAnOutcome(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "agent.pid")
+	stubLiveClaude(t, pidFile)
+
+	s := newStore(t)
+	id, err := s.CreateDispatch(store.Dispatch{
+		Loop: "planning", Repo: "o/r", Number: 1,
+		Kind: store.KindStart, SessionID: "abc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := s.GetDispatch(id)
+
+	logPath := filepath.Join(t.TempDir(), "run.jsonl")
+	cfg := &config.Config{Agent: config.Agent{Model: "opus"}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Supervise(ctx, cfg, s, d,
+			Invocation{SessionID: "abc", Prompt: "go"}, t.TempDir(), logPath)
+	}()
+
+	// Wait for the agent to record its own pid, proving it is actually
+	// running before cancelling.
+	var agentPID int
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(pidFile)
+		if err == nil && len(strings.TrimSpace(string(b))) > 0 {
+			agentPID, err = strconv.Atoi(strings.TrimSpace(string(b)))
+			if err == nil && agentPID > 0 {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if agentPID <= 0 {
+		t.Fatalf("stub agent never recorded a pid in %s", pidFile)
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Supervise returned nil error for a cancelled run; want a recorded failure")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Supervise did not return within 15s of cancellation")
+	}
+
+	got, err := s.GetDispatch(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status == store.StatusRunning {
+		t.Fatalf("dispatch status = %q, want it retired out of running", got.Status)
+	}
+
+	// The stub process must actually be gone -- proof the SIGKILL sweep
+	// reached its process group, not merely that Supervise gave up waiting.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		if err := syscall.Kill(agentPID, 0); err != nil {
+			break // ESRCH: the process is gone.
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent pid %d is still alive 10s after cancellation", agentPID)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

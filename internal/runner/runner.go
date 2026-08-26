@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,11 +137,16 @@ func Supervise(
 	// Pick the agent binary and the matching argument builder and stream parser
 	// from the harness. The pi integration is a different program with a
 	// different stream shape, so the select is per-harness.
+	// Use the EFFECTIVE harness, not cfg.Agent.Harness directly: a harness:
+	// override on the row must select the pi binary and argument builder, and
+	// must keep claudeEnv (the print-mode background-task environment) out of
+	// a pi child, which reads none of it.
+	effective := Effective(cfg, inv.Overrides)
 	bin := "claude"
 	build := func(inv Invocation) []string { return BuildArgs(cfg, inv) }
 	parse := ParseStream
 	extraEnv := claudeEnv(cfg)
-	if cfg.Agent.Harness == config.HarnessPi {
+	if effective.Harness == config.HarnessPi {
 		bin = "pi"
 		build = func(inv Invocation) []string { return PiBuildArgs(cfg, inv) }
 		parse = ParsePiStream
@@ -195,6 +201,18 @@ func Supervise(
 		}, time.Now())
 	}
 
+	// Record the agent child's own pid, distinct from the RUNNER's pid this
+	// process already carries. --force needs it to SIGKILL the agent's
+	// process group without touching the runner's, and nothing outside this
+	// function otherwise knows which group the agent occupies.
+	//
+	// Logged and ignored on failure: the agent is already running, and
+	// abandoning the run over a bookkeeping write is worse than leaving
+	// agent_pid unset for this one dispatch.
+	if err := st.SetDispatchAgentPID(d.ID, cmd.Process.Pid); err != nil {
+		slog.Error("record agent pid", "dispatch", d.ID, "pid", cmd.Process.Pid, "err", err)
+	}
+
 	// Tee the stream to the log file and parse it at the same time, so one read
 	// serves both the record and the operator.
 	tee := io.TeeReader(stdout, logFile)
@@ -227,7 +245,7 @@ func Supervise(
 		SessionStarted: result.SessionID != "" || (waitErr != nil && inUse.Seen()),
 	}
 	// pi reports no wall-clock duration in its stream; the runner measures it.
-	if cfg.Agent.Harness == config.HarnessPi {
+	if effective.Harness == config.HarnessPi {
 		res.DurationMS = time.Since(start).Milliseconds()
 	}
 

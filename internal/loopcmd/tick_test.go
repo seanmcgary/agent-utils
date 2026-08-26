@@ -406,6 +406,65 @@ func TestTickIsQuietWhenNothingMatches(t *testing.T) {
 	}
 }
 
+// TestTickStopsAnIssueCarryingAnInvalidHarnessOverride is spec section 6.4:
+// an invalid label makes Decide emit KindStop instead of dispatching, and the
+// tick applies it locally -- MarkStopped -- with no GitHub write at all. That
+// last part is the one-GitHub-write invariant (parkRetryExhausted is the
+// only write this program performs, tick.go:493) surviving a second decision
+// kind, so this asserts the absence of EditLabels and PostComment as strongly
+// as it asserts the presence of the stopped state.
+func TestTickStopsAnIssueCarryingAnInvalidHarnessOverride(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{
+		{Number: 1, Labels: []string{"trigger", "harness:gpt"}},
+	}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Started != 0 {
+		t.Errorf("Started = %d, want 0", sum.Started)
+	}
+	if sum.Stopped != 1 {
+		t.Errorf("Stopped = %d, want 1", sum.Stopped)
+	}
+	if spawned != 0 {
+		t.Errorf("spawned = %d, want 0: an invalid override must not dispatch", spawned)
+	}
+	if len(gh.added) != 0 || len(gh.removed) != 0 {
+		t.Errorf("EditLabels must not be called for a stop: added=%v removed=%v", gh.added, gh.removed)
+	}
+	if len(gh.comments) != 0 {
+		t.Errorf("PostComment must not be called for a stop: %v", gh.comments)
+	}
+
+	states, err := deps.Store.IssueStates(cfg.Name, cfg.Repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := states[1]
+	if !ok || !st.Stopped {
+		t.Fatalf("issue state = %+v, ok=%v, want Stopped=true", st, ok)
+	}
+	if !strings.Contains(st.StoppedReason, "harness") {
+		t.Errorf("StoppedReason = %q, want it to name the harness override", st.StoppedReason)
+	}
+
+	// A second tick must change nothing: the issue is stopped, and Decide
+	// refuses to dispatch a stopped issue before it ever reaches the override
+	// parse.
+	sum2, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum2.Started != 0 || sum2.Stopped != 0 || spawned != 0 {
+		t.Errorf("second tick = %+v spawned=%d, want no further action", sum2, spawned)
+	}
+}
+
 func TestTruncateKeepsColumnsAligned(t *testing.T) {
 	cases := []struct {
 		in    string
