@@ -165,6 +165,7 @@ absolute path** — it depends on no working directory and can never prompt.
 - [Quick reference](#quick-reference)
 - [Identity and paths](#identity-and-paths)
 - [`labels`](#labels)
+- [Agent overrides from labels](#agent-overrides-from-labels)
 - [`agent`](#agent)
 - [`tend_pr`](#tend_pr)
 - [`retry`](#retry)
@@ -498,17 +499,28 @@ invalid:
   or a word joiner.
 - The value starts with `-`. The value becomes one argument in the list the agent binary is
   run with, and an argument starting with `-` is read as a flag, not a value.
-- The value contains a character outside `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`, or `/`.
+- The value contains a character outside `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`, or `/` — and even
+  among those, the FIRST character must be one of `A-Z`, `a-z`, `0-9`, `.`, or `_`: a leading
+  `-` or a leading `/` is rejected, though either may appear later in the value.
 - Two labels on the same issue carry the same prefix. Two `model:` labels is an error, not a
   choice between them — nothing decides which one wins.
 - `harness:` names anything other than `claude` or `pi`.
 - `effort:` names anything other than `low`, `medium`, `high`, `xhigh`, or `max`.
 
-A `harness:` label is also refused when the loop's own configuration sets `agent.permission_mode`
-or a nonzero `agent.max_budget_usd`. The `pi` harness accepts neither flag — see
-[`agent.harness`](#agentharness--optional) — so switching harness would silently run the
-dispatch with no permission mode and no cost ceiling. Refusing the label keeps both safety
-settings in force.
+A `harness:` label naming the loop's OWN configured harness is a no-op: it is accepted, but
+changes nothing.
+
+A `harness:` label that would switch the EFFECTIVE harness to `pi` is refused when the loop's
+own configuration sets `agent.permission_mode` or a nonzero `agent.max_budget_usd`. The `pi`
+harness accepts neither flag — see [`agent.harness`](#agentharness--optional) — so switching TO
+`pi` would silently run the dispatch with no permission mode and no cost ceiling. The rule is
+directional: switching to `claude` is never refused, however the loop is configured, because
+`claude` only ever adds a bound `pi` did not enforce in the first place — it can never drop one.
+
+On a loop that configures NEITHER `agent.permission_mode` nor `agent.max_budget_usd` — the
+default — a `harness:` label changes which binary runs with no additional gate at all. This is
+accepted and deliberate, not an oversight: the guard exists to protect two specific settings, and
+a loop that never set them has nothing for the guard to protect.
 
 ### What an invalid label does
 

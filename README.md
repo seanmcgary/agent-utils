@@ -118,6 +118,8 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 |---|---|
 | `agent-utils list` | Every project on this machine, with each loop's ticks, live dispatches, cost and last tick |
 | `agent-utils sessions list [--project <p>] [--loop <l>] [--running] [--orphaned]` | Every session on this machine, with its project, issue, runs, cost and state |
+| `agent-utils sessions kill --session <id> \| --issue <n> \| --all --yes [--project <p>] [--loop <l>] [--force] [--timeout <d>]` | Stop a running session: signal its runner, mark the issue stopped, and record the outcome |
+| `agent-utils sessions resume --session <id> \| --issue <n> \| --all --yes [--project <p>] [--loop <l>]` | Clear a stopped issue's flags so its next trigger starts fresh |
 | `agent-utils logs [--name <loop>] [--session <id>]` | The log of a dispatched agent, for the project in the current directory |
 | `agent-utils forget <name\|id\|path>` | Drop a project from the registry, touching none of its files |
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
@@ -396,6 +398,17 @@ the choice of which binary runs and which model is billed. An invalid label stop
 rather than falling back to a default, and clearing that flag needs `sessions resume` run on the
 loop's own machine — so a label applied from GitHub can halt an issue that only a local operator
 can restart. See [Stopping a session](#stopping-a-session).
+
+A `harness:` label is refused only when it would switch the effective harness to `pi` on a loop
+that configured `agent.permission_mode` or a nonzero `agent.max_budget_usd` — the `pi` harness
+enforces neither, so switching to it would silently drop both. Switching to `claude` is never
+refused, since `claude` only ever adds a bound `pi` did not enforce. On a loop that configures
+neither setting, a `harness:` label changes which binary runs — and therefore which model
+provider's credentials are used and which of that loop's environment is exposed to the agent —
+with **no additional gate at all**. This is accepted, deliberate behaviour: the guard protects
+two specific settings, and a loop that never set either has nothing for it to protect. Set
+`agent.permission_mode` or `agent.max_budget_usd` on any loop where an untrusted collaborator
+choosing the harness is a concern.
 
 The webhook listener adds one more thing worth naming plainly: it accepts a request from the
 internet that starts an agent. That is a stronger claim than "a cron job reads issues on a
