@@ -704,10 +704,10 @@ func runAgentContext(ctx context.Context) (context.Context, context.CancelFunc)
 
 | Field   | Value                                                        |
 |---------|--------------------------------------------------------------|
-| stage   | 3 (implementation)                                           |
+| stage   | 5 (pr feedback loop)                                         |
 | class   | large (new command, new columns, signals, argv-bound values) |
 | profile | backend                                                      |
 | branch  | feat/session-kill-and-label-overrides                        |
 | pr      | #12                                                          |
 | gate    | approved 2026-08-26                                          |
-| round   | 0                                                            |
+| round   | 1 (awaiting review)                                          |
