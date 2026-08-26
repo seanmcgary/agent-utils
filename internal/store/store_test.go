@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -193,13 +194,11 @@ func TestReopenPersists(t *testing.T) {
 	}
 }
 
-// A database created by an older build must keep working. CREATE TABLE IF NOT
-// EXISTS does nothing to an existing file, so every column added after the
-// first release has to be added explicitly.
-func TestOpenMigratesAnOlderDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-
-	// Build a database with the pre-migration shape.
+// writeOldSchema builds a database file with the pre-migration shape, so a
+// test can assert that Open brings it forward. Extracted so more than one
+// test can start from the same pre-migration fixture.
+func writeOldSchema(t *testing.T, path string) {
+	t.Helper()
 	old, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +227,14 @@ func TestOpenMigratesAnOlderDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	old.Close()
+}
+
+// A database created by an older build must keep working. CREATE TABLE IF NOT
+// EXISTS does nothing to an existing file, so every column added after the
+// first release has to be added explicitly.
+func TestOpenMigratesAnOlderDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	writeOldSchema(t, path)
 
 	db, err := Open(path)
 	if err != nil {
@@ -259,5 +266,221 @@ func TestOpenMigratesAnOlderDatabase(t *testing.T) {
 	}
 	if got, err := s.IssueStates("planning", "o/r"); err != nil || len(got) != 0 {
 		t.Errorf("a project must not see unclaimed rows: %v, %v", got, err)
+	}
+}
+
+// MarkStopped and ClearStopped round-trip the flag and its reason.
+//
+// ClearStopped also clears needs_retry and retry_after, but leaves parked
+// alone. A killed runner's dispatch is recorded FAILED, and finish marks the
+// issue for retry (runner.go:320), so a resumed issue would otherwise carry a
+// failure it did not earn.
+func TestMarkStoppedAndClearStopped(t *testing.T) {
+	s := openTemp(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if err := s.MarkStopped("planning", "o/r", 1, "harness:gpt is not valid", now); err != nil {
+		t.Fatalf("MarkStopped: %v", err)
+	}
+	got, err := s.IssueState("planning", "o/r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Stopped || got.StoppedReason != "harness:gpt is not valid" {
+		t.Fatalf("after MarkStopped = %+v", got)
+	}
+
+	// Simulate the retry a killed dispatch earns, so ClearStopped's extra
+	// clearing has something to prove it clears.
+	if err := s.MarkNeedsRetry("planning", "o/r", 1, now, []time.Duration{time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutIssueState(IssueState{
+		Loop: "planning", Repo: "o/r", Number: 1, Parked: true, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ClearStopped("planning", "o/r", 1, now); err != nil {
+		t.Fatalf("ClearStopped: %v", err)
+	}
+	got, err = s.IssueState("planning", "o/r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Stopped || got.StoppedReason != "" {
+		t.Fatalf("after ClearStopped, still stopped: %+v", got)
+	}
+	if got.NeedsRetry || !got.RetryAfter.IsZero() {
+		t.Fatalf("ClearStopped must clear needs_retry and retry_after: %+v", got)
+	}
+	if !got.Parked {
+		t.Fatalf("ClearStopped must NOT clear parked: %+v", got)
+	}
+}
+
+// BeginDispatch, MarkSucceeded, and PutIssueState must all leave stopped
+// alone. PutIssueState is the subtle one: parkRetryExhausted reads a whole
+// state and writes it back (tick.go:499), and if stopped were in its
+// conflict set, a state read before a kill and written after it would carry
+// stopped = 0 and silently un-stop the issue.
+func TestStoppedSurvivesBeginDispatchMarkSucceededAndPutIssueState(t *testing.T) {
+	s := openTemp(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if err := s.MarkStopped("planning", "o/r", 1, "operator kill", now); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.BeginDispatch("planning", "o/r", 1, "sess-1", false, now); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.IssueState("planning", "o/r", 1)
+	if !got.Stopped {
+		t.Fatalf("BeginDispatch cleared stopped: %+v", got)
+	}
+
+	if err := s.MarkSucceeded("planning", "o/r", 1); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.IssueState("planning", "o/r", 1)
+	if !got.Stopped {
+		t.Fatalf("MarkSucceeded cleared stopped: %+v", got)
+	}
+
+	// The park path's exact shape: read a state, then write it back stale.
+	stale, err := s.IssueState("planning", "o/r", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutIssueState(stale); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.IssueState("planning", "o/r", 1)
+	if !got.Stopped {
+		t.Fatalf("PutIssueState cleared stopped: %+v", got)
+	}
+}
+
+// Store.StoppedIssues is scoped to one project; DB.StoppedIssues spans every
+// project. Two projects each hold an issue 7 in a loop with the same name, so
+// a read that forgot the project would merge them.
+func TestStoppedIssuesScoping(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	const projA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	const projB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	sA := db.Project(projA)
+	sB := db.Project(projB)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if err := sA.MarkStopped("loopname", "o/r", 7, "reason A", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := sB.MarkStopped("loopname", "o/r", 7, "reason B", now); err != nil {
+		t.Fatal(err)
+	}
+
+	scoped, err := sA.StoppedIssues("loopname", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].StoppedReason != "reason A" {
+		t.Fatalf("Store.StoppedIssues scoped = %+v", scoped)
+	}
+
+	all, err := db.StoppedIssues()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("DB.StoppedIssues = %d entries, want 2: %+v", len(all), all)
+	}
+	byProject := map[string]StoppedIssue{}
+	for _, si := range all {
+		byProject[si.ProjectID] = si
+	}
+	if byProject[projA].Reason != "reason A" || byProject[projB].Reason != "reason B" {
+		t.Fatalf("DB.StoppedIssues merged projects: %+v", all)
+	}
+}
+
+// CreateDispatch round-trips the three override columns; SetDispatchAgentPID
+// round-trips the agent's own pid, separate from the runner's pid.
+func TestCreateDispatchOverridesAndAgentPID(t *testing.T) {
+	s := openTemp(t)
+	id, err := s.CreateDispatch(Dispatch{
+		Loop: "planning", Repo: "o/r", Number: 3, Kind: KindStart,
+		Model: "claude-opus-5", Harness: "pi", Effort: "high",
+	})
+	if err != nil {
+		t.Fatalf("CreateDispatch: %v", err)
+	}
+	got, err := s.GetDispatch(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "claude-opus-5" || got.Harness != "pi" || got.Effort != "high" {
+		t.Fatalf("override columns did not round-trip: %+v", got)
+	}
+	if got.AgentPID != 0 {
+		t.Fatalf("AgentPID should start at 0: %+v", got)
+	}
+
+	if err := s.SetDispatchAgentPID(id, 9999); err != nil {
+		t.Fatalf("SetDispatchAgentPID: %v", err)
+	}
+	got, err = s.GetDispatch(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AgentPID != 9999 {
+		t.Fatalf("AgentPID = %d, want 9999", got.AgentPID)
+	}
+}
+
+// A database created by an older build gains all six new columns, and the
+// rebuild list keeps naming the two issues columns by hand — a rebuild that
+// dropped them would silently un-stop every stopped issue.
+func TestOpenMigratesTheStoppedAndOverrideColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	writeOldSchema(t, path)
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open must migrate an older database: %v", err)
+	}
+	defer db.Close()
+
+	for _, c := range []struct{ table, column string }{
+		{"issues", "stopped"},
+		{"issues", "stopped_reason"},
+		{"dispatches", "agent_pid"},
+		{"dispatches", "model"},
+		{"dispatches", "harness"},
+		{"dispatches", "effort"},
+	} {
+		has, err := hasColumn(db.db, c.table, c.column)
+		if err != nil {
+			t.Fatalf("hasColumn(%s.%s): %v", c.table, c.column, err)
+		}
+		if !has {
+			t.Errorf("column %s.%s missing after migration", c.table, c.column)
+		}
+	}
+
+	var issuesColumns string
+	for _, r := range rebuilt {
+		if r.table == "issues" {
+			issuesColumns = r.columns
+		}
+	}
+	if !strings.Contains(issuesColumns, "stopped") || !strings.Contains(issuesColumns, "stopped_reason") {
+		t.Fatalf("rebuilt's issues entry does not name stopped and stopped_reason: %q", issuesColumns)
 	}
 }

@@ -49,6 +49,13 @@ CREATE TABLE IF NOT EXISTS issues (
   -- DEFAULT so an existing database gains the column without a backfill, and no
   -- literal TIMESTAMP default reads back as the zero time.
   retry_after     INTEGER NOT NULL DEFAULT 0,
+  -- stopped and stopped_reason are set by an operator's "sessions kill" or by
+  -- a KindStop decision (an invalid label), and cleared only by
+  -- "sessions resume". PutIssueState must never write them: it is a
+  -- read-modify-write, and a state read before a kill and written after would
+  -- silently un-stop the issue.
+  stopped         INTEGER NOT NULL DEFAULT 0,
+  stopped_reason  TEXT NOT NULL DEFAULT '',
   updated_at      TIMESTAMP NOT NULL,
   PRIMARY KEY (project_id, loop, repo, number)
 );
@@ -74,7 +81,16 @@ CREATE TABLE IF NOT EXISTS dispatches (
   pr_number     INTEGER NOT NULL DEFAULT 0,
   title         TEXT NOT NULL DEFAULT '',
   legacy_source TEXT NOT NULL DEFAULT '',
-  legacy_id     INTEGER NOT NULL DEFAULT 0
+  legacy_id     INTEGER NOT NULL DEFAULT 0,
+  -- agent_pid is the agent CHILD's pid, distinct from pid above (the
+  -- runner's). It is never cleared once set, so it is stale on any row whose
+  -- runner has already died.
+  agent_pid     INTEGER NOT NULL DEFAULT 0,
+  -- model, harness, and effort are the label overrides in effect for this
+  -- dispatch. Empty means "no override", never "the empty model".
+  model         TEXT NOT NULL DEFAULT '',
+  harness       TEXT NOT NULL DEFAULT '',
+  effort        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS pr_links (
@@ -326,6 +342,12 @@ var addedColumns = []struct{ table, column, def string }{
 	{"dispatches", "legacy_id", "INTEGER NOT NULL DEFAULT 0"},
 	{"ticks", "project_id", "TEXT NOT NULL DEFAULT ''"},
 	{"issues", "retry_after", "INTEGER NOT NULL DEFAULT 0"},
+	{"issues", "stopped", "INTEGER NOT NULL DEFAULT 0"},
+	{"issues", "stopped_reason", "TEXT NOT NULL DEFAULT ''"},
+	{"dispatches", "agent_pid", "INTEGER NOT NULL DEFAULT 0"},
+	{"dispatches", "model", "TEXT NOT NULL DEFAULT ''"},
+	{"dispatches", "harness", "TEXT NOT NULL DEFAULT ''"},
+	{"dispatches", "effort", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // addColumns adds any column missing from an existing database. Each column has
@@ -352,7 +374,7 @@ func addColumns(tx *sql.Tx) error {
 var rebuilt = []struct{ table, columns string }{
 	{"issues", `loop, repo, number, session_id, worktree_path, retry_count,
 		last_retry_tick, needs_retry, session_started, parked, retry_after,
-		updated_at`},
+		stopped, stopped_reason, updated_at`},
 	{"pr_links", `loop, repo, number, pr_number, head_ref, base_ref, behind_by`},
 	{"cooldowns", `loop, until`},
 }
@@ -435,7 +457,8 @@ func hasColumn(q querier, table, column string) (bool, error) {
 func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	rows, err := s.db.Query(`
 		SELECT number, session_id, worktree_path, retry_count, last_retry_tick,
-		       needs_retry, session_started, parked, retry_after, updated_at
+		       needs_retry, session_started, parked, retry_after,
+		       stopped, stopped_reason, updated_at
 		FROM issues WHERE project_id = ? AND loop = ? AND repo = ?`,
 		s.projectID, loop, repo)
 	if err != nil {
@@ -449,7 +472,8 @@ func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 		var retryAfter int64
 		if err := rows.Scan(&st.Number, &st.SessionID, &st.WorktreePath,
 			&st.RetryCount, &st.LastRetryTick, &st.NeedsRetry, &st.SessionStarted,
-			&st.Parked, &retryAfter, &st.UpdatedAt); err != nil {
+			&st.Parked, &retryAfter, &st.Stopped, &st.StoppedReason,
+			&st.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan issue: %w", err)
 		}
 		st.RetryAfter = retryAfterTime(retryAfter)
@@ -609,6 +633,74 @@ func (s *Store) ClearRetryAfter(loop, repo string, number int) error {
 		return fmt.Errorf("clear retry after: %w", err)
 	}
 	return nil
+}
+
+// MarkStopped sets the stopped flag and its reason for one issue.
+//
+// It is an UPSERT, ON CONFLICT(project_id, loop, repo, number), rather than an
+// UPDATE, because an invalid label can be the very FIRST thing Decide ever
+// sees for an issue -- no row exists yet, and an UPDATE that matched nothing
+// would silently fail to record the stop. It is a targeted write, not a
+// read-modify-write, for the reason BeginDispatch gives above: a killed
+// dispatch's own MarkNeedsRetry can land between a read and this write, and a
+// stale write-back would lose that failure.
+func (s *Store) MarkStopped(loop, repo string, number int, reason string, now time.Time) error {
+	_, err := s.db.Exec(`
+		INSERT INTO issues (project_id, loop, repo, number, stopped, stopped_reason, updated_at)
+		VALUES (?, ?, ?, ?, 1, ?, ?)
+		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
+		  stopped        = 1,
+		  stopped_reason = excluded.stopped_reason,
+		  updated_at     = excluded.updated_at`,
+		s.projectID, loop, repo, number, reason, now.UTC())
+	if err != nil {
+		return fmt.Errorf("mark stopped: %w", err)
+	}
+	return nil
+}
+
+// ClearStopped resumes a stopped issue.
+//
+// It also clears needs_retry and retry_after, but leaves parked alone. A
+// killed runner's dispatch is recorded FAILED, and the runner's own finish
+// call marks the issue for retry (internal/runner/runner.go:320) -- that
+// happens whether or not an operator meant to resume it, so a resumed issue
+// must not carry a failure it did not earn. parked is a fact about the
+// retry budget, unrelated to why the issue was stopped, so it is untouched.
+func (s *Store) ClearStopped(loop, repo string, number int, now time.Time) error {
+	_, err := s.db.Exec(`
+		UPDATE issues
+		SET stopped = 0, stopped_reason = '', needs_retry = 0, retry_after = 0,
+		    updated_at = ?
+		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
+		now.UTC(), s.projectID, loop, repo, number)
+	if err != nil {
+		return fmt.Errorf("clear stopped: %w", err)
+	}
+	return nil
+}
+
+// StoppedIssues returns every stopped issue in one loop.
+func (s *Store) StoppedIssues(loop, repo string) ([]IssueState, error) {
+	rows, err := s.db.Query(`
+		SELECT number, stopped_reason
+		FROM issues
+		WHERE project_id = ? AND loop = ? AND repo = ? AND stopped = 1`,
+		s.projectID, loop, repo)
+	if err != nil {
+		return nil, fmt.Errorf("query stopped issues: %w", err)
+	}
+	defer rows.Close()
+
+	var out []IssueState
+	for rows.Next() {
+		st := IssueState{ProjectID: s.projectID, Loop: loop, Repo: repo, Stopped: true}
+		if err := rows.Scan(&st.Number, &st.StoppedReason); err != nil {
+			return nil, fmt.Errorf("scan stopped issue: %w", err)
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
 }
 
 // BeginDispatch records the issue state a dispatch owns, just before the agent
@@ -776,10 +868,12 @@ func (s *Store) DeleteIssueState(loop, repo string, number int) error {
 func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO dispatches (project_id, loop, repo, number, kind, session_id,
-		                        status, started_at, log_path, pr_number, title)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                        status, started_at, log_path, pr_number, title,
+		                        model, harness, effort)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.projectID, d.Loop, d.Repo, d.Number, d.Kind, d.SessionID,
-		StatusRunning, time.Now().UTC(), d.LogPath, d.PRNumber, d.Title)
+		StatusRunning, time.Now().UTC(), d.LogPath, d.PRNumber, d.Title,
+		d.Model, d.Harness, d.Effort)
 	if err != nil {
 		return 0, fmt.Errorf("create dispatch: %w", err)
 	}
@@ -794,6 +888,22 @@ func (s *Store) SetDispatchProcess(id int64, pid int, startedAt time.Time) error
 		pid, startedAt.UTC(), id, s.projectID)
 	if err != nil {
 		return fmt.Errorf("set dispatch process: %w", err)
+	}
+	return nil
+}
+
+// SetDispatchAgentPID records the agent CHILD's own process identifier, once
+// Supervise has started it. It is separate from SetDispatchProcess (the
+// runner's own pid) because the runner is spawned Setsid and the agent child
+// Setpgid into its own group -- a signal to one does not reach the other, and
+// killing the agent needs this pid, verified against the runner independently
+// by internal/proc.
+func (s *Store) SetDispatchAgentPID(id int64, pid int) error {
+	_, err := s.db.Exec(
+		`UPDATE dispatches SET agent_pid = ? WHERE id = ? AND project_id = ?`,
+		pid, id, s.projectID)
+	if err != nil {
+		return fmt.Errorf("set dispatch agent pid: %w", err)
 	}
 	return nil
 }
@@ -829,7 +939,8 @@ var ErrDispatchNotRunning = errors.New("dispatch is no longer running")
 
 const dispatchColumns = `id, project_id, loop, repo, number, kind, session_id, pid,
 	pid_start_at, status, started_at, finished_at, exit_code, cost_usd, duration_ms,
-	api_error, log_path, pr_number, title, legacy_source, legacy_id`
+	api_error, log_path, pr_number, title, legacy_source, legacy_id,
+	agent_pid, model, harness, effort`
 
 func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 	var d Dispatch
@@ -837,7 +948,8 @@ func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 	err := sc.Scan(&d.ID, &d.ProjectID, &d.Loop, &d.Repo, &d.Number, &d.Kind,
 		&d.SessionID, &d.PID, &pidStart, &d.Status, &d.StartedAt, &finished,
 		&d.ExitCode, &d.CostUSD, &d.DurationMS, &d.APIError, &d.LogPath,
-		&d.PRNumber, &d.Title, &d.LegacySource, &d.LegacyID)
+		&d.PRNumber, &d.Title, &d.LegacySource, &d.LegacyID,
+		&d.AgentPID, &d.Model, &d.Harness, &d.Effort)
 	if err != nil {
 		return Dispatch{}, err
 	}
@@ -1043,6 +1155,29 @@ func (d *DB) RunningDispatches() ([]Dispatch, error) {
 		return nil, fmt.Errorf("query running dispatches: %w", err)
 	}
 	return scanDispatches(rows)
+}
+
+// StoppedIssues returns every stopped issue on the machine, in every project.
+// It is the machine-wide read the per-project view cannot answer -- the same
+// reason DB.RunningDispatches exists beside Store.RunningDispatches.
+func (d *DB) StoppedIssues() ([]StoppedIssue, error) {
+	rows, err := d.db.Query(`
+		SELECT project_id, loop, repo, number, stopped_reason
+		FROM issues WHERE stopped = 1`)
+	if err != nil {
+		return nil, fmt.Errorf("query stopped issues: %w", err)
+	}
+	defer rows.Close()
+
+	var out []StoppedIssue
+	for rows.Next() {
+		var si StoppedIssue
+		if err := rows.Scan(&si.ProjectID, &si.Loop, &si.Repo, &si.Number, &si.Reason); err != nil {
+			return nil, fmt.Errorf("scan stopped issue: %w", err)
+		}
+		out = append(out, si)
+	}
+	return out, rows.Err()
 }
 
 // DispatchesForProject returns every dispatch of one project, newest first.
