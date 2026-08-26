@@ -196,6 +196,14 @@ deadline that delays the next dispatch.
 `resume` does NOT clear `parked`. The two flags are independent, and a resume
 must not silently undo a retry-cap park.
 
+`resume` REFUSES an issue whose dispatch is still marked running and whose
+runner is still alive. The runner holds no loop lock, and its `finish` calls
+`MarkNeedsRetry` (`internal/runner/runner.go:321`). A resume issued while the
+runner is still dying would clear the retry state and then have it written
+back, leaving the issue un-stopped AND flagged for retry, so the next tick
+takes the retry path instead of a clean start. The refusal names the dispatch
+and tells the operator to wait or to use `kill --force`.
+
 ### 4.4 The recorded outcome
 
 A killed dispatch is recorded with status `failed` and with the api_error
@@ -246,25 +254,43 @@ which process group the agent occupies.
 
 `--force` kills the agent first, then the runner:
 
-1. Send SIGKILL to the agent's process group, addressed as the negative of
+1. Confirm the RUNNER is verifiably this dispatch's runner. See below.
+2. Send SIGKILL to the agent's process group, addressed as the negative of
    `agent_pid`.
-2. Send SIGKILL to the runner.
-3. Write the outcome, because no process survives to write it.
+3. Send SIGKILL to the runner.
+4. Write the outcome, because no process survives to write it.
 
-The order matters. SIGKILL on the runner alone leaves the agent running in a
-worktree that the loop believes is free.
+The order of steps 2 and 3 matters. SIGKILL on the runner alone leaves the
+agent running in a worktree that the loop believes is free.
+
+Step 1 is the safety rule, and it is not optional. `agent_pid` is written once
+and never cleared, so any row still marked `running` after a crash, a host
+reboot, or an externally killed runner carries a STALE identifier. After a
+reboot the identifier space is reused wholesale, so a group kill on a stale
+`agent_pid` would SIGKILL whatever unrelated process group now leads that
+number — across the machine under `kill --all --yes --force`. A live, verified
+runner is the only evidence that `agent_pid` is current.
+
+When the runner cannot be verified, the command does NOT signal the agent
+group. It records the outcome, reports the row, and says that the agent could
+not be reached. This leaves one residual case: an agent orphaned by a runner
+that something else killed is not reachable by this command. That is stated
+rather than papered over; the operator kills it by hand.
 
 `--force` skips the wait in step 7 of section 4.2.
 
 The command validates `agent_pid` exactly as it validates the runner's
-identifier. A value that is not positive is not signalled.
+identifier, and more strictly: see section 5.4.
 
 ### 5.4 A new helper in `internal/proc`
 
 `internal/proc` gains two functions:
 
-    // Signal sends sig to pid after it confirms that pid is the runner for
-    // dispatchID.
+    // VerifyRunner reports an error unless pid is CONFIRMED to be the runner
+    // for dispatchID.
+    func VerifyRunner(pid int, dispatchID int64) error
+
+    // Signal sends sig to pid after VerifyRunner passes.
     func Signal(pid int, dispatchID int64, sig syscall.Signal) error
 
     // SignalGroup sends sig to the process group led by pid.
@@ -273,6 +299,19 @@ identifier. A value that is not positive is not signalled.
 The package already owns the rule that a process identifier must be checked
 against the dispatch before it is trusted. The signal belongs with that rule,
 not in the command layer.
+
+`VerifyRunner` exists rather than a reuse of `IsAlive`, because the two want
+OPPOSITE biases. `IsAlive` fails SAFE by reporting alive when `ps` errors
+(`internal/proc/proc.go:42`): for liveness that is right, since a transient
+error must not cause a duplicate dispatch. For signalling it is inverted. A
+`ps` that fails means the process was never confirmed to be ours, and the safe
+answer is to refuse. `VerifyRunner` therefore treats a `CommandLine` error as a
+refusal.
+
+`SignalGroup` rejects any identifier of 1 or less, not merely 0 or less. It
+negates its argument, and `kill(2)` reads -1 as "every process this user
+owns". A `pid` of 1 is positive, is a live identifier in any container, and
+would produce exactly that broadcast.
 
 ## 6. Feature 2: label overrides
 
@@ -317,17 +356,49 @@ parses these labels.
 2. The value contains a space or any other whitespace.
 3. The value starts with `-`. The value becomes an element of an `exec`
    argument list, and a value that starts with `-` is read as a flag.
-4. Two labels carry the same prefix. `model:a` and `model:b` on one issue is
+4. The value does not match `^[A-Za-z0-9._][A-Za-z0-9._/-]*$`. This is an
+   allowlist, not a denylist. `ghub.SafeRef` sets the precedent for an
+   externally supplied string that becomes an argument
+   (`internal/ghub/types.go:141`). The allowlist also excludes the zero-width
+   and word-joiner characters that `unicode.IsSpace` does not match.
+5. Two labels carry the same prefix. `model:a` and `model:b` on one issue is
    an error, not a choice.
-5. `harness` is not `claude` and is not `pi`. The list is the one
-   `config.validate` already enforces (`internal/config/config.go:215`).
+6. `harness` is not `claude` and is not `pi`. The comparison ignores case, and
+   the stored value is lowered. The list is the one `config.validate` already
+   enforces (`internal/config/config.go:215`).
+7. `effort` is not one of `low`, `medium`, `high`, `xhigh`, or `max`. The
+   comparison ignores case, and the stored value is lowered.
+   `config.validate` enforces exactly this closed list
+   (`internal/config/config.go:263`). Without the rule, `effort:bogus` would
+   reach the argument list through a path the configuration closes.
 
-One more rule needs the configuration as well as the labels, so `Decide`
-applies it after the parse: the `pi` harness requires a model
-(`internal/config/config.go:232`). An issue that selects `harness:pi` on a
-loop whose `agent.model` is empty must also carry a `model:` label.
+Rules 3 and 4 are the argument-injection rules. Section 9 explains them.
 
-Rule 3 is the security rule. Section 9 explains it.
+Every error message quotes the label with `%q`. The text is persisted in
+`stopped_reason`, logged, and printed to a terminal, so a raw label carrying a
+newline or a terminal escape must not travel unquoted.
+
+### 6.3.1 One rule needs the configuration as well as the labels
+
+A `harness:` override must not drop a safety setting the loop configured.
+
+`config.validate` forbids `agent.permission_mode` together with `harness: pi`
+(`internal/config/config.go:218`), and `PiBuildArgs` emits neither a permission
+mode nor a cost ceiling (`internal/runner/args.go:60`). So on a loop configured
+`harness: claude` with a restrictive `agent.permission_mode` and an
+`agent.max_budget_usd`, a `harness:pi` label would run the dispatch with NO
+permission mode and NO budget ceiling. A label would then weaken exactly the
+two settings that bound an agent reading third-party issue text.
+
+`Decide` therefore refuses a `harness:` override that changes the harness away
+from the configured one when the configuration sets either
+`agent.permission_mode` or a non-zero `agent.max_budget_usd`. The issue is
+stopped with a reason naming the setting.
+
+There is deliberately NO rule that the `pi` harness needs a model.
+`agent.model` is required for every harness (`internal/config/config.go:261`),
+so a validated configuration always has one and such a rule could never
+fire.
 
 ### 6.4 An invalid label stops the issue
 
@@ -386,6 +457,17 @@ longer matches the file it was loaded from.
 Overrides apply to a dispatch that comes from an issue: `start`, `resume`,
 `retry_start`, and `retry_resume`.
 
+The retry kinds matter, and they are easy to lose. `retryDecision` builds them
+and receives no labels (`internal/engine/engine.go:199`), so `Decide` must
+attach the overrides to the decision that function RETURNS. If it did not,
+every retry would silently fall back to the configured model.
+
+An invalid override label stops the issue only where a DISPATCH would
+otherwise happen. It must not block `KindClearRetry` or
+`KindParkRetryExhausted`: both are repair actions, and an issue whose retry
+flag can no longer be cleared is stranded permanently
+(`internal/engine/engine.go:81`).
+
 Overrides do NOT apply to a `tend` dispatch. A tend run rebases a pull
 request. It is not the issue's work, and the reference loops configure it
 once. The documentation states this limit.
@@ -409,6 +491,31 @@ Each has a default, so no backfill is needed.
 An empty override column means "no override". It does not mean "the empty
 model".
 
+### 7.1.1 Two reads, because there are two scopes
+
+`Store.StoppedIssues(loop, repo)` answers a project-scoped resume.
+
+`DB.StoppedIssues()` is new and answers the machine-wide report. It returns
+`{ProjectID, Loop, Repo, Number, Reason}`. It has to exist: every `Store` read
+is project-scoped, and `sessions list` spans the machine, so there is no way
+to label a machine-wide table from a scoped read. `DB.RunningDispatches`
+(`internal/store/store.go:1038`) is the precedent for the pair.
+
+A stopped issue is keyed by `{ProjectID, Loop, Number}` wherever it is joined
+to a session. A key of loop and number alone collides across projects, which
+is the same reason `sessionKey` carries the project
+(`internal/loopcmd/sessions.go:231`).
+
+### 7.1.2 Where the reason is shown
+
+`stopped_reason` is written to be read. Two surfaces show it:
+
+- `sessions list` shows `STOPPED` in the STATE column.
+- `agent-utils project loop status` shows `stopped` in its state column and
+  lists each stopped issue with its reason under the table. The table has no
+  room for a sentence, and the reason is the whole point of the flag. The
+  `parked` state is rendered in the same column (`internal/loopcmd/status.go:115`).
+
 ### 7.2 Which writes touch `stopped`
 
 - `sessions kill` sets it.
@@ -418,6 +525,12 @@ model".
   is not stopped, so a clear there would be unreachable at best and a silent
   un-stop at worst.
 - `MarkSucceeded` must NOT clear it, for the same reason.
+- `PutIssueState` must NOT write either column. It reads a whole state and
+  writes it back, and `parkRetryExhausted` uses it that way
+  (`internal/loopcmd/tick.go:499`). A state read before a kill and written
+  after it would carry `stopped = 0` and silently un-stop the issue. The two
+  columns are READ by `IssueStates` and written only by `MarkStopped` and
+  `ClearStopped`.
 
 ### 7.3 The rebuild list
 
@@ -437,6 +550,9 @@ issue.
 | The process identifier is not positive | The command does not signal. It records the outcome and reports the row. |
 | The process is not this dispatch's runner | The command does not signal. It records the outcome and reports that the process was gone. |
 | The runner does not exit within the timeout | The command reports it and names `--force`. The `stopped` flag is already written, so the issue is safe. |
+| The signal itself fails (EPERM, or any error that is not "already gone") | The command reports the target as failed and names `--force`. The issue stays stopped, so the loop dispatches nothing, but the agent is still alive. The report says so plainly rather than implying the agent is dead. |
+| `--force` cannot verify the runner | The command does not signal the agent group. It records the outcome and reports that the agent could not be reached. See section 5.3. |
+| `resume` finds a live runner for the issue | The command refuses that target and names the dispatch. See section 4.3. |
 | `kill` finds no running dispatch | The command reports it and exits 0. Killing nothing is not an error. |
 | `resume` finds no stopped issue | The command reports it and exits 0. |
 
