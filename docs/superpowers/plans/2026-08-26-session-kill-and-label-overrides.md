@@ -1,6 +1,6 @@
 # Session kill and label overrides — implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let an operator stop a running session from the command line, and let a label on an issue override the agent model, harness, or effort for that issue.
 
@@ -12,7 +12,9 @@
 
 **Class:** Large. **Profile:** backend.
 
-**Execution:** inline, TDD per task — write the listed tests, watch them fail, implement, watch them pass, run the task's gate, commit. Only Task 3 carries a per-task reviewer; the stage-4 whole-diff fan-out covers the rest.
+**Execution:** one fresh subagent per task, TDD within it — write the listed tests, watch them fail, implement, watch them pass, run the task's gate, commit. Tasks are deliberately broad so there are four passes, not eight.
+
+**Review:** NO per-task reviewers. Every task is gated by its own tests and acceptance criteria, which is what a specified-enough plan buys. There is exactly ONE authoritative review: the stage-4 whole-diff fan-out over the finished branch. Do not add a review between tasks — that is the ratchet this cadence exists to prevent, where each round's fixes hand the next round a changed diff to find new findings in.
 
 ## Global Constraints
 
@@ -419,8 +421,9 @@ it prevents.
 
 ## Task 3: Kill, resume, and the signal path
 
-**review: yes** — a mistake here orphans an agent or signals the wrong process.
-This is the one task that gets its own reviewer.
+**review: no** — the largest task, and the one whose tests are most load-bearing.
+Every guard below has a test that names the failure it prevents; the whole-diff
+fan-out at the end is what reviews it.
 
 **Files:** create `internal/loopcmd/kill.go` + test, `cmd/agent-utils/runagent.go`
 + test; modify `internal/runner/{args.go,runner.go}`,
@@ -588,9 +591,6 @@ func runAgentContext(ctx context.Context) (context.Context, context.CancelFunc)
 
 - [ ] **Commit** in two: `feat: handle SIGTERM in the runner and apply agent overrides`,
   then `feat: add the session kill and resume actions`.
-
-- [ ] **Dispatch one reviewer** (`claude-opus-5`, backend reviewer slice) over
-  this task's diff only.
 
 **Acceptance criteria:**
 - `Effective` is the only place resolving an override against the config:
