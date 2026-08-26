@@ -269,6 +269,21 @@ func TestSuperviseUnderCancellationKillsTheAgentAndRecordsAnOutcome(t *testing.T
 		t.Fatalf("stub agent never recorded a pid in %s", pidFile)
 	}
 
+	// Supervise must have recorded the agent's own pid via
+	// SetDispatchAgentPID (runner.go:212-214) immediately after starting it,
+	// while the agent is still alive. Without this, agent_pid stays 0
+	// forever, and kill.go:291's `if w.Dispatch.AgentPID > 0` silently skips
+	// the agent group kill under --force -- degrading it to a runner-only
+	// kill that leaves the agent orphaned in a worktree the loop believes is
+	// free. (agent_pid is read here, before cancellation: Supervise clears it
+	// back to 0 once cmd.Wait returns, so a live process is the only window
+	// in which it is expected to be set.)
+	if beforeCancel, err := s.GetDispatch(id); err != nil {
+		t.Fatal(err)
+	} else if beforeCancel.AgentPID != agentPID {
+		t.Errorf("AgentPID = %d, want the stub's own pid %d while it is still running", beforeCancel.AgentPID, agentPID)
+	}
+
 	cancel()
 
 	select {

@@ -465,6 +465,53 @@ func TestTickStopsAnIssueCarryingAnInvalidHarnessOverride(t *testing.T) {
 	}
 }
 
+// TestTickCarriesAModelOverrideToTheDispatchRow is spec section 6.5: a valid
+// `model:` label must survive the full path from Decide's decision through
+// dispatch's CreateDispatch call to the row a real runner would read. A test
+// that only checks Decide's returned decision, or only checks ParseOverrides,
+// would stay green even if dispatch dropped Model/Harness/Effort from the
+// CreateDispatch call entirely -- every label override would then be lost
+// silently, end to end. Driving a full Tick and reading the row back with
+// GetDispatch is what closes that gap.
+func TestTickCarriesAModelOverrideToTheDispatchRow(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{
+		{Number: 1, Labels: []string{"trigger", "model:claude-opus-5"}},
+	}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Started != 1 {
+		t.Fatalf("Started = %d, want 1", sum.Started)
+	}
+
+	running, err := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *store.Dispatch
+	for i := range running {
+		if running[i].Number == 1 {
+			found = &running[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no running dispatch found for issue #1: %+v", running)
+	}
+
+	got, err := deps.Store.GetDispatch(found.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "claude-opus-5" {
+		t.Errorf("Model = %q, want %q", got.Model, "claude-opus-5")
+	}
+}
+
 func TestTruncateKeepsColumnsAligned(t *testing.T) {
 	cases := []struct {
 		in    string

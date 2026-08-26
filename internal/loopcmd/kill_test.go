@@ -401,35 +401,51 @@ func startFakeRunnerProcess(t *testing.T, dispatchID int64) (pid int, cleanup fu
 	return 0, func() {}
 }
 
-// TestResumeRefusesALiveRunner proves the exact refusal rule Resume's
-// closure applies: a dispatch whose runner still verifies as live must not
-// be cleared. The runner holds no loop lock and its own finish calls
-// MarkNeedsRetry (runner.go:321), so clearing the flag while it might still
-// be dying would have the clear written straight back by the runner's own
-// exit.
-func TestResumeRefusesALiveRunner(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+// seedResumeFixture opens the loop at path through the real Open path (so it
+// shares the exact database runByLoop will reopen), seeds a stopped issue,
+// and returns the Target the resume test drives through runByLoop.
+func seedResumeFixture(t *testing.T, path string, withLiveRunner bool) Target {
+	t.Helper()
+	cfg, deps, cleanup, err := Open(
+		ProjectRef{ID: "demo", Name: "demo", Dir: filepath.Dir(path)},
+		path,
+		Options{MigrationPolicy: WarnOnUnimported},
+	)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
-	st := db.Project(testProject)
-
-	cfg := &config.Config{Name: "planning", Repo: "o/r"}
-	if err := st.MarkStopped(cfg.Name, cfg.Repo, 7, killedByOperatorReason, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	id, err := st.CreateDispatch(store.Dispatch{Loop: cfg.Name, Repo: cfg.Repo, Number: 7, Kind: store.KindStart})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, cleanup := startFakeRunnerProcess(t, id)
 	defer cleanup()
-	if err := st.SetDispatchProcess(id, pid, time.Now()); err != nil {
+
+	if err := deps.Store.MarkStopped(cfg.Name, cfg.Repo, 7, killedByOperatorReason, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if withLiveRunner {
+		id, err := deps.Store.CreateDispatch(store.Dispatch{Loop: cfg.Name, Repo: cfg.Repo, Number: 7, Kind: store.KindStart})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, runnerCleanup := startFakeRunnerProcess(t, id)
+		t.Cleanup(runnerCleanup)
+		if err := deps.Store.SetDispatchProcess(id, pid, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return Target{ConfigPath: path, Loop: cfg.Name, Issue: 7, Project: "demo", ProjectID: "demo", Dir: filepath.Dir(path)}
+}
 
-	results := resumeAll(t, st, cfg, Target{Issue: 7, Loop: cfg.Name, Project: "demo"})
+// TestResumeRefusesALiveRunner proves the exact refusal rule Resume applies,
+// by driving the real runByLoop/resumeTarget production path -- deleting the
+// refusal branch at resumeTarget's live-runner check makes this test fail.
+// A dispatch whose runner still verifies as live must not be cleared: the
+// runner holds no loop lock and its own finish calls MarkNeedsRetry
+// (runner.go:321), so clearing the flag while it might still be dying would
+// have the clear written straight back by the runner's own exit.
+func TestResumeRefusesALiveRunner(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeKillTestConfig(t, "planning")
+	target := seedResumeFixture(t, path, true)
+
+	results := runByLoop([]Target{target}, resumeTarget)
 	if len(results) != 1 || results[0].Action != ActionRefused {
 		t.Fatalf("results = %+v, want a single ActionRefused", results)
 	}
@@ -437,65 +453,43 @@ func TestResumeRefusesALiveRunner(t *testing.T) {
 		t.Errorf("err = %v, want it to name --force", results[0].Err)
 	}
 
-	st2, err := st.IssueState(cfg.Name, cfg.Repo, 7)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !st2.Stopped {
-		t.Error("issue must remain stopped when Resume refuses")
-	}
+	verifyResumeIssueState(t, path, target, true)
 }
 
 func TestResumeClearsADeadRunner(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	st := db.Project(testProject)
-
-	cfg := &config.Config{Name: "planning", Repo: "o/r"}
-	if err := st.MarkStopped(cfg.Name, cfg.Repo, 7, killedByOperatorReason, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeKillTestConfig(t, "planning")
 	// No running dispatch at all -- the ordinary case for a fully retired kill.
+	target := seedResumeFixture(t, path, false)
 
-	results := resumeAll(t, st, cfg, Target{Issue: 7, Loop: cfg.Name, Project: "demo"})
+	results := runByLoop([]Target{target}, resumeTarget)
 	if len(results) != 1 || results[0].Action != ActionResumed {
 		t.Fatalf("results = %+v, want a single ActionResumed", results)
 	}
 
-	st2, err := st.IssueState(cfg.Name, cfg.Repo, 7)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st2.Stopped {
-		t.Error("issue must no longer be stopped after a resume")
-	}
+	verifyResumeIssueState(t, path, target, false)
 }
 
-// resumeAll runs the exact closure Resume passes to runByLoop, against a
-// Store this test already has open, so the refusal/clear logic is tested
-// without going through registry/config file resolution.
-func resumeAll(t *testing.T, st *store.Store, cfg *config.Config, target Target) []Result {
+// verifyResumeIssueState re-opens the same store to check the stopped flag
+// after runByLoop's cleanup has run.
+func verifyResumeIssueState(t *testing.T, path string, target Target, wantStopped bool) {
 	t.Helper()
-	running, err := st.RunningDispatches(cfg.Name, cfg.Repo)
+	cfg, deps, cleanup, err := Open(
+		ProjectRef{ID: "demo", Name: "demo", Dir: filepath.Dir(path)},
+		path,
+		Options{MigrationPolicy: WarnOnUnimported},
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, target.Issue)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var res Result
-	if d, ok := matchDispatch(running, target); ok {
-		if verifyErr := proc.VerifyRunner(d.PID, d.RunnerID()); verifyErr == nil {
-			res = Result{Target: target, Action: ActionRefused, Err: fmt.Errorf(
-				"dispatch %d for issue #%d has a live runner; wait for it to exit, or use `sessions kill --force`",
-				d.ID, target.Issue)}
-			return []Result{res}
-		}
+	if st.Stopped != wantStopped {
+		t.Errorf("Stopped = %v, want %v", st.Stopped, wantStopped)
 	}
-	if err := st.ClearStopped(cfg.Name, cfg.Repo, target.Issue, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	return []Result{{Target: target, Action: ActionResumed}}
 }
 
 // --- runByLoop / the loop lock ---

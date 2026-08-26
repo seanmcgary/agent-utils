@@ -3,7 +3,6 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -444,12 +443,17 @@ func TestCreateDispatchOverridesAndAgentPID(t *testing.T) {
 	}
 }
 
-// A database created by an older build gains all six new columns, and the
-// rebuild list keeps naming the two issues columns by hand — a rebuild that
-// dropped them would silently un-stop every stopped issue.
+// A database created by an older build gains all six new columns, and a
+// stopped issue's stopped/stopped_reason survive the key rebuild that
+// happens along the way. A string check that only greps for "stopped" in the
+// rebuild column list is satisfied by "stopped_reason" alone and would stay
+// green even if "stopped," itself were dropped from the rebuild -- the exact
+// silently-un-stop-every-issue bug this test guards against. Asserting on the
+// actual data survives that mutation; asserting on the column list does not.
 func TestOpenMigratesTheStoppedAndOverrideColumns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 	writeOldSchema(t, path)
+	writeOldSchemaStoppedIssue(t, path)
 
 	db, err := Open(path)
 	if err != nil {
@@ -474,13 +478,41 @@ func TestOpenMigratesTheStoppedAndOverrideColumns(t *testing.T) {
 		}
 	}
 
-	var issuesColumns string
-	for _, r := range rebuilt {
-		if r.table == "issues" {
-			issuesColumns = r.columns
-		}
+	unclaimed := db.Project("")
+	states, err := unclaimed.IssueStates("planning", "o/r")
+	if err != nil {
+		t.Fatalf("IssueStates after migration: %v", err)
 	}
-	if !strings.Contains(issuesColumns, "stopped") || !strings.Contains(issuesColumns, "stopped_reason") {
-		t.Fatalf("rebuilt's issues entry does not name stopped and stopped_reason: %q", issuesColumns)
+	got, ok := states[2]
+	if !ok {
+		t.Fatalf("stopped issue #2 lost in migration: %+v", states)
+	}
+	if !got.Stopped {
+		t.Errorf("Stopped did not survive migration: %+v", got)
+	}
+	if got.StoppedReason != "pre-existing stop" {
+		t.Errorf("StoppedReason = %q, want %q", got.StoppedReason, "pre-existing stop")
+	}
+}
+
+// writeOldSchemaStoppedIssue inserts a second issue row directly, with the
+// stopped flag and reason set, into the pre-migration schema written by
+// writeOldSchema -- which predates the stopped/stopped_reason columns
+// entirely, so this uses ALTER TABLE to add them the way an intermediate
+// build would have, then sets them on a fresh row.
+func writeOldSchemaStoppedIssue(t *testing.T, path string) {
+	t.Helper()
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	_, err = old.Exec(`
+		ALTER TABLE issues ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE issues ADD COLUMN stopped_reason TEXT NOT NULL DEFAULT '';
+		INSERT INTO issues (loop, repo, number, session_id, stopped, stopped_reason, updated_at)
+		  VALUES ('planning', 'o/r', 2, '', 1, 'pre-existing stop', CURRENT_TIMESTAMP);`)
+	if err != nil {
+		t.Fatal(err)
 	}
 }

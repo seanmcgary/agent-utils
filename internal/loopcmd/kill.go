@@ -697,24 +697,30 @@ func Resume(sel Selector) ([]Result, error) {
 		return nil, err
 	}
 
-	results := runByLoop(targets, func(cfg *config.Config, st *store.Store, t Target) Result {
-		running, err := st.RunningDispatches(cfg.Name, cfg.Repo)
-		if err != nil {
-			return Result{Target: t, Action: ActionFailed, Err: err}
-		}
-		if d, ok := matchDispatch(running, t); ok {
-			if verifyErr := proc.VerifyRunner(d.PID, d.RunnerID()); verifyErr == nil {
-				return Result{Target: t, Action: ActionRefused, Err: fmt.Errorf(
-					"dispatch %d for issue #%d has a live runner; wait for it to exit, or use `sessions kill --force`",
-					d.ID, t.Issue)}
-			}
-		}
-		if err := st.ClearStopped(cfg.Name, cfg.Repo, t.Issue, time.Now()); err != nil {
-			return Result{Target: t, Action: ActionFailed, Err: err}
-		}
-		return Result{Target: t, Action: ActionResumed}
-	})
+	results := runByLoop(targets, resumeTarget)
 	return results, nil
+}
+
+// resumeTarget is Resume's per-target action, extracted so a test can drive
+// it directly through runByLoop against a real store fixture (the shape
+// TestRunByLoopAHeldLockFailsOnlyThatLoopsTargets already uses) instead of
+// re-implementing the refusal rule in the test file.
+func resumeTarget(cfg *config.Config, st *store.Store, t Target) Result {
+	running, err := st.RunningDispatches(cfg.Name, cfg.Repo)
+	if err != nil {
+		return Result{Target: t, Action: ActionFailed, Err: err}
+	}
+	if d, ok := matchDispatch(running, t); ok {
+		if verifyErr := proc.VerifyRunner(d.PID, d.RunnerID()); verifyErr == nil {
+			return Result{Target: t, Action: ActionRefused, Err: fmt.Errorf(
+				"dispatch %d for issue #%d has a live runner; wait for it to exit, or use `sessions kill --force`",
+				d.ID, t.Issue)}
+		}
+	}
+	if err := st.ClearStopped(cfg.Name, cfg.Repo, t.Issue, time.Now()); err != nil {
+		return Result{Target: t, Action: ActionFailed, Err: err}
+	}
+	return Result{Target: t, Action: ActionResumed}
 }
 
 // RenderResults formats one line per result for a terminal. verb is "kill" or
