@@ -391,12 +391,15 @@ func dispatch(
 	now time.Time,
 	kind string,
 ) error {
+	// A tend is included here, and used to be excluded. It inherits the issue's
+	// session when the engine offered one, so the rebase agent arrives knowing
+	// the branch it is rebasing. The earlier rule -- always a fresh identifier,
+	// on the grounds that a rebase is idempotent and needs no memory -- gave
+	// every tend a throwaway conversation and a cold read of the diff. The
+	// engine still offers nothing when the issue has no STARTED session, and
+	// that case lands on the same fresh identifier as before.
 	sessionID := d.SessionID
 	if sessionID == "" {
-		sessionID = uuid.NewString()
-	}
-	// A tend run keeps no memory between runs, because a rebase is idempotent.
-	if kind == store.KindTend {
 		sessionID = uuid.NewString()
 	}
 
@@ -537,6 +540,21 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 	return nil
 }
 
+// tendResumes reports whether a tend dispatch borrowed the issue's session and
+// must therefore continue it rather than create it.
+//
+// It compares identifiers instead of trusting the kind, because a tend carries
+// its own throwaway session whenever the issue had no started one, and "-r"
+// against a session claude never created fails every time. This is the same
+// gate engine.tendDecisions applies when it decides what to offer; the two
+// agree by both reading SessionStarted.
+func tendResumes(d store.Dispatch, state store.IssueState) bool {
+	return d.Kind == store.KindTend &&
+		state.SessionStarted &&
+		state.SessionID != "" &&
+		state.SessionID == d.SessionID
+}
+
 // RunAgent executes one dispatch. The detached runner process calls it.
 func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int64) error {
 	d, err := deps.Store.GetDispatch(dispatchID)
@@ -561,6 +579,21 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		tmpl, resume = cfg.ResumePrompt, true
 	case store.KindTend:
 		tmpl = cfg.TendPrompt
+		// A tend that inherited the issue's session must RESUME it. Passing an
+		// existing identifier to --session-id is refused outright ("Session ID
+		// <uuid> is already in use"), so getting this wrong fails the dispatch
+		// in under a second rather than degrading quietly.
+		//
+		// The answer is re-derived from the store rather than carried on the
+		// row: this runs in a detached process that holds only the dispatch,
+		// and the alternative -- a second tend kind, or a resume column -- puts
+		// the fact in two places for reapDead, the liveness map, worktree
+		// selection and cleanup to disagree about.
+		st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Number)
+		if err != nil {
+			return err
+		}
+		resume = tendResumes(d, st)
 	}
 
 	links, err := deps.Store.PRLinks(cfg.Name, cfg.Repo)

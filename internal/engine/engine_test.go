@@ -492,3 +492,83 @@ func TestDecisionsAreOrderedByIssueNumber(t *testing.T) {
 		}
 	}
 }
+
+func TestTendResumesTheIssuesSession(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{Issues: map[int]store.IssueState{
+		1: {SessionID: "sess-1", SessionStarted: true},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	if got := p.Decisions[0].SessionID; got != "sess-1" {
+		t.Errorf("session = %q, want the issue's session %q", got, "sess-1")
+	}
+}
+
+func TestTendStartsAFreshSessionWhenNoneWasStarted(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	// The identifier exists but claude never created the session, so "-r" would
+	// fail every time. This is the same rule retryDecision applies.
+	st := State{Issues: map[int]store.IssueState{
+		1: {SessionID: "sess-1", SessionStarted: false},
+	}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	if got := p.Decisions[0].SessionID; got != "" {
+		t.Errorf("session = %q, want empty so dispatch mints a fresh one", got)
+	}
+}
+
+func TestLiveTendHoldingTheIssueSessionSuppressesResume(t *testing.T) {
+	cfg := testConfig()
+	// Both labels are present: a human re-applied the trigger while the pull
+	// request was still awaiting review. Without the guard this resumes the
+	// very session the live tend is already using.
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review, cfg.Labels.Trigger)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{
+		Issues:  map[int]store.IssueState{1: {SessionID: "sess-1", SessionStarted: true}},
+		Running: []store.Dispatch{{Number: 1, PRNumber: 20, Kind: store.KindTend, SessionID: "sess-1"}},
+	}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none while a tend holds the issue's session", kinds(p))
+	}
+}
+
+func TestLiveTendOnItsOwnSessionDoesNotSuppressResume(t *testing.T) {
+	cfg := testConfig()
+	// A tend that minted its own session -- a row written before tend inherited
+	// the issue's, or one dispatched when no session had started -- shares
+	// nothing with the issue, so it must not block the issue's own work.
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review, cfg.Labels.Trigger)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{
+		Issues:  map[int]store.IssueState{1: {SessionID: "sess-1", SessionStarted: true}},
+		Running: []store.Dispatch{{Number: 1, PRNumber: 20, Kind: store.KindTend, SessionID: "throwaway"}},
+	}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindResume {
+		t.Fatalf("decisions = %v, want one resume", kinds(p))
+	}
+}

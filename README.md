@@ -158,6 +158,19 @@ A session is one claude conversation. It survives resumes, so an issue keeps a s
 across a park and its answer, and several dispatches share it. That makes a session the unit
 to follow when you want the whole story of an issue rather than one run.
 
+A tend run shares it too. Rebasing a pull request is maintenance on work the session already
+did, so the rebase agent resumes that conversation rather than opening a throwaway one and
+reading the diff cold. It borrows the session without owning it: a tend never stamps the
+issue's session row, never spends its retry budget, and never marks it succeeded. The session
+belongs to the loop that carries `tend_pr: true` — the same loop's own row for that issue, so
+an issue that passed through `planning` before `execution` resumes the execution conversation,
+not the planning one. An issue whose session was never started still gets a fresh identifier,
+because `-r` against a session claude never created fails every time.
+
+One consequence is worth knowing: while a tend holds the issue's session, the issue itself is
+not dispatched. Re-applying the trigger label to an issue that is mid-rebase queues the work
+for after it, rather than putting a second `claude` process on one conversation.
+
 ```
 $ agent-utils project sessions list
 SESSION            LOOP       ISSUE  TITLE                  RUNS  COST     STATE      LAST RUN

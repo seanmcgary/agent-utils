@@ -28,6 +28,17 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	for _, d := range st.Running {
 		if d.Kind == store.KindTend {
 			liveTendPRs[d.PRNumber] = true
+			// A tend that inherited the issue's session HOLDS that session for
+			// as long as it runs, so it blocks the issue as well as its pull
+			// request. Two claude processes resuming one session id is the same
+			// hazard as two agents in one branch, and it is reachable: a human
+			// re-applying the trigger label to an issue still awaiting review
+			// produces exactly that pair. A tend carrying its own throwaway
+			// session shares nothing and blocks nothing, which is why this
+			// compares identifiers rather than testing the kind alone.
+			if s := st.Issues[d.Number]; s.SessionID != "" && s.SessionID == d.SessionID {
+				liveIssues[d.Number] = true
+			}
 			continue
 		}
 		liveIssues[d.Number] = true
@@ -170,7 +181,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	decisions = append(decisions, parks...)
 
 	if cfg.TendPR {
-		decisions = append(decisions, tendDecisions(cfg, issues, snap, liveTendPRs, decided, skips)...)
+		decisions = append(decisions, tendDecisions(cfg, issues, snap, st.Issues, liveTendPRs, decided, skips)...)
 	}
 
 	return finish(Plan{Decisions: decisions, Skips: skips})
@@ -243,10 +254,19 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, now t
 // trigger label") is true but useless for a review issue: what the operator
 // needs is that the pull request is current, or already being tended, or not
 // linked at all.
+//
+// states is the issue state of THIS loop only, which is what makes the
+// inherited session the right one without a lookup. An issue is worked by
+// several loops in turn -- planning, then execution -- and each keeps its own
+// session under its own name. Decide is called per loop, tending is gated on
+// that loop's tend_pr, and states came from that loop's rows, so the session a
+// tend inherits is necessarily the one belonging to the loop that owns the
+// pull request.
 func tendDecisions(
 	cfg *config.Config,
 	issues []ghub.Issue,
 	snap Snapshot,
+	states map[int]store.IssueState,
 	liveTendPRs map[int]bool,
 	decided map[int]bool,
 	skips map[int]string,
@@ -280,14 +300,29 @@ func tendDecisions(
 			skips[iss.Number] = "the linked pull request is already up to date with its base"
 			continue
 		}
+		// Inherit the issue's session, so the rebase agent carries the context
+		// of the work it is rebasing rather than meeting the branch cold.
+		//
+		// SessionStarted is the same gate retryDecision applies, and for the
+		// same reason: an identifier claude never created cannot be resumed,
+		// and "-r" against one fails identically every run. An empty
+		// identifier here tells dispatch to mint a fresh one, which is what a
+		// pull request whose issue has no started session still gets.
+		sessionID := ""
+		reason := fmt.Sprintf("%s is %d commits behind",
+			describeLink(iss.Number, pr), snap.BehindBy[pr.Number])
+		if s := states[iss.Number]; s.SessionStarted && s.SessionID != "" {
+			sessionID = s.SessionID
+			reason += ", resuming the issue's session"
+		}
 		out = append(out, Decision{
-			Kind:    KindTend,
-			Issue:   iss.Number,
-			PR:      pr.Number,
-			HeadRef: pr.HeadRef,
-			BaseRef: pr.BaseRef,
-			Reason: fmt.Sprintf("%s is %d commits behind",
-				describeLink(iss.Number, pr), snap.BehindBy[pr.Number]),
+			Kind:      KindTend,
+			Issue:     iss.Number,
+			PR:        pr.Number,
+			HeadRef:   pr.HeadRef,
+			BaseRef:   pr.BaseRef,
+			SessionID: sessionID,
+			Reason:    reason,
 		})
 	}
 	return out
