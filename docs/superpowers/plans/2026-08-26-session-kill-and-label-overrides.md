@@ -669,7 +669,10 @@ func TestDispatchCarriesOverridesAndAgentPID(t *testing.T) {
 }
 ```
 
-Add `"path/filepath"` to the test imports if absent.
+Add `"path/filepath"` and `"strings"` to the test imports. The file currently
+imports only `database/sql`, `path/filepath`, `testing`, and `time`, so
+`strings` is genuinely missing and `TestRebuildCarriesTheStoppedColumns` needs
+it.
 
 - [ ] **Step 2: Write the failing migration test**
 
@@ -1130,7 +1133,9 @@ func TestSignalDeliversToTheRunner(t *testing.T) {
 	if err := Signal(cmd.Process.Pid, 7, syscall.SIGKILL); err != nil {
 		t.Fatalf("Signal: %v", err)
 	}
-	go func() { _, _ = cmd.Process.Wait() }()
+	// No reaper goroutine: waitDead polls kill(pid, 0), and t.Cleanup already
+	// owns the one Wait on this process. A second concurrent Wait on one
+	// os.Process would be a data race the -race build could catch.
 	waitDead(t, cmd.Process.Pid)
 }
 
@@ -1522,6 +1527,62 @@ func TestDecideStillClearsAStaleRetryFlagWithAnInvalidOverride(t *testing.T) {
 	}
 }
 
+// A tripped circuit breaker drops every DISPATCH, but a stop is the refusal
+// to dispatch. Swallowing it would leave an invalid label unrecorded and
+// unexplained for the whole cooldown.
+func TestDecideStopsSurviveATrippedBreaker(t *testing.T) {
+	cfg := testConfig()
+	cfg.Retry.Max = 3
+	cfg.Retry.Breaker.OrphanThreshold = 1
+	snap := Snapshot{Issues: []ghub.Issue{
+		{Number: 7, Labels: []string{cfg.Labels.Trigger, "harness:gpt"}, State: "open"},
+		{Number: 8, Labels: []string{cfg.Labels.Trigger, cfg.Labels.InFlight}, State: "open"},
+	}}
+	st := State{Issues: map[int]store.IssueState{
+		8: {Number: 8, NeedsRetry: true, SessionID: "sess", SessionStarted: true},
+	}}
+
+	plan := Decide(cfg, snap, st, time.Now())
+
+	if !plan.BreakerTripped {
+		t.Fatalf("plan = %+v, want the breaker tripped", plan)
+	}
+	var stops int
+	for _, d := range plan.Decisions {
+		if d.Kind == KindStop {
+			stops++
+			if !strings.Contains(d.Reason, "harness must be") {
+				t.Fatalf("stop reason = %q, want the parse error kept", d.Reason)
+			}
+		}
+	}
+	if stops != 1 {
+		t.Fatalf("decisions = %+v, want the stop for issue 7 to survive", plan.Decisions)
+	}
+}
+
+// A label must not be able to push the breaker over its threshold. A retry
+// that becomes a stop never dispatches, so it is not an eligible retry.
+func TestDecideDoesNotCountAStoppedRetryTowardTheBreaker(t *testing.T) {
+	cfg := testConfig()
+	cfg.Retry.Max = 3
+	cfg.Retry.Breaker.OrphanThreshold = 1
+	snap := Snapshot{Issues: []ghub.Issue{
+		{Number: 7, Labels: []string{
+			cfg.Labels.Trigger, cfg.Labels.InFlight, "harness:gpt",
+		}, State: "open"},
+	}}
+	st := State{Issues: map[int]store.IssueState{
+		7: {Number: 7, NeedsRetry: true, SessionID: "sess", SessionStarted: true},
+	}}
+
+	plan := Decide(cfg, snap, st, time.Now())
+
+	if plan.BreakerTripped {
+		t.Fatal("a label-stopped retry tripped the circuit breaker")
+	}
+}
+
 // A park is not a dispatch either: the retry cap is a fact about the issue,
 // not about its labels.
 func TestDecideStillParksWithAnInvalidOverride(t *testing.T) {
@@ -1630,24 +1691,49 @@ Still inside the issue loop, immediately after the stopped skip and BEFORE the
 
 Apply it at the dispatch sites, and only there.
 
-Inside the `state.NeedsRetry` branch, within `if d != nil`, before the
-`KindParkRetryExhausted` check:
+First declare a slice beside `parks`, near `var decisions []Decision`:
 
 ```go
+	// stops collects KindStop decisions. They are kept OUT of `decisions` for
+	// the reason parks are: the circuit-breaker branch drops every entry of
+	// `decisions` and rewrites its skip reason. A stop is not a dispatch --
+	// it is the refusal to dispatch -- so a breaker tick must not swallow it,
+	// or an invalid label would go unrecorded and unexplained for the whole
+	// cooldown.
+	var stops []Decision
+```
+
+Inside the `state.NeedsRetry` branch, replace the `d, eligible, skip :=
+retryDecision(...)` block's opening so the stop conversion happens BEFORE the
+eligibility count:
+
+```go
+			d, eligible, skip := retryDecision(cfg, iss.Number, state, now)
 			// A retry IS a dispatch, so an invalid label stops it. A park is
 			// not, so it proceeds unchanged.
-			if d.Kind != KindParkRetryExhausted {
-				if ovErr != nil {
-					decided[iss.Number] = true
-					decisions = append(decisions, Decision{
-						Kind: KindStop, Issue: iss.Number, Title: iss.Title,
-						Reason: ovErr.Error(),
-					})
-					continue
-				}
+			//
+			// This runs BEFORE eligibleRetries is incremented. A retry that
+			// becomes a stop never dispatches, so counting it would let a
+			// label push the circuit breaker over its threshold and drop every
+			// other loop's dispatches for the cooldown.
+			if d != nil && d.Kind != KindParkRetryExhausted && ovErr != nil {
+				decided[iss.Number] = true
+				stops = append(stops, Decision{
+					Kind: KindStop, Issue: iss.Number, Title: iss.Title,
+					Reason: ovErr.Error(),
+				})
+				continue
+			}
+			if d != nil && d.Kind != KindParkRetryExhausted {
 				d.Overrides = ov
 			}
+			if eligible {
+				eligibleRetries++
+			}
 ```
+
+Delete the original `if eligible { eligibleRetries++ }` that followed the call,
+so it is not counted twice.
 
 And after the trigger-label check (`:113-119`), before
 `decided[iss.Number] = true`:
@@ -1655,7 +1741,7 @@ And after the trigger-label check (`:113-119`), before
 ```go
 		if ovErr != nil {
 			decided[iss.Number] = true
-			decisions = append(decisions, Decision{
+			stops = append(stops, Decision{
 				Kind: KindStop, Issue: iss.Number, Title: iss.Title,
 				Reason: ovErr.Error(),
 			})
@@ -1664,6 +1750,13 @@ And after the trigger-label check (`:113-119`), before
 ```
 
 Add `Overrides: ov,` to BOTH the `KindResume` and the `KindStart` decisions.
+
+Finally, carry `stops` through BOTH exits, exactly as `parks` is carried. In the
+breaker branch (`:159`), change `Decisions: parks` to
+`Decisions: append(stops, parks...)`, and leave the loop that rewrites skip
+reasons iterating `decisions` only — a stop already has its own reason and must
+keep it. After that branch, beside `decisions = append(decisions, parks...)`,
+add `decisions = append(decisions, stops...)`.
 
 - [ ] **Step 6: Add `validateOverrides`**
 
@@ -1732,6 +1825,8 @@ git commit -m "feat: skip stopped issues and carry label overrides in Decide"
 - Overrides reach retry decisions, proven by a test.
 - `KindClearRetry` and `KindParkRetryExhausted` still fire when the label is
   invalid, each proven by a test.
+- A `KindStop` survives a tripped circuit breaker, and a stopped retry does not
+  count toward the breaker threshold. Both proven by tests.
 - `validateOverrides` has a reachable rule and a test for each branch.
 
 ---
@@ -1744,9 +1839,14 @@ git commit -m "feat: skip stopped issues and carry label overrides in Decide"
 - Create: `internal/loopcmd/kill.go`, `internal/loopcmd/kill_test.go`
 
 **Interfaces:**
-- Consumes: `store.MarkStopped`, `store.ClearStopped`, `Store.StoppedIssues`,
-  `DB.StoppedIssues`, `store.Dispatch.AgentPID` (Task 2); `proc.VerifyRunner`,
-  `proc.Signal`, `proc.SignalGroup`, `proc.ErrNotRunner` (Task 3).
+- Consumes, from Task 2: `Store.MarkStopped`, `Store.ClearStopped`,
+  `Store.StoppedIssues`, `DB.StoppedIssues`, `Dispatch.AgentPID`.
+  From Task 3: `proc.VerifyRunner`, `proc.Signal`, `proc.SignalGroup`,
+  `proc.ErrNotRunner`.
+  Pre-existing: `loopcmd.Open`, `loopcmd.ProjectRef`, `loopcmd.AllSessions`,
+  `loopcmd.ResolveProject`, `Store.RunningDispatches`, `DB.RunningDispatches`,
+  `lock.Acquire`, `lock.ErrHeld`, `config.List`, `config.Resolve`,
+  `registry.List`.
 - Produces:
   ```go
   type Selector struct {
@@ -1759,11 +1859,26 @@ git commit -m "feat: skip stopped issues and carry label overrides in Decide"
   func (s Selector) Validate() error   // EXPORTED: cmd/agent-utils calls it
   func (s Selector) Describe() string  // for the confirmation prompt
 
+  // Target is IDENTITY ONLY. It deliberately carries no store.Dispatch: a
+  // loopcmd.Session has no repo, no pid and no dispatch id, so resolve cannot
+  // build one. Kill and Resume open each loop anyway to take its lock, and
+  // that is where cfg.Repo and a scoped Store exist -- so the dispatch rows
+  // are read THERE, not here.
   type Target struct {
-      ProjectID, Project, Loop, Repo string
+      ProjectID  string
+      Project    string // display name
+      Dir        string // the project's .agent-utils directory; ProjectRef.Dir
+      Loop       string
       Issue      int
-      Dispatch   store.Dispatch
+      Session    string // set only when --session selected this target
       ConfigPath string
+  }
+
+  // work is one target bound to the loop it was resolved in, after Open.
+  type work struct {
+      Target   Target
+      Repo     string
+      Dispatch store.Dispatch
   }
   type KillOptions struct {
       Selector Selector
@@ -1776,14 +1891,15 @@ git commit -m "feat: skip stopped issues and carry label overrides in Decide"
       ActionAlreadyGone Action = "already gone" // no verifiable runner; outcome recorded
       ActionForced      Action = "forced"       // SIGKILLed agent group, then runner
       ActionStillAlive  Action = "still alive"  // stopped, but the runner outlived the timeout
-      ActionStopped     Action = "stopped"      // flag written, no dispatch to signal
       ActionResumed     Action = "resumed"
+      ActionRefused     Action = "refused"      // resume only: the runner is still live
   )
   type Result struct {
       Target Target
       Action Action
       Err    error
   }
+  // narrowByLoop and resolve are unexported; Kill/Resume are the entry points.
   func Kill(opts KillOptions) ([]Result, error)
   func Resume(sel Selector) ([]Result, error)
   func RenderResults(verb string, rs []Result) string
@@ -1870,9 +1986,10 @@ with the store and `proc` calls. Append:
 ```go
 var errWriteFailed = errors.New("write failed")
 
-func testTarget(runnerPID, agentPID int) Target {
-	return Target{
-		Project: "p", Loop: "l", Issue: 7,
+func testWork(runnerPID, agentPID int) work {
+	return work{
+		Target: Target{Project: "p", Loop: "l", Issue: 7},
+		Repo:   "o/r",
 		Dispatch: store.Dispatch{
 			ID: 1, PID: runnerPID, AgentPID: agentPID,
 			Status: store.StatusRunning, Number: 7, Kind: store.KindStart,
@@ -1887,15 +2004,15 @@ func testTarget(runnerPID, agentPID int) Target {
 func TestKillWritesTheStoppedFlagBeforeItSignals(t *testing.T) {
 	var order []string
 	k := killer{
-		markStopped: func(Target, string) error { order = append(order, "stopped"); return nil },
-		verify:      func(Target) error { return nil },
-		signal:      func(Target) error { order = append(order, "signalled"); return nil },
-		waitGone:    func(Target, time.Duration) bool { return true },
-		reread:      func(t Target) (store.Dispatch, error) { return t.Dispatch, nil },
-		finish:      func(Target) error { return nil },
+		markStopped: func(work, string) error { order = append(order, "stopped"); return nil },
+		verify:      func(work) error { return nil },
+		signal:      func(work) error { order = append(order, "signalled"); return nil },
+		waitGone:    func(work, time.Duration) bool { return true },
+		reread:      func(w work) (store.Dispatch, error) { return w.Dispatch, nil },
+		finish:      func(work) error { return nil },
 	}
 
-	res, err := k.one(testTarget(11, 22), KillOptions{Timeout: time.Second})
+	res, err := k.one(testWork(11, 22), KillOptions{Timeout: time.Second})
 	if err != nil {
 		t.Fatalf("one: %v", err)
 	}
@@ -1912,12 +2029,12 @@ func TestKillWritesTheStoppedFlagBeforeItSignals(t *testing.T) {
 func TestKillDoesNotSignalWhenTheFlagCannotBeWritten(t *testing.T) {
 	signalled := false
 	k := killer{
-		markStopped: func(Target, string) error { return errWriteFailed },
-		verify:      func(Target) error { return nil },
-		signal:      func(Target) error { signalled = true; return nil },
+		markStopped: func(work, string) error { return errWriteFailed },
+		verify:      func(work) error { return nil },
+		signal:      func(work) error { signalled = true; return nil },
 	}
 
-	res, _ := k.one(testTarget(11, 22), KillOptions{})
+	res, _ := k.one(testWork(11, 22), KillOptions{})
 	if res.Err == nil {
 		t.Fatal("one() recorded no error, want the write error")
 	}
@@ -1931,13 +2048,13 @@ func TestKillDoesNotSignalWhenTheFlagCannotBeWritten(t *testing.T) {
 func TestKillRecordsWithoutSignallingWhenTheRunnerIsGone(t *testing.T) {
 	signalled, finished := false, false
 	k := killer{
-		markStopped: func(Target, string) error { return nil },
-		verify:      func(Target) error { return proc.ErrNotRunner },
-		signal:      func(Target) error { signalled = true; return nil },
-		finish:      func(Target) error { finished = true; return nil },
+		markStopped: func(work, string) error { return nil },
+		verify:      func(work) error { return proc.ErrNotRunner },
+		signal:      func(work) error { signalled = true; return nil },
+		finish:      func(work) error { finished = true; return nil },
 	}
 
-	res, err := k.one(testTarget(11, 22), KillOptions{})
+	res, err := k.one(testWork(11, 22), KillOptions{})
 	if err != nil {
 		t.Fatalf("one: %v", err)
 	}
@@ -1954,14 +2071,14 @@ func TestKillRecordsWithoutSignallingWhenTheRunnerIsGone(t *testing.T) {
 func TestForceKillsTheAgentBeforeTheRunner(t *testing.T) {
 	var order []string
 	k := killer{
-		markStopped: func(Target, string) error { return nil },
-		verify:      func(Target) error { return nil },
-		killAgent:   func(Target) error { order = append(order, "agent"); return nil },
-		killRunner:  func(Target) error { order = append(order, "runner"); return nil },
-		finish:      func(Target) error { order = append(order, "finish"); return nil },
+		markStopped: func(work, string) error { return nil },
+		verify:      func(work) error { return nil },
+		killAgent:   func(work) error { order = append(order, "agent"); return nil },
+		killRunner:  func(work) error { order = append(order, "runner"); return nil },
+		finish:      func(work) error { order = append(order, "finish"); return nil },
 	}
 
-	res, err := k.one(testTarget(11, 22), KillOptions{Force: true})
+	res, err := k.one(testWork(11, 22), KillOptions{Force: true})
 	if err != nil {
 		t.Fatalf("one: %v", err)
 	}
@@ -1982,14 +2099,14 @@ func TestForceKillsTheAgentBeforeTheRunner(t *testing.T) {
 func TestForceDoesNotKillTheAgentGroupWhenTheRunnerIsUnverified(t *testing.T) {
 	agentKilled := false
 	k := killer{
-		markStopped: func(Target, string) error { return nil },
-		verify:      func(Target) error { return proc.ErrNotRunner },
-		killAgent:   func(Target) error { agentKilled = true; return nil },
-		killRunner:  func(Target) error { return nil },
-		finish:      func(Target) error { return nil },
+		markStopped: func(work, string) error { return nil },
+		verify:      func(work) error { return proc.ErrNotRunner },
+		killAgent:   func(work) error { agentKilled = true; return nil },
+		killRunner:  func(work) error { return nil },
+		finish:      func(work) error { return nil },
 	}
 
-	res, err := k.one(testTarget(11, 22), KillOptions{Force: true})
+	res, err := k.one(testWork(11, 22), KillOptions{Force: true})
 	if err != nil {
 		t.Fatalf("one: %v", err)
 	}
@@ -2005,12 +2122,12 @@ func TestForceDoesNotKillTheAgentGroupWhenTheRunnerIsUnverified(t *testing.T) {
 // issue stays stopped, but the report must not imply the agent is dead.
 func TestKillReportsARealSignalFailure(t *testing.T) {
 	k := killer{
-		markStopped: func(Target, string) error { return nil },
-		verify:      func(Target) error { return nil },
-		signal:      func(Target) error { return syscall.EPERM },
+		markStopped: func(work, string) error { return nil },
+		verify:      func(work) error { return nil },
+		signal:      func(work) error { return syscall.EPERM },
 	}
 
-	res, _ := k.one(testTarget(11, 22), KillOptions{Timeout: time.Millisecond})
+	res, _ := k.one(testWork(11, 22), KillOptions{Timeout: time.Millisecond})
 	if res.Err == nil {
 		t.Fatal("a failed signal was not reported")
 	}
@@ -2023,13 +2140,13 @@ func TestKillReportsARealSignalFailure(t *testing.T) {
 // the operator must be told and pointed at --force.
 func TestKillReportsARunnerThatOutlivesTheTimeout(t *testing.T) {
 	k := killer{
-		markStopped: func(Target, string) error { return nil },
-		verify:      func(Target) error { return nil },
-		signal:      func(Target) error { return nil },
-		waitGone:    func(Target, time.Duration) bool { return false },
+		markStopped: func(work, string) error { return nil },
+		verify:      func(work) error { return nil },
+		signal:      func(work) error { return nil },
+		waitGone:    func(work, time.Duration) bool { return false },
 	}
 
-	res, err := k.one(testTarget(11, 22), KillOptions{Timeout: time.Millisecond})
+	res, err := k.one(testWork(11, 22), KillOptions{Timeout: time.Millisecond})
 	if err != nil {
 		t.Fatalf("one: %v", err)
 	}
@@ -2043,19 +2160,19 @@ func TestKillReportsARunnerThatOutlivesTheTimeout(t *testing.T) {
 func TestKillDoesNotDoubleRecordWhenTheRunnerRecordedItsOwnOutcome(t *testing.T) {
 	finished := false
 	k := killer{
-		markStopped: func(Target, string) error { return nil },
-		verify:      func(Target) error { return nil },
-		signal:      func(Target) error { return nil },
-		waitGone:    func(Target, time.Duration) bool { return true },
-		reread: func(tg Target) (store.Dispatch, error) {
-			d := tg.Dispatch
+		markStopped: func(work, string) error { return nil },
+		verify:      func(work) error { return nil },
+		signal:      func(work) error { return nil },
+		waitGone:    func(work, time.Duration) bool { return true },
+		reread: func(w work) (store.Dispatch, error) {
+			d := w.Dispatch
 			d.Status = store.StatusFailed // the runner's handler got there first
 			return d, nil
 		},
-		finish: func(Target) error { finished = true; return nil },
+		finish: func(work) error { finished = true; return nil },
 	}
 
-	if _, err := k.one(testTarget(11, 22), KillOptions{Timeout: time.Second}); err != nil {
+	if _, err := k.one(testWork(11, 22), KillOptions{Timeout: time.Second}); err != nil {
 		t.Fatalf("one: %v", err)
 	}
 	if finished {
@@ -2066,18 +2183,18 @@ func TestKillDoesNotDoubleRecordWhenTheRunnerRecordedItsOwnOutcome(t *testing.T)
 // A tend dispatch holds no issue state, so there is no flag to write.
 func TestKillDoesNotStopAnIssueForATendDispatch(t *testing.T) {
 	stopped := false
-	tg := testTarget(11, 22)
-	tg.Dispatch.Kind = store.KindTend
+	w := testWork(11, 22)
+	w.Dispatch.Kind = store.KindTend
 	k := killer{
-		markStopped: func(Target, string) error { stopped = true; return nil },
-		verify:      func(Target) error { return nil },
-		signal:      func(Target) error { return nil },
-		waitGone:    func(Target, time.Duration) bool { return true },
-		reread:      func(t Target) (store.Dispatch, error) { return t.Dispatch, nil },
-		finish:      func(Target) error { return nil },
+		markStopped: func(work, string) error { stopped = true; return nil },
+		verify:      func(work) error { return nil },
+		signal:      func(work) error { return nil },
+		waitGone:    func(work, time.Duration) bool { return true },
+		reread:      func(w work) (store.Dispatch, error) { return w.Dispatch, nil },
+		finish:      func(work) error { return nil },
 	}
 
-	if _, err := k.one(tg, KillOptions{Timeout: time.Second}); err != nil {
+	if _, err := k.one(w, KillOptions{Timeout: time.Second}); err != nil {
 		t.Fatalf("one: %v", err)
 	}
 	if stopped {
@@ -2137,7 +2254,115 @@ func TestNarrowByLoopAcceptsASingleCandidate(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: Write `internal/loopcmd/kill.go`**
+- [ ] **Step 4: Write the failing Kill, Resume and Describe tests**
+
+`killer.one` is unit-tested above. These cover the rules that live in `Kill`
+and `Resume` themselves, each of which an acceptance criterion names. Drive
+them through the same seam: give `Kill` and `Resume` an unexported
+`runLoop` function field (defaulting to the real Open-and-lock pass) so a test
+can supply loops without a real project on disk. Append:
+
+```go
+// A tick holding the loop lock must fail EVERY target of that loop, with the
+// wording `loop reset` uses -- and must not abandon the other loops.
+func TestKillReportsALockedLoopAndContinuesToTheNext(t *testing.T) {
+	targets := []Target{
+		{Project: "p", Loop: "locked", Issue: 7},
+		{Project: "p", Loop: "locked", Issue: 8},
+		{Project: "p", Loop: "free", Issue: 9},
+	}
+	rs := killTargets(targets, KillOptions{}, func(loop string) (loopPass, error) {
+		if loop == "locked" {
+			return nil, lock.ErrHeld
+		}
+		return func(w work, _ KillOptions) (Result, error) {
+			return Result{Target: w.Target, Action: ActionSignalled}, nil
+		}, nil
+	})
+
+	if len(rs) != 3 {
+		t.Fatalf("results = %+v, want one per target", rs)
+	}
+	for _, r := range rs[:2] {
+		if r.Err == nil || !strings.Contains(r.Err.Error(), "a tick is running for loop") {
+			t.Fatalf("result = %+v, want the held-lock wording", r)
+		}
+	}
+	if rs[2].Err != nil || rs[2].Action != ActionSignalled {
+		t.Fatalf("the unlocked loop was abandoned: %+v", rs[2])
+	}
+}
+
+// Resume must refuse while the runner is still alive, or its retry clear is
+// written straight back by the dying runner's finish().
+func TestResumeRefusesALiveRunner(t *testing.T) {
+	cleared := false
+	r := resumeOne(
+		work{
+			Target:   Target{Project: "p", Loop: "l", Issue: 7},
+			Repo:     "o/r",
+			Dispatch: store.Dispatch{ID: 1, PID: 11, Status: store.StatusRunning},
+		},
+		func(work) error { return nil },                 // verify: the runner IS live
+		func(work) error { cleared = true; return nil }, // clearStopped
+	)
+
+	if cleared {
+		t.Fatal("resume cleared the stopped flag while the runner was still alive")
+	}
+	if r.Action != ActionRefused || r.Err == nil {
+		t.Fatalf("result = %+v, want a refusal naming the dispatch", r)
+	}
+	if !strings.Contains(r.Err.Error(), "--force") {
+		t.Fatalf("refusal %q does not tell the operator what to do next", r.Err)
+	}
+}
+
+// A dead runner is the normal case: the flag clears.
+func TestResumeClearsWhenTheRunnerIsGone(t *testing.T) {
+	cleared := false
+	r := resumeOne(
+		work{
+			Target:   Target{Project: "p", Loop: "l", Issue: 7},
+			Repo:     "o/r",
+			Dispatch: store.Dispatch{ID: 1, PID: 11, Status: store.StatusRunning},
+		},
+		func(work) error { return proc.ErrNotRunner },
+		func(work) error { cleared = true; return nil },
+	)
+
+	if !cleared || r.Action != ActionResumed {
+		t.Fatalf("result = %+v, cleared = %v; want the flag cleared", r, cleared)
+	}
+}
+
+// Describe is what the confirmation prompt shows before a destructive --all.
+func TestSelectorDescribe(t *testing.T) {
+	tests := []struct {
+		sel  Selector
+		want []string
+	}{
+		{Selector{Session: "abc"}, []string{"abc"}},
+		{Selector{Issue: 7, Loop: "planning"}, []string{"7", "planning"}},
+		{Selector{All: true}, []string{"every"}},
+		{Selector{All: true, Project: "p"}, []string{"every", "p"}},
+	}
+	for _, tt := range tests {
+		got := tt.sel.Describe()
+		for _, want := range tt.want {
+			if !strings.Contains(got, want) {
+				t.Fatalf("Describe(%+v) = %q, want it to name %q", tt.sel, got, want)
+			}
+		}
+	}
+}
+```
+
+Name the seam types in the implementation step below; `loopPass` is
+`func(work, KillOptions) (Result, error)`, and `killTargets` /`resumeOne` are
+the unexported cores `Kill` and `Resume` wrap.
+
+- [ ] **Step 5: Write `internal/loopcmd/kill.go`**
 
 Implement in this order. Every rule below must appear in the code WITH a
 comment saying why — this file is the feature.
@@ -2147,21 +2372,29 @@ comment saying why — this file is the feature.
 2. `Target`, `KillOptions`, `Action` with its constants, `Result`.
 3. `narrowByLoop(candidates []Target, loop string) ([]Target, error)` — the
    ambiguity rule, tested in step 3.
-4. `resolve(sel Selector, forResume bool) ([]Target, error)`:
+4. `resolve(sel Selector, forResume bool) ([]Target, error)` — identity only.
+   It never reads a dispatch row; see the `Target` comment for why.
    - `Session`: `AllSessions(SessionFilter{Project: sel.Project, Loop: sel.Loop})`
      matched on `Session.ID`. A session names one project, one loop, one issue.
+     Set `Target.Session` so the loop pass can pick the right dispatch row.
    - `Issue`: resolve the project with `ResolveProject(sel.Project)`, list its
-     loops with `config.List(p.Dir)`, build a candidate per loop that holds a
-     row for that number, then `narrowByLoop`.
+     loops with `config.List(p.Dir)`, build a candidate per loop, then
+     `narrowByLoop`.
    - `All`: for `Kill`, `db.RunningDispatches()`; for `Resume`,
-     `db.StoppedIssues()`. Narrow both by `sel.Project` and `sel.Loop`.
-   - Fill `ConfigPath` with `config.Resolve(p.Dir, loopName)`. A target whose
-     configuration cannot be resolved becomes a FAILED `Result`, never a fatal
-     error: one broken loop must not abandon the rest.
+     `db.StoppedIssues()`. Narrow both by `sel.Project` and `sel.Loop`, and map
+     each row's `ProjectID` back to a registry entry for `Project` and `Dir`.
+   - **Fill `Dir` from the registry entry's `AgentUtilsDir`, and `ConfigPath`
+     with `config.Resolve(p.Dir, loopName)`.** `Dir` is not optional: it becomes
+     `ProjectRef.Dir`, which drives `cfg.ResolveWorkDirs` and
+     `migrate.Discover` (`internal/loopcmd/open.go:114`, `:179`). An empty one
+     silently resolves different worktree paths and, under
+     `MigrationPolicy: FailOnUnimported`, turns into a hard error.
+   - A target whose configuration cannot be resolved becomes a FAILED `Result`,
+     never a fatal error: one broken loop must not abandon the rest.
 5. `killer` — the struct of function fields the tests drive:
    `markStopped`, `verify`, `signal`, `waitGone`, `reread`, `finish`,
    `killAgent`, `killRunner`.
-6. `(k killer) one(t Target, opts KillOptions) (Result, error)`, implementing
+6. `(k killer) one(w work, opts KillOptions) (Result, error)`, implementing
    spec section 4.2 exactly:
    - A TEND dispatch sets no flag — it holds no issue state
      (`internal/runner/runner.go:311`). Skip `markStopped` only; still signal
@@ -2181,19 +2414,30 @@ comment saying why — this file is the feature.
        so the issue is safe; the report names `--force`.
    - A `signal` error that is NOT "already gone" sets `Result.Err` and must not
      claim the agent is dead.
-7. `Kill(opts KillOptions) ([]Result, error)` — `Validate`, resolve, group by
-   loop; per loop open it once with `Open(ref, configPath, Options{
-   RequireGitHub: false, MigrationPolicy: FailOnUnimported})`, take
-   `lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))`, run `one` per
-   target, release before the next loop. On `lock.ErrHeld`, report EVERY target
-   of that loop as failed with the `loop reset` wording: `a tick is running for
-   loop %q; try again`.
-8. `Resume(sel Selector) ([]Result, error)` — same resolution and locking,
-   calling `ClearStopped`. It REFUSES a target whose dispatch is still marked
-   running and whose runner verifies live: the runner holds no lock and its
+7. `Kill(opts KillOptions) ([]Result, error)` — `Validate`, `resolve`, group
+   the targets by loop, then per loop:
+   - `Open(ProjectRef{ID: t.ProjectID, Name: t.Project, Dir: t.Dir},
+     t.ConfigPath, Options{RequireGitHub: false, MigrationPolicy:
+     FailOnUnimported})`.
+   - `lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))`. On
+     `lock.ErrHeld`, report EVERY target of that loop as failed with the
+     `loop reset` wording — `a tick is running for loop %q; try again` — and
+     move to the next loop.
+   - **Bind each target to its dispatch row HERE**, where `cfg.Repo` and a
+     scoped `Store` exist: `deps.Store.RunningDispatches(cfg.Name, cfg.Repo)`,
+     matched on `Target.Session` when set and on `Target.Issue` otherwise. A
+     target with no running dispatch yields a `Result` saying so, not an error.
+   - Run `one` per `work`. Release the lock before the next loop.
+8. `Resume(sel Selector) ([]Result, error)` — the same resolution, opening and
+   locking, then `ClearStopped(cfg.Name, cfg.Repo, t.Issue, now)`.
+
+   It REFUSES a target whose dispatch is still marked running and whose runner
+   VERIFIES LIVE, reporting `ActionRefused`. The runner holds no lock, and its
    `finish` calls `MarkNeedsRetry` (`internal/runner/runner.go:321`), so a
-   resume issued then would have its retry clear written straight back. The
-   refusal names the dispatch and says to wait or to use `kill --force`.
+   resume issued while the runner is still dying would have its retry clear
+   written straight back — leaving the issue un-stopped AND flagged for retry,
+   so the next tick takes the retry path instead of a clean start. The refusal
+   names the dispatch and says to wait or to use `kill --force`.
 9. `RenderResults(verb string, rs []Result) string` — one line per target
    naming project, loop, issue, and action; `--force` named on
    `ActionStillAlive`; the "nothing matched" sentence when `rs` is empty.
@@ -2205,12 +2449,12 @@ written with `store.FinishDispatch` and **not** `runner.Finish`. Comment why:
 warns against skipping that — but here arming a retry is exactly wrong, because
 the issue is stopped and `ClearStopped` clears the flag on resume anyway.
 
-- [ ] **Step 5: Run the tests and confirm they pass**
+- [ ] **Step 6: Run the tests and confirm they pass**
 
 Run: `go test ./internal/loopcmd/ -count=1`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add internal/loopcmd/kill.go internal/loopcmd/kill_test.go
@@ -2224,9 +2468,14 @@ git commit -m "feat: add the session kill and resume actions"
   timeout is reported and names `--force`; no double-recording when the runner
   wrote its own outcome; a tend kill writes no issue flag.
 - `narrowByLoop` has tests for the ambiguous, narrowed, and single cases.
-- `RenderResults` has a test, including the empty case.
+- `RenderResults` and `Selector.Describe` each have a test, including
+  `RenderResults`' empty case.
+- A held loop lock fails every target of that loop with the `loop reset`
+  wording and does NOT abandon the other loops. Proven by a test.
+- `Resume` refuses a live runner and clears a dead one. Both proven by tests.
 - `Selector.Validate` is EXPORTED.
-- One failing target does not abandon the others.
+- `Target` carries `Dir`, and it reaches `ProjectRef.Dir`.
+- No `Action` constant is dead.
 
 ---
 
@@ -2244,9 +2493,12 @@ git commit -m "feat: add the session kill and resume actions"
 - Create: `cmd/agent-utils/runagent.go`, `cmd/agent-utils/runagent_test.go`
 
 **Interfaces:**
-- Consumes: `config.Overrides`, `config.ParseOverrides` (Task 1);
-  `store.SetDispatchAgentPID`, `Dispatch.Model/Harness/Effort` (Task 2);
-  `Decision.Overrides` (Task 4).
+- Consumes, from Task 1: `config.Overrides`, `config.ParseOverrides`,
+  `config.OverrideModelPrefix`, `config.OverrideHarnessPrefix`,
+  `config.OverrideEffortPrefix`.
+  From Task 2: `Store.SetDispatchAgentPID`, `Store.MarkStopped`,
+  `Dispatch.Model`, `Dispatch.Harness`, `Dispatch.Effort`.
+  From Task 4: `engine.Decision.Overrides`, `engine.KindStop`.
 - Produces:
   ```go
   type Settings struct{ Harness, Model, Effort string }
@@ -2644,8 +2896,13 @@ git commit -m "feat: handle SIGTERM in the runner and apply agent overrides"
   type killArgs struct {
       Selector loopcmd.Selector
       Yes      bool
-      Force    bool
-      Timeout  time.Duration
+      Force    bool          // kill only; resume ignores it
+      Timeout  time.Duration // kill only; resume ignores it
+      // Confirm asks the operator to approve a destructive --all. It is a
+      // field, not a direct call, so the branch is testable without a tty --
+      // the same seam registerWebhookRun uses for its own --yes prompt.
+      // Nil means "not interactive".
+      Confirm func(prompt string) (bool, error)
   }
   func sessionsKillRun(args killArgs) error
   func sessionsResumeRun(args killArgs) error
@@ -2702,6 +2959,28 @@ func TestSessionsKillRejectsABadSelector(t *testing.T) {
 	}
 }
 
+// An interactive session confirms instead of erroring, and a decline does
+// nothing at all.
+func TestSessionsKillAllConfirmsWhenInteractive(t *testing.T) {
+	asked := ""
+	err := sessionsKillRun(killArgs{
+		Selector: loopcmd.Selector{All: true},
+		Confirm: func(prompt string) (bool, error) {
+			asked = prompt
+			return false, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("a declined confirmation returned %v, want nil", err)
+	}
+	if asked == "" {
+		t.Fatal("sessionsKillRun did not ask for confirmation")
+	}
+	if !strings.Contains(asked, "every") {
+		t.Fatalf("prompt %q does not describe what --all will act on", asked)
+	}
+}
+
 // Both guards must run BEFORE anything opens the database or resolves a
 // project, so a mistyped command touches no state. AGENT_UTILS_HOME points at
 // a directory that does not exist, so any read would fail loudly and
@@ -2746,18 +3025,21 @@ The loop selector is spelled `--loop`, matching `sessions list`. The comment at
 `:329-338` explains why this surface differs from the project-scoped twin; do
 not add an alias.
 
-Each `Action` reads the flags into a `killArgs` and calls the matching `*Run`.
+Each `Action` reads the flags into a `killArgs`, sets `Confirm` only when
+`isInteractive()` (`cmd/agent-utils/main.go:197`), and calls the matching
+`*Run`.
 The two `*Run` functions apply their rules in this order:
 
 1. `args.Selector.Validate()`. A bad selector fails before anything opens the
    database.
-2. The `--yes` guard when `Selector.All` is set.
-3. In an INTERACTIVE session with `--all` and `--yes` absent, print the targets
-   and confirm, following `project.go:429`'s `Confirm` and the
-   `--yes` = "skip the prompt" convention at `project.go:574`. A
-   non-interactive session errors and names `--yes`, which is what step 1
-   asserts.
-4. `loopcmd.Kill` / `loopcmd.Resume`, then `fmt.Print(RenderResults(...))`.
+2. The destructive-`--all` gate, in ONE branch. `--yes` means "skip the
+   prompt", exactly as it does at `project.go:574`:
+   - `!Selector.All` or `Yes` → proceed.
+   - `Confirm == nil` (not interactive) → error naming `--yes`. This is the
+     case step 1's tests assert, because a test has no tty.
+   - otherwise → `Confirm(args.Selector.Describe())`; a decline returns nil and
+     prints nothing, following `project.go:429`.
+3. `loopcmd.Kill` / `loopcmd.Resume`, then `fmt.Print(RenderResults(...))`.
 
 They return an error only when EVERY target failed. A partial failure prints
 its lines and exits 0: the report already names what went wrong per target.
@@ -2799,10 +3081,18 @@ type stoppedKey struct {
 }
 ```
 
-`Sessions` (project-scoped) fills the set from `Store.StoppedIssues` for each of
-the project's loops. `AllSessions` (machine-wide) fills it from
-`DB.StoppedIssues`, which is exactly why that read exists. A session with no
-matching entry is not stopped.
+BOTH renderers fill the set from `DB.StoppedIssues()`. `Sessions` filters it to
+`p.Config.ID`; `AllSessions` keeps all of it.
+
+`Store.StoppedIssues(loop, repo)` is deliberately NOT used here. It needs a
+repo, and `Sessions(p *Project, loopFilter string)` has none — a project holds
+several loops and each names its own repo, so the renderer would have to load
+every loop configuration just to label a column. `DB.StoppedIssues` already
+returns the loop and the project on each row, which is exactly what the key
+needs. The scoped read stays for `Resume`, which runs after `Open` and does
+have `cfg.Repo`.
+
+A session with no matching entry is not stopped.
 
 - [ ] **Step 5: Show the reason in `loop status`**
 
@@ -2824,6 +3114,18 @@ existing `parked` case (`:115`):
 And after the table, list each stopped issue with its reason:
 
 ```go
+	// Collected while rendering the table above -- NOT re-read. The render
+	// loop's `default: continue` skips an issue carrying none of the label
+	// states, so a stopped issue could otherwise be missing from the table AND
+	// from this list. Build `stopped` from the `states` map directly, before
+	// the loop, so it is complete either way:
+	//
+	//   var stopped []store.IssueState
+	//   for _, s := range states {
+	//       if s.Stopped { stopped = append(stopped, s) }
+	//   }
+	//   sort.Slice(stopped, func(i, j int) bool { return stopped[i].Number < stopped[j].Number })
+	//
 	// The reason is a sentence, and no column is wide enough for one. It is
 	// also the whole point of the flag: without it an operator sees "stopped"
 	// and has no way to learn why.
@@ -2837,7 +3139,30 @@ And after the table, list each stopped issue with its reason:
 ```
 
 Add a test in `internal/loopcmd/status_test.go` asserting that a stopped issue
-renders BOTH the `stopped` state and its reason.
+renders BOTH the `stopped` state and its reason, including one that carries no
+label state at all.
+
+Add a test in `internal/loopcmd/sessions_test.go` for the two session
+renderers:
+
+```go
+// The stopped set is keyed by PROJECT, loop and number. Two projects can hold
+// an issue 7 in a loop with the same name, and the machine-wide report is the
+// first thing that sees both at once.
+func TestRenderAllSessionsMarksOnlyTheStoppedProjectsSession(t *testing.T) {
+	// Two sessions, same loop name and issue number, different ProjectID.
+	// Only project-a's issue is stopped. Assert project-a's row reads STOPPED
+	// and project-b's does not.
+}
+
+// A live agent outranks the flag: the operator needs to know something is
+// still running.
+func TestRenderSessionsPrefersRunningOverStopped(t *testing.T) {
+	// One session that is both Live and Stopped renders "running".
+}
+```
+
+Write both bodies with the file's existing helpers.
 
 - [ ] **Step 6: Run the tests**
 
@@ -2854,9 +3179,12 @@ git commit -m "feat: add sessions kill and sessions resume commands"
 **Acceptance criteria:**
 - Every new flag has a `Usage:` string.
 - `--all` without `--yes` fails and names `--yes`; interactively it confirms.
-- The stopped set is keyed by project, loop, and number.
-- `loop status` shows both the `stopped` state and the reason, with a test.
-- `running` still wins over `STOPPED` in the session table.
+- The stopped set is keyed by project, loop, and number, proven by a test that
+  uses two projects.
+- `loop status` shows both the `stopped` state and the reason, with a test,
+  including an issue carrying no label state.
+- `running` still wins over `STOPPED` in the session table, proven by a test.
+- A declined confirmation does nothing and returns nil, proven by a test.
 
 ---
 
