@@ -54,7 +54,20 @@ type IssueState struct {
 	// RetryAfter is the deadline before which no retry for this issue may run.
 	// The zero value means no deadline, so a pending retry runs at once.
 	RetryAfter time.Time
-	UpdatedAt  time.Time
+	// Stopped records that an operator killed this issue's session, or that
+	// Decide refused to dispatch it because of an invalid label. It is
+	// deliberately NOT Parked: Parked means the retry budget ran out, which
+	// is a fact about the issue's failure history, while Stopped is a
+	// refusal to dispatch at all, cleared only by `sessions resume`. Only
+	// MarkStopped and ClearStopped write it; PutIssueState reads it back but
+	// must never write it, or a stale read-modify-write (parkRetryExhausted)
+	// would silently un-stop the issue.
+	Stopped bool
+	// StoppedReason is why Stopped is set: the operator's own text, or a
+	// label parse error. It is shown in `sessions list` and `loop status`
+	// so an operator who did not kill the session can learn why it stopped.
+	StoppedReason string
+	UpdatedAt     time.Time
 }
 
 // Dispatch is one agent run.
@@ -86,6 +99,23 @@ type Dispatch struct {
 	LegacySource string
 	// LegacyID is the identifier this row had in that file.
 	LegacyID int64
+	// AgentPID is the agent child's own process identifier, recorded after
+	// Supervise starts it. It is distinct from PID, the RUNNER's process --
+	// the runner is spawned Setsid and the agent child Setpgid into its own
+	// group, so a signal to one does not reach the other, and killing an
+	// agent needs its own pid. Supervise clears it back to 0 once cmd.Wait
+	// returns, because the runner OUTLIVES its agent child; a row whose
+	// runner then dies or is killed before recording anything still carries
+	// whatever value was last written, so a caller must verify the runner is
+	// still alive before trusting a non-zero value here.
+	AgentPID int
+	// Model, Harness, and Effort are the label overrides in effect for this
+	// dispatch, empty when none applied. An empty column means "no
+	// override", never "the empty model" -- runner.Effective is the one
+	// place that resolves these against the configured value.
+	Model   string
+	Harness string
+	Effort  string
 }
 
 // RunnerID is the dispatch identifier the runner process actually carries.
@@ -197,4 +227,16 @@ type Webhook struct {
 	// still points, which is what makes an orphan diagnosable.
 	URL          string
 	RegisteredAt time.Time
+}
+
+// StoppedIssue is one stopped issue, reported machine-wide by DB.StoppedIssues.
+// It names the project because a key of loop and number alone collides
+// across projects -- the same reason sessionKey carries the project
+// (internal/loopcmd/sessions.go:231).
+type StoppedIssue struct {
+	ProjectID string
+	Loop      string
+	Repo      string
+	Number    int
+	Reason    string
 }

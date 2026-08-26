@@ -3,6 +3,7 @@ package engine
 import (
 	"time"
 
+	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
@@ -29,6 +30,11 @@ const (
 	// because the issue is not in flight. Without it such an issue is stranded
 	// permanently and no human action recovers it.
 	KindClearRetry Kind = "clear_retry"
+	// KindStop refuses to dispatch an issue: an operator stopped it, or an
+	// issue label's override is invalid. It is a refusal, not a dispatch, so
+	// it must survive a tripped circuit breaker, which drops every entry of
+	// Decisions and rewrites its skip reason (engine.go:159-168).
+	KindStop Kind = "stop"
 )
 
 // Snapshot is the GitHub view for one tick.
@@ -60,6 +66,12 @@ type Decision struct {
 	HeadRef   string
 	BaseRef   string
 	Reason    string
+	// Overrides carries the per-issue label overrides for a dispatch that
+	// starts, resumes, or retries a session. The runner is a detached
+	// process that never sees the tick's GitHub snapshot, so this is how an
+	// override reaches it: on the row, the same way title and behind_by
+	// already travel.
+	Overrides config.Overrides
 }
 
 // Plan is the full output of one decision pass.

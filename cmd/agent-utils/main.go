@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/home"
@@ -361,8 +362,211 @@ func sessionsCommand() *cli.Command {
 					return nil
 				},
 			},
+			sessionsKillCommand(),
+			sessionsResumeCommand(),
 		},
 	}
+}
+
+// selectorFlags are the three mutually exclusive targets, plus the two
+// flags that narrow --issue and --all, shared by `sessions kill` and
+// `sessions resume`. Every flag carries a Usage string, matching the
+// convention `sessions list`'s flags set above.
+func selectorFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{Name: "project",
+			Usage: "restrict to one project, by name, id or path"},
+		&cli.StringFlag{Name: "loop",
+			Usage: "restrict --issue and --all to loops with this name"},
+		&cli.StringFlag{Name: "session",
+			Usage: "act on this session id"},
+		&cli.IntFlag{Name: "issue",
+			Usage: "act on this issue number (needs a project, and a loop if the number is ambiguous)"},
+		&cli.BoolFlag{Name: "all",
+			Usage: "act on every matching target; destructive, so it requires --yes outside a terminal"},
+		&cli.BoolFlag{Name: "yes",
+			Usage: "skip the confirmation prompt --all would otherwise print"},
+	}
+}
+
+// selectorFrom reads the shared selector flags off c. --loop is spelled the
+// same as `sessions list`'s own --loop (see that command's flag comment for
+// why the top level does not alias --name here too).
+func selectorFrom(c *cli.Command) loopcmd.Selector {
+	return loopcmd.Selector{
+		Project: c.String("project"),
+		Loop:    c.String("loop"),
+		Session: c.String("session"),
+		Issue:   c.Int("issue"),
+		All:     c.Bool("all"),
+	}
+}
+
+// sessionsKillCommand stops a running session: it holds the issue (so the
+// next tick does not dispatch it again) and signals the runner. See
+// sessionsKillRun for the guard order.
+func sessionsKillCommand() *cli.Command {
+	flags := selectorFlags()
+	flags = append(flags,
+		&cli.BoolFlag{Name: "force",
+			Usage: "SIGKILL the agent's process group and the runner, instead of waiting for a graceful exit"},
+		&cli.DurationFlag{Name: "timeout", Value: loopcmd.DefaultKillTimeout,
+			Usage: "how long to wait for the runner to exit after SIGTERM before reporting it still alive"},
+	)
+	return &cli.Command{
+		Name:  "kill",
+		Usage: "stop a running session: hold its issue and signal the runner",
+		Flags: flags,
+		Action: func(_ context.Context, c *cli.Command) error {
+			args := killArgs{
+				Selector: selectorFrom(c),
+				Yes:      c.Bool("yes"),
+				Force:    c.Bool("force"),
+				Timeout:  c.Duration("timeout"),
+			}
+			if isInteractive() {
+				args.Confirm = confirmSessionAction
+			}
+			return sessionsKillRun(args)
+		},
+	}
+}
+
+// sessionsResumeCommand clears the stopped flag a kill (or an invalid
+// override label) left on an issue.
+func sessionsResumeCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "resume",
+		Usage: "clear the stopped flag on an issue, so the loop may dispatch it again",
+		Flags: selectorFlags(),
+		Action: func(_ context.Context, c *cli.Command) error {
+			args := killArgs{
+				Selector: selectorFrom(c),
+				Yes:      c.Bool("yes"),
+			}
+			if isInteractive() {
+				args.Confirm = confirmSessionAction
+			}
+			return sessionsResumeRun(args)
+		},
+	}
+}
+
+// killArgs bundles sessions kill/resume's inputs so the ordered guard
+// sequence in sessionsKillRun/sessionsResumeRun -- Selector.Validate, then
+// the destructive --all gate -- can be driven directly by a test, with a
+// canned Confirm and no real terminal.
+type killArgs struct {
+	Selector loopcmd.Selector
+	Yes      bool
+	// Force and Timeout are read by kill only; resume ignores them.
+	Force   bool
+	Timeout time.Duration
+	// Confirm asks the operator to approve a destructive --all. It is a
+	// function FIELD, not a direct call, which is what makes the gate
+	// testable without a tty -- the same seam registerWebhookRun uses
+	// (project.go:519). It is set only when isInteractive() is true; a
+	// non-interactive run leaves it nil, which the gate below treats as "no
+	// way to ask".
+	Confirm func(desc string) (bool, error)
+}
+
+// confirmDestructiveAll applies the --all gate as ONE branch: anything other
+// than a bare, unconfirmed --all proceeds; a non-interactive run (Confirm ==
+// nil) refuses and names --yes; otherwise the operator is asked, and a
+// decline is reported back as (false, nil) -- not an error -- so the caller
+// prints nothing and exits clean.
+func confirmDestructiveAll(args killArgs) (bool, error) {
+	if !args.Selector.All || args.Yes {
+		return true, nil
+	}
+	if args.Confirm == nil {
+		return false, errors.New(
+			"refusing --all without confirmation in a non-interactive run; pass --yes")
+	}
+	return args.Confirm(args.Selector.Describe())
+}
+
+// allFailed reports whether every result in rs failed. sessionsKillRun and
+// sessionsResumeRun use it to decide their own exit status: a partial
+// failure already printed, per target, exactly what went wrong, so the
+// command still exits 0 -- only a total loss is worth a nonzero exit.
+func allFailed(rs []loopcmd.Result) bool {
+	if len(rs) == 0 {
+		return false
+	}
+	for _, r := range rs {
+		if r.Action != loopcmd.ActionFailed {
+			return false
+		}
+	}
+	return true
+}
+
+// sessionsKillRun applies, in order: Selector.Validate (a bad selector must
+// fail before anything opens the database), the destructive --all gate, and
+// then loopcmd.Kill. It returns an error only when every target failed.
+func sessionsKillRun(args killArgs) error {
+	if err := args.Selector.Validate(); err != nil {
+		return err
+	}
+	proceed, err := confirmDestructiveAll(args)
+	if err != nil {
+		return err
+	}
+	if !proceed {
+		return nil
+	}
+	results, err := loopcmd.Kill(loopcmd.KillOptions{
+		Selector: args.Selector, Force: args.Force, Timeout: args.Timeout,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Print(loopcmd.RenderResults("kill", results))
+	if allFailed(results) {
+		return errors.New("every target failed to kill")
+	}
+	return nil
+}
+
+// sessionsResumeRun mirrors sessionsKillRun for `sessions resume`.
+func sessionsResumeRun(args killArgs) error {
+	if err := args.Selector.Validate(); err != nil {
+		return err
+	}
+	proceed, err := confirmDestructiveAll(args)
+	if err != nil {
+		return err
+	}
+	if !proceed {
+		return nil
+	}
+	results, err := loopcmd.Resume(args.Selector)
+	if err != nil {
+		return err
+	}
+	fmt.Print(loopcmd.RenderResults("resume", results))
+	if allFailed(results) {
+		return errors.New("every target failed to resume")
+	}
+	return nil
+}
+
+// confirmSessionAction prompts before a destructive --all kill or resume. It
+// follows confirmRegisterWebhook's shape: prompt to stderr, read one line
+// from stdin, accept only "y"/"yes".
+func confirmSessionAction(desc string) (bool, error) {
+	fmt.Fprintf(os.Stderr, "This will act on %s.\n", desc)
+	fmt.Fprint(os.Stderr, "Continue? [y/N] ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return false, fmt.Errorf("read confirmation: %w", err)
+	}
+	choice := strings.ToLower(strings.TrimSpace(line))
+	return choice == "y" || choice == "yes", nil
 }
 
 // projectCommand groups everything scoped to one project. Naming it explicitly
@@ -696,6 +900,14 @@ func internalCommand() *cli.Command {
 					&cli.StringFlag{Name: "project", Usage: "project id", Required: true},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
+					// Install the signal handler so an operator's `sessions kill`
+					// (which SIGTERMs this process) cancels the context Supervise
+					// runs the agent under, instead of leaving the agent behind
+					// with no supervisor left to record its outcome or sweep its
+					// process group.
+					ctx, cancel := runAgentContext(ctx)
+					defer cancel()
+
 					configPath := c.String("config")
 					ref := loopcmd.ProjectRef{
 						ID: c.String("project"),

@@ -16,6 +16,83 @@ type Invocation struct {
 	Prompt    string
 	// Resume continues an existing session instead of assigning a new one.
 	Resume bool
+	// Overrides carries the per-issue label overrides read off the dispatch
+	// row. The detached runner never sees the tick's GitHub snapshot, so this
+	// is the only way an override reaches it.
+	Overrides config.Overrides
+}
+
+// Settings is the resolved agent configuration for one invocation, after an
+// override has been applied (or not) to the configured value.
+type Settings struct {
+	Harness string
+	Model   string
+	Effort  string
+}
+
+// Effective returns the agent settings for one invocation. An override
+// replaces the configured value; an empty override keeps it.
+//
+// It returns a VALUE and never mutates cfg. Writing into cfg.Agent in place
+// would leave every later reader -- the retry policy, the log paths -- holding
+// a configuration that no longer matches the file it was loaded from.
+//
+// Each override value is RE-VALIDATED through config.ParseOverrides, and a
+// value that fails is dropped rather than applied. This process did not parse
+// the row it is reading: the tick did, in another process, possibly under an
+// older binary, and internal/store/legacy.go writes the dispatches table by a
+// second path. Effective is the last line of defence before a value becomes
+// an argv element.
+//
+// It uses the PARSED, normalised value ParseOverrides returns, never the raw
+// ov field: ParseOverrides lowercases harness and effort (overrides.go:88,
+// 108), so a row carrying harness "PI" (an older binary, or a hand-edited
+// database) must resolve to the lowercase form the harness switch in
+// Supervise compares against -- otherwise it fails that comparison silently
+// and launches claude with the pi model and claudeEnv.
+//
+// The harness-safety rule (config.Overrides.ValidateHarnessSafety) is
+// re-applied here too, for the same reason: a row can reach RunAgent by a
+// path this function is the only guard for. A harness override that fails it
+// is DROPPED, exactly like a syntactically invalid value.
+func Effective(cfg *config.Config, ov config.Overrides) Settings {
+	s := Settings{
+		Harness: cfg.Agent.Harness,
+		Model:   cfg.Agent.Model,
+		Effort:  cfg.Agent.Effort,
+	}
+
+	var parsed config.Overrides
+	if ov.Model != "" {
+		if p, err := config.ParseOverrides([]string{config.OverrideModelPrefix + ov.Model}); err == nil {
+			parsed.Model = p.Model
+		}
+	}
+	if ov.Harness != "" {
+		if p, err := config.ParseOverrides([]string{config.OverrideHarnessPrefix + ov.Harness}); err == nil {
+			parsed.Harness = p.Harness
+		}
+	}
+	if ov.Effort != "" {
+		if p, err := config.ParseOverrides([]string{config.OverrideEffortPrefix + ov.Effort}); err == nil {
+			parsed.Effort = p.Effort
+		}
+	}
+
+	if parsed.Harness != "" && parsed.ValidateHarnessSafety(cfg) != nil {
+		parsed.Harness = ""
+	}
+
+	if parsed.Model != "" {
+		s.Model = parsed.Model
+	}
+	if parsed.Harness != "" {
+		s.Harness = parsed.Harness
+	}
+	if parsed.Effort != "" {
+		s.Effort = parsed.Effort
+	}
+	return s
 }
 
 // BuildArgs returns the argument list for claude.
@@ -25,6 +102,8 @@ type Invocation struct {
 // --print with --output-format stream-json is rejected unless --verbose is also
 // present, so --verbose is not optional here.
 func BuildArgs(cfg *config.Config, inv Invocation) []string {
+	s := Effective(cfg, inv.Overrides)
+
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -37,11 +116,11 @@ func BuildArgs(cfg *config.Config, inv Invocation) []string {
 		args = append(args, "--session-id", inv.SessionID)
 	}
 
-	if cfg.Agent.Model != "" {
-		args = append(args, "--model", cfg.Agent.Model)
+	if s.Model != "" {
+		args = append(args, "--model", s.Model)
 	}
-	if cfg.Agent.Effort != "" {
-		args = append(args, "--effort", cfg.Agent.Effort)
+	if s.Effort != "" {
+		args = append(args, "--effort", s.Effort)
 	}
 	if cfg.Agent.PermissionMode != "" {
 		args = append(args, "--permission-mode", cfg.Agent.PermissionMode)
@@ -63,14 +142,16 @@ func BuildArgs(cfg *config.Config, inv Invocation) []string {
 // pi has no cost-ceiling flag: the config layer accepts max_budget_usd but this
 // builder never emits it.
 func PiBuildArgs(cfg *config.Config, inv Invocation) []string {
+	s := Effective(cfg, inv.Overrides)
+
 	args := []string{
 		"-p",
 		"--mode", "json",
 		"--session-id", inv.SessionID,
-		"--model", cfg.Agent.Model,
+		"--model", s.Model,
 	}
-	if cfg.Agent.Effort != "" {
-		args = append(args, "--thinking", cfg.Agent.Effort)
+	if s.Effort != "" {
+		args = append(args, "--thinking", s.Effort)
 	}
 	// The prompt is positional and must come last.
 	return append(args, inv.Prompt)

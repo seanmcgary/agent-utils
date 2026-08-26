@@ -115,11 +115,44 @@ func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) 
 		if s.Parked {
 			state = "parked"
 		}
+		// stopped wins over parked: both mean the loop will not dispatch
+		// this issue, but stopped is the actionable one -- an operator
+		// clears it with `sessions resume`, where a parked issue waits out
+		// its own cooldown.
+		if s.Stopped {
+			state = "stopped"
+		}
 		fmt.Fprintf(&b, "%-6d %-44s %-14s %-9d %-9s %-38s %s\n",
 			iss.Number, truncate(iss.Title, 44), state, s.RetryCount,
 			fmt.Sprintf("$%.2f", cost[iss.Number]), session, wt)
 	}
 
 	fmt.Fprintf(&b, "\nlive dispatches: %d   orphaned: %d\n", len(live), len(dead))
+
+	// Built from states directly, NOT from the render loop above: that
+	// loop's `default: continue` skips any issue carrying none of the
+	// recognised labels, which would drop a stopped issue (and its reason)
+	// from the report entirely if this list were built the same way. No
+	// table column fits a full sentence, and the reason is the whole point
+	// of the flag -- an operator who sees only `stopped` cannot learn why.
+	var stoppedNumbers []int
+	for number, s := range states {
+		if s.Stopped {
+			stoppedNumbers = append(stoppedNumbers, number)
+		}
+	}
+	if len(stoppedNumbers) > 0 {
+		sort.Ints(stoppedNumbers)
+		fmt.Fprintln(&b, "\nstopped issues:")
+		for _, number := range stoppedNumbers {
+			reason := states[number].StoppedReason
+			if reason == "" {
+				reason = "(no reason recorded)"
+			}
+			fmt.Fprintf(&b, "  #%d: %s\n", number, reason)
+		}
+		fmt.Fprintln(&b, "clear with: agent-utils sessions resume")
+	}
+
 	return b.String(), nil
 }

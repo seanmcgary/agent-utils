@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,11 +137,16 @@ func Supervise(
 	// Pick the agent binary and the matching argument builder and stream parser
 	// from the harness. The pi integration is a different program with a
 	// different stream shape, so the select is per-harness.
+	// Use the EFFECTIVE harness, not cfg.Agent.Harness directly: a harness:
+	// override on the row must select the pi binary and argument builder, and
+	// must keep claudeEnv (the print-mode background-task environment) out of
+	// a pi child, which reads none of it.
+	effective := Effective(cfg, inv.Overrides)
 	bin := "claude"
 	build := func(inv Invocation) []string { return BuildArgs(cfg, inv) }
 	parse := ParseStream
 	extraEnv := claudeEnv(cfg)
-	if cfg.Agent.Harness == config.HarnessPi {
+	if effective.Harness == config.HarnessPi {
 		bin = "pi"
 		build = func(inv Invocation) []string { return PiBuildArgs(cfg, inv) }
 		parse = ParsePiStream
@@ -195,6 +201,18 @@ func Supervise(
 		}, time.Now())
 	}
 
+	// Record the agent child's own pid, distinct from the RUNNER's pid this
+	// process already carries. --force needs it to SIGKILL the agent's
+	// process group without touching the runner's, and nothing outside this
+	// function otherwise knows which group the agent occupies.
+	//
+	// Logged and ignored on failure: the agent is already running, and
+	// abandoning the run over a bookkeeping write is worse than leaving
+	// agent_pid unset for this one dispatch.
+	if err := st.SetDispatchAgentPID(d.ID, cmd.Process.Pid); err != nil {
+		slog.Error("record agent pid", "dispatch", d.ID, "pid", cmd.Process.Pid, "err", err)
+	}
+
 	// Tee the stream to the log file and parse it at the same time, so one read
 	// serves both the record and the operator.
 	tee := io.TeeReader(stdout, logFile)
@@ -215,6 +233,19 @@ func Supervise(
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 
+	// Clear agent_pid now that cmd.Wait has returned: this runner OUTLIVES its
+	// agent child (it still drains the stream, calls finish, and MarkNeedsRetry
+	// below), so from here on the pid this row named no longer identifies a
+	// live process at all, let alone this dispatch's agent. Left in place, a
+	// `--force` kill racing this window would read a pid the kernel may already
+	// have reissued to an unrelated process and SIGKILL that process's group
+	// instead. Logged and ignored on failure, for the same reason the initial
+	// write is: a bookkeeping failure here must not abandon recording the run's
+	// real outcome below.
+	if err := st.SetDispatchAgentPID(d.ID, 0); err != nil {
+		slog.Error("clear agent pid", "dispatch", d.ID, "err", err)
+	}
+
 	res := store.DispatchResult{
 		Status:     store.StatusSucceeded,
 		CostUSD:    result.CostUSD,
@@ -227,7 +258,7 @@ func Supervise(
 		SessionStarted: result.SessionID != "" || (waitErr != nil && inUse.Seen()),
 	}
 	// pi reports no wall-clock duration in its stream; the runner measures it.
-	if cfg.Agent.Harness == config.HarnessPi {
+	if effective.Harness == config.HarnessPi {
 		res.DurationMS = time.Since(start).Milliseconds()
 	}
 

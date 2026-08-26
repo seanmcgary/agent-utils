@@ -118,6 +118,8 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 |---|---|
 | `agent-utils list` | Every project on this machine, with each loop's ticks, live dispatches, cost and last tick |
 | `agent-utils sessions list [--project <p>] [--loop <l>] [--running] [--orphaned]` | Every session on this machine, with its project, issue, runs, cost and state |
+| `agent-utils sessions kill --session <id> \| --issue <n> \| --all --yes [--project <p>] [--loop <l>] [--force] [--timeout <d>]` | Stop a running session: signal its runner, mark the issue stopped, and record the outcome |
+| `agent-utils sessions resume --session <id> \| --issue <n> \| --all --yes [--project <p>] [--loop <l>]` | Clear a stopped issue's flags so its next trigger starts fresh |
 | `agent-utils logs [--name <loop>] [--session <id>]` | The log of a dispatched agent, for the project in the current directory |
 | `agent-utils forget <name\|id\|path>` | Drop a project from the registry, touching none of its files |
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
@@ -215,6 +217,58 @@ Follow a session from the machine-wide list with `agent-utils project --name <pr
 --session <id>`. The project selector is needed because top-level `logs` resolves the project
 from the current directory.
 
+### Stopping a session
+
+`agent-utils sessions kill` and `agent-utils sessions resume` stop and restart one issue's
+dispatch, from any directory:
+
+```bash
+agent-utils sessions kill    --session <id>
+agent-utils sessions kill    --issue <n> [--project <p>] [--loop <l>]
+agent-utils sessions kill    --all --yes [--project <p>] [--loop <l>]
+agent-utils sessions resume  --session <id> | --issue <n> | --all --yes
+```
+
+| Flag | Effect |
+|---|---|
+| `--session <id>` | The target, by session identifier |
+| `--issue <n>` | The target, by issue number. Needs `--project`, or run from the project's directory. Needs `--loop` too if the number matches more than one loop |
+| `--all` | Every running dispatch (`kill`) or every stopped issue (`resume`) matched by `--project` and `--loop` |
+| `--project <name\|id\|path>` | Narrow `--issue` and `--all` to one project |
+| `--loop <name>` | Narrow `--issue` and `--all` to one loop |
+| `--yes` | Skip the confirmation prompt `--all` otherwise requires |
+| `--force` (`kill` only) | SIGKILL the agent's process group and the runner, instead of waiting for a graceful exit |
+| `--timeout` (`kill` only) | How long to wait for the runner to exit after SIGTERM. Default 30s |
+
+Exactly one of `--session`, `--issue`, or `--all` is required. `--all` is destructive, so it
+needs `--yes` outside an interactive terminal, and prompts for confirmation inside one.
+
+`kill` sets a `stopped` flag on the issue **before** it signals anything. This holds the issue:
+without the flag, the next tick would see the trigger label, find no running dispatch yet, and
+start a second agent on the same issue. `kill` then sends SIGTERM to the runner and waits for it
+to exit.
+
+`resume` clears the flag, so the loop may dispatch the issue again. It refuses while the
+runner is still alive — signal it with `kill` first.
+
+Both states show up where you already look:
+
+- `agent-utils sessions list` shows `STOPPED` in the STATE column.
+- `agent-utils project loop status` shows `stopped` in its state column, and lists every
+  stopped issue with its reason underneath the table.
+
+An invalid `model:`/`harness:`/`effort:` label (see
+[Configuration](#configuration)) sets the same flag, with the label's error as the reason.
+`sessions resume` clears that too, once the label is fixed.
+
+Three limits, stated plainly:
+
+- `--force` will not signal an agent whose runner cannot be verified. An issue orphaned by a
+  runner that was killed some other way (not through this command) must be stopped by hand.
+- `resume` is refused while the runner still verifies as alive.
+- If the runner outlives `--timeout`, the issue stays safely stopped, but the agent keeps
+  running. Retry with `--force`.
+
 ## Watching a run
 
 `loop tick` starts agents and exits, by design: it runs from cron and must not block. The
@@ -274,6 +328,13 @@ remains the reference for editing one by hand** — what each field means, what 
 what happens if you get it wrong. `examples/planning.yaml` and `examples/execution.yaml` are
 complete working files, ported from the reference planning and execution orchestrators.
 
+A label on an issue can also override, for that issue alone, which model, harness, or effort
+level a dispatch uses: `model:<value>`, `harness:<value>`, `effort:<value>`. These are always
+active — no configuration field enables them. See
+[Agent overrides from labels](docs/configuration.md#agent-overrides-from-labels) for the syntax,
+the rejection rules, and why an invalid label stops the issue instead of falling back to the
+configured value.
+
 ## Migration
 
 State used to live in one SQLite file per loop, at `{state_dir}/state.db`. Those files are
@@ -328,6 +389,26 @@ tools with no gate, like claude with permission off, and the filtered environmen
 agent environment. For the worktree, trust of `AGENTS.md`/`CLAUDE.md` follows pi's
 `defaultProjectTrust`; keep an open trust default off for a loop whose worktree is fed with
 untrusted issue text. See [docs/configuration.md](docs/configuration.md#agent-harness-optional).
+
+The `model:`, `harness:`, and `effort:` override labels (see
+[Configuration](#configuration)) are always active and grant no new code execution: GitHub
+already restricts the label permission to a collaborator with triage access or above, and that
+collaborator's issues already run an agent with a repository-write token. What the labels add is
+the choice of which binary runs and which model is billed. An invalid label stops the issue
+rather than falling back to a default, and clearing that flag needs `sessions resume` run on the
+loop's own machine — so a label applied from GitHub can halt an issue that only a local operator
+can restart. See [Stopping a session](#stopping-a-session).
+
+A `harness:` label is refused only when it would switch the effective harness to `pi` on a loop
+that configured `agent.permission_mode` or a nonzero `agent.max_budget_usd` — the `pi` harness
+enforces neither, so switching to it would silently drop both. Switching to `claude` is never
+refused, since `claude` only ever adds a bound `pi` did not enforce. On a loop that configures
+neither setting, a `harness:` label changes which binary runs — and therefore which model
+provider's credentials are used and which of that loop's environment is exposed to the agent —
+with **no additional gate at all**. This is accepted, deliberate behaviour: the guard protects
+two specific settings, and a loop that never set either has nothing for it to protect. Set
+`agent.permission_mode` or `agent.max_budget_usd` on any loop where an untrusted collaborator
+choosing the harness is a concern.
 
 The webhook listener adds one more thing worth naming plainly: it accepts a request from the
 internet that starts an agent. That is a stronger claim than "a cron job reads issues on a

@@ -165,6 +165,7 @@ absolute path** — it depends on no working directory and can never prompt.
 - [Quick reference](#quick-reference)
 - [Identity and paths](#identity-and-paths)
 - [`labels`](#labels)
+- [Agent overrides from labels](#agent-overrides-from-labels)
 - [`agent`](#agent)
 - [`tend_pr`](#tend_pr)
 - [`retry`](#retry)
@@ -462,6 +463,92 @@ veto:
 
 Quote any value containing `*`, or YAML may complain.
 
+## Agent overrides from labels
+
+Three label prefixes let a label on the issue override one setting from `agent`, for that
+issue's dispatch only. They are always active. No configuration field turns them on, and none
+turns them off.
+
+| Label prefix | Overrides | Example |
+|---|---|---|
+| `model:` | `agent.model` | `model:claude-opus-5` |
+| `harness:` | `agent.harness` | `harness:pi` |
+| `effort:` | `agent.effort` | `effort:high` |
+
+See [`agent.model`](#agentmodel--required), [`agent.harness`](#agentharness--optional), and
+[`agent.effort`](#agenteffort--optional) for what each setting does.
+
+### Case
+
+The prefix ignores case: `Model:`, `MODEL:`, and `model:` are the same label.
+
+The value's case depends on what it names:
+
+- `harness:` and `effort:` name one of a fixed, closed list of values, so the value is lowered.
+  `harness:PI` and `harness:pi` are the same override.
+- `model:` names a model identifier, which is case-sensitive, so its value is kept exactly as
+  written.
+
+### Rejected labels
+
+The loop refuses a label instead of guessing what it meant. Each of these makes the label
+invalid:
+
+- The value is empty. `model:` names no model.
+- The value contains a space or any other whitespace character, including a zero-width space
+  or a word joiner.
+- The value starts with `-`. The value becomes one argument in the list the agent binary is
+  run with, and an argument starting with `-` is read as a flag, not a value.
+- The value contains a character outside `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`, or `/` — and even
+  among those, the FIRST character must be one of `A-Z`, `a-z`, `0-9`, `.`, or `_`: a leading
+  `-` or a leading `/` is rejected, though either may appear later in the value.
+- Two labels on the same issue carry the same prefix. Two `model:` labels is an error, not a
+  choice between them — nothing decides which one wins.
+- `harness:` names anything other than `claude` or `pi`.
+- `effort:` names anything other than `low`, `medium`, `high`, `xhigh`, or `max`.
+
+A `harness:` label naming the loop's OWN configured harness is a no-op: it is accepted, but
+changes nothing.
+
+A `harness:` label that would switch the EFFECTIVE harness to `pi` is refused when the loop's
+own configuration sets `agent.permission_mode` or a nonzero `agent.max_budget_usd`. The `pi`
+harness accepts neither flag — see [`agent.harness`](#agentharness--optional) — so switching TO
+`pi` would silently run the dispatch with no permission mode and no cost ceiling. The rule is
+directional: switching to `claude` is never refused, however the loop is configured, because
+`claude` only ever adds a bound `pi` did not enforce in the first place — it can never drop one.
+
+On a loop that configures NEITHER `agent.permission_mode` nor `agent.max_budget_usd` — the
+default — a `harness:` label changes which binary runs with no additional gate at all. This is
+accepted and deliberate, not an oversight: the guard exists to protect two specific settings, and
+a loop that never set them has nothing for the guard to protect.
+
+### What an invalid label does
+
+An invalid label does not fail silently and does not fall back to the configured value. It
+stops the issue: the loop sets a `stopped` flag and records the label's error as the reason. No
+agent runs for that issue until the flag is cleared.
+
+The loop writes nothing to GitHub for this. The reason shows in `agent-utils sessions list` and
+in `agent-utils project loop status`.
+
+Clearing the flag needs `agent-utils sessions resume`, and only on the machine running the loop.
+A label applied from GitHub can therefore halt an issue that only a local operator can restart —
+fix the label, or remove it, then run `sessions resume`. See
+[`README.md`](../README.md#sessions).
+
+### Scope
+
+A valid override applies to every dispatch that works the issue itself: its first run, every
+resume, and every retry. It does not apply to a tend dispatch — the run that rebases a pull
+request against its base branch — because a tend dispatch is not the issue's own work, and a
+loop configures how it runs once, for every issue alike.
+
+### Who controls this
+
+Anyone who can add a label to an issue chooses that issue's model and harness. There is no
+separate permission for it. Point a loop only at a repository whose issue and label population
+you trust — see [Security](../README.md#security).
+
 ## `agent`
 
 How to invoke the agent for a dispatch. The `agent.harness` field selects which agent
@@ -487,6 +574,9 @@ Choose `pi` to use a model that `claude` does not offer. For a `pi` harness:
 - A `pi` run's session resumes by the same session id, because pi's `--session-id`
   creates a session when new and resumes it when known.
 
+A `harness:` label on an issue can override this setting for that issue's dispatch. See
+[Agent overrides from labels](#agent-overrides-from-labels).
+
 ### `agent.model` — required
 
 Passed straight through as `--model`. Accepts an alias (`opus`, `sonnet`, `haiku`) or a full
@@ -499,6 +589,9 @@ implicit silently downgrades the work and nothing fails loudly — you simply ge
 model: opus
 ```
 
+A `model:` label on an issue can override this setting for that issue's dispatch. See
+[Agent overrides from labels](#agent-overrides-from-labels).
+
 ### `agent.effort` — optional
 
 Passed as `--effort`. One of `low`, `medium`, `high`, `xhigh`, `max`.
@@ -509,6 +602,9 @@ dispatch, so a typo costs you a startup error instead of a retry slot.
 ```yaml
 effort: high
 ```
+
+An `effort:` label on an issue can override this setting for that issue's dispatch. See
+[Agent overrides from labels](#agent-overrides-from-labels).
 
 ### `agent.permission_mode` — optional
 
