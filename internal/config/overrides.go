@@ -137,52 +137,13 @@ func cutPrefixFold(label, prefix string) (matchedPrefix, rest string, ok bool) {
 	return label[:len(prefix)], label[len(prefix):], true
 }
 
-// ValidateHarnessSafety refuses a harness: override whose EFFECTIVE harness
-// would be pi when the configuration sets a safety setting pi enforces
-// neither of: agent.permission_mode or a non-zero agent.max_budget_usd.
-// BuildArgs (claude) emits both; PiBuildArgs emits NEITHER (args.go) -- so
-// switching TO pi on a loop that configured either would silently run the
-// dispatch with no permission mode and no cost ceiling, the exact two bounds
-// that exist because the agent reads third-party issue text.
-//
-// The hazard is directional. Switching FROM pi TO claude only ever ADDS a
-// bound PiBuildArgs never enforced in the first place, so it is never
-// refused, however the configuration is set — the same is true when the
-// override equals the configured harness (a no-op) or is empty (no
-// override at all).
-//
-// It lives here, not in internal/engine, so BOTH callers that can put a row
-// in front of RunAgent enforce it: engine.Decide, on the ordinary tick path,
-// and runner.Effective, the last line of defence before a value becomes an
-// argv element, for a row reaching RunAgent by any other path (legacy
-// import, an older binary, a hand-edited database).
-func (ov Overrides) ValidateHarnessSafety(cfg *Config) error {
-	if ov.Harness == "" {
-		return nil
-	}
-	configured := cfg.Agent.Harness
-	if configured == "" {
-		configured = HarnessClaude
-	}
-	if ov.Harness == configured {
-		return nil
-	}
-	if ov.Harness != HarnessPi {
-		// Switching to claude never drops a bound: claude enforces both.
-		return nil
-	}
-	if cfg.Agent.PermissionMode != "" {
-		return fmt.Errorf(
-			"harness override %q would drop agent.permission_mode %q: the pi harness enforces no permission mode",
-			ov.Harness, cfg.Agent.PermissionMode)
-	}
-	if cfg.Agent.MaxBudgetUSD != 0 {
-		return fmt.Errorf(
-			"harness override %q would drop the agent.max_budget_usd %.2f ceiling: the pi harness enforces no cost ceiling",
-			ov.Harness, cfg.Agent.MaxBudgetUSD)
-	}
-	return nil
-}
+// A harness: override carries no cross-harness safety rule. claude and pi
+// support different settings, and the ones only claude has --
+// agent.permission_mode, agent.max_budget_usd, agent.background_tasks --
+// are simply not emitted when the effective harness is pi
+// (internal/runner/args.go PiBuildArgs). An override that lands on a
+// harness which does not implement a setting IGNORES that setting; it is
+// never a reason to refuse the override, in either direction.
 
 // validateOverrideValue applies the argument-injection rule: the value is
 // checked against an ALLOWLIST regex, not a denylist, so no enumeration of

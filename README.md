@@ -399,16 +399,17 @@ rather than falling back to a default, and clearing that flag needs `sessions re
 loop's own machine — so a label applied from GitHub can halt an issue that only a local operator
 can restart. See [Stopping a session](#stopping-a-session).
 
-A `harness:` label is refused only when it would switch the effective harness to `pi` on a loop
-that configured `agent.permission_mode` or a nonzero `agent.max_budget_usd` — the `pi` harness
-enforces neither, so switching to it would silently drop both. Switching to `claude` is never
-refused, since `claude` only ever adds a bound `pi` did not enforce. On a loop that configures
-neither setting, a `harness:` label changes which binary runs — and therefore which model
-provider's credentials are used and which of that loop's environment is exposed to the agent —
-with **no additional gate at all**. This is accepted, deliberate behaviour: the guard protects
-two specific settings, and a loop that never set either has nothing for it to protect. Set
-`agent.permission_mode` or `agent.max_budget_usd` on any loop where an untrusted collaborator
-choosing the harness is a concern.
+A `harness:` label is never refused for a setting the chosen harness does not implement. The
+claude-only settings — `agent.permission_mode`, `agent.max_budget_usd`, `agent.background_tasks`
+— are simply **ignored** when the effective harness is `pi`, which has no permission model, no
+cost-ceiling flag and no background-task switch; `pi -p` already runs tools with no gate. So a
+`harness:` label changes which binary runs — and therefore which model provider's credentials
+are used, which of that loop's environment is exposed to the agent, and whether the configured
+permission mode and cost ceiling apply at all — with **no additional gate**. This is accepted,
+deliberate behaviour: the label permission is already collaborator-only, and the same
+collaborator's issues already run an agent with a repository-write token. Do not put a loop on
+`pi` — or leave `harness:` reachable — where an untrusted collaborator dropping those two
+bounds is a concern.
 
 The webhook listener adds one more thing worth naming plainly: it accepts a request from the
 internet that starts an agent. That is a stronger claim than "a cron job reads issues on a

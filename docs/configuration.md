@@ -510,17 +510,18 @@ invalid:
 A `harness:` label naming the loop's OWN configured harness is a no-op: it is accepted, but
 changes nothing.
 
-A `harness:` label that would switch the EFFECTIVE harness to `pi` is refused when the loop's
-own configuration sets `agent.permission_mode` or a nonzero `agent.max_budget_usd`. The `pi`
-harness accepts neither flag — see [`agent.harness`](#agentharness--optional) — so switching TO
-`pi` would silently run the dispatch with no permission mode and no cost ceiling. The rule is
-directional: switching to `claude` is never refused, however the loop is configured, because
-`claude` only ever adds a bound `pi` did not enforce in the first place — it can never drop one.
+A `harness:` label is never refused for a setting the chosen harness does not implement. The
+claude-only settings — `agent.permission_mode`, `agent.max_budget_usd`, `agent.background_tasks`
+— are **ignored** when the effective harness is `pi`, exactly as they are for a loop configured
+`harness: pi` outright: pi has no permission model, no cost-ceiling flag and no background-task
+switch, so the builder emits none of them. See [`agent.harness`](#agentharness--optional).
 
-On a loop that configures NEITHER `agent.permission_mode` nor `agent.max_budget_usd` — the
-default — a `harness:` label changes which binary runs with no additional gate at all. This is
-accepted and deliberate, not an oversight: the guard exists to protect two specific settings, and
-a loop that never set them has nothing for the guard to protect.
+So a `harness:` label changes which binary runs with no additional gate, and a `harness:pi`
+label on a loop that set `agent.permission_mode` or `agent.max_budget_usd` runs that issue
+without either bound. This is accepted and deliberate: applying a label already requires triage
+access or above, and the same collaborator's issues already run an agent with a
+repository-write token. A loop where dropping those bounds matters should not leave `harness:`
+reachable.
 
 ### What an invalid label does
 
@@ -567,10 +568,11 @@ Choose `pi` to use a model that `claude` does not offer. For a `pi` harness:
   `anthropic/claude-sonnet-4-5`, `openrouter/...`), not a claude alias like `opus`.
 - `agent.effort` maps to pi's `--thinking` level. `low`, `medium`, `high`, `xhigh`, `max`
   are valid for both harnesses.
-- `agent.permission_mode` is claude-only. A `pi` config must not set it; the loop rejects it.
-- `agent.background_tasks` is claude-only. A `pi` config must not set it; the loop rejects it.
-- `agent.max_budget_usd` is a claude-only ceiling. For `pi` it is accepted but has no
-  effect, because pi exposes no cost-ceiling flag.
+- `agent.permission_mode`, `agent.background_tasks` and `agent.max_budget_usd` are claude-only.
+  A `pi` config may carry them — a `harness:claude` label can make them take effect for one
+  issue — but a `pi` dispatch IGNORES all three: pi has no permission model, no background-task
+  switch and no cost-ceiling flag, so none of them is ever emitted. `agent.permission_mode` is
+  still validated as a claude mode whatever the harness is, acknowledgement included.
 - A `pi` run's session resumes by the same session id, because pi's `--session-id`
   creates a session when new and resumes it when known.
 
@@ -611,6 +613,10 @@ An `effort:` label on an issue can override this setting for that issue's dispat
 Passed as `--permission-mode`. One of `acceptEdits`, `auto`, `manual`, `dontAsk`, `plan`,
 `bypassPermissions`. Omit to use claude's default.
 
+claude-only: a `pi` dispatch — whether from `harness: pi` or a `harness:pi` label — ignores it,
+because pi has no permission model. The value is still validated whatever the harness is, since
+a `harness:claude` label can make it take effect for one issue.
+
 **`bypassPermissions` requires `i_understand_bypass_permissions: true`.** It disables every
 permission prompt, and the agent reads issue and comment text written by other people, so an
 instruction hidden in a comment executes with no gate. The acknowledgement exists to make
@@ -650,6 +656,9 @@ typed for `25` would have run uncapped and said nothing.
 This is a per-dispatch ceiling, not a per-issue or per-day one. An issue that is retried
 three times can spend up to three times this amount.
 
+claude-only: a `pi` dispatch — whether from `harness: pi` or a `harness:pi` label — ignores it,
+because pi exposes no cost-ceiling flag. Such a dispatch is bounded only by `agent.timeout`.
+
 ```yaml
 max_budget_usd: 25   # or 0 for no cap
 ```
@@ -684,7 +693,8 @@ Whatever this is set to, a run whose background work is terminated is recorded *
 succeeded, so the issue is marked for retry and the next tick resumes the session and picks the
 abandoned tasks back up.
 
-Claude-only. A `pi` config must not set it; the loop rejects it.
+claude-only: it reaches the child through the claude environment, which a `pi` dispatch —
+whether from `harness: pi` or a `harness:pi` label — never builds, so such a dispatch ignores it.
 
 ```yaml
 background_tasks: false   # true only if you know why you want it
@@ -959,7 +969,6 @@ Beyond the required fields in the quick reference:
 | `agent.permission_mode` is a real claude mode or empty | `… is not a valid claude permission mode` |
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
 | `agent.max_budget_usd` ≥ 0 (`0` means no cap) | `agent.max_budget_usd must not be negative` |
-| `agent.background_tasks` unset for `harness: pi` | `agent.background_tasks is claude-only` |
 | `agent.timeout` > 0 | `agent.timeout must be greater than zero` |
 | `retry.max` ≥ 0 | `retry.max must not be negative` |
 | `len(retry.backoff)` ≥ `retry.max` | `it needs one entry per retry` |

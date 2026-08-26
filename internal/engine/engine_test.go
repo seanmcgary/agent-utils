@@ -686,23 +686,33 @@ func TestInvalidHarnessLabelStopsTheIssue(t *testing.T) {
 	}
 }
 
-func TestHarnessOverrideRefusedWhenItDropsPermissionMode(t *testing.T) {
-	cfg := testConfig()
-	cfg.Agent.PermissionMode = "plan"
-	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:pi")}}
-	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStop {
-		t.Fatalf("decisions = %v, want one stop: harness:pi would drop permission_mode", kinds(p))
-	}
-}
-
-func TestHarnessOverrideRefusedWhenItDropsBudgetCeiling(t *testing.T) {
-	cfg := testConfig()
-	cfg.Agent.MaxBudgetUSD = 5
-	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:pi")}}
-	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStop {
-		t.Fatalf("decisions = %v, want one stop: harness:pi would drop max_budget_usd", kinds(p))
+// A claude-only setting must never refuse a harness: override. pi has no
+// permission model and no cost ceiling, so PiBuildArgs emits neither; the
+// override IGNORES them and the issue dispatches.
+func TestHarnessOverrideIgnoresTheClaudeOnlySettings(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(*config.Config)
+	}{
+		{"permission_mode", func(c *config.Config) { c.Agent.PermissionMode = "plan" }},
+		{"max_budget_usd", func(c *config.Config) { c.Agent.MaxBudgetUSD = 5 }},
+		{"both", func(c *config.Config) {
+			c.Agent.PermissionMode = "plan"
+			c.Agent.MaxBudgetUSD = 5
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			tc.apply(cfg)
+			snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:pi")}}
+			p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+			if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStart {
+				t.Fatalf("decisions = %v, want one start: pi ignores what it does not implement", kinds(p))
+			}
+			if p.Decisions[0].Overrides.Harness != config.HarnessPi {
+				t.Errorf("Overrides.Harness = %q, want pi", p.Decisions[0].Overrides.Harness)
+			}
+		})
 	}
 }
 
@@ -737,6 +747,25 @@ func TestHarnessOverrideToClaudeIsNeverRefusedOnAPiLoop(t *testing.T) {
 	}
 	if p.Decisions[0].Overrides.Harness != "claude" {
 		t.Errorf("Overrides.Harness = %q, want claude", p.Decisions[0].Overrides.Harness)
+	}
+}
+
+// The KindStop reason is stored verbatim as StoppedReason, and
+// stoppedSkipReason appends the resume hint every time that row is read
+// back. A reason that carried the hint itself rendered it twice.
+func TestStopReasonDoesNotCarryTheResumeHint(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:gpt")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStop {
+		t.Fatalf("decisions = %v, want one stop", kinds(p))
+	}
+	if strings.Contains(p.Decisions[0].Reason, "sessions resume") {
+		t.Errorf("Reason = %q, want the bare cause: stoppedSkipReason adds the hint",
+			p.Decisions[0].Reason)
+	}
+	if got := stoppedSkipReason(p.Decisions[0].Reason); strings.Count(got, "sessions resume") != 1 {
+		t.Errorf("rendered = %q, want the hint exactly once", got)
 	}
 }
 

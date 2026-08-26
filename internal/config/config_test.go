@@ -315,15 +315,48 @@ func TestLoadRejectsBadHarness(t *testing.T) {
 	}
 }
 
-func TestRejectsPiPermissionMode(t *testing.T) {
+// A claude-only setting is IGNORED by pi, never rejected: PiBuildArgs emits
+// no permission mode, and a harness: label can flip either harness to the
+// other for one issue, so a config that carries the field must stay loadable
+// under both.
+func TestAcceptsPiPermissionModeAsANoOp(t *testing.T) {
 	body := replaceOnce(piYAML, "  worktree: per_issue\n",
 		"  permission_mode: acceptEdits\n  worktree: per_issue\n")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("Load pi with permission_mode: %v", err)
+	}
+	if cfg.Agent.PermissionMode != "acceptEdits" {
+		t.Errorf("PermissionMode = %q, want it kept for a harness:claude override",
+			cfg.Agent.PermissionMode)
+	}
+}
+
+// The VALUE is still checked under pi. A harness:claude label makes it take
+// effect, so a typo must not survive to that dispatch.
+func TestRejectsAnInvalidPermissionModeUnderPi(t *testing.T) {
+	body := replaceOnce(piYAML, "  worktree: per_issue\n",
+		"  permission_mode: nonsense\n  worktree: per_issue\n")
 	_, err := Load(writeTemp(t, body))
 	if err == nil {
-		t.Fatal("want reject permission_mode for a pi harness, got nil")
+		t.Fatal("want reject an invalid permission_mode under pi, got nil")
 	}
 	if !strings.Contains(err.Error(), "permission_mode") {
 		t.Errorf("err = %v, want it to name permission_mode", err)
+	}
+}
+
+// Same reason for the acknowledgement: bypassPermissions on a pi config is
+// one harness:claude label away from disabling every prompt.
+func TestRequiresBypassAcknowledgementUnderPi(t *testing.T) {
+	body := replaceOnce(piYAML, "  worktree: per_issue\n",
+		"  permission_mode: bypassPermissions\n  worktree: per_issue\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want reject unacknowledged bypassPermissions under pi, got nil")
+	}
+	if !strings.Contains(err.Error(), "i_understand_bypass_permissions") {
+		t.Errorf("err = %v, want it to name the acknowledgement", err)
 	}
 }
 
@@ -338,15 +371,17 @@ func TestAcceptsPiBudgetNoOp(t *testing.T) {
 	}
 }
 
-func TestRejectsPiBackgroundTasks(t *testing.T) {
+// background_tasks is claude-only and reaches the child through claudeEnv,
+// which a pi dispatch never builds. Accepted, and a no-op.
+func TestAcceptsPiBackgroundTasksAsANoOp(t *testing.T) {
 	body := replaceOnce(piYAML, "  worktree: per_issue\n",
 		"  background_tasks: true\n  worktree: per_issue\n")
-	_, err := Load(writeTemp(t, body))
-	if err == nil {
-		t.Fatal("want reject background_tasks for a pi harness, got nil")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("Load pi with background_tasks: %v", err)
 	}
-	if !strings.Contains(err.Error(), "background_tasks") {
-		t.Errorf("err = %v, want it to name background_tasks", err)
+	if !cfg.Agent.BackgroundTasksEnabled() {
+		t.Error("BackgroundTasks must be kept for a harness:claude override")
 	}
 }
 

@@ -227,17 +227,22 @@ func TestEffectiveUsesTheNormalisedHarnessValue(t *testing.T) {
 	}
 }
 
-// TestEffectiveDropsAHarnessOverrideThatFailsTheSafetyRule is spec B8:
-// Effective is "the last line of defence before a value becomes an argv
-// element" (its own doc comment), so a row reaching RunAgent by a path other
-// than this tick's engine.Decide -- a legacy import, an older binary, a
-// hand-edited database -- must still have the harness-safety rule applied.
-// cfg() sets both PermissionMode and MaxBudgetUSD, so switching to pi would
-// silently drop both.
-func TestEffectiveDropsAHarnessOverrideThatFailsTheSafetyRule(t *testing.T) {
-	s := Effective(cfg(), config.Overrides{Harness: config.HarnessPi})
-	if s.Harness != "" {
-		t.Errorf("Harness = %q, want the override dropped: it would silently drop permission_mode and max_budget_usd", s.Harness)
+// The claude-only settings never refuse a harness override. cfg() sets both
+// PermissionMode and MaxBudgetUSD; pi implements neither, so the override is
+// applied and PiBuildArgs simply emits neither flag.
+func TestEffectiveKeepsAPiOverrideOverTheClaudeOnlySettings(t *testing.T) {
+	c := cfg()
+	s := Effective(c, config.Overrides{Harness: config.HarnessPi})
+	if s.Harness != config.HarnessPi {
+		t.Fatalf("Harness = %q, want %q: pi ignores what it does not implement",
+			s.Harness, config.HarnessPi)
+	}
+	j := joined(PiBuildArgs(c, Invocation{
+		SessionID: "s", Prompt: "p",
+		Overrides: config.Overrides{Harness: config.HarnessPi},
+	}))
+	if strings.Contains(j, "--permission-mode") || strings.Contains(j, "--max-budget-usd") {
+		t.Errorf("pi args = %s, want neither claude-only flag", j)
 	}
 }
 

@@ -51,10 +51,11 @@ type Settings struct {
 // Supervise compares against -- otherwise it fails that comparison silently
 // and launches claude with the pi model and claudeEnv.
 //
-// The harness-safety rule (config.Overrides.ValidateHarnessSafety) is
-// re-applied here too, for the same reason: a row can reach RunAgent by a
-// path this function is the only guard for. A harness override that fails it
-// is DROPPED, exactly like a syntactically invalid value.
+// A harness override is never refused for the settings the other harness
+// lacks. cfg.Agent.PermissionMode, MaxBudgetUSD and BackgroundTasks are
+// claude-only; when the effective harness is pi, PiBuildArgs and claudeEnv
+// never emit them, so the override IGNORES them rather than dropping a
+// guard the harness could have honoured.
 func Effective(cfg *config.Config, ov config.Overrides) Settings {
 	s := Settings{
 		Harness: cfg.Agent.Harness,
@@ -77,10 +78,6 @@ func Effective(cfg *config.Config, ov config.Overrides) Settings {
 		if p, err := config.ParseOverrides([]string{config.OverrideEffortPrefix + ov.Effort}); err == nil {
 			parsed.Effort = p.Effort
 		}
-	}
-
-	if parsed.Harness != "" && parsed.ValidateHarnessSafety(cfg) != nil {
-		parsed.Harness = ""
 	}
 
 	if parsed.Model != "" {

@@ -108,9 +108,6 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// DISPATCH; it must never block KindClearRetry or
 		// KindParkRetryExhausted, which are repair actions.
 		ov, ovErr := config.ParseOverrides(iss.Labels)
-		if ovErr == nil {
-			ovErr = validateOverrides(cfg, ov)
-		}
 
 		// FAILURE PATH. NeedsRetry is durable state written when a dispatch died
 		// or exited non-zero. It covers both a dead runner and a clean non-zero
@@ -146,10 +143,9 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			if d != nil && d.Kind != KindParkRetryExhausted && ovErr != nil {
 				decided[iss.Number] = true
 				stops = append(stops, Decision{
-					Kind:  KindStop,
-					Issue: iss.Number,
-					Reason: fmt.Sprintf(
-						"%s; clear it with `agent-utils sessions resume`", ovErr.Error()),
+					Kind:   KindStop,
+					Issue:  iss.Number,
+					Reason: ovErr.Error(),
 				})
 				continue
 			}
@@ -183,10 +179,9 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		decided[iss.Number] = true
 		if ovErr != nil {
 			stops = append(stops, Decision{
-				Kind:  KindStop,
-				Issue: iss.Number,
-				Reason: fmt.Sprintf(
-					"%s; clear it with `agent-utils sessions resume`", ovErr.Error()),
+				Kind:   KindStop,
+				Issue:  iss.Number,
+				Reason: ovErr.Error(),
 			})
 			continue
 		}
@@ -319,18 +314,6 @@ func stoppedSkipReason(reason string) string {
 		return "clear it with `agent-utils sessions resume`"
 	}
 	return fmt.Sprintf("%s; clear it with `agent-utils sessions resume`", reason)
-}
-
-// validateOverrides refuses a harness: override that would drop a safety
-// setting the loop configured. The rule itself lives on config.Overrides
-// (ValidateHarnessSafety), shared with runner.Effective, so a row reaching
-// RunAgent by any path other than this tick still gets it enforced.
-//
-// There is deliberately no "pi requires a model" rule: agent.model is
-// required for every harness (config.go:261), so such a rule could never
-// fire.
-func validateOverrides(cfg *config.Config, ov config.Overrides) error {
-	return ov.ValidateHarnessSafety(cfg)
 }
 
 // tendDecisions selects stale pull requests for issues awaiting review.
