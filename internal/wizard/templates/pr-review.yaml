@@ -20,6 +20,10 @@ labels:
   # there is no later state for this loop to approve.
   veto:
     - "blocked:*"
+    # The states the EXECUTION loop owns. An issue still being built must never
+    # be reviewed underneath the agent building it.
+    - status:ready-for-execution
+    - status:executing
 
 agent:
   # The point of this loop is a REVIEWER stronger than whatever wrote the code.
@@ -38,8 +42,18 @@ i_understand_bypass_permissions: true
 # Tending is an EXECUTION-loop duty, and this loop must never do it.
 # reviewing-commits rebases the branch itself (--fixup plus --autosquash), so a
 # tend agent rebasing the same branch would race the review's own force-push.
-# Once this loop finishes it applies labels.review, and the execution loop's
-# tend sweep -- which targets that label -- takes the pull request back over.
+#
+# Be clear about what that leaves, because it is a trade and not a free win.
+# A loop tends whatever ITS labels.review names, and for the execution loop
+# feeding this one that is this loop's TRIGGER. So a pull request WAITING on
+# this loop is tended, and one this loop has already handed to the human is
+# not. Setting tend_pr true here (its labels.review being the human's queue)
+# moves tending to the other end instead; it cannot be in both places, because
+# labels.review is one field doing both jobs.
+#
+# Whichever end tends, it must not be vetoed: labels.veto is checked before
+# tend decisions too (internal/engine/engine.go), so vetoing a label would
+# silently disable tending on it as well as dispatching.
 tend_pr: false
 
 retry:
