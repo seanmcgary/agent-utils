@@ -146,6 +146,15 @@ type harness struct {
 	cleanups int
 	backoff  []time.Duration
 	max      int
+	// live is what the RunIssue seam reports as Summary.Live: how many of
+	// THIS issue's agents are still running. Non-zero means the pass decided
+	// nothing because an agent already holds the issue, which is the case the
+	// busy re-look exists for.
+	live int // guarded by mu
+	// busy is what the IssueBusy seam answers. It stands for the production
+	// read -- the loop's running dispatch rows, and kill(0) on each pid --
+	// which a test has no process to perform.
+	busy bool // guarded by mu
 }
 
 // newHarness returns a Worker whose seams are all fakes. db may be nil for a
@@ -172,6 +181,7 @@ func newHarness(db *store.DB) *harness {
 	w.RunIssue = h.runIssue
 	w.RunTend = h.runTend
 	w.RunCleanup = h.runCleanup
+	w.IssueBusy = h.issueBusy
 	w.Targets = h.targetsSeam
 	w.TargetFor = func(projectID, loop string) (Target, Routing, error) {
 		if h.targetFor != nil {
@@ -184,6 +194,12 @@ func newHarness(db *store.DB) *harness {
 	w.MinWakeInterval = time.Hour
 	w.OpenRetryDelay = 90 * time.Second
 	w.MinRetryDelay = 30 * time.Second
+	// Windowing OFF by default. Every test written before windows existed
+	// asserts on the timers a delivery arms, and a window in every one of them
+	// would shift those assertions without saying anything about what they
+	// test. The tests that ARE about windows turn it on.
+	w.IssueDelay = 0
+	w.BusyDelay = time.Minute
 	h.w = w
 	return h
 }
@@ -267,7 +283,7 @@ func (h *harness) runIssue(
 	h.mu.Lock()
 	h.ran = append(h.ran, cfg.Name)
 	h.ranIssues = append(h.ranIssues, number)
-	fn := h.runFn
+	fn, live := h.runFn, h.live
 	h.mu.Unlock()
 
 	// The first thing loopcmd.TickIssue does is fetch the issue the delivery
@@ -283,7 +299,15 @@ func (h *harness) runIssue(
 	if fn != nil {
 		return loopcmd.Summary{}, fn(cfg)
 	}
-	return loopcmd.Summary{}, nil
+	return loopcmd.Summary{Live: live}, nil
+}
+
+// issueBusy is the fake IssueBusy seam: the answer a test set, with no
+// database and no process behind it.
+func (h *harness) issueBusy(Target, int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.busy
 }
 
 // runTend is the fake RunTend seam. It records "loop@base" for each sweep,
@@ -386,6 +410,14 @@ func (h *harness) ranNumbers() []int {
 	return append([]int(nil), h.ranIssues...)
 }
 
+// clientsBuilt reports how many GitHub clients were built, which is one per
+// pass that read GitHub with access of its own.
+func (h *harness) clientsBuilt() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.clients
+}
+
 // pendingLen reports how many loops hold a scheduled retry.
 func (h *harness) pendingLen() int {
 	h.w.mu.Lock()
@@ -433,22 +465,28 @@ func seedDeadline(t *testing.T, db *store.DB, loop string, number int, at time.T
 	}
 }
 
-// A tick that lost the race for the loop's lock schedules nothing: the
-// delivery carries no state, so the tick that holds the lock reads the same
-// GitHub state a moment later. A retry here would tick the same loop again
-// for no new information.
+// A tick that lost the race for the loop's lock spends no RETRY budget: a
+// held lock is not a failed tick, and a backoff entry burnt here would leave
+// the next real failure with a shorter list than it was configured.
+//
+// It does arm a re-look, which is a different thing and is not on the retry
+// path at all; see TestALockHeldTickLooksAgainInsteadOfBeingDropped.
 func TestALockHeldTickSchedulesNoRetry(t *testing.T) {
 	h := newHarness(nil)
 	h.targets = []Target{h.target("planning")}
+	h.backoff = []time.Duration{5 * time.Minute}
 	h.runFn = func(*config.Config) error { return fmt.Errorf("run tick: %w", lock.ErrHeld) }
 
 	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
 
-	if n := h.timers.len(); n != 0 {
-		t.Errorf("armed %d retry timers, want 0 for a held lock", n)
-	}
 	if n := h.pendingLen(); n != 0 {
 		t.Errorf("pending = %d, want 0", n)
+	}
+	for i := 0; i < h.timers.len(); i++ {
+		if got := h.timers.at(t, i).d; got != h.w.BusyDelay {
+			t.Errorf("timer %d waits %v; the only timer a held lock may arm is the re-look at %v",
+				i, got, h.w.BusyDelay)
+		}
 	}
 }
 
@@ -1844,5 +1882,352 @@ func TestTheClosedIssuesOwnPassStillRuns(t *testing.T) {
 	// thing from scratch, so there is nothing here for a retry to recover.
 	if n := h.timers.len(); n != 0 {
 		t.Errorf("armed %d retry timers for a failed sweep, want 0", n)
+	}
+}
+
+// --- Delivery bursts and the busy re-look -----------------------------------
+//
+// One edit to an issue's labels is one delivery PER LABEL. Removing three
+// labels and adding one, in a single edit in the GitHub UI, is four
+// deliveries inside half a second. See armIssueWindow.
+
+// The first delivery of a burst still ticks at once -- the fast path is the
+// point of the daemon -- and the three behind it collapse into the ONE
+// trailing tick that reads the settled labels.
+func TestABurstForOneIssueTicksOnceAtEachEdge(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.w.IssueDelay = 2 * time.Second
+
+	for i := 0; i < 4; i++ {
+		h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	}
+
+	// The leading tick ran during the first Deliver; the other three armed
+	// nothing of their own.
+	if got := h.ranLoops(); len(got) != 1 {
+		t.Fatalf("issue passes during the burst = %d, want 1 (the leading edge)", len(got))
+	}
+	if got := h.timers.len(); got != 1 {
+		t.Fatalf("armed %d timers, want 1: a burst rides one window", got)
+	}
+	if got := h.timers.at(t, 0).d; got != h.w.IssueDelay {
+		t.Errorf("window delay = %v, want IssueDelay %v", got, h.w.IssueDelay)
+	}
+
+	h.timers.at(t, 0).f()
+
+	if got := h.ranLoops(); len(got) != 2 {
+		t.Fatalf("issue passes after the window closed = %d, want 2", len(got))
+	}
+	if got := h.ranNumbers(); got[1] != 15 {
+		t.Errorf("the trailing tick decided issue %d, want 15", got[1])
+	}
+}
+
+// A lone delivery is the common case and must not pay for the burst case: it
+// ticks once and the window closes with nothing behind it.
+func TestALoneDeliveryDoesNotTickTwice(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.w.IssueDelay = 2 * time.Second
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	if got := h.ranLoops(); len(got) != 1 {
+		t.Fatalf("issue passes = %d, want 1", len(got))
+	}
+
+	// The window still closes; it just has nothing to run.
+	h.timers.at(t, 0).f()
+	if got := h.ranLoops(); len(got) != 1 {
+		t.Errorf("issue passes after an empty window closed = %d, want 1", len(got))
+	}
+}
+
+// The window is per ISSUE. A burst on one issue must never swallow another
+// issue's delivery, which is a different decision entirely.
+func TestABurstOnOneIssueDoesNotSuppressAnother(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.w.IssueDelay = 2 * time.Second
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 16})
+
+	got := h.ranNumbers()
+	if len(got) != 2 || got[0] != 15 || got[1] != 16 {
+		t.Fatalf("leading ticks = %v, want [15 16]", got)
+	}
+	if n := h.timers.len(); n != 2 {
+		t.Fatalf("armed %d windows, want 2 (one per issue)", n)
+	}
+}
+
+// The whole point. A tick that decided nothing because an agent already holds
+// the issue must come back; today it returns and the issue waits for an
+// unrelated future delivery. Issue #15 of 2026-08-27 sat for hours this way.
+func TestAPassThatFindsItsIssueBusyLooksAgain(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.live = 1
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+
+	if n := h.timers.len(); n != 1 {
+		t.Fatalf("armed %d timers, want 1 (the busy re-look)", n)
+	}
+	if got := h.timers.at(t, 0).d; got != h.w.BusyDelay {
+		t.Errorf("busy delay = %v, want BusyDelay %v", got, h.w.BusyDelay)
+	}
+	if n := h.pendingLen(); n != 0 {
+		t.Errorf("pending = %d, want 0: a busy issue is not a FAILED tick", n)
+	}
+}
+
+// While the agent is still running, the re-look costs a dispatch-row read and
+// a kill(0). It must not tick, which would mean a GitHub fetch a minute for
+// the whole life of an eight-hour agent.
+func TestABusyRelookDoesNotTickWhileTheAgentIsStillRunning(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.live = 1
+	h.busy = true
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	before := len(h.ranLoops())
+
+	h.timers.at(t, 0).f()
+
+	if got := h.ranLoops(); len(got) != before {
+		t.Errorf("issue passes = %d, want %d: a live agent must not be ticked around", len(got), before)
+	}
+	if n := h.timers.len(); n != 2 {
+		t.Fatalf("armed %d timers, want 2: the re-look must arm another", n)
+	}
+	if got := h.timers.at(t, 1).d; got != h.w.BusyDelay {
+		t.Errorf("second busy delay = %v, want %v", got, h.w.BusyDelay)
+	}
+}
+
+// Once the agent's process is gone the re-look runs a real tick, which is
+// what finally dispatches the work the trigger label has been asking for.
+func TestABusyRelookTicksOnceTheAgentHasExited(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.live = 1
+	h.busy = true
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	before := len(h.ranLoops())
+
+	// The agent exits, and this pass is no longer busy.
+	h.busy = false
+	h.live = 0
+	h.timers.at(t, 0).f()
+
+	got := h.ranLoops()
+	if len(got) != before+1 {
+		t.Fatalf("issue passes = %d, want %d", len(got), before+1)
+	}
+	if n := h.ranNumbers(); n[len(n)-1] != 15 {
+		t.Errorf("the re-look decided issue %d, want 15", n[len(n)-1])
+	}
+}
+
+// A busy re-look re-reads its own labels rather than replaying the delivery's
+// fetch. The agent it waited for changes labels as it finishes, so deciding
+// from the burst's snapshot would decide from before the handoff.
+func TestABusyRelookFetchesAgainInsteadOfReusingTheDeliverysFetch(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.live = 1
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	fetches := len(h.gh.fetches())
+
+	h.live = 0
+	h.timers.at(t, 0).f()
+
+	if got := len(h.gh.fetches()); got != fetches+1 {
+		t.Errorf("issue fetches = %d, want %d: the re-look must read GitHub again", got, fetches+1)
+	}
+	if got := h.clientsBuilt(); got < 2 {
+		t.Errorf("clients built = %d, want at least 2: the re-look needs its own", got)
+	}
+}
+
+// A held lock is the OTHER way a pass decides nothing, and it was dropped for
+// the same wrong reason. It still schedules no retry -- it is not a failure --
+// but it must be looked at again. tendPass already reached this conclusion for
+// sweeps; see its ErrHeld branch.
+func TestALockHeldTickLooksAgainInsteadOfBeingDropped(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.runFn = func(*config.Config) error { return fmt.Errorf("run tick: %w", lock.ErrHeld) }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+
+	if n := h.pendingLen(); n != 0 {
+		t.Errorf("pending = %d, want 0: a held lock is not a failed tick", n)
+	}
+	if n := h.timers.len(); n != 1 {
+		t.Fatalf("armed %d timers, want 1 (the busy re-look)", n)
+	}
+	if got := h.timers.at(t, 0).d; got != h.w.BusyDelay {
+		t.Errorf("busy delay = %v, want %v", got, h.w.BusyDelay)
+	}
+}
+
+// A busy re-look already armed is ridden, not doubled: an issue with two
+// loops' deliveries landing on it must not accumulate one timer per delivery
+// for as long as the agent runs.
+func TestABusyRelookIsArmedOnlyOncePerIssue(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.live = 1
+
+	// Two passes that both find the issue busy: the delivery's own, and the
+	// one the second delivery's trailing tick runs.
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+
+	busy := 0
+	for i := 0; i < h.timers.len(); i++ {
+		if h.timers.at(t, i).d == h.w.BusyDelay {
+			busy++
+		}
+	}
+	if busy != 1 {
+		t.Errorf("armed %d busy re-looks, want 1: the second pass must ride the first", busy)
+	}
+}
+
+// A daemon told to stop starts no new agent, and an armed window or re-look
+// is exactly the timer that would.
+func TestStopAllStopsArmedWindowsAndBusyRelooks(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.w.IssueDelay = 2 * time.Second
+	h.live = 1
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 15})
+	if n := h.timers.len(); n != 2 {
+		t.Fatalf("armed %d timers, want 2", n)
+	}
+
+	h.w.stopAll()
+
+	for i := 0; i < 2; i++ {
+		if !h.timers.stopped(t, i) {
+			t.Errorf("timer %d was left armed after stopAll", i)
+		}
+	}
+}
+
+// Windowing is ON in production (NewWorker sets IssueDelay), so the paths a
+// delivery drives beside the issue pass must still work with a window open.
+// The window gates the ISSUE pass alone.
+func TestAWindowedDeliveryStillRetriesAndTends(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.w.IssueDelay = 2 * time.Second
+	h.defaultBranch = "master"
+	h.tendPR = true
+	h.max = 1
+	h.backoff = []time.Duration{5 * time.Minute}
+	h.runFn = func(*config.Config) error { return errBoom }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+
+	// A window, the failed pass's retry, and the merge's sweep -- each told
+	// apart by the wait it asked for.
+	waits := map[time.Duration]int{}
+	for i := 0; i < h.timers.len(); i++ {
+		waits[h.timers.at(t, i).d]++
+	}
+	want := map[time.Duration]int{
+		h.w.IssueDelay:   1, // the window
+		5 * time.Minute:  1, // the retry, at the loop's own backoff
+		defaultTendDelay: 1, // the sweep
+	}
+	for d, n := range want {
+		if waits[d] != n {
+			t.Errorf("timers waiting %v = %d, want %d (armed: %v)", d, waits[d], n, waits)
+		}
+	}
+
+	// The sweep still runs: the window gates the ISSUE pass and nothing else.
+	for i := 0; i < h.timers.len(); i++ {
+		if h.timers.at(t, i).d == defaultTendDelay {
+			h.timers.at(t, i).f()
+		}
+	}
+	if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
+		t.Errorf("tends = %v, want [planning@master]", got)
+	}
+}
+
+// A daemon told to stop starts no new agent, and a window's trailing tick is
+// exactly the timer that would. It mirrors the same rule for a tend sweep.
+func TestATrailingTickDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.w.IssueDelay = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.w.Deliver(ctx, Delivery{Repo: "o/r", Number: 15})
+	h.w.Deliver(ctx, Delivery{Repo: "o/r", Number: 15})
+	before := len(h.ranLoops())
+	cancel()
+
+	h.timers.at(t, 0).f()
+
+	if got := h.ranLoops(); len(got) != before {
+		t.Errorf("issue passes = %d, want %d: a cancelled context runs no trailing tick", len(got), before)
+	}
+}
+
+// The production IssueBusy reads dispatch rows and the process table, never
+// GitHub. A row whose runner is this test process counts as busy; one whose
+// pid cannot exist does not.
+func TestIssueBusyAnswersFromTheDispatchRows(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	tgt := h.target("planning")
+
+	// A row for a runner that is definitely gone: pid 0 is never alive, and
+	// proc.IsAlive rejects it before it touches the process table.
+	id, err := db.Project(workProject).CreateDispatch(store.Dispatch{
+		ProjectID: workProject, Loop: "planning", Repo: "o/r", Number: 15,
+		Kind: "start", Status: store.StatusRunning, StartedAt: workNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateDispatch: %v", err)
+	}
+	if err := db.Project(workProject).SetDispatchProcess(id, 0, workNow); err != nil {
+		t.Fatalf("SetDispatchProcess: %v", err)
+	}
+
+	if h.w.issueBusy(tgt, 15) {
+		t.Error("issueBusy = true for a dispatch whose runner is gone")
+	}
+	// Another issue's live row must not make this issue busy.
+	if h.w.issueBusy(tgt, 16) {
+		t.Error("issueBusy = true for an issue with no dispatch at all")
+	}
+}
+
+// A database that cannot be read is not evidence an agent is alive. Answering
+// "busy" there would re-arm on the same broken read for as long as the daemon
+// ran and never tick; answering "not busy" sends it down the full pass, which
+// re-reads under the loop's lock.
+func TestIssueBusyIsFalseWhenTheDatabaseCannotBeRead(t *testing.T) {
+	db := openWorkDB(t)
+	h := newHarness(db)
+	db.Close()
+
+	if h.w.issueBusy(h.target("planning"), 15) {
+		t.Error("issueBusy = true on a database it could not read")
 	}
 }

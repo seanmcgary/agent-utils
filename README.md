@@ -492,6 +492,25 @@ the issue its pull request closes (`Closes #N` in the body); a pull request that
 is a no-op. The `accepted delivery` line in the log names the issue, so a delivery can be matched
 against the dispatch it caused.
 
+One edit is many deliveries. GitHub sends one `issues` event **per label**, so removing three
+labels and adding one — a single edit in the UI — arrives as four deliveries inside half a
+second, and the first of them can read the issue half edited: the old status label already
+gone, the new one not yet added. Each issue therefore has a short **delivery window**. The
+first delivery ticks at once, the deliveries that arrive while the window is open are collapsed
+into one trailing tick when it closes, and that trailing tick is the one guaranteed to have
+seen the edit whole. The window is two seconds and per issue, so a burst on one issue never
+delays another, and it is not configurable per loop: it describes how GitHub sends events, not
+anything about a project.
+
+A tick that decides nothing because an **agent is already working that issue** looks again
+rather than giving up. This is the case that used to strand work: an execution agent sets the
+handoff label before it exits, the next loop's deliveries all land while that agent is still
+running, every one of them declines, and the issue then sits at its trigger label until some
+unrelated event happens to tick the loop again. The re-look waits a minute and asks the
+dispatch rows and the process table — not GitHub — so waiting out an eight-hour agent costs a
+row read and a `kill(0)` a minute rather than eight hours of API calls. It runs a real tick
+only once the agent's process is gone, and stops re-arming when it does.
+
 The daemon is the fast path; cron remains the safety net. A `loop tick` is still a full sweep,
 and it is what catches the work no event names — a pull request that fell behind because
 someone pushed to the default branch directly (a `push` event, which this daemon does not
