@@ -325,8 +325,10 @@ logs.
 
 `agent-utils project loop new` writes a loop file for you, by asking; **[`docs/configuration.md`](docs/configuration.md)
 remains the reference for editing one by hand** — what each field means, what reads it, and
-what happens if you get it wrong. `examples/planning.yaml` and `examples/execution.yaml` are
-complete working files, ported from the reference planning and execution orchestrators.
+what happens if you get it wrong. `examples/planning.yaml`, `examples/execution.yaml` and
+`examples/pr-review.yaml` are complete working files — the first two ported from the reference
+planning and execution orchestrators, the third a review loop that runs the strongest model over
+whatever the execution loop's produced, fixing what it finds rather than reporting it.
 
 A label on an issue can also override, for that issue alone, which model, harness, or effort
 level a dispatch uses: `model:<value>`, `harness:<value>`, `effort:<value>`. These are always
@@ -489,6 +491,25 @@ watching that repository. Pull requests share the issue number space, so a `pull
 the issue its pull request closes (`Closes #N` in the body); a pull request that closes no issue
 is a no-op. The `accepted delivery` line in the log names the issue, so a delivery can be matched
 against the dispatch it caused.
+
+One edit is many deliveries. GitHub sends one `issues` event **per label**, so removing three
+labels and adding one — a single edit in the UI — arrives as four deliveries inside half a
+second, and the first of them can read the issue half edited: the old status label already
+gone, the new one not yet added. Each issue therefore has a short **delivery window**. The
+first delivery ticks at once, the deliveries that arrive while the window is open are collapsed
+into one trailing tick when it closes, and that trailing tick is the one guaranteed to have
+seen the edit whole. The window is two seconds and per issue, so a burst on one issue never
+delays another, and it is not configurable per loop: it describes how GitHub sends events, not
+anything about a project.
+
+A tick that decides nothing because an **agent is already working that issue** looks again
+rather than giving up. This is the case that used to strand work: an execution agent sets the
+handoff label before it exits, the next loop's deliveries all land while that agent is still
+running, every one of them declines, and the issue then sits at its trigger label until some
+unrelated event happens to tick the loop again. The re-look waits a minute and asks the
+dispatch rows and the process table — not GitHub — so waiting out an eight-hour agent costs a
+row read and a `kill(0)` a minute rather than eight hours of API calls. It runs a real tick
+only once the agent's process is gone, and stops re-arming when it does.
 
 The daemon is the fast path; cron remains the safety net. A `loop tick` is still a full sweep,
 and it is what catches the work no event names — a pull request that fell behind because

@@ -11,6 +11,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
+	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -37,6 +38,27 @@ const (
 	// and a tend agent that has already finished suppresses nothing, so an
 	// uncoalesced train multiplies by the number of merges in it.
 	defaultTendDelay = time.Minute
+	// defaultIssueDelay is how long an issue's delivery window stays open.
+	//
+	// One edit to an issue's labels is one delivery PER LABEL: removing three
+	// and adding one, in a single edit, is four deliveries inside half a
+	// second. Each was a tick of its own, and the first of them read the
+	// labels HALF APPLIED -- after a removal, before the addition that was
+	// the point of the edit.
+	//
+	// Two seconds is long enough to cover an edit made in one action and
+	// short enough that the trailing tick still belongs to it. See
+	// openIssueWindow for why the leading tick is not delayed by it.
+	defaultIssueDelay = 2 * time.Second
+	// defaultBusyDelay is how long a pass that found an agent already working
+	// its issue waits before looking again.
+	//
+	// A minute, not seconds: what it waits for is an agent, and agents run for
+	// minutes to hours. It is also not a poll of GitHub -- see armBusy, which
+	// re-arms from local state until the agent's process is gone -- so the
+	// interval costs a dispatch-row read and a kill(0), and buys at most a
+	// minute of latency on the tick that finally dispatches.
+	defaultBusyDelay = time.Minute
 )
 
 // openRetryMax caps the retries for a failure that happened inside
@@ -117,6 +139,33 @@ func (a *attempt) counter(kind retryKind) *int {
 	return &a.n
 }
 
+// issueKey identifies ONE issue of one loop of one project. It is the key the
+// delivery window and the busy re-look are held under, and it carries the
+// issue number where loopKey does not: a burst on one issue must not suppress
+// another issue's delivery, which is a different decision entirely.
+type issueKey struct {
+	ProjectID string
+	LoopName  string
+	Number    int
+}
+
+// issueWindow is one issue's open delivery window.
+//
+// pending records that a delivery arrived while the window was open, which is
+// what says the labels the leading tick read may already be stale. It is a
+// pointer for the same reason tendTimer is: openIssueWindow has to tell ITS
+// entry from one a later delivery registered after this timer fired.
+type issueWindow struct {
+	timer   *time.Timer // guarded by Worker.mu
+	pending bool        // guarded by Worker.mu
+}
+
+// busyTimer is one issue's armed re-look. It is a pointer for the same reason
+// tendTimer is; see armBusy.
+type busyTimer struct {
+	timer *time.Timer // guarded by Worker.mu
+}
+
 // tendTimer is one loop's armed tend sweep. It is a pointer so armTend can
 // tell ITS entry from one a later merge registered after this timer fired.
 type tendTimer struct {
@@ -178,7 +227,16 @@ type Worker struct {
 	// label writes, which is what makes it safe for a delivery to act on more
 	// than the issue it names. See loopcmd.EpicSweep.
 	RunEpic func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, closed int) (loopcmd.Summary, error)
-	Now     func() time.Time
+	// IssueBusy reports whether an agent of this loop is still running on this
+	// issue. Production wires it to Worker.issueBusy, which answers from the
+	// dispatch rows and the kernel; it is a seam because a test has no agent
+	// process to ask about.
+	//
+	// It exists so the busy re-look can wait for an agent WITHOUT ticking: a
+	// tick reads GitHub, and an eight-hour agent would mean eight hours of
+	// fetches for an answer the local process table already has.
+	IssueBusy func(t Target, number int) bool
+	Now       func() time.Time
 	// After schedules f. It is a seam: production wires it to time.AfterFunc,
 	// and a test substitutes a controlled clock. Without it the retry tests
 	// would have to sleep for the real delays, which the acceptance forbids.
@@ -189,6 +247,8 @@ type Worker struct {
 	MinRetryDelay   time.Duration // default 30s
 	MinWakeInterval time.Duration // default 30s
 	TendDelay       time.Duration // default 1m
+	IssueDelay      time.Duration // default 2s
+	BusyDelay       time.Duration // default 1m
 
 	mu      sync.Mutex
 	pending map[loopKey]*attempt // guarded by mu
@@ -204,6 +264,14 @@ type Worker struct {
 	// this program (see loopcmd.Tick), and a bare SweepDelay beside
 	// OpenRetryDelay would read as a delay before that.
 	tends map[loopKey]*tendTimer // guarded by mu
+	// windows holds each issue's open delivery window, guarded by mu. A
+	// delivery arriving while one is open rides it rather than ticking again.
+	windows map[issueKey]*issueWindow // guarded by mu
+	// busy holds the armed busy re-look of each issue, guarded by mu. Like
+	// tends, a second pass that finds one armed rides it rather than arming a
+	// second, which is what keeps an issue to one re-look however many
+	// deliveries land on it while its agent runs.
+	busy map[issueKey]*busyTimer // guarded by mu
 	// unroutable throttles the "cannot route this deadline" warning per
 	// loop; it carries its own lock. See warnUnroutable.
 	unroutable *throttledLog
@@ -233,11 +301,18 @@ func NewWorker(db *store.DB) *Worker {
 		MinRetryDelay:   defaultMinRetryDelay,
 		MinWakeInterval: defaultMinWakeInterval,
 		TendDelay:       defaultTendDelay,
+		IssueDelay:      defaultIssueDelay,
+		BusyDelay:       defaultBusyDelay,
 		pending:         make(map[loopKey]*attempt),
 		orphans:         make(map[loopKey]int),
 		tends:           make(map[loopKey]*tendTimer),
+		windows:         make(map[issueKey]*issueWindow),
+		busy:            make(map[issueKey]*busyTimer),
 		unroutable:      newThrottledLog(unroutableLogInterval),
 	}
+	// Bound to the Worker after the literal, like the throttle's clock below:
+	// the default reads w.DB, which the literal is still building.
+	w.IssueBusy = w.issueBusy
 	// The throttle reads the Worker's OWN clock, and reads it late: a test
 	// replaces Now after NewWorker returns, and a value captured here would
 	// leave it waiting a real ten minutes.
@@ -487,7 +562,16 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 		return
 	}
 
-	w.issuePass(ctx, t, d, cfg, deps, key)
+	// Gated on the window, not called outright. The leading delivery of a
+	// burst ticks here as it always has; the ones behind it are collapsed into
+	// the single trailing tick the window fires when it closes.
+	//
+	// Only the ISSUE pass is gated. The passes below decide different things
+	// and state their own timing: tending is already delayed by a timer of its
+	// own, and the epic sweep deliberately is not delayed at all.
+	if w.openIssueWindow(ctx, t, d.Number) {
+		w.issuePass(ctx, t, d, cfg, deps, key)
+	}
 
 	// Armed on BOTH paths of the issue pass. The merged pull request's own pass
 	// moves its issue to a terminal state; whether that succeeded says nothing
@@ -523,16 +607,23 @@ func (w *Worker) issuePass(
 ) {
 	number := d.Number
 
-	if _, err := w.RunIssue(ctx, cfg, deps, number); err != nil {
+	sum, err := w.RunIssue(ctx, cfg, deps, number)
+	if err != nil {
 		if errors.Is(err, lock.ErrHeld) {
-			// No retry. The delivery carries no state of its own, so the
-			// tick already holding the lock reads the same GitHub state a
-			// moment later than this one would have. The pending attempt is
-			// cleared too, or the next real failure would resume a backoff
-			// list part way through and give up early.
-			slog.Info("skipping tick: another tick holds the loop lock",
+			// Still no RETRY: a held lock is not a failed tick, and the
+			// pending attempt is cleared too, or the next real failure would
+			// resume a backoff list part way through and give up early.
+			//
+			// But no longer DROPPED. The reasoning that justified dropping it
+			// -- that the tick holding the lock reads the same GitHub state a
+			// moment later -- holds only if that tick is free to act on this
+			// issue, and the commonest holder is the tick that is dispatching
+			// FOR it. tendPass reached this conclusion first, for sweeps; see
+			// its own ErrHeld branch.
+			slog.Info("another tick holds the loop lock; looking at this issue again",
 				"loop", cfg.Name, "project", t.ProjectName, "issue", number)
 			w.clear(key)
+			w.armBusy(ctx, t, number)
 			return
 		}
 		slog.Error("tick failed", "loop", cfg.Name, "project", t.ProjectName,
@@ -543,7 +634,211 @@ func (w *Worker) issuePass(
 		return
 	}
 
+	// A pass that decided nothing because an agent already holds this issue
+	// has to come back on its own. Nothing else will bring it back: the
+	// delivery that would have is the one being answered here, and the labels
+	// that ask for the work are already set. This is the whole reason an
+	// issue could sit at its trigger label for hours -- the handoff landed
+	// while the previous stage's agent was still running, every delivery in
+	// that window declined, and the last one to decline armed nothing.
+	//
+	// sum.Live is scoped to THIS issue, not the loop; see loopcmd.TickIssue.
+	if sum.Live > 0 {
+		slog.Info("an agent is still working this issue; looking again later",
+			"loop", cfg.Name, "project", t.ProjectName, "issue", number,
+			"live", sum.Live, "in", w.BusyDelay)
+		w.armBusy(ctx, t, number)
+	}
+
 	w.clear(key)
+}
+
+// openIssueWindow reports whether the caller should tick this issue now, and
+// opens the issue's delivery window if it was closed.
+//
+// The window is LEADING and trailing. The first delivery ticks at once --
+// answering an event quickly is the whole point of the daemon, and delaying
+// every dispatch by IssueDelay to serve the burst case would be paying the
+// burst's cost on every issue that never bursts. The deliveries that arrive
+// while the window is open tick nothing of their own; they mark the window
+// pending, and one trailing tick runs when it closes.
+//
+// The trailing tick is not merely a saving. A burst is one edit, and its
+// deliveries arrive in the order the labels changed, so the leading tick can
+// read the issue HALF EDITED -- with the old status label already removed and
+// the new one not yet added. Only a tick after the window closes is
+// guaranteed to have seen the edit whole.
+//
+// A zero or negative IssueDelay turns windowing off: every delivery ticks, as
+// every delivery did before windows existed. It is the escape hatch for an
+// operator who would rather pay the duplicate ticks than the trailing one.
+func (w *Worker) openIssueWindow(ctx context.Context, t Target, number int) bool {
+	if w.IssueDelay <= 0 {
+		return true
+	}
+	key := issueKey{ProjectID: t.ProjectID, LoopName: t.LoopName, Number: number}
+
+	w.mu.Lock()
+	if ent, open := w.windows[key]; open {
+		// Marked, not counted: a window closes into ONE trailing tick however
+		// many deliveries rode it.
+		ent.pending = true
+		w.mu.Unlock()
+		slog.Info("a delivery window is already open for this issue; riding it",
+			"loop", t.LoopName, "project", t.ProjectName, "issue", number)
+		return false
+	}
+	// Registered before the timer is built, so a delivery arriving between
+	// these two statements rides this window instead of opening its own. The
+	// entry is an identity token for the same reason armTend's is.
+	ent := &issueWindow{}
+	w.windows[key] = ent
+	w.mu.Unlock()
+
+	timer := w.After(w.IssueDelay, func() {
+		w.mu.Lock()
+		trailing := false
+		if cur, ok := w.windows[key]; ok && cur == ent {
+			trailing = ent.pending
+			delete(w.windows, key)
+		}
+		w.mu.Unlock()
+		// Nothing rode this window, so its leading tick is the whole story.
+		if !trailing {
+			return
+		}
+		// Same rule schedule and armTend state: a cancelled context means the
+		// daemon is shutting down, and a daemon told to stop starts no agent.
+		if ctx.Err() != nil {
+			return
+		}
+		w.issueFresh(ctx, t, number)
+	})
+
+	w.mu.Lock()
+	if cur, ok := w.windows[key]; ok && cur == ent {
+		cur.timer = timer
+	}
+	w.mu.Unlock()
+
+	return true
+}
+
+// armBusy schedules another look at an issue whose own agent is still
+// running, unless a look is already armed for it.
+//
+// It does NOT re-tick blindly. The timer first asks IssueBusy, which reads the
+// dispatch rows and the process table and never GitHub: while the agent is
+// alive it simply arms again, so waiting out an eight-hour agent costs a
+// row read and a kill(0) a minute rather than eight hours of fetches. Only
+// when the agent is gone does it run a real pass.
+//
+// It is uncapped, and self-terminating: the re-arm happens only while a
+// process is alive, so the chain ends when that process does.
+func (w *Worker) armBusy(ctx context.Context, t Target, number int) {
+	key := issueKey{ProjectID: t.ProjectID, LoopName: t.LoopName, Number: number}
+
+	w.mu.Lock()
+	if _, armed := w.busy[key]; armed {
+		w.mu.Unlock()
+		slog.Info("a re-look is already armed for this issue; riding it",
+			"loop", t.LoopName, "project", t.ProjectName, "issue", number)
+		return
+	}
+	ent := &busyTimer{}
+	w.busy[key] = ent
+	w.mu.Unlock()
+
+	timer := w.After(w.BusyDelay, func() {
+		w.mu.Lock()
+		if cur, ok := w.busy[key]; ok && cur == ent {
+			delete(w.busy, key)
+		}
+		w.mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		if w.IssueBusy(t, number) {
+			// Still working. Wait again, without a tick and without a line in
+			// the log: this fires every BusyDelay for the life of the agent,
+			// and a line each time would bury everything else the daemon says.
+			w.armBusy(ctx, t, number)
+			return
+		}
+		slog.Info("the agent working this issue has finished; looking again now",
+			"loop", t.LoopName, "project", t.ProjectName, "issue", number)
+		w.issueFresh(ctx, t, number)
+	})
+
+	w.mu.Lock()
+	if cur, ok := w.busy[key]; ok && cur == ent {
+		cur.timer = timer
+	}
+	w.mu.Unlock()
+}
+
+// issueBusy is the production IssueBusy: it answers from the machine-wide
+// dispatch rows and the kernel, and never from GitHub.
+func (w *Worker) issueBusy(t Target, number int) bool {
+	if w.DB == nil {
+		return false
+	}
+	running, err := w.DB.RunningDispatches()
+	if err != nil {
+		// NOT "still busy". A database this pass could not read is no evidence
+		// that an agent is alive, and answering true would re-arm on that same
+		// broken read for as long as the daemon ran, never ticking. Answering
+		// false sends it down the full pass, which re-reads the rows under the
+		// loop's lock and arms another re-look if the agent really is there.
+		slog.Error("cannot read the running dispatches; looking at the issue instead",
+			"loop", t.LoopName, "project", t.ProjectName, "issue", number, "err", err)
+		return false
+	}
+	for _, d := range running {
+		if d.ProjectID != t.ProjectID || d.Loop != t.LoopName || d.Number != number {
+			continue
+		}
+		if proc.IsAlive(d.PID, d.RunnerID()) {
+			return true
+		}
+	}
+	return false
+}
+
+// issueFresh runs the ISSUE pass of one loop with GitHub access of its own.
+//
+// It is what the delivery window's trailing tick and the busy re-look both
+// run, and it exists for the reason tickFresh states: both fire long after the
+// delivery that armed them, and re-deciding from that delivery's fetched
+// labels would decide from a moment that has passed. The busy re-look makes
+// that sharper still -- what it waited for was an agent, and an agent's last
+// act is to change the labels this pass is about to read.
+//
+// It runs the issue pass ALONE. Going back through tickOne would re-enter the
+// window that fired it, and would re-run the tend, epic and cleanup passes
+// that belong to the delivery rather than to this issue.
+func (w *Worker) issueFresh(ctx context.Context, t Target, number int) {
+	acc, err := w.access()
+	if err != nil {
+		slog.Error("cannot read the github token", "loop", t.LoopName,
+			"project", t.ProjectName, "issue", number, "err", err)
+		return
+	}
+	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
+		Token: acc.token, GH: acc.gh, Epic: acc.epic, RequireGitHub: true,
+		MigrationPolicy: loopcmd.FailOnUnimported,
+	})
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		slog.Error("cannot open loop", "loop", t.LoopName, "project", t.ProjectName,
+			"config", t.ConfigPath, "err", err)
+		w.schedule(ctx, t, number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		return
+	}
+	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
+	w.issuePass(ctx, t, Delivery{Repo: t.Repo, Number: number}, cfg, deps, key)
 }
 
 // armTend schedules the tend sweep a merge calls for, unless one is already
@@ -856,6 +1151,20 @@ func (w *Worker) stopAll() {
 			ent.timer.Stop()
 		}
 		delete(w.tends, key)
+	}
+	// A window's trailing tick and a busy re-look both dispatch, so both are
+	// the kind of already-armed timer this exists to stop.
+	for key, ent := range w.windows {
+		if ent != nil && ent.timer != nil {
+			ent.timer.Stop()
+		}
+		delete(w.windows, key)
+	}
+	for key, ent := range w.busy {
+		if ent != nil && ent.timer != nil {
+			ent.timer.Stop()
+		}
+		delete(w.busy, key)
 	}
 }
 

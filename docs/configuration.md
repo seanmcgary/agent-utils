@@ -7,8 +7,8 @@ The parser is **strict**: an unknown key is an error, not a warning. A misspelle
 the load rather than being silently ignored. Every validation error for a file is reported
 together, in a stable order.
 
-`examples/planning.yaml` and `examples/execution.yaml` are complete working files. Read this
-reference for what each field means; read those for a shape to copy.
+`examples/planning.yaml`, `examples/execution.yaml` and `examples/pr-review.yaml` are complete
+working files. Read this reference for what each field means; read those for a shape to copy.
 
 ## Where configuration files live
 
@@ -816,6 +816,11 @@ a pull request that fell behind for any reason other than a merge. Schedule it.
 whose body also says `Closes #N`, so a planning loop with tending on would force-push a draft
 you are in the middle of reading.
 
+**Set it `false` for a review loop too**, for a different reason: `reviewing-commits` rebases the
+branch itself to fold its fixes in, so a tend agent rebasing the same branch would race the
+review's own force-push. A review loop hands the pull request back by applying the label the
+EXECUTION loop tends on, which is what puts tending back in one place.
+
 Version 1 rebases only. It does not reply to review feedback.
 
 ```yaml
@@ -921,7 +926,7 @@ did; it needs to be told what changed, not told everything again.
 
 Write these prompts as the agent's whole instruction set. The loop enforces nothing about the
 agent's behaviour, so every rule — how to stop, which labels to apply, never to merge, never
-to apply the terminal label — lives here. The two example files carry the full set.
+to apply the terminal label — lives here. The example files carry the full set.
 
 ```yaml
 prompt: |
