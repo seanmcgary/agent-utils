@@ -116,10 +116,23 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			// The reference loops define an orphan as "carries the in-flight
 			// label AND has no live agent". Honour that: an agent that finished
 			// its work and moved the label on must not be woken by a retry.
-			if !iss.HasLabel(cfg.Labels.InFlight) {
-				// No in-flight run to retry: either the agent moved the label on
-				// before the failure was recorded, or the failure happened before
-				// any agent took ownership.
+			//
+			// The TRIGGER label is the second way to still have work. A dispatch
+			// that dies at startup -- a bad prompt template, a session the
+			// harness cannot resume -- never takes ownership, so it never
+			// applies the in-flight label and the trigger label it was
+			// dispatched for is still sitting there. That is a failure with
+			// work left, not an agent that moved on, and it must reach
+			// retryDecision so the cap can eventually park it.
+			//
+			// Conflating the two made a startup failure UNCOUNTABLE: the flag
+			// was cleared, the next tick saw a triggered issue with a clean
+			// slate, dispatched, died in about a second, and cleared again.
+			// RetryCount never advanced, so the cap never engaged and the loop
+			// could not escalate to the human.
+			if !iss.HasLabel(cfg.Labels.InFlight) && !iss.HasLabel(cfg.Labels.Trigger) {
+				// Nothing to retry: the agent moved the label on before the
+				// failure was recorded.
 				//
 				// The flag MUST be cleared here. Nothing else clears it, so
 				// leaving it set strands the issue permanently: every later tick
@@ -129,11 +142,11 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				decisions = append(decisions, Decision{
 					Kind:   KindClearRetry,
 					Issue:  iss.Number,
-					Reason: "failure recorded while the issue was not in flight",
+					Reason: "failure recorded after the agent moved the issue on",
 				})
 				continue
 			}
-			d, eligible, skip := retryDecision(cfg, iss.Number, state, now)
+			d, eligible, skip := retryDecision(cfg, iss.Number, state, ov, now)
 			// Convert to a stop BEFORE counting toward the breaker. A retry
 			// that becomes a stop never dispatches, so counting it would let
 			// a label push the circuit breaker over its threshold and drop
@@ -185,7 +198,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			})
 			continue
 		}
-		if state.SessionID != "" && state.SessionStarted {
+		if resumable(cfg, state, ov) {
 			decisions = append(decisions, Decision{
 				Kind:      KindResume,
 				Issue:     iss.Number,
@@ -196,12 +209,22 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			})
 			continue
 		}
+		// A session belonging to ANOTHER harness carries no identifier into the
+		// start: the new harness must mint its own. Reusing the old id would
+		// hand claude an id it refuses and pi an id it would quietly reuse.
+		sessionID, reason := state.SessionID, "trigger label present and no started session exists"
+		if state.SessionStarted && state.SessionID != "" {
+			sessionID = ""
+			reason = fmt.Sprintf(
+				"starting a new session: the existing one was created by %s and this dispatch runs %s",
+				state.SessionHarness, effectiveHarness(cfg, ov))
+		}
 		decisions = append(decisions, Decision{
 			Kind:      KindStart,
 			Issue:     iss.Number,
 			Title:     iss.Title,
-			SessionID: state.SessionID,
-			Reason:    "trigger label present and no started session exists",
+			SessionID: sessionID,
+			Reason:    reason,
 			Overrides: ov,
 		})
 	}
@@ -266,7 +289,8 @@ func finish(p Plan) Plan {
 // ticks. A tick used to be a fixed cron interval, but the webhook daemon can
 // tick a loop at any moment, so a tick count no longer names a stable wait.
 // MarkNeedsRetry stamps the deadline where the failure is recorded.
-func retryDecision(cfg *config.Config, number int, state store.IssueState, now time.Time) (*Decision, bool, string) {
+func retryDecision(cfg *config.Config, number int, state store.IssueState,
+	ov config.Overrides, now time.Time) (*Decision, bool, string) {
 	if state.RetryCount >= cfg.Retry.Max {
 		return &Decision{
 			Kind:   KindParkRetryExhausted,
@@ -290,7 +314,7 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, now t
 	// reuse one ("Session ID <uuid> is already in use"), so passing the old id
 	// would make every retry fail in under a second and then park the issue with
 	// a comment blaming the platform.
-	if state.SessionStarted && state.SessionID != "" {
+	if resumable(cfg, state, ov) {
 		return &Decision{
 			Kind:      KindRetryResume,
 			Issue:     number,
@@ -298,12 +322,59 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState, now t
 			Reason:    fmt.Sprintf("retry %d/%d, resuming the existing session", state.RetryCount+1, cfg.Retry.Max),
 		}, true, ""
 	}
+	// A session the running harness cannot see is no better than no session:
+	// resuming it would fail identically every attempt and spend the whole
+	// budget reaching a park that blamed the platform.
+	why := "the previous attempt never started one"
+	if state.SessionStarted && state.SessionID != "" {
+		why = fmt.Sprintf("the existing one was created by %s and this retry runs %s",
+			state.SessionHarness, effectiveHarness(cfg, ov))
+	}
 	return &Decision{
 		Kind:      KindRetryStart,
 		Issue:     number,
 		SessionID: "",
-		Reason:    fmt.Sprintf("retry %d/%d with a new session; the previous attempt never started one", state.RetryCount+1, cfg.Retry.Max),
+		Reason:    fmt.Sprintf("retry %d/%d with a new session; %s", state.RetryCount+1, cfg.Retry.Max, why),
 	}, true, ""
+}
+
+// resumable reports whether state's session may be handed to a resume by the
+// harness this dispatch will run under.
+//
+// A session id is only meaningful to the harness that minted it: each keeps its
+// own store. Handing one across fails in opposite directions -- claude exits
+// non-zero on an id it has never seen, and pi creates a fresh session under
+// that id and carries on, so the conversation is silently gone. Neither is a
+// resume, so the engine starts clean instead and lets the dispatch mint a new
+// identifier.
+//
+// An UNKNOWN recorded harness (empty) is not a mismatch. Rows written before
+// the column existed all have one, and treating unknown as "different" would
+// restart every in-flight session the moment this version was installed.
+func resumable(cfg *config.Config, state store.IssueState, ov config.Overrides) bool {
+	if state.SessionID == "" || !state.SessionStarted {
+		return false
+	}
+	if state.SessionHarness == "" {
+		return true
+	}
+	return state.SessionHarness == effectiveHarness(cfg, ov)
+}
+
+// effectiveHarness is the harness a dispatch will actually run under: the
+// issue's override when it carries one, and the loop's configured harness
+// otherwise. ov is already parsed and validated by ParseOverrides, so its
+// Harness is either empty or a known harness name.
+func effectiveHarness(cfg *config.Config, ov config.Overrides) string {
+	if ov.Harness != "" {
+		return ov.Harness
+	}
+	if cfg.Agent.Harness != "" {
+		return cfg.Agent.Harness
+	}
+	// config.Load defaults this, so an empty value only reaches here from a
+	// hand-built Config in a test. Name the same default Load applies.
+	return config.HarnessClaude
 }
 
 // stoppedSkipReason renders the skip reason for a stopped issue. An empty

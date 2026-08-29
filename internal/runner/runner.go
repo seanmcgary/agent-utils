@@ -344,7 +344,14 @@ func finish(cfg *config.Config, st *store.Store, d store.Dispatch, res store.Dis
 			// Record this on failure as well as success. A run that created the
 			// session and then crashed must be resumed, never restarted against
 			// the same identifier: claude refuses a reused --session-id outright.
-			if err := st.MarkSessionStarted(d.Loop, d.Repo, d.Number); err != nil {
+			//
+			// The EFFECTIVE harness is stored beside the flag, not the override
+			// from the row: the override is empty whenever the loop's configured
+			// harness was used, and "" already means "unknown" to the engine.
+			// Recording the resolved name is what lets a later dispatch tell a
+			// session it may resume from one another harness minted.
+			harness := Effective(cfg, config.Overrides{Harness: d.Harness}).Harness
+			if err := st.MarkSessionStarted(d.Loop, d.Repo, d.Number, harness); err != nil {
 				return fmt.Errorf("mark session started: %w", err)
 			}
 		}

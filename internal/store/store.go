@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS issues (
   last_retry_tick INTEGER NOT NULL DEFAULT 0,
   needs_retry     INTEGER NOT NULL DEFAULT 0,
   session_started INTEGER NOT NULL DEFAULT 0,
+  -- session_harness is the harness that CREATED the session, so a later
+  -- dispatch can tell whether it may resume it. Each harness keeps its own
+  -- session store, so an identifier minted by one means nothing to the other:
+  -- claude refuses outright ("No conversation found with session ID"), and pi
+  -- silently creates a new session under that id, losing the conversation
+  -- without saying so. Empty means "recorded before this column existed".
+  session_harness TEXT NOT NULL DEFAULT '',
   parked          INTEGER NOT NULL DEFAULT 0,
   -- retry_after is Unix seconds, and 0 means "no deadline". It is an INTEGER
   -- where every other timestamp in this schema is a TIMESTAMP
@@ -312,6 +319,9 @@ func applySchema(db *sql.DB) error {
 	if err := upgradeKeys(tx); err != nil {
 		return err
 	}
+	if err := backfillSessionHarness(tx); err != nil {
+		return err
+	}
 	// The indexes come last: every column they name exists by now, and the key
 	// upgrade above drops tables, which takes their indexes with them.
 	if _, err := tx.Exec(schemaIndexes); err != nil {
@@ -333,6 +343,7 @@ func applySchema(db *sql.DB) error {
 var addedColumns = []struct{ table, column, def string }{
 	{"issues", "needs_retry", "INTEGER NOT NULL DEFAULT 0"},
 	{"issues", "session_started", "INTEGER NOT NULL DEFAULT 0"},
+	{"issues", "session_harness", "TEXT NOT NULL DEFAULT ''"},
 	{"issues", "parked", "INTEGER NOT NULL DEFAULT 0"},
 	{"dispatches", "pr_number", "INTEGER NOT NULL DEFAULT 0"},
 	{"dispatches", "title", "TEXT NOT NULL DEFAULT ''"},
@@ -348,6 +359,40 @@ var addedColumns = []struct{ table, column, def string }{
 	{"dispatches", "model", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "harness", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "effort", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// backfillSessionHarness fills issues.session_harness for rows whose session was
+// created before the column existed, reading the harness from the dispatch that
+// created it.
+//
+// Only an EXPLICIT harness override is recovered: dispatches.harness records the
+// issue's harness: label, and is empty whenever the loop's configured harness
+// was used. An empty value therefore stays empty, which is what the engine reads
+// as "unknown" and treats as resumable. That is the safe direction -- it can
+// miss a mismatch, but it can never invent one and restart a healthy session.
+//
+// It runs once in effect: after this pass the rows it can fill are filled, and
+// MarkSessionStarted records the resolved harness on every session from here on.
+func backfillSessionHarness(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		UPDATE issues SET session_harness = (
+		  SELECT d.harness FROM dispatches d
+		  WHERE d.project_id = issues.project_id AND d.loop = issues.loop
+		    AND d.repo = issues.repo AND d.number = issues.number
+		    AND d.harness <> '' AND d.kind <> 'tend'
+		  ORDER BY d.id DESC LIMIT 1
+		)
+		WHERE session_harness = '' AND session_started = 1
+		  AND EXISTS (
+		    SELECT 1 FROM dispatches d
+		    WHERE d.project_id = issues.project_id AND d.loop = issues.loop
+		      AND d.repo = issues.repo AND d.number = issues.number
+		      AND d.harness <> '' AND d.kind <> 'tend'
+		  )`)
+	if err != nil {
+		return fmt.Errorf("backfill session harness: %w", err)
+	}
+	return nil
 }
 
 // addColumns adds any column missing from an existing database. Each column has
@@ -373,8 +418,8 @@ func addColumns(tx *sql.Tx) error {
 // columns to carry over. SQLite cannot ALTER a key, so each is rebuilt.
 var rebuilt = []struct{ table, columns string }{
 	{"issues", `loop, repo, number, session_id, worktree_path, retry_count,
-		last_retry_tick, needs_retry, session_started, parked, retry_after,
-		stopped, stopped_reason, updated_at`},
+		last_retry_tick, needs_retry, session_started, session_harness, parked,
+		retry_after, stopped, stopped_reason, updated_at`},
 	{"pr_links", `loop, repo, number, pr_number, head_ref, base_ref, behind_by`},
 	{"cooldowns", `loop, until`},
 }
@@ -457,7 +502,7 @@ func hasColumn(q querier, table, column string) (bool, error) {
 func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	rows, err := s.db.Query(`
 		SELECT number, session_id, worktree_path, retry_count, last_retry_tick,
-		       needs_retry, session_started, parked, retry_after,
+		       needs_retry, session_started, session_harness, parked, retry_after,
 		       stopped, stopped_reason, updated_at
 		FROM issues WHERE project_id = ? AND loop = ? AND repo = ?`,
 		s.projectID, loop, repo)
@@ -472,7 +517,7 @@ func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 		var retryAfter int64
 		if err := rows.Scan(&st.Number, &st.SessionID, &st.WorktreePath,
 			&st.RetryCount, &st.LastRetryTick, &st.NeedsRetry, &st.SessionStarted,
-			&st.Parked, &retryAfter, &st.Stopped, &st.StoppedReason,
+			&st.SessionHarness, &st.Parked, &retryAfter, &st.Stopped, &st.StoppedReason,
 			&st.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan issue: %w", err)
 		}
@@ -508,8 +553,9 @@ func (s *Store) PutIssueState(st IssueState) error {
 	_, err := s.db.Exec(`
 		INSERT INTO issues (project_id, loop, repo, number, session_id, worktree_path,
 		                    retry_count, last_retry_tick, needs_retry,
-		                    session_started, parked, retry_after, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                    session_started, session_harness, parked, retry_after,
+		                    updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
 		  session_id      = excluded.session_id,
 		  worktree_path   = excluded.worktree_path,
@@ -517,12 +563,14 @@ func (s *Store) PutIssueState(st IssueState) error {
 		  last_retry_tick = excluded.last_retry_tick,
 		  needs_retry     = excluded.needs_retry,
 		  session_started = excluded.session_started,
+		  session_harness = excluded.session_harness,
 		  parked          = excluded.parked,
 		  retry_after     = excluded.retry_after,
 		  updated_at      = excluded.updated_at`,
 		s.projectID, st.Loop, st.Repo, st.Number, st.SessionID, st.WorktreePath,
 		st.RetryCount, st.LastRetryTick, st.NeedsRetry, st.SessionStarted,
-		st.Parked, retryAfterSeconds(st.RetryAfter), st.UpdatedAt.UTC())
+		st.SessionHarness, st.Parked, retryAfterSeconds(st.RetryAfter),
+		st.UpdatedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("put issue state: %w", err)
 	}
@@ -759,11 +807,11 @@ func (s *Store) SetWorktreePath(loop, repo string, number int, path string, now 
 // created a session and then crashed would leave the flag false, and every
 // retry would start a NEW run against the already-used identifier, which claude
 // refuses outright.
-func (s *Store) MarkSessionStarted(loop, repo string, number int) error {
+func (s *Store) MarkSessionStarted(loop, repo string, number int, harness string) error {
 	_, err := s.db.Exec(`
-		UPDATE issues SET session_started = 1, updated_at = ?
+		UPDATE issues SET session_started = 1, session_harness = ?, updated_at = ?
 		WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
-		time.Now().UTC(), s.projectID, loop, repo, number)
+		harness, time.Now().UTC(), s.projectID, loop, repo, number)
 	if err != nil {
 		return fmt.Errorf("mark session started: %w", err)
 	}

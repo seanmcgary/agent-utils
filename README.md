@@ -10,9 +10,18 @@ retries, backoff, the circuit breaker. The agent owns every judgement and every 
 two: the retry-cap park, and the epic sweep's promotion (see [Epics](#epics)). Cron does the
 scheduling; the engine has no timer.
 
-The load-bearing property is session continuity: an issue keeps one `claude` session across a
+The load-bearing property is session continuity: an issue keeps one agent session across a
 park and its answer, so a resumed run continues the conversation instead of re-deriving its
 plan.
+
+Continuity is per HARNESS. Each harness keeps its own session store, so an identifier minted
+by one means nothing to the other — and the two fail in opposite directions: `claude` exits
+non-zero (`No conversation found with session ID`), while `pi` creates a fresh session under
+that id and carries on, losing the conversation without saying so. So the loop records which
+harness created a session, and when an issue's `harness:` override changes it starts a NEW
+session rather than resuming into either failure. That costs the conversation, which is
+already unreachable, and says so in the dispatch reason. Changing only the `model:` override
+keeps resuming: that conversation is still there.
 
 ## Install
 

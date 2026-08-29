@@ -861,3 +861,165 @@ func TestStoppedRetryDoesNotTripTheBreaker(t *testing.T) {
 		}
 	}
 }
+
+// A dispatch that dies at STARTUP never takes ownership: no agent ran, so the
+// in-flight label was never applied and the TRIGGER label is still there. That
+// is not "the agent moved on" -- it is a failure with work still to do, and it
+// must spend the retry budget so the cap can eventually park it.
+//
+// Regression test. Clearing the flag here made the failure uncountable: the
+// next tick found a triggered issue with a clean slate, dispatched again, died
+// again in about a second, and cleared again. retry_count never advanced, the
+// cap never engaged, and the loop could never escalate to the human. Observed
+// on a resume issued to a harness that had never seen the session.
+func TestFailedIssueStillCarryingTheTriggerLabelIsRetriedNotCleared(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{
+		Issues: map[int]store.IssueState{1: {Number: 1, NeedsRetry: true}},
+	}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 {
+		t.Fatalf("decisions = %v, want exactly one", kinds(p))
+	}
+	if k := p.Decisions[0].Kind; k != KindRetryStart && k != KindRetryResume {
+		t.Fatalf("decision = %v, want a retry: a startup failure has work left to do", k)
+	}
+}
+
+// The retry budget must actually run out, so the cap parks the issue and the
+// human hears about it. This is the escalation the cleared flag prevented.
+func TestATriggeredIssueThatKeepsFailingReachesTheRetryCap(t *testing.T) {
+	cfg := testConfig()
+	cfg.Retry.Max = 2
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{
+		Issues: map[int]store.IssueState{1: {Number: 1, NeedsRetry: true, RetryCount: 2}},
+	}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindParkRetryExhausted {
+		t.Fatalf("decisions = %v, want one park_retry_exhausted", kinds(p))
+	}
+}
+
+// --- Session continuity across a harness change ------------------------------
+//
+// Each harness keeps its own session store, so a session id minted by one means
+// nothing to the other. The engine must not hand such an id to a resume.
+
+// The case that stranded issue #15: the session was created under pi (a
+// harness: label), the label was removed, and the loop then resumed the pi
+// session under claude. claude exits non-zero on an id it has never seen, in
+// about a second, on every tick.
+func TestAResumeIsAFreshStartWhenTheSessionBelongsToAnotherHarness(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s-pi", SessionStarted: true, SessionHarness: config.HarnessPi},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 {
+		t.Fatalf("decisions = %v, want exactly one", kinds(p))
+	}
+	d := p.Decisions[0]
+	if d.Kind != KindStart {
+		t.Errorf("kind = %v, want start: a pi session cannot be resumed by claude", d.Kind)
+	}
+	if d.SessionID != "" {
+		t.Errorf("session id = %q, want empty: the new session must be minted fresh", d.SessionID)
+	}
+}
+
+// The mirror case, and the one that fails SILENTLY in production: resuming a
+// claude session under pi. pi creates a new session with that id and carries
+// on, so nothing errors and the whole conversation is gone.
+func TestAClaudeSessionIsNotResumedUnderPi(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "harness:pi")}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s-claude", SessionStarted: true, SessionHarness: config.HarnessClaude},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStart {
+		t.Fatalf("decisions = %v, want one start", kinds(p))
+	}
+	if id := p.Decisions[0].SessionID; id != "" {
+		t.Errorf("session id = %q, want empty", id)
+	}
+}
+
+// The ordinary case must keep resuming: same harness, same session.
+func TestAMatchingHarnessStillResumes(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s1", SessionStarted: true, SessionHarness: config.HarnessClaude},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindResume {
+		t.Fatalf("decisions = %v, want one resume", kinds(p))
+	}
+	if id := p.Decisions[0].SessionID; id != "s1" {
+		t.Errorf("session id = %q, want s1", id)
+	}
+}
+
+// A MODEL change is not a harness change. Swapping the model within one harness
+// resumes as before -- that conversation is still there.
+func TestAModelOverrideAloneStillResumes(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "model:sonnet")}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s1", SessionStarted: true, SessionHarness: config.HarnessClaude},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindResume {
+		t.Fatalf("decisions = %v, want one resume", kinds(p))
+	}
+}
+
+// An UNKNOWN harness is not a mismatch. Every row written before the column
+// existed has one, and guessing would restart every in-flight session the
+// moment this version was installed.
+func TestAnUnknownSessionHarnessStillResumes(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s1", SessionStarted: true, SessionHarness: ""},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindResume {
+		t.Fatalf("decisions = %v, want one resume for an unknown harness", kinds(p))
+	}
+}
+
+// The retry path resumes too, and needs the same guard: a retry that resumes a
+// session the harness cannot see fails identically every attempt, straight to
+// the cap.
+func TestARetryDoesNotResumeAnotherHarnessSession(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, NeedsRetry: true, SessionID: "s-pi",
+			SessionStarted: true, SessionHarness: config.HarnessPi},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryStart {
+		t.Fatalf("decisions = %v, want one retry_start", kinds(p))
+	}
+	if id := p.Decisions[0].SessionID; id != "" {
+		t.Errorf("session id = %q, want empty", id)
+	}
+}

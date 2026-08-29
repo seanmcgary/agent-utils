@@ -45,10 +45,24 @@ type IssueState struct {
 	// derived from the dispatches table: a tick that declines to act (backoff or
 	// circuit breaker) would then lose the fact and strand the issue forever.
 	NeedsRetry bool
-	// SessionStarted records that claude actually created the session. Until it
-	// is true, a retry must start rather than resume, because "-r" against a
-	// session that was never created fails every time.
+	// SessionStarted records that the harness actually created the session.
+	// Until it is true, a retry must start rather than resume, because "-r"
+	// against a session that was never created fails every time.
 	SessionStarted bool
+	// SessionHarness is the harness that created the session, and it is what
+	// says whether SessionID means anything to the harness about to run.
+	//
+	// Each harness keeps its own session store, so an id minted by one is
+	// meaningless to the other -- and the two fail in OPPOSITE directions.
+	// claude exits non-zero ("No conversation found with session ID: <uuid>");
+	// pi creates a fresh session under that id and carries on, so the
+	// conversation is silently gone. Neither is a resume, and the engine turns
+	// a mismatch into a clean start rather than either outcome.
+	//
+	// Empty means "unknown": the row predates this column, or the session was
+	// created before it was recorded. An unknown harness never counts as a
+	// mismatch -- guessing would restart every in-flight session on upgrade.
+	SessionHarness string
 	// Parked records that the loop gave up after the retry cap.
 	Parked bool
 	// RetryAfter is the deadline before which no retry for this issue may run.

@@ -542,3 +542,92 @@ func writeOldSchemaStoppedIssue(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+// The harness that created a session is recorded beside the started flag, so a
+// later dispatch can tell whether the id means anything to the harness it is
+// about to run.
+func TestMarkSessionStartedRecordsTheHarness(t *testing.T) {
+	s := openTemp(t)
+	if err := s.PutIssueState(IssueState{
+		Loop: "execution", Repo: "o/r", Number: 15,
+		SessionID: "s1", UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("PutIssueState: %v", err)
+	}
+	if err := s.MarkSessionStarted("execution", "o/r", 15, "pi"); err != nil {
+		t.Fatalf("MarkSessionStarted: %v", err)
+	}
+
+	got, err := s.IssueState("execution", "o/r", 15)
+	if err != nil {
+		t.Fatalf("IssueState: %v", err)
+	}
+	if !got.SessionStarted {
+		t.Error("SessionStarted = false, want true")
+	}
+	if got.SessionHarness != "pi" {
+		t.Errorf("SessionHarness = %q, want pi", got.SessionHarness)
+	}
+}
+
+// A session created before the column existed is recovered from the dispatch
+// that made it, so an issue whose session belongs to another harness heals on
+// upgrade instead of failing every resume forever.
+func TestSessionHarnessIsBackfilledFromAnExplicitOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s := openTempAt(t, path)
+
+	if err := s.PutIssueState(IssueState{
+		Loop: "execution", Repo: "o/r", Number: 15,
+		SessionID: "s-pi", SessionStarted: true, UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("PutIssueState: %v", err)
+	}
+	if _, err := s.CreateDispatch(Dispatch{
+		ProjectID: testProject, Loop: "execution", Repo: "o/r", Number: 15,
+		Kind: "start", Status: StatusSucceeded, StartedAt: time.Now().UTC(),
+		Harness: "pi", Model: "deepseek/deepseek-v4-flash-0731",
+	}); err != nil {
+		t.Fatalf("CreateDispatch: %v", err)
+	}
+
+	// Re-opening runs the migration, which is where the backfill lives.
+	reopened := openTempAt(t, path)
+	got, err := reopened.IssueState("execution", "o/r", 15)
+	if err != nil {
+		t.Fatalf("IssueState: %v", err)
+	}
+	if got.SessionHarness != "pi" {
+		t.Errorf("SessionHarness = %q, want pi from the dispatch row", got.SessionHarness)
+	}
+}
+
+// A session run under the loop's CONFIGURED harness records no override, so
+// there is nothing to recover and the value stays unknown. Unknown is the safe
+// answer: the engine resumes on it, so no healthy session is restarted.
+func TestSessionHarnessBackfillLeavesAnUnknownHarnessEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s := openTempAt(t, path)
+
+	if err := s.PutIssueState(IssueState{
+		Loop: "execution", Repo: "o/r", Number: 7,
+		SessionID: "s1", SessionStarted: true, UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("PutIssueState: %v", err)
+	}
+	if _, err := s.CreateDispatch(Dispatch{
+		ProjectID: testProject, Loop: "execution", Repo: "o/r", Number: 7,
+		Kind: "start", Status: StatusSucceeded, StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateDispatch: %v", err)
+	}
+
+	reopened := openTempAt(t, path)
+	got, err := reopened.IssueState("execution", "o/r", 7)
+	if err != nil {
+		t.Fatalf("IssueState: %v", err)
+	}
+	if got.SessionHarness != "" {
+		t.Errorf("SessionHarness = %q, want empty", got.SessionHarness)
+	}
+}
