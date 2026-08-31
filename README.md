@@ -127,6 +127,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 |---|---|
 | `agent-utils list` | Every project on this machine, with each loop's ticks, live dispatches, cost and last tick |
 | `agent-utils sessions list [--project <p>] [--loop <l>] [--running] [--orphaned]` | Every session on this machine, with its project, issue, runs, cost and state |
+| `agent-utils sessions describe <id> [--project <p>]` | One session's runs, what each cost, and why any of them failed |
 | `agent-utils sessions kill --session <id> \| --issue <n> \| --all --yes [--project <p>] [--loop <l>] [--force] [--timeout <d>]` | Stop a running session: signal its runner, mark the issue stopped, and record the outcome |
 | `agent-utils sessions resume --session <id> \| --issue <n> \| --all --yes [--project <p>] [--loop <l>]` | Clear a stopped issue's flags so its next trigger starts fresh |
 | `agent-utils logs [--name <loop>] [--session <id>]` | The log of a dispatched agent, for the project in the current directory |
@@ -145,6 +146,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils project status` | Identity, file locations, and every loop's state |
 | `agent-utils project list` | This project's loop configurations |
 | `agent-utils project sessions list` | Every claude session with its issue, runs, cost and state |
+| `agent-utils project sessions describe <id>` | One session's runs, what each cost, and why any of them failed |
 | `agent-utils project logs` | Watch a dispatched agent, live or after the fact |
 | `agent-utils project loop tick --name <loop>` | One reconcile-and-dispatch pass, then exit. This is what cron (and the webhook daemon) runs |
 | `agent-utils project loop status --name <loop>` | The reconciled view of one loop: issues, titles, dispatch state, retries |
@@ -234,6 +236,50 @@ The two commands spell the loop filter differently, because the machine-wide one
 Follow a session from the machine-wide list with `agent-utils project --name <project> logs
 --session <id>`. The project selector is needed because top-level `logs` resolves the project
 from the current directory.
+
+### What happened to one session
+
+`sessions list` carries one row per session, so a session whose first run succeeded and whose
+next three failed shows only the last state, and never says why. `sessions describe` is that
+missing account:
+
+```
+$ agent-utils sessions describe 369ff362-714b-49d2-9a8d-eb2cd4680f6b
+session 369ff362-714b-49d2-9a8d-eb2cd4680f6b
+  project  lawndominator      loop   execution
+  issue    #183 feat: add to shed UI refresh
+  harness  pi (deepseek/deepseek-v4-flash-0731)
+  pr       #186
+
+  RUN   KIND    STATE      COST      DURATION  WHEN
+  110   start   succeeded  $0.43     2h28m     08-30 22:21
+  118   tend    failed     $0.00     0s        08-31 09:51
+        └ No conversation found with session ID: 369ff362-714b-49d2-9a8d-eb2cd4680f6b
+
+  1 of 2 runs failed.
+  Run 118 ran under claude, but the session was created by pi: a session id means
+  nothing to a harness that did not mint it.
+```
+
+It needs no `--project`: the session identifier already names one. `agent-utils project
+sessions describe <id>` is the same report scoped to the project you are in.
+
+Three things in it are worth knowing about:
+
+- **The harness is the CREATING run's**, not the newest run's. `sessions list` shows the
+  newest, and a tend carrying no override resolves to the loop's defaults — so a session whose
+  work ran under pi would otherwise be reported as a claude session.
+- **A repeated identical failure is called out**, because a loop failing the same way every
+  tick will keep failing that way. That is a different problem from runs that failed for
+  unrelated reasons, and the two are never reported alike.
+- **A run under a harness the session did not start with is named.** A session identifier
+  only means something to the harness that minted it, so such a run either fails at once or
+  silently loses the conversation.
+
+The reason under a failed run is what the harness itself said, recorded when the run finished.
+Runs that finished before this was recorded show their exit status instead. For the full
+transcript of one run, `agent-utils project logs --dispatch <RUN>`; for its raw standard error,
+add `--stderr`.
 
 ### Stopping a session
 

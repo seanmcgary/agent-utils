@@ -324,6 +324,38 @@ func projectSessionsCommand() *cli.Command {
 					return nil
 				},
 			},
+			projectSessionsDescribeCommand(),
+		},
+	}
+}
+
+// projectSessionsDescribeCommand reports one session's whole history.
+//
+// It is the report `sessions list` cannot give. That table carries one row per
+// session, so a session whose first run succeeded and whose next three failed
+// shows only the last state, and the reason is nowhere. This prints every run
+// with what it cost, how long it took, and -- for a failure -- what the harness
+// said went wrong.
+func projectSessionsDescribeCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "describe",
+		Usage:     "show one session's runs and why any of them failed",
+		ArgsUsage: "<session-id>",
+		Action: func(_ context.Context, c *cli.Command) error {
+			if c.Args().Len() != 1 {
+				return fmt.Errorf("describe takes exactly one session id\n\n" +
+					"See them with: agent-utils project sessions list")
+			}
+			p, err := openProject(c)
+			if err != nil {
+				return err
+			}
+			sd, err := loopcmd.DescribeSession(p, c.Args().First())
+			if err != nil {
+				return err
+			}
+			fmt.Print(loopcmd.RenderSessionDetail(sd))
+			return nil
 		},
 	}
 }
@@ -379,8 +411,38 @@ func sessionsCommand() *cli.Command {
 					return nil
 				},
 			},
+			sessionsDescribeCommand(),
 			sessionsKillCommand(),
 			sessionsResumeCommand(),
+		},
+	}
+}
+
+// sessionsDescribeCommand is projectSessionsDescribeCommand at the machine-wide
+// scope. It takes no --project: the session identifier the operator copied out
+// of `sessions list` already determines which project owns it, and demanding
+// one would defeat the table they read it from. --project is accepted only to
+// narrow the search when two projects could hold the same id.
+func sessionsDescribeCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "describe",
+		Usage:     "show one session's runs and why any of them failed",
+		ArgsUsage: "<session-id>",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "project",
+				Usage: "restrict the search to one project (a name, an id, or a path)"},
+		},
+		Action: func(_ context.Context, c *cli.Command) error {
+			if c.Args().Len() != 1 {
+				return fmt.Errorf("describe takes exactly one session id\n\n" +
+					"See them with: agent-utils sessions list")
+			}
+			sd, err := loopcmd.DescribeSessionAnywhere(c.String("project"), c.Args().First())
+			if err != nil {
+				return err
+			}
+			fmt.Print(loopcmd.RenderSessionDetail(sd))
+			return nil
 		},
 	}
 }
