@@ -44,9 +44,12 @@ func (m *Manager) PathForPR(number int) string {
 // Fetch updates the primary checkout. It never changes its branch and never
 // edits its files.
 //
-// It is the unbounded form, kept for the command-line tick: a human watching
-// `loop tick` hang sees it and stops it. Anything running on the daemon's
-// goroutine must call FetchCtx instead.
+// It is the unbounded form, and NOTHING in the shipped binary calls it:
+// loopcmd.Open wires FetchCtx for the daemon and the command-line tick alike,
+// so `loop tick`'s fetch is bounded too. It survives for a caller that holds
+// no context, and for the tests. Anything on the daemon's goroutine must use
+// FetchCtx, which is what makes an unreachable remote stop one pass instead of
+// every project's retry deadlines.
 func (m *Manager) Fetch() error {
 	return m.FetchCtx(context.Background())
 }

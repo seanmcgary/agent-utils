@@ -258,7 +258,8 @@ func tendDispatch(
 	var tends []engine.Decision
 	if !plan.BreakerTripped {
 		for _, d := range plan.Decisions {
-			// The boundary that bounds the blast radius of a merge. It is the
+			// The boundary that bounds the blast radius of whichever trigger
+			// armed this sweep -- a merge, a push, or the periodic check. It is the
 			// counterpart of tickIssue's per-issue check, and it is what keeps
 			// this from being the per-delivery reconcile that was removed. It
 			// must not depend on an invariant living in another package.
