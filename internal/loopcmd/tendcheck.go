@@ -86,7 +86,7 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 	// tracking ref this updates. A stale answer is worse than no answer: it
 	// reports a branch as current after the base moved.
 	if deps.Fetch != nil {
-		if err := deps.Fetch(); err != nil {
+		if err := deps.Fetch(ctx); err != nil {
 			return out, fmt.Errorf("fetch primary checkout: %w", err)
 		}
 	}
@@ -98,7 +98,7 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 
 	behind := make(map[int]bool, len(links))
 	for number, link := range links {
-		n, known, err := deps.Behind(link.HeadRef, link.BaseRef)
+		n, known, err := deps.Behind(ctx, link.HeadRef, link.BaseRef)
 		if err != nil {
 			// One unusable row must not abandon the pass, for the reason
 			// tendSnapshot gives: anyone able to open a pull request could
@@ -182,7 +182,7 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 		if pr.BaseRef != cfg.DefaultBranch {
 			continue
 		}
-		n, known, err := deps.Behind(pr.HeadRef, pr.BaseRef)
+		n, known, err := deps.Behind(ctx, pr.HeadRef, pr.BaseRef)
 		if err != nil {
 			slog.Warn("local compare failed; skipping this pull request",
 				"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)

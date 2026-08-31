@@ -39,15 +39,26 @@ type Deps struct {
 	// It is a seam so a test can control liveness; production passes proc.IsAlive.
 	IsAlive func(pid int, dispatchID int64) bool
 	// Fetch updates the primary checkout. It is a seam so a test can skip git.
-	Fetch func() error
+	//
+	// It takes a context because it runs "git fetch origin --prune" over the
+	// NETWORK, and the daemon's periodic tend check calls it on the single
+	// wake goroutine while holding the loop lock: unbounded, one unreachable
+	// remote stops every retry of every loop until the daemon is restarted.
+	// The command-line tick may legitimately pass context.Background(); the
+	// daemon must not. Open wires it to Manager.FetchCtx.
+	Fetch func(ctx context.Context) error
 	// Behind counts the commits baseRef has that headRef does not, using only
 	// the local checkout, and reports known=false for a ref that does not
 	// resolve. It is the gate of the periodic tend check.
 	//
 	// It is a seam because WT is a concrete *worktree.Manager that a test
 	// cannot substitute, and because the answer depends on a git checkout no
-	// unit test has. Open wires it to Manager.BehindLocal.
-	Behind func(headRef, baseRef string) (behind int, known bool, err error)
+	// unit test has. Open wires it to Manager.BehindLocalCtx.
+	//
+	// It takes a context for the reason Fetch does: the periodic check calls
+	// it once per stored link on the wake goroutine, and a git command that
+	// never returns there stalls the whole daemon.
+	Behind func(ctx context.Context, headRef, baseRef string) (behind int, known bool, err error)
 	// Git is the git the automatic rebase drives. A nil Git disables that path
 	// entirely and every tend decision falls through to the agent, which is
 	// what keeps a Deps built by hand -- every test that predates this field --
@@ -141,7 +152,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	// runner's issue with no failure flag at all.
 	fetchOK := true
 	if deps.Fetch != nil {
-		if err := deps.Fetch(); err != nil {
+		if err := deps.Fetch(ctx); err != nil {
 			fetchOK = false
 			slog.Error("fetch primary checkout; skipping tend this tick",
 				"loop", cfg.Name, "err", err)

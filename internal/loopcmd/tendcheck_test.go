@@ -141,8 +141,8 @@ func tendCheckDeps(t *testing.T, gh ghub.Client, behind map[string]int) Deps {
 			return 0, nil
 		},
 		IsAlive: func(int, int64) bool { return true },
-		Fetch:   func() error { return nil },
-		Behind: func(headRef, _ string) (int, bool, error) {
+		Fetch:   func(context.Context) error { return nil },
+		Behind: func(_ context.Context, headRef, _ string) (int, bool, error) {
 			n, ok := behind[headRef]
 			if !ok {
 				return 5, false, nil
@@ -240,7 +240,7 @@ func TestTendCheckSkipsARowWhoseBranchIsGone(t *testing.T) {
 func TestTendCheckSurvivesAFailedLocalCompare(t *testing.T) {
 	gh := &countingGH{}
 	deps := tendCheckDeps(t, gh, nil)
-	deps.Behind = func(string, string) (int, bool, error) {
+	deps.Behind = func(context.Context, string, string) (int, bool, error) {
 		return 0, false, errors.New("unsafe branch name")
 	}
 	seedPRLink(t, deps, 7, 9, "feat/../../etc", "master")
@@ -349,11 +349,11 @@ func TestTendCheckDoesNothingWhenTheLoopDoesNotTend(t *testing.T) {
 	cfg.TendPR = false
 
 	fetched := 0
-	deps.Fetch = func() error {
+	deps.Fetch = func(context.Context) error {
 		fetched++
 		return nil
 	}
-	deps.Behind = func(string, string) (int, bool, error) {
+	deps.Behind = func(context.Context, string, string) (int, bool, error) {
 		t.Error("a loop that does not tend compared a branch")
 		return 0, false, nil
 	}
@@ -389,7 +389,7 @@ func TestTendCheckDoesNothingWithoutTheLocalSeam(t *testing.T) {
 // rather than reporting a branch as current after the base moved.
 func TestTendCheckFailsWhenTheFetchFails(t *testing.T) {
 	deps := tendCheckDeps(t, &countingGH{}, nil)
-	deps.Fetch = func() error { return errors.New("no route to host") }
+	deps.Fetch = func(context.Context) error { return errors.New("no route to host") }
 
 	if _, err := TendCheck(context.Background(), tendCheckConfig(t), deps, false); err == nil {
 		t.Error("a failed fetch must fail the pass")
@@ -432,11 +432,11 @@ func TestTendCheckFetchesBeforeItCompares(t *testing.T) {
 	seedPRLink(t, deps, 7, 9, "feat/x", "master")
 
 	fetched := 0
-	deps.Fetch = func() error {
+	deps.Fetch = func(context.Context) error {
 		fetched++
 		return nil
 	}
-	deps.Behind = func(string, string) (int, bool, error) {
+	deps.Behind = func(context.Context, string, string) (int, bool, error) {
 		if fetched == 0 {
 			t.Error("the local compare ran before the fetch updated the refs it reads")
 		}

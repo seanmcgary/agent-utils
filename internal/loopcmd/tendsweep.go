@@ -162,7 +162,7 @@ func tendDispatch(
 	// dispatch INTO. Unlike Tick, which suppresses tending and still reaps and
 	// retries, this pass has only tending to do, so it stops.
 	if deps.Fetch != nil {
-		if err := deps.Fetch(); err != nil {
+		if err := deps.Fetch(ctx); err != nil {
 			return sum, fmt.Errorf("fetch primary checkout: %w", err)
 		}
 	}

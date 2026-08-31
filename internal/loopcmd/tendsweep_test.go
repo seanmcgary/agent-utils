@@ -246,7 +246,7 @@ func TestTendSweepStopsWhenTheFetchFails(t *testing.T) {
 	}
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
-	deps.Fetch = func() error { return errors.New("network down") }
+	deps.Fetch = func(context.Context) error { return errors.New("network down") }
 
 	sum, err := TendSweep(context.Background(), cfg, deps, "master")
 	if err == nil {

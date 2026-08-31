@@ -43,8 +43,22 @@ func (m *Manager) PathForPR(number int) string {
 
 // Fetch updates the primary checkout. It never changes its branch and never
 // edits its files.
+//
+// It is the unbounded form, kept for the command-line tick: a human watching
+// `loop tick` hang sees it and stops it. Anything running on the daemon's
+// goroutine must call FetchCtx instead.
 func (m *Manager) Fetch() error {
-	return m.git(m.checkoutBaseDir, "fetch", "origin", "--prune")
+	return m.FetchCtx(context.Background())
+}
+
+// FetchCtx is Fetch with a deadline on the git command.
+//
+// "fetch origin --prune" is the one command on the periodic tend check's path
+// that talks to the NETWORK, and that check runs on the daemon's single wake
+// goroutine while it holds the loop lock. Unbounded, one unreachable remote
+// stops every retry of every loop until the daemon is restarted.
+func (m *Manager) FetchCtx(ctx context.Context) error {
+	return m.gitC(ctx, m.checkoutBaseDir, "fetch", "origin", "--prune")
 }
 
 // EnsureIssue creates the worktree for an issue if it does not exist. The path
@@ -136,6 +150,17 @@ var safeRef = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._/-]*$`)
 // was deleted loses its remote ref, and the caller must skip the row rather
 // than fail the pass.
 func (m *Manager) BehindLocal(headRef, baseRef string) (behind int, known bool, err error) {
+	return m.BehindLocalCtx(context.Background(), headRef, baseRef)
+}
+
+// BehindLocalCtx is BehindLocal with a deadline on every git command.
+//
+// The periodic tend check calls it once per stored pull request link, on the
+// daemon's single wake goroutine and under the loop lock. These commands are
+// local, but a checkout on a stalled network filesystem blocks the same way a
+// fetch does, and one blocked rev-list here would stop every retry of every
+// loop for as long as the daemon runs.
+func (m *Manager) BehindLocalCtx(ctx context.Context, headRef, baseRef string) (behind int, known bool, err error) {
 	if !SafeRef(headRef) {
 		return 0, false, fmt.Errorf("unsafe branch name %q", headRef)
 	}
@@ -143,13 +168,16 @@ func (m *Manager) BehindLocal(headRef, baseRef string) (behind int, known bool, 
 		return 0, false, fmt.Errorf("unsafe branch name %q", baseRef)
 	}
 	head, base := "origin/"+headRef, "origin/"+baseRef
-	if _, err := m.gitOutput(m.checkoutBaseDir, "rev-parse", "--verify", "--quiet", head+"^{commit}"); err != nil {
+	if _, err := m.gitCtx(ctx, m.checkoutBaseDir, "rev-parse", "--verify", "--quiet", head+"^{commit}"); err != nil {
 		return 0, false, nil
 	}
-	if _, err := m.gitOutput(m.checkoutBaseDir, "rev-parse", "--verify", "--quiet", base+"^{commit}"); err != nil {
+	if _, err := m.gitCtx(ctx, m.checkoutBaseDir, "rev-parse", "--verify", "--quiet", base+"^{commit}"); err != nil {
 		return 0, false, nil
 	}
-	out, err := m.gitOutput(m.checkoutBaseDir, "rev-list", "--count", head+".."+base)
+	// gitStdout, not gitCtx: the count is PARSED. git prints advice and
+	// fsmonitor warnings on stderr even on success, and CombinedOutput would
+	// prepend them to the number; see HeadSHA.
+	out, err := m.gitStdout(ctx, m.checkoutBaseDir, "rev-list", "--count", head+".."+base)
 	if err != nil {
 		return 0, false, err
 	}
