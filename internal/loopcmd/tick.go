@@ -40,6 +40,14 @@ type Deps struct {
 	IsAlive func(pid int, dispatchID int64) bool
 	// Fetch updates the primary checkout. It is a seam so a test can skip git.
 	Fetch func() error
+	// Behind counts the commits baseRef has that headRef does not, using only
+	// the local checkout, and reports known=false for a ref that does not
+	// resolve. It is the gate of the periodic tend check.
+	//
+	// It is a seam because WT is a concrete *worktree.Manager that a test
+	// cannot substitute, and because the answer depends on a git checkout no
+	// unit test has. Open wires it to Manager.BehindLocal.
+	Behind func(headRef, baseRef string) (behind int, known bool, err error)
 }
 
 // count increments n only when the action succeeded, so the recorded summary

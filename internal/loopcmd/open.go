@@ -214,6 +214,7 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		Spawn:      runner.Spawn,
 		IsAlive:    proc.IsAlive,
 		Fetch:      wt.Fetch,
+		Behind:     wt.BehindLocal,
 	}
 	return cfg, deps, func() { db.Close() }, nil
 }
