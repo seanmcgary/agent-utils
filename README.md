@@ -546,12 +546,17 @@ Passing `--config` with an absolute path works too and skips discovery entirely.
 
 The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
 request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
-A delivery acts on the issue it names. There are three exceptions. Two are on a `pull_request`
-delivery, and a pull request that **closes**, merged or not, has its `pr-<N>` worktree
-removed, along with the `issue-<M>` worktree of the issue it closes, once neither has a live
-dispatch. That deletes files: the live-dispatch guard protects work in progress, not
-uncommitted or unpushed work sitting in an idle worktree, and only a trusted pull request's
-`Closes #M` is honoured.
+A delivery acts on the issue it names. There are four exceptions.
+
+Two are on a `pull_request` delivery. A pull request that **closes**, merged or not, has its
+`pr-<N>` worktree removed, along with the `issue-<M>` worktree of the issue it closes, once
+neither has a live dispatch. That deletes files: the live-dispatch guard protects work in
+progress, not uncommitted or unpushed work sitting in an idle worktree, and only a trusted
+pull request's `Closes #M` is honoured. And a pull request **merged** into `default_branch`
+arms a tend sweep, which acts on pull requests the delivery never names.
+
+The third is a `push` delivery, which names no issue at all: its subject is a branch, and the
+only work it can start is that same sweep.
 
 Three things arm a **tend sweep** for a loop with `tend_pr: true`:
 
@@ -568,8 +573,9 @@ Three things arm a **tend sweep** for a loop with `tend_pr: true`:
   to leave running. See [`tend_interval`](#tend_interval) below for how often it fires.
 
 Whichever trigger fires, the sweep tries a plain git rebase before it dispatches anything —
-see [`tend_pr`](docs/configuration.md#tend_pr) for what that changes. It is capped either way,
-and the third exception is on an `issues` delivery reporting a **close**: when the closed issue
+see [`tend_pr`](docs/configuration.md#tend_pr) for what that changes. It is capped either way.
+
+The fourth exception is on an `issues` delivery reporting a **close**: when the closed issue
 is a sub-issue of an epic, the delivery also sweeps that epic, promoting sibling sub-issues the
 delivery never names — see [Epics](#epics).
 
@@ -641,9 +647,11 @@ actually binds).
 how often the periodic tend check described above runs, for every loop with `tend_pr: true`
 of every registered project. The default, when it is unset, is `15m`; the check is cheap when
 nothing is behind, so this is tuned by how soon a stale branch should be noticed, not by what
-the check costs. Setting it to `0` disables the periodic check only — the merge trigger, the
-push trigger, and cron's full sweep all still reach the rebase path, so this does not turn
-tending off; `tend_pr: false` on the loop does that.
+the check costs. The minimum is `1m`: each pass fetches and opens a database once per tending
+loop of every registered project, so a smaller value is a spin rather than a fast setting, and
+`config set` refuses one. Setting it to `0` disables the periodic check only — the merge
+trigger, the push trigger, and cron's full sweep all still reach the rebase path, so this does
+not turn tending off; `tend_pr: false` on the loop does that.
 
 As it comes up, a foreground `listener start` prints the routing table it will use — every
 repository it will accept deliveries for, and the loops each one dispatches. This is the
