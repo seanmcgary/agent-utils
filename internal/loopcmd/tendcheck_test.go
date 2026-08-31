@@ -114,6 +114,11 @@ func tendCheckConfig(t *testing.T) *config.Config {
 // present in the map is that many commits behind, and one absent from it does
 // not resolve -- which is what BehindLocal reports for a branch the prune
 // removed.
+//
+// An unknown branch answers a NON-ZERO count alongside known=false. Production
+// returns 0 there, but a fake that did the same would let a caller drop the
+// known check and still pass every test, because n <= 0 skips the row on its
+// own. The two skips have different reasons and must fail separately.
 func tendCheckDeps(t *testing.T, gh ghub.Client, behind map[string]int) Deps {
 	t.Helper()
 	dir := t.TempDir()
@@ -139,7 +144,10 @@ func tendCheckDeps(t *testing.T, gh ghub.Client, behind map[string]int) Deps {
 		Fetch:   func() error { return nil },
 		Behind: func(headRef, _ string) (int, bool, error) {
 			n, ok := behind[headRef]
-			return n, ok, nil
+			if !ok {
+				return 5, false, nil
+			}
+			return n, true, nil
 		},
 	}
 }
@@ -210,7 +218,9 @@ func TestTendCheckConfirmsWithTwoCallsWhenSomethingIsBehind(t *testing.T) {
 }
 
 // A branch the prune removed is a pull request whose branch is gone. It is not
-// a candidate, and it is not an error.
+// a candidate, and it is not an error -- and it is skipped for that reason
+// alone: the fake answers a count of 5, so a caller that dropped the known
+// check would treat this row as behind and call GitHub.
 func TestTendCheckSkipsARowWhoseBranchIsGone(t *testing.T) {
 	gh := &countingGH{}
 	deps := tendCheckDeps(t, gh, nil) // Behind reports known=false for everything
@@ -327,15 +337,31 @@ func TestTendCheckIgnoresAnUntrustedPullRequest(t *testing.T) {
 	}
 }
 
-// A loop that does not tend must not fetch, must not read rows, and must not
-// call GitHub.
+// A loop that does not tend must not fetch, must not compare, and must not call
+// GitHub -- not even when forced. The check is first in the function for the
+// reason TendSweep gives: TendCheck is exported, so a loop that does not tend
+// costs nothing whoever calls it.
 func TestTendCheckDoesNothingWhenTheLoopDoesNotTend(t *testing.T) {
 	gh := &countingGH{}
-	deps := tendCheckDeps(t, gh, nil)
+	deps := tendCheckDeps(t, gh, map[string]int{"feat/x": 3})
+	seedPRLink(t, deps, 7, 9, "feat/x", "master")
 	cfg := tendCheckConfig(t)
 	cfg.TendPR = false
 
+	fetched := 0
+	deps.Fetch = func() error {
+		fetched++
+		return nil
+	}
+	deps.Behind = func(string, string) (int, bool, error) {
+		t.Error("a loop that does not tend compared a branch")
+		return 0, false, nil
+	}
+
 	got, err := TendCheck(context.Background(), cfg, deps, true)
+	if fetched != 0 {
+		t.Errorf("fetches = %d; a loop that does not tend must not touch git", fetched)
+	}
 	if err != nil || got.Confirmed || gh.calls != 0 {
 		t.Errorf("got %+v, err %v, calls %d; want a no-op", got, err, gh.calls)
 	}
@@ -422,5 +448,39 @@ func TestTendCheckFetchesBeforeItCompares(t *testing.T) {
 	}
 	if fetched != 1 {
 		t.Errorf("fetches = %d, want 1", fetched)
+	}
+}
+
+// The boundary that keeps this pass off a release branch. A pull request
+// targeting release/1.0 is behind for reasons the loop default branch knows
+// nothing about, and later tasks in this plan FORCE-PUSH what this pass counts,
+// so a base the loop does not own must never reach that path. TendSweep
+// enforces the same rule against the branch a merge landed on.
+func TestTendCheckIgnoresAPullRequestTargetingAnotherBase(t *testing.T) {
+	release := ghub.PullRequest{
+		Number: 10, HeadRef: "feat/rel", BaseRef: "release/1.0",
+		Trusted: true, Body: "Closes #8",
+	}
+	gh := &countingGH{
+		prs:    []ghub.PullRequest{release},
+		issues: []ghub.Issue{{Number: 8, Repo: "o/r", Labels: []string{"status:review"}}},
+	}
+	deps := tendCheckDeps(t, gh, map[string]int{"feat/rel": 3})
+	seedPRLink(t, deps, 8, 10, "feat/rel", "release/1.0")
+
+	cfg := tendCheckConfig(t) // DefaultBranch is master
+	got, err := TendCheck(context.Background(), cfg, deps, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The gate opened -- the branch really is three commits behind its own base
+	// -- so this is the base check doing the work, not an accident of the
+	// fixture.
+	if !got.Confirmed {
+		t.Fatal("Confirmed = false; the fixture must reach the confirm step for this test to mean anything")
+	}
+	if got.Stale != 0 {
+		t.Errorf("Stale = %d, want 0 for a pull request targeting %q while default_branch is %q",
+			got.Stale, release.BaseRef, cfg.DefaultBranch)
 	}
 }
