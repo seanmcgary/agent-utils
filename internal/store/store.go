@@ -1127,6 +1127,25 @@ func (s *Store) PRLinks(loop, repo string) (map[int]PRLink, error) {
 	return out, rows.Err()
 }
 
+// DeletePRLink removes one issue-to-pull-request mapping.
+//
+// A row outlives the pull request it names: nothing removed one before this,
+// so a database accumulates a row for every pull request it ever linked. The
+// periodic tend pass counts a merged branch as behind its base forever, so the
+// dead rows would defeat the gate that exists to avoid GitHub calls.
+//
+// Deleting a row that is not there is not an error. The confirm pass deletes
+// what GitHub says is gone, and two passes may agree about the same row.
+func (s *Store) DeletePRLink(loop, repo string, number int) error {
+	_, err := s.db.Exec(
+		`DELETE FROM pr_links WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
+		s.projectID, loop, repo, number)
+	if err != nil {
+		return fmt.Errorf("delete pr link: %w", err)
+	}
+	return nil
+}
+
 // RecordTick appends one tick row and returns its identifier.
 func (s *Store) RecordTick(loop string, breakerTripped bool, summary string) (int64, error) {
 	tripped := 0

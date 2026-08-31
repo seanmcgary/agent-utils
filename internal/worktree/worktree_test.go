@@ -39,6 +39,46 @@ func initRepo(t *testing.T) string {
 	return dir
 }
 
+// newTestManagerWithOrigin builds a repository with a master branch two
+// commits ahead of origin/feature, and a feature branch with a commit of its
+// own that master lacks -- so ahead and behind differ and an implementation
+// that swaps the two directions cannot pass.
+func newTestManagerWithOrigin(t *testing.T) *Manager {
+	t.Helper()
+	dir := initRepo(t)
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	run("checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("f"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "feature work")
+	run("push", "-u", "origin", "feature")
+
+	run("checkout", "master")
+	for i := 0; i < 2; i++ {
+		name := filepath.Join(dir, "m.txt")
+		if err := os.WriteFile(name, []byte{byte('a' + i)}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run("add", ".")
+		run("commit", "-m", "master work")
+	}
+	run("push", "origin", "master")
+
+	return New(dir, filepath.Join(t.TempDir(), "worktrees"), "planning", "master")
+}
+
 func TestEnsureIssueCreatesWorktreeAndIsIdempotent(t *testing.T) {
 	repo := initRepo(t)
 	wtDir := filepath.Join(t.TempDir(), "worktrees")
@@ -79,6 +119,40 @@ func TestRemoveDeletesWorktree(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("worktree still exists after Remove")
+	}
+}
+
+// The periodic tend pass counts what the base has and the head does not, with
+// no GitHub call. A branch the prune removed is not an error and not behind:
+// it is a pull request whose branch is gone, and the pass must skip it.
+func TestBehindLocal(t *testing.T) {
+	m := newTestManagerWithOrigin(t) // origin/master and origin/feature exist
+
+	behind, known, err := m.BehindLocal("feature", "master")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !known {
+		t.Fatal("known = false, want true for a branch that resolves")
+	}
+	if behind != 2 {
+		t.Errorf("behind = %d, want 2", behind)
+	}
+
+	_, known, err = m.BehindLocal("branch-that-was-pruned", "master")
+	if err != nil {
+		t.Fatalf("a missing ref must not be an error: %v", err)
+	}
+	if known {
+		t.Error("known = true for a ref that does not resolve")
+	}
+}
+
+// An unsafe ref never reaches git.
+func TestBehindLocalRejectsAnUnsafeRef(t *testing.T) {
+	m := newTestManagerWithOrigin(t)
+	if _, _, err := m.BehindLocal("-oops", "master"); err == nil {
+		t.Error("an unsafe ref must be refused")
 	}
 }
 

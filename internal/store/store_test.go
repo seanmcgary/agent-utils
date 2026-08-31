@@ -138,6 +138,34 @@ func TestPRLinkRoundTrip(t *testing.T) {
 	}
 }
 
+// Nothing deleted a pr_links row before this. A row for a pull request that
+// merged days ago is still read by every later pass, and the local gate would
+// count its branch as behind forever.
+func TestDeletePRLink(t *testing.T) {
+	s := openTemp(t)
+	if err := s.PutPRLink(PRLink{
+		Loop: "execution", Repo: "o/r", Number: 7, PRNumber: 9,
+		HeadRef: "feat/x", BaseRef: "master", BehindBy: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeletePRLink("execution", "o/r", 7); err != nil {
+		t.Fatal(err)
+	}
+	links, err := s.PRLinks("execution", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := links[7]; ok {
+		t.Error("the row is still present after DeletePRLink")
+	}
+	// Deleting a row that is not there is not an error: the confirm pass
+	// deletes what it believes is gone, and two passes can agree.
+	if err := s.DeletePRLink("execution", "o/r", 7); err != nil {
+		t.Errorf("a second delete must be a no-op: %v", err)
+	}
+}
+
 func TestTickCountAndCooldown(t *testing.T) {
 	s := openTemp(t)
 	for i := 0; i < 3; i++ {

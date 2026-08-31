@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -107,6 +108,45 @@ func (m *Manager) EnsurePR(number int, headRef string) (string, error) {
 func SafeRef(ref string) bool { return safeRef.MatchString(ref) }
 
 var safeRef = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._/-]*$`)
+
+// BehindLocal counts the commits origin/baseRef has that origin/headRef does
+// not, using only the local checkout.
+//
+// It is the gate of the periodic tend pass. The equivalent GitHub call costs
+// one request per pull request, per loop, per project, on every interval;
+// this costs a rev-list against refs the loop's fetch already updated. It
+// answers only "is this branch behind", never "should this branch be
+// rebased" -- the caller stays the one place that decides that, so a stale
+// local ref can never cause a dispatch on its own.
+//
+// known is false when origin/headRef or origin/baseRef does not resolve.
+// That is not an error: Manager.Fetch prunes, so a pull request whose branch
+// was deleted loses its remote ref, and the caller must skip the row rather
+// than fail the pass.
+func (m *Manager) BehindLocal(headRef, baseRef string) (behind int, known bool, err error) {
+	if !SafeRef(headRef) {
+		return 0, false, fmt.Errorf("unsafe branch name %q", headRef)
+	}
+	if !SafeRef(baseRef) {
+		return 0, false, fmt.Errorf("unsafe branch name %q", baseRef)
+	}
+	head, base := "origin/"+headRef, "origin/"+baseRef
+	if _, err := m.gitOutput(m.checkoutBaseDir, "rev-parse", "--verify", "--quiet", head+"^{commit}"); err != nil {
+		return 0, false, nil
+	}
+	if _, err := m.gitOutput(m.checkoutBaseDir, "rev-parse", "--verify", "--quiet", base+"^{commit}"); err != nil {
+		return 0, false, nil
+	}
+	out, err := m.gitOutput(m.checkoutBaseDir, "rev-list", "--count", head+".."+base)
+	if err != nil {
+		return 0, false, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return 0, false, fmt.Errorf("parse rev-list count %q: %w", strings.TrimSpace(out), err)
+	}
+	return n, true, nil
+}
 
 // Remove deletes a worktree and its directory.
 func (m *Manager) Remove(path string) error {
