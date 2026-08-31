@@ -2743,12 +2743,12 @@ Recorded here rather than discovered later, following the predecessor plan's pre
 
 | Field     | Value                                                                    |
 |-----------|--------------------------------------------------------------------------|
-| stage     | 2 (plan review complete; awaiting the human gate)                        |
+| stage     | 3 (implementation)                                                       |
 | class     | large (new subsystem, new config surface, automatic force-push)          |
 | profile   | backend                                                                  |
 | branch    | feat/tend-triggers-and-agent-free-rebase                                 |
 | pr        | #18                                                                      |
-| gate      | pending                                                                  |
+| gate      | approved 2026-08-31                                                      |
 | round     | 0                                                                        |
 | decisions | 0                                                                        |
 
