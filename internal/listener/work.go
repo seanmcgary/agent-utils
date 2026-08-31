@@ -307,9 +307,16 @@ type Worker struct {
 	// deliveries land on it while its agent runs.
 	busy map[issueKey]*busyTimer // guarded by mu
 	// confirms holds, per loop, when the periodic check last called GitHub.
+	//
 	// It is memory only: a restart costs one forced pass per loop, which is
-	// two API calls, and that is cheaper than the column and the migration a
-	// durable version would need.
+	// one ListOpenIssues plus one ListOpenPullRequests -- and both paginate at
+	// 100 per page, so a busy repository costs two REQUESTS PER PAGE, not two
+	// requests. Still cheaper than the column and the migration a durable
+	// version would need, and paid once per loop per restart.
+	//
+	// Pruned in tendCheckPass, like every other map on this struct. Nothing
+	// else removes an entry, and a loop deleted from the registry would
+	// otherwise keep one for the daemon's life; see pruneConfirms.
 	confirms map[loopKey]time.Time // guarded by mu
 	// unroutable throttles the "cannot route this deadline" warning per
 	// loop; it carries its own lock. See warnUnroutable.
@@ -459,15 +466,6 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 		slog.Info("no loop watches this repository", "repo", d.Repo)
 		return
 	}
-	// The non-zero case is logged too, not only the zero one. Without it the
-	// only delivery that said anything was the one that did nothing, and the
-	// fan-out -- one delivery, several projects, several agents, on several
-	// token budgets -- was invisible.
-	loops := make([]string, 0, len(targets))
-	for _, t := range targets {
-		loops = append(loops, t.ProjectName+"/"+t.LoopName)
-	}
-
 	// The push filter runs BEFORE w.access(), not only before tickOne.
 	// access() reads the token file and builds a client; subscribing to push
 	// multiplies delivery volume by every branch of every watched repository,
@@ -484,26 +482,47 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 		kept = append(kept, t)
 	}
 	if len(kept) == 0 {
-		slog.Info("no loop tends the branch this push moved",
-			"repo", d.Repo, "pushed_to", safeText(d.PushedTo))
+		// Deliberately SILENT, and the one log line in Deliver that is.
+		//
+		// Every other "nothing to do" here reports something an operator did
+		// not already know. This reports the ordinary case: a developer pushed
+		// a feature branch, which is what feature branches are for. The daemon
+		// subscribes to push for every branch of every watched repository, so
+		// a line here is one line per developer push per repository, forever,
+		// into the unrotated launchd log unroutableLogInterval was invented
+		// for. tendCheckOne states the same rule where it declines to log its
+		// own common case: a line here would bury every line that means
+		// something.
+		//
+		// Throttling was the alternative and was rejected: a throttled line
+		// still says only "somebody pushed a branch nothing tends", which is
+		// not a condition an operator acts on, so the surviving line would be
+		// noise at a slower rate rather than a signal.
 		return
 	}
 
+	// Built from what SURVIVED the filter, and built after it. Naming every
+	// target watching the repository would claim a loop with tend_pr false
+	// will sweep when it never will, and building the list first allocated it
+	// for every feature-branch push this daemon then dropped. An issue
+	// delivery keeps every target, so this is the same list it always was.
+	//
+	// The non-zero case is logged too, not only the zero one. Without it the
+	// only delivery that said anything was the one that did nothing, and the
+	// fan-out -- one delivery, several projects, several agents, on several
+	// token budgets -- was invisible.
+	loops := make([]string, 0, len(kept))
+	for _, t := range kept {
+		loops = append(loops, t.ProjectName+"/"+t.LoopName)
+	}
+
 	if d.Number == 0 {
-		// keptLoops, not loops: loops names every target watching the
-		// repository, including ones with tend_pr false that the filter
-		// above just dropped. Naming those here would claim they will sweep
-		// when they never will.
-		keptLoops := make([]string, 0, len(kept))
-		for _, t := range kept {
-			keptLoops = append(keptLoops, t.ProjectName+"/"+t.LoopName)
-		}
 		// safeText, because PushedTo is attacker-written. SafeRef bounds its
 		// charset but not its length, so a multi-kilobyte branch name would go
 		// verbatim into an unrotated log -- the failure handler.go:185-196
 		// documents. work.go is the same package and gets the same treatment.
 		slog.Info("a push moved a branch; every loop that tends it will sweep",
-			"repo", d.Repo, "pushed_to", safeText(d.PushedTo), "loops", keptLoops)
+			"repo", d.Repo, "pushed_to", safeText(d.PushedTo), "loops", loops)
 	} else {
 		// EVALUATED, not "acted on". Every watching loop does evaluate the
 		// issue, and this line is what ties the ticks below back to the
@@ -617,8 +636,9 @@ func (w *Worker) tickFresh(ctx context.Context, t Target, number int) {
 	}
 	// A retry re-runs the ISSUE pass only. A retry may fire minutes after the
 	// merge that caused it, and a sweep then is not what that merge asked for:
-	// the base has moved again or has not, and the next merge arms a sweep
-	// either way. MergedInto is left empty here on purpose.
+	// the base has moved again or has not, and the next trigger -- a merge, a
+	// push, or the periodic check -- arms a sweep either way. MergedInto is
+	// left empty here on purpose.
 	w.tickOne(ctx, t, Delivery{Repo: t.Repo, Number: number}, acc)
 }
 
@@ -700,14 +720,25 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	// collapse a merge train into one batch of agents; this writes labels, so a
 	// burst costs a few more API calls and nothing else. A delay would only
 	// postpone the promotion.
-	if d.ClosedIssue {
+	//
+	// d.Number > 0 for the reason the issue pass carries it, and it is not
+	// redundant: this pass reads d.Number as the CLOSED ISSUE, so a push whose
+	// body happened to set ClosedIssue would sweep the epic of issue 0. The
+	// handler never sets it for a push today, which makes this an invariant
+	// living in another file with nothing pinning it. The guard is one
+	// condition and removes the coupling.
+	if d.Number > 0 && d.ClosedIssue {
 		w.epicPass(ctx, t, d, cfg, deps)
 	}
 
 	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
 	// for the operator's decision -- so it is gated on ClosedPR alone, not on
 	// cfg.TendPR or the merge check above.
-	if d.ClosedPR {
+	//
+	// d.Number > 0 for the reason the epic pass carries it: prNumber IS
+	// d.Number here, and a cleanup for pull request 0 would ask the worktree
+	// manager to remove "pr-0".
+	if d.Number > 0 && d.ClosedPR {
 		w.cleanupPass(ctx, t, d, cfg, deps)
 	}
 }
@@ -1041,7 +1072,8 @@ func (w *Worker) tendFresh(ctx context.Context, t Target, base string) {
 // Nothing. A failure is logged and dropped, and schedules NO retry: the retry
 // path re-runs the ISSUE pass, so a sweep failure would spend an issue's retry
 // budget on something that issue did not do, and the work is not lost because
-// the next merge arms another sweep.
+// the next trigger arms another sweep: a merge, a push to the default branch,
+// or the periodic tend check, whichever comes first.
 func (w *Worker) tendPass(
 	ctx context.Context, t Target, cfg *config.Config, deps loopcmd.Deps, base string,
 ) {
@@ -1114,6 +1146,10 @@ func (w *Worker) tendCheckPass(ctx context.Context) {
 		return
 	}
 
+	// Before the loops below, so a scan that named fewer loops than the last
+	// one drops their entries in the same pass that stopped using them.
+	w.pruneConfirms(routes.Targets)
+
 	for _, t := range routes.Targets {
 		if !t.TendPR {
 			continue
@@ -1125,6 +1161,30 @@ func (w *Worker) tendCheckPass(ctx context.Context) {
 			return
 		}
 		w.tendCheckOne(ctx, checkCtx, t, acc)
+	}
+}
+
+// pruneConfirms drops the confirm timestamp of every loop the scan no longer
+// names.
+//
+// confirms is the only map on Worker with no removal path of its own -- tends,
+// windows and busy each delete their entry when their timer fires. An entry is
+// two words, so this is a small leak, but it is an unbounded one: a project
+// deleted and re-registered under a new id, or a loop renamed, leaves a key
+// nothing will ever look up again for as long as the daemon runs. Deleting a
+// live loop's entry would cost one forced pass, which is what a restart costs
+// anyway, so the failure mode of being wrong here is bounded too.
+func (w *Worker) pruneConfirms(targets []Target) {
+	live := make(map[loopKey]bool, len(targets))
+	for _, t := range targets {
+		live[loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}] = true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for key := range w.confirms {
+		if !live[key] {
+			delete(w.confirms, key)
+		}
 	}
 }
 

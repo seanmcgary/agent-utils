@@ -359,8 +359,12 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 		// daemon cannot read is already reported by every delivery it fails to
 		// verify, and silently running with the tend check OFF is the worse of
 		// the two ways to be wrong about it.
+		// "tend_interval", not "interval": this line and the banner line below
+		// report the same value, and an operator greps the setting's name. A
+		// second key for one value hides the warning from exactly the search
+		// that would find it.
 		slog.Warn("cannot read the settings; using the default tend check interval",
-			"interval", tendEvery, "err", err)
+			"tend_interval", tendEvery, "err", err)
 	} else {
 		tendEvery = st.TendEvery()
 	}

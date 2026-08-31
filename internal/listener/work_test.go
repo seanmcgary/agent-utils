@@ -2737,3 +2737,37 @@ func TestTendTickerIsNilOnlyWhenTheIntervalIsZero(t *testing.T) {
 	}
 	stop()
 }
+
+// The spec says a push skips the issue pass, the epic pass AND the cleanup
+// pass. Only the issue pass had a d.Number > 0 guard; the other two were gated
+// on d.ClosedIssue/d.ClosedPR alone, which was safe only because the handler
+// never sets those for a push -- an invariant living in another file that
+// nothing pinned. Both passes read d.Number as their subject, so a push that
+// reached them would sweep the epic of issue 0 and remove the worktree "pr-0".
+func TestAPushRunsNeitherTheEpicPassNorTheCleanupPass(t *testing.T) {
+	h := newHarness(nil)
+	tgt := h.target("planning")
+	tgt.DefaultBranch = "master"
+	tgt.TendPR = true
+	h.targets = []Target{tgt}
+	h.defaultBranch = "master"
+	h.tendPR = true
+	swept, mu := sweptNumbers(h)
+
+	// ClosedIssue and ClosedPR are set deliberately: the handler does not set
+	// them for a push, and this test exists so tickOne does not depend on
+	// that.
+	h.w.Deliver(context.Background(), Delivery{
+		Repo: "o/r", PushedTo: "master", ClosedIssue: true, ClosedPR: true,
+	})
+
+	mu.Lock()
+	got := append([]int(nil), *swept...)
+	mu.Unlock()
+	if len(got) != 0 {
+		t.Errorf("epic sweeps = %v, want none for a push", got)
+	}
+	if cleaned := h.cleanedPRs(); len(cleaned) != 0 {
+		t.Errorf("cleaned = %v, want none for a push", cleaned)
+	}
+}

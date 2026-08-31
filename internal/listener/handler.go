@@ -513,9 +513,6 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			s.rejected(w, deliveryID, "issue number", http.StatusBadRequest)
 			return
 		}
-		if number < 0 {
-			number = 0
-		}
 		// A push carries no issue even if its body also happened to carry a
 		// non-zero issue.number or pull_request.number: only GitHub can
 		// produce a body that passes the HMAC, so this is not
