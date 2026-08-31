@@ -171,14 +171,23 @@ A session is one claude conversation. It survives resumes, so an issue keeps a s
 across a park and its answer, and several dispatches share it. That makes a session the unit
 to follow when you want the whole story of an issue rather than one run.
 
-A tend run shares it too. Rebasing a pull request is maintenance on work the session already
-did, so the rebase agent resumes that conversation rather than opening a throwaway one and
-reading the diff cold. It borrows the session without owning it: a tend never stamps the
-issue's session row, never spends its retry budget, and never marks it succeeded. The session
-belongs to the loop that carries `tend_pr: true` — the same loop's own row for that issue, so
-an issue that passed through `planning` before `execution` resumes the execution conversation,
-not the planning one. An issue whose session was never started still gets a fresh identifier,
-because `-r` against a session claude never created fails every time.
+A tend does not always mean an agent, though. Whichever trigger calls for one, git attempts
+the rebase first, with no agent and no session at all: a stale branch that replays cleanly
+against its base costs one fetch, one rebase, and one `--force-with-lease` push, and none of
+that is a conversation. Only a conflict escalates to the tend agent described below. A clean
+rebase still writes a `rebase` dispatch row — visible in `agent-utils project logs --list`
+like any other dispatch — and it is deliberately absent from `agent-utils project sessions
+list`, because a row with no session names nothing to list there.
+
+When a rebase does need the agent, it shares the session too. Rebasing a pull request is
+maintenance on work the session already did, so the rebase agent resumes that conversation
+rather than opening a throwaway one and reading the diff cold. It borrows the session without
+owning it: a tend never stamps the issue's session row, never spends its retry budget, and
+never marks it succeeded. The session belongs to the loop that carries `tend_pr: true` — the
+same loop's own row for that issue, so an issue that passed through `planning` before
+`execution` resumes the execution conversation, not the planning one. An issue whose session
+was never started still gets a fresh identifier, because `-r` against a session claude never
+created fails every time.
 
 For the same reason, a tend runs the issue's `model:` and `harness:` labels rather than the
 loop's defaults: a session identifier only means something to the harness that minted it. When
@@ -497,9 +506,10 @@ Cron is optional. `loop tick` is what any driver runs — a cron entry, or the w
 on a GitHub delivery — and the per-loop lock (`internal/lock`) makes it safe to run both at
 once: an overlapping tick simply finds the lock held and exits rather than double-dispatching.
 Keep the cron entry after the listener is running. It is not only a heartbeat for a quiet
-repository or a proxy that is briefly down: the listener acts on the issue a delivery names,
-so the full sweep is the only thing that notices a pull request that fell behind on someone
-else's push, or a retry deadline on an issue nobody touched.
+repository or a proxy that is briefly down: the daemon's merge, push, and periodic tend
+triggers all run only where the daemon runs, so the full sweep is what notices a retry
+deadline on an issue nobody touched, and it is the only thing that notices any of the above at
+all on a machine with no daemon.
 
 Do NOT put the token inline in the crontab. cron runs the whole line through `/bin/sh -c`, so
 a `VAR=value command` prefix puts the token in the shell's argument list, where `ps` shows it
@@ -537,17 +547,31 @@ Passing `--config` with an absolute path works too and skips discovery entirely.
 The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
 request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
 A delivery acts on the issue it names. There are three exceptions. Two are on a `pull_request`
-delivery. A pull request **merged** into a loop's `default_branch` also sweeps the loop for
-rebases — that merge is what makes every other open pull request stale while naming none of
-them — dispatching tend agents only, capped, and only for loops with `tend_pr: true`. And a pull
-request that **closes**, merged or not, has its `pr-<N>` worktree removed, along with the
-`issue-<M>` worktree of the issue it closes, once neither has a live dispatch. That second one
-deletes files: the live-dispatch guard protects work in progress, not uncommitted or unpushed
-work sitting in an idle worktree, and only a trusted pull request's `Closes #M` is honoured.
+delivery, and a pull request that **closes**, merged or not, has its `pr-<N>` worktree
+removed, along with the `issue-<M>` worktree of the issue it closes, once neither has a live
+dispatch. That deletes files: the live-dispatch guard protects work in progress, not
+uncommitted or unpushed work sitting in an idle worktree, and only a trusted pull request's
+`Closes #M` is honoured.
 
-The third is on an `issues` delivery reporting a **close**: when the closed issue is a sub-issue
-of an epic, the delivery also sweeps that epic, promoting sibling sub-issues the delivery never
-names — see [Epics](#epics).
+Three things arm a **tend sweep** for a loop with `tend_pr: true`:
+
+- **A merge into `default_branch`.** GitHub sends a `pull_request` delivery with `merged: true`
+  on the close action, and that merge is what makes every other open pull request stale while
+  naming none of them.
+- **A push to `default_branch`.** Someone pushing straight to the base branch — no pull
+  request, so no merge event — makes every open pull request stale the same way a merge does,
+  and the daemon now subscribes to `push` deliveries to catch it.
+- **A periodic check**, on a timer independent of any delivery. It runs only while the
+  listener runs — a machine with no daemon gets none of the three triggers above, and cron's
+  full sweep (below) is its only safety net. Each pass reads the refs the loop's own fetch
+  already updated; when nothing is behind it makes no GitHub call at all, so it costs nothing
+  to leave running. See [`tend_interval`](#tend_interval) below for how often it fires.
+
+Whichever trigger fires, the sweep tries a plain git rebase before it dispatches anything —
+see [`tend_pr`](docs/configuration.md#tend_pr) for what that changes. It is capped either way,
+and the third exception is on an `issues` delivery reporting a **close**: when the closed issue
+is a sub-issue of an epic, the delivery also sweeps that epic, promoting sibling sub-issues the
+delivery never names — see [Epics](#epics).
 
 Otherwise, a delivery says "something about this issue changed, figure out
 what and dispatch the right executor." The daemon fetches that issue and decides it — the epic
@@ -579,11 +603,10 @@ row read and a `kill(0)` a minute rather than eight hours of API calls. It runs 
 only once the agent's process is gone, and stops re-arming when it does.
 
 The daemon is the fast path; cron remains the safety net. A `loop tick` is still a full sweep,
-and it is what catches the work no event names — a pull request that fell behind because
-someone pushed to the default branch directly (a `push` event, which this daemon does not
-subscribe to),
-or a retry deadline on an issue nobody touched. Both can run at once: the per-loop lock makes
-an overlapping tick harmless.
+and it is what catches the work no event names — a retry deadline on an issue nobody touched,
+and on a machine with no daemon, everything above: the merge, push, and periodic tend
+triggers all belong to the listener, so cron alone is what a machine with no daemon has. Both
+can run at once: the per-loop lock makes an overlapping tick harmless.
 
 Set it up in this order:
 
@@ -610,6 +633,17 @@ check. Change the bind address or port with `agent-utils config set webhook.list
 / `--listen-port` (the `--daemon` form writes its override into the launchd plist, not into
 `config.yaml` — `config show` still reports the configured value, not what the installed agent
 actually binds).
+
+#### `tend_interval`
+
+`tend_interval` is the other machine-wide setting the listener reads, and it is also set with
+`agent-utils config set` — for example `agent-utils config set tend_interval 30m`. It controls
+how often the periodic tend check described above runs, for every loop with `tend_pr: true`
+of every registered project. The default, when it is unset, is `15m`; the check is cheap when
+nothing is behind, so this is tuned by how soon a stale branch should be noticed, not by what
+the check costs. Setting it to `0` disables the periodic check only — the merge trigger, the
+push trigger, and cron's full sweep all still reach the rebase path, so this does not turn
+tending off; `tend_pr: false` on the loop does that.
 
 As it comes up, a foreground `listener start` prints the routing table it will use — every
 repository it will accept deliveries for, and the loops each one dispatches. This is the
@@ -676,6 +710,16 @@ trigger agent dispatch — unless you pass `--yes`, and it refuses to run unatte
 terminal, no `--yes`) for the same reason a config wizard does. Run it again after
 `config webhook --rotate-secret`: GitHub returns a hook's secret obfuscated, so there is no way
 to detect that a hook's secret is stale short of always re-pushing it.
+
+**Run it again for `push` too.** `push` is a new event this listener subscribes to, so every
+repository already registered before this change needs `register-webhook` re-run to pick it
+up — a hook registered under the old event list is not updated by anything else. Doing that
+needs a token with **admin** on the repository, not `maintain`: reading a repository's own
+webhooks (`GET /repos/{owner}/{repo}/hooks`) 404s for a `maintain` token exactly the way a
+missing scope does, which is easy to mistake for "no webhook registered" rather than "wrong
+scope." The token in `~/.agent-utils/env` needs upgrading to `admin` before re-running the
+command. Until that is done, the merge trigger and the periodic tend check still work
+unchanged; only the push trigger waits on it.
 
 Each registration is recorded in the canonical state database, keyed by project and
 repository, with the hook id GitHub assigned and the URL it was registered with.

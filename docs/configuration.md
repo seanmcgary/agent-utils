@@ -763,46 +763,67 @@ cleanup_closed_pr: false   # keep the worktrees
 
 Whether the loop rebases stale pull requests. Default `false`.
 
-When true, for each issue carrying `labels.review`, on every tick and also when a merge sweeps
-the loop (see below):
+When true, for each issue carrying `labels.review`, on every tick and also when a tend sweep
+fires for the loop (see below):
 
 1. Find the open pull request whose body closes it (`Closes #N`, `Fixes #N`, `Resolves #N`).
-2. Ask the GitHub API how far behind its base it is.
-3. Dispatch a tend agent **only** if it is behind by at least one commit.
+2. Ask how far behind its base it is (the local checkout for a sweep, the GitHub API for a
+   full tick).
+3. If it is behind by at least one commit, **git attempts the rebase first.** A clean replay
+   costs no agent and no tokens: fetch, rebase, and a lease-guarded force-push, and nothing of
+   that is a conversation. Only a rebase that conflicts falls through to the tend agent.
 
-A current pull request costs one API call and produces nothing — no comment, no push, no
-agent. Silence is the correct output.
+A current pull request costs no push and produces nothing — no comment, no rebase, no agent.
+Silence is the correct output.
 
 Three safeguards apply:
 
 - **Only a trusted pull request is ever linked.** Its head branch must live in the target
   repository and its author must be an `OWNER`, `MEMBER`, or `COLLABORATOR`. A fork pull
   request claiming `Closes #7` cannot hijack the link, because tending checks the head branch
-  out and runs an agent inside it.
+  out and rebases or runs an agent inside it.
 - **An issue with a live agent is never tended**, so a rebase cannot force-push a branch its
   own build agent is committing to.
 - **Tending never changes a label.**
-- **A tend resumes the issue's session** when the loop can — it carries the context of the work
-  it is rebasing. When the issue has no started session, or that session was minted by a
+- **A clean rebase has no session at all.** git replays the branch in this process, so there is
+  no conversation to be fresh or stale, and no agent is dispatched. The rest of this bullet
+  applies only to the tend agent a conflict escalates to.
+- **A tend agent resumes the issue's session** when the loop can — it carries the context of the
+  work it is rebasing. When the issue has no started session, or that session was minted by a
   different harness than this tend will run, the tend gets a fresh session instead: a rebase is
   idempotent and needs no memory of an earlier one.
 
-**Two things dispatch a tend agent.** A delivery for one issue — the issue carries
-`labels.review`, its linked pull request is behind its base, and the delivery named that issue.
-And a merge into `default_branch`: GitHub sends a `pull_request` delivery with `merged: true`,
-and because the merge is what made every other pull request stale while naming none of them,
-that one delivery sweeps the loop. Every issue carrying `labels.review` whose linked pull
-request targets `default_branch` and is now behind gets a tend dispatch.
+**Three things arm a tend sweep.** A delivery for one issue still tends it directly — the
+issue carries `labels.review`, its linked pull request is behind its base, and the delivery
+named that issue — and beyond that:
+
+- **A merge into `default_branch`.** GitHub sends a `pull_request` delivery with `merged:
+  true`, and because the merge is what made every other pull request stale while naming none
+  of them, that one delivery sweeps the loop.
+- **A push to `default_branch`.** A push with no pull request attached makes every open pull
+  request stale the same way a merge does, and the listener now subscribes to `push` deliveries
+  to catch it — see the main README's [Webhooks](../README.md#webhooks) section for the
+  deployment step this requires.
+- **The periodic tend check.** A timer independent of any delivery, described in the main
+  README next to `tend_interval`. It runs only while the listener runs, and each pass costs no
+  GitHub call when nothing is behind.
+
+Whichever of these fires, every issue carrying `labels.review` whose linked pull request
+targets `default_branch` and is now behind gets a rebase attempt — git first, the agent only on
+conflict, exactly as above.
 
 A pull request targeting any other branch is left alone. A merge into `master` says nothing
 about a branch based on `release/1.0`.
 
-The sweep dispatches **tend agents only**. It never starts, resumes, or retries an issue agent,
-and it never parks an issue. A merge is a reason to rebase; it is not a reason to start work.
+The sweep dispatches **tend agents only**, and only for the pull requests git could not rebase
+cleanly. It never starts, resumes, or retries an issue agent, and it never parks an issue. A
+stale branch is a reason to rebase; it is not a reason to start work.
 
-A sweep waits about a minute before it runs, so a merge train produces one sweep rather than one
-per merge, and it dispatches at most ten rebases. If more pull requests are behind than that,
-the rest are named in the log line and wait for the next merge.
+A sweep waits about a minute before it runs, so a merge train (or a push train) produces one
+sweep rather than one per event, and it acts on at most ten pull requests per pass — a cap that
+applies to the agent-free rebases as well as the agent dispatches, since the point is bounding
+how much force-pushing and how many agents one sweep can start. If more pull requests are
+behind than that, the rest are named in the log line and wait for the next sweep.
 
 **A closed pull request has its worktrees removed.** This is separate from `tend_pr` and is not
 gated by it; `cleanup_closed_pr` turns it off. When GitHub reports a pull request closed — merged or not — the loop removes that
@@ -815,9 +836,10 @@ contributor cannot name someone else's issue in a `Closes #M` body and have its 
 And the live-dispatch guard protects work in progress, not uncommitted or unpushed work in an
 idle worktree — that is removed too, with a warning naming the worktree in the log.
 
-**A sweep does not replace a periodic tick.** `agent-utils project loop tick` is still the only
-full reconcile: it is what retires a dead runner for an issue no delivery names, and what finds
-a pull request that fell behind for any reason other than a merge. Schedule it.
+**None of the sweeps above replace `agent-utils project loop tick`.** It is still the only full
+reconcile: it is what retires a dead runner for an issue no delivery names, and it is the only
+tend trigger at all on a machine that runs no listener daemon — the merge, push, and periodic
+triggers belong to the listener. Schedule it under cron regardless of whether the daemon runs.
 
 **Set this `false` for a planning loop.** `plan-feature` opens a design draft pull request
 whose body also says `Closes #N`, so a planning loop with tending on would force-push a draft

@@ -124,12 +124,13 @@ type Summary struct {
 // Tick runs one FULL reconcile and dispatch pass over every open issue.
 //
 // This is the sweep, and it stays: it is what catches the work no webhook
-// event names. GitHub sends no delivery when a pull request falls behind
-// because someone pushed to master (that is a push event, which this daemon
-// does not subscribe to), and none when a retry deadline passes on an issue
-// nobody touched. `project loop tick` under cron runs this; the daemon runs
-// TickIssue for the fast path. Both may run at once -- the per-loop lock in
-// RunTick and TickIssue makes an overlapping pass harmless.
+// event names. GitHub sends no delivery when a retry deadline passes on an
+// issue nobody touched, and the daemon's merge, push, and periodic triggers
+// all cover only a machine that runs it -- a machine with no daemon gets
+// none of the three, so this is the only thing that ever notices a pull
+// request behind its base there. `project loop tick` under cron runs this;
+// the daemon runs TickIssue for the fast path. Both may run at once -- the
+// per-loop lock in RunTick and TickIssue makes an overlapping pass harmless.
 func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	var sum Summary
 	now := deps.Now()
