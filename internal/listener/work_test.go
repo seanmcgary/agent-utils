@@ -2351,13 +2351,18 @@ func TestIssueBusyIsFalseWhenTheDatabaseCannotBeRead(t *testing.T) {
 
 // --- the periodic tend check ---------------------------------------------
 
-// tendCheckHarness returns a harness whose one registered loop tends, with
+// tendCheckHarness returns a harness with TWO registered tending loops and
 // the ScanTargets seam set.
 //
 // Setting that seam is not optional in any test below. It is the ONLY routing
 // seam tendCheckPass uses, and the default reads this machine's real
 // registry: a test that left it alone would find no target, call
 // RunTendCheck never, and then pass while asserting nothing.
+//
+// Two loops, not one, because the whole reason this pass exists is that it
+// walks the registry. With a single target, a pass that checked the first loop
+// and returned would satisfy every assertion in this file -- while every other
+// project on the machine went on stranding its pull requests.
 func tendCheckHarness(t *testing.T) *harness {
 	t.Helper()
 	h := newHarness(nil)
@@ -2366,16 +2371,35 @@ func tendCheckHarness(t *testing.T) *harness {
 	// loopcmd.TendCheck itself refuses a loop with tend_pr false.
 	h.defaultBranch = "master"
 	h.tendPR = true
-	target := h.target("planning")
-	// Set on the TARGET as well as on the config: the pass filters on
-	// Target.TendPR before it opens anything, and the harness's target helper
-	// leaves both fields zero.
-	target.DefaultBranch = "master"
-	target.TendPR = true
-	h.w.ScanTargets = func() (Routes, error) {
-		return Routes{Targets: []Target{target}}, nil
-	}
+	h.scanTending("planning", "execution")
 	return h
+}
+
+// tendTarget is the harness's target for one loop, marked as tending.
+//
+// DefaultBranch and TendPR are set here as well as on the config the open seam
+// builds: the pass filters on Target.TendPR before it opens anything, and the
+// harness's target helper leaves both fields zero.
+func (h *harness) tendTarget(loop string) Target {
+	t := h.target(loop)
+	t.DefaultBranch = "master"
+	t.TendPR = true
+	return t
+}
+
+// scanTending points the ScanTargets seam at exactly these loops, all tending.
+//
+// A test that is about the per-loop confirm schedule narrows the scan to one
+// loop with it: the schedule is kept per loop, so a second loop would double
+// every recorded flag and say nothing extra.
+func (h *harness) scanTending(loops ...string) {
+	targets := make([]Target, 0, len(loops))
+	for _, loop := range loops {
+		targets = append(targets, h.tendTarget(loop))
+	}
+	h.w.ScanTargets = func() (Routes, error) {
+		return Routes{Targets: targets}, nil
+	}
 }
 
 // fireTends runs every armed tend sweep timer, told apart from the other
@@ -2404,12 +2428,13 @@ func TestTendCheckPassArmsASweepForEachStaleLoop(t *testing.T) {
 
 	h.w.tendCheckPass(context.Background())
 
-	if len(checked) != 1 || checked[0] != "planning" {
-		t.Fatalf("checked = %v, want [planning]", checked)
+	if len(checked) != 2 || checked[0] != "planning" || checked[1] != "execution" {
+		t.Fatalf("checked = %v, want [planning execution]", checked)
 	}
 	fireTends(t, h)
-	if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
-		t.Errorf("tends = %v, want [planning@master]", got)
+	got := h.tendedLoops()
+	if len(got) != 2 || got[0] != "planning@master" || got[1] != "execution@master" {
+		t.Errorf("tends = %v, want [planning@master execution@master]", got)
 	}
 }
 
@@ -2465,6 +2490,7 @@ func TestTendCheckPassSkipsALoopThatDoesNotTend(t *testing.T) {
 // pass does not force it, which is what keeps the interval cheap.
 func TestTendCheckPassForcesTheFirstPassOnly(t *testing.T) {
 	h := tendCheckHarness(t)
+	h.scanTending("planning")
 	var forced []bool
 	h.w.RunTendCheck = func(
 		_ context.Context, _ *config.Config, _ loopcmd.Deps, force bool,
@@ -2485,6 +2511,7 @@ func TestTendCheckPassForcesTheFirstPassOnly(t *testing.T) {
 // delivery is corrected.
 func TestTendCheckPassForcesTheConfirmEverySixHours(t *testing.T) {
 	h := tendCheckHarness(t)
+	h.scanTending("planning")
 	// A clock of its own, because the harness's is frozen: what this test is
 	// about is time passing between two passes.
 	now := workNow
@@ -2511,6 +2538,7 @@ func TestTendCheckPassForcesTheConfirmEverySixHours(t *testing.T) {
 // rows it never got.
 func TestTendCheckPassKeepsForcingUntilAConfirmHappens(t *testing.T) {
 	h := tendCheckHarness(t)
+	h.scanTending("planning")
 	var forced []bool
 	h.w.RunTendCheck = func(
 		_ context.Context, _ *config.Config, _ loopcmd.Deps, force bool,
@@ -2536,6 +2564,7 @@ func TestTendCheckPassKeepsForcingUntilAConfirmHappens(t *testing.T) {
 // catches that, because both contexts are alive while the pass runs.
 func TestTendCheckPassArmsWithTheDaemonContextNotItsOwnDeadline(t *testing.T) {
 	h := tendCheckHarness(t)
+	h.scanTending("planning")
 	var checkCtx context.Context
 	h.w.RunTendCheck = func(
 		ctx context.Context, _ *config.Config, _ loopcmd.Deps, _ bool,
@@ -2582,6 +2611,7 @@ func TestTendCheckPassStopsWhenTheScanFails(t *testing.T) {
 // one handle leaked every interval, forever.
 func TestTendCheckPassReleasesTheLoopEvenWhenTheCheckFails(t *testing.T) {
 	h := tendCheckHarness(t)
+	h.scanTending("planning")
 	h.w.RunTendCheck = func(
 		context.Context, *config.Config, loopcmd.Deps, bool,
 	) (loopcmd.TendCheckResult, error) {
@@ -2595,6 +2625,94 @@ func TestTendCheckPassReleasesTheLoopEvenWhenTheCheckFails(t *testing.T) {
 	}
 }
 
+// One loop's failure must not strand every loop after it in the scan.
+//
+// This is the pass's own failure mode at machine scale: the loops share
+// nothing but this goroutine, and "logged and dropped, the next interval tries
+// again" is only true if the pass reaches the next interval having checked
+// everything else.
+func TestTendCheckPassChecksTheNextLoopAfterOneCheckFails(t *testing.T) {
+	h := tendCheckHarness(t)
+	var checked []string
+	h.w.RunTendCheck = func(
+		_ context.Context, cfg *config.Config, _ loopcmd.Deps, _ bool,
+	) (loopcmd.TendCheckResult, error) {
+		checked = append(checked, cfg.Name)
+		if cfg.Name == "planning" {
+			return loopcmd.TendCheckResult{}, errBoom
+		}
+		return loopcmd.TendCheckResult{Stale: 1, Confirmed: true}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if len(checked) != 2 || checked[1] != "execution" {
+		t.Fatalf("checked = %v, want the second loop checked after the first failed", checked)
+	}
+	fireTends(t, h)
+	if got := h.tendedLoops(); len(got) != 1 || got[0] != "execution@master" {
+		t.Errorf("tends = %v, want [execution@master]", got)
+	}
+}
+
+// The same, one layer earlier: a loop whose database or config cannot be
+// opened at all. It schedules no retry -- the pass names no issue whose budget
+// could pay for one -- so the only thing that saves the loops behind it is the
+// pass continuing.
+func TestTendCheckPassChecksTheNextLoopAfterOneCannotBeOpened(t *testing.T) {
+	h := tendCheckHarness(t)
+	// Wrapped rather than set through h.openErr, which would fail both loops
+	// and prove nothing about continuing.
+	open := h.w.Open
+	h.w.Open = func(
+		ref loopcmd.ProjectRef, path string, o loopcmd.Options,
+	) (*config.Config, loopcmd.Deps, func(), error) {
+		if loopFromPath(path) == "planning" {
+			return nil, loopcmd.Deps{}, nil, errBoom
+		}
+		return open(ref, path, o)
+	}
+	var checked []string
+	h.w.RunTendCheck = func(
+		_ context.Context, cfg *config.Config, _ loopcmd.Deps, _ bool,
+	) (loopcmd.TendCheckResult, error) {
+		checked = append(checked, cfg.Name)
+		return loopcmd.TendCheckResult{}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if len(checked) != 1 || checked[0] != "execution" {
+		t.Errorf("checked = %v, want [execution]", checked)
+	}
+	if h.timers.len() != 0 {
+		t.Errorf("timers armed = %d, want 0; a failed Open schedules no retry here", h.timers.len())
+	}
+}
+
+// A token that cannot be read stops the pass before it opens anything.
+//
+// The token is machine-wide, so every loop would fail on the identical read --
+// and there is no access for a loop to be checked WITH, which is what makes
+// carrying on past this a nil dereference on the wake goroutine rather than a
+// wasted pass.
+func TestTendCheckPassStopsWhenTheTokenCannotBeRead(t *testing.T) {
+	h := tendCheckHarness(t)
+	h.tokenErr = errBoom
+	h.w.RunTendCheck = func(
+		context.Context, *config.Config, loopcmd.Deps, bool,
+	) (loopcmd.TendCheckResult, error) {
+		t.Error("the check ran without a token")
+		return loopcmd.TendCheckResult{}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if opens, _, _ := h.counts(); opens != 0 {
+		t.Errorf("opens = %d, want 0", opens)
+	}
+}
+
 // Zero disables the pass outright.
 //
 // Asserted on the ticker rather than on Serve: Serve returns at its own
@@ -2604,12 +2722,18 @@ func TestTendTickerIsNilOnlyWhenTheIntervalIsZero(t *testing.T) {
 	h := newHarness(nil)
 
 	h.w.TendInterval = 0
-	if ch := h.w.tendTicker(); ch != nil {
+	ch, stop := h.w.tendTicker()
+	if ch != nil {
 		t.Error("a zero interval must build no ticker; a nil channel blocks forever, which is the disable")
 	}
+	// Called, not merely non-nil: Serve defers it unconditionally, so a
+	// disabled pass returning a nil func would panic the daemon on shutdown.
+	stop()
 
 	h.w.TendInterval = time.Minute
-	if ch := h.w.tendTicker(); ch == nil {
+	ch, stop = h.w.tendTicker()
+	if ch == nil {
 		t.Error("a non-zero interval must build a ticker")
 	}
+	stop()
 }

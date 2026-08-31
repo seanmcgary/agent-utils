@@ -1099,6 +1099,15 @@ func (w *Worker) tendCheckPass(ctx context.Context) {
 		slog.Error("cannot scan projects for the tend check", "err", err)
 		return
 	}
+	// ONE access for the whole pass, which bends the lifetime rule access
+	// states, so it is bounded here rather than left to be discovered.
+	// ghub.DeliveryCache memoises Issue and PullRequest, and this cache lives
+	// for every loop of the pass -- up to tendPassTimeout -- where a delivery's
+	// lives for one fan-out. That is safe only because loopcmd.TendCheck reads
+	// ListOpenPullRequests and ListOpenIssues, neither of which is memoised. A
+	// TendCheck that reached for Issue or PullRequest would start deciding
+	// from labels fetched minutes ago, for a different loop; give this pass an
+	// access per loop before making that change.
 	acc, err := w.access()
 	if err != nil {
 		slog.Error("cannot read the github token for the tend check", "err", err)
@@ -1182,19 +1191,27 @@ func (w *Worker) tendCheckOne(ctx, checkCtx context.Context, t Target, acc *acce
 	w.armTend(ctx, t, cfg.DefaultBranch)
 }
 
-// tendTicker returns the channel the periodic tend check fires on, or nil when
-// it is disabled.
+// tendTicker returns the channel the periodic tend check fires on and the
+// func that stops it. The channel is nil, and the stop a no-op, when the check
+// is disabled.
 //
 // A nil channel blocks forever in a select, which is exactly what "disabled"
 // means here -- no branch, no flag, nothing for a later reader to get subtly
-// wrong. It is a method rather than three lines inside Serve so that the
+// wrong. It is a method rather than four lines inside Serve so that the
 // decision itself can be tested: Serve is a loop around seams, and a test of
 // it would return at its own ctx.Err() guard before ever reaching the select.
-func (w *Worker) tendTicker() <-chan time.Time {
+//
+// The stop func is returned rather than left to the garbage collector. An
+// unreachable ticker is collectable on this Go version whether it was stopped
+// or not, so nothing leaks either way -- but that is a language-version
+// property, and handing the caller the same defer every other timer in this
+// file gets costs one line and needs no such argument.
+func (w *Worker) tendTicker() (<-chan time.Time, func()) {
 	if w.TendInterval <= 0 {
-		return nil
+		return nil, func() {}
 	}
-	return time.NewTicker(w.TendInterval).C
+	tk := time.NewTicker(w.TendInterval)
+	return tk.C, tk.Stop
 }
 
 // epicPass promotes the sub-issues the delivery's closed issue unblocked.
@@ -1656,11 +1673,8 @@ func (w *Worker) Serve(ctx context.Context) {
 	// reach the interval at all. It is deliberately not folded into the wake
 	// timer above -- that one is driven by retry deadlines and floored at
 	// MinWakeInterval, which is a different schedule entirely.
-	//
-	// Nothing stops it: a ticker whose channel is unreachable is collected on
-	// this Go version, and this one becomes unreachable exactly when Serve
-	// returns, which is when the daemon is shutting down.
-	tendC := w.tendTicker()
+	tendC, stopTend := w.tendTicker()
+	defer stopTend()
 
 	for {
 		// Checked before Wake, not only in the select below. Wake is
