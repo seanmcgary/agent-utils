@@ -299,6 +299,20 @@ func reapDead(
 			continue
 		}
 
+		// Clear the git locks the dead runner left in its worktree. The retry
+		// lands in that SAME worktree (EnsureIssue returns an existing one
+		// untouched), so an index.lock left by a SIGKILL mid-operation fails
+		// every git command the next agent runs -- and it would burn the whole
+		// retry budget on debris no agent can clear.
+		//
+		// Safe precisely here and nowhere else: this runner has just been
+		// proven dead and the caller holds the loop lock, so no process can be
+		// holding those files. Logged and continued on failure -- the row and
+		// the retry flag below are the reap's real job, and abandoning them
+		// over debris would strand the issue holding an in-flight label with
+		// no agent and no failure recorded.
+		clearStaleLocks(cfg, deps, d)
+
 		// The runner died without recording an outcome. Retire the row AND write
 		// the durable failure flag. The flag is what the next decision reads: a
 		// tick that declines to act (backoff or breaker) must not lose the fact.
@@ -327,6 +341,37 @@ func reapDead(
 		sum.Orphans++
 	}
 	return live, nil
+}
+
+// clearStaleLocks removes the git lock files a dead dispatch left behind.
+//
+// A tend runs in the PULL REQUEST's worktree and every other kind in the
+// issue's, so the path is chosen by kind: clearing the wrong one would leave
+// the debris that is actually in the way and delete a file in a worktree this
+// dispatch never touched.
+//
+// A loop configured with no per-issue worktree has nothing to clear. Its
+// agents run in the primary checkout, which is shared with every other loop
+// and with whatever the operator is doing in it, so a lock there may well be
+// held by a live git process.
+func clearStaleLocks(cfg *config.Config, deps Deps, d store.Dispatch) {
+	if cfg.Agent.Worktree != config.WorktreePerIssue || deps.WT == nil {
+		return
+	}
+	path := deps.WT.PathForIssue(d.Number)
+	if d.Kind == store.KindTend {
+		path = deps.WT.PathForPR(d.PRNumber)
+	}
+	cleared, err := worktree.ClearStaleLocks(path)
+	if err != nil {
+		slog.Warn("could not clear stale git locks after a dead runner",
+			"loop", cfg.Name, "dispatch", d.ID, "worktree", path, "err", err)
+		return
+	}
+	for _, p := range cleared {
+		slog.Info("cleared a stale git lock left by a dead runner",
+			"loop", cfg.Name, "dispatch", d.ID, "lock", p)
+	}
 }
 
 // clearUnreachableDeadlines drops the retry DEADLINE from every stamped row

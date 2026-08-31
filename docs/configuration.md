@@ -922,6 +922,14 @@ One issue misbehaving is noise. Two at once, in the same window, is the platform
 orphan_threshold: 2
 ```
 
+**It is counted per tick, and a tick scoped to ONE issue can never reach a threshold above 1.**
+Both the webhook listener and the crash recovery it runs at start act one issue at a time, so
+only a full `loop tick` — a cron entry, or a manual run — can trip this. That is deliberate for
+recovery: a machine coming back with two dead agents is not a platform fault in progress, and a
+whole-loop tick over them would reap both, count two eligible retries, trip a threshold of 2,
+and go quiet for the cooldown having dispatched nothing. Recovery drains them one per wake
+instead. If you run a cron sweep after a crash, expect exactly that trip.
+
 ### `retry.breaker.cooldown`
 
 How long to dispatch nothing after the breaker trips. A Go duration string.

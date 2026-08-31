@@ -767,10 +767,39 @@ after you have unset the webhook configuration. Three cases are worth knowing:
   says plainly which projects just lost delivery; run `deregister-webhook` in each of them
   afterwards to clear their now-stale records.
 
+### Recovering from a crash
+
+An agent that dies without recording an outcome — the machine going down, an OOM kill, a
+`kill -9` — leaves its dispatch row marked `running` with no process behind it. **The listener
+finds these and queues each one's retry**: once when it starts, and every five minutes after.
+
+This exists because such a row is otherwise invisible. The daemon schedules future work from
+retry *deadlines*, only a reap writes one, and a reap happens only inside a tick — which
+happens only when a delivery arrives. A machine that went down satisfies none of that, so
+before this its dead agents waited for a webhook that might never come.
+
+The sweep queues the retries and stops there. Everything after is the ordinary machinery: one
+recovered issue is dispatched per wake, through the same per-issue tick, under the same
+backoff and retry cap. A crash spends one retry from the issue's budget like any other failure,
+so a machine that crash-loops parks its issues instead of dispatching forever.
+
+Two details worth knowing:
+
+- **It needs no GitHub token.** The sweep asks the kernel which processes are alive and writes
+  local rows, so it recovers even when the machine is otherwise unhealthy.
+- **It clears stale git locks.** A crash mid-`git` leaves `index.lock` in the agent's worktree,
+  and the retry lands in that same worktree — so every git command would fail until the retry
+  cap ran out. Only lock files are removed. An in-progress rebase, uncommitted edits, and every
+  commit are left for the retrying agent to resolve.
+
+An agent still running when the listener stops is **not** an orphan: agents are detached, so a
+graceful stop leaves them working and the sweep correctly ignores them.
+
 `agent-utils listener start --daemon` installs the listener as a launchd user agent (macOS
 only) instead of running it in your terminal — `RunAtLoad` and `KeepAlive`, so it starts at
-login and restarts if it dies. Without `--daemon` it just runs in the foreground, useful for
-watching its logs while you get the proxy working. `agent-utils listener status` reports
+login and restarts if it dies — which is also what makes the crash recovery above run at all,
+since a listener that does not come back after a reboot never sweeps. Without `--daemon` it
+just runs in the foreground, useful for watching its logs while you get the proxy working. `agent-utils listener status` reports
 whether it is installed and running; `agent-utils listener stop` removes it, or signals a
 foreground instance, or both.
 
