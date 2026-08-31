@@ -1055,6 +1055,28 @@ func (s *Store) RunningDispatches(loop, repo string) ([]Dispatch, error) {
 // RecentDispatches returns the most recent dispatches for a loop, newest first.
 // A non-zero issue restricts the result to that issue.
 func (s *Store) RecentDispatches(loop, repo string, issue, limit int) ([]Dispatch, error) {
+	return s.recentDispatches(loop, repo, issue, limit, false)
+}
+
+// RecentDispatchesWithLogs is RecentDispatches restricted to the rows that
+// have a log file, newest first.
+//
+// The restriction is made in SQL rather than by filtering a page of rows in
+// Go, and the difference is not performance. A caller that wants "the newest
+// dispatch an operator can actually read" needs LIMIT 1 against a filtered
+// query; filtering a fixed page afterwards gives it a horizon instead, and a
+// loop whose tend work is mostly agent-free rebases can push its last agent
+// past that horizon and be told it has no dispatches at all.
+//
+// Only a rebase row lacks a log path today -- every dispatch that spawns a
+// process is given one when the row is created -- but the condition is written
+// on the column rather than on the kind, because "has something to show" is
+// the question being asked.
+func (s *Store) RecentDispatchesWithLogs(loop, repo string, issue, limit int) ([]Dispatch, error) {
+	return s.recentDispatches(loop, repo, issue, limit, true)
+}
+
+func (s *Store) recentDispatches(loop, repo string, issue, limit int, withLogs bool) ([]Dispatch, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -1064,6 +1086,9 @@ func (s *Store) RecentDispatches(loop, repo string, issue, limit int) ([]Dispatc
 	if issue > 0 {
 		query += ` AND number = ?`
 		args = append(args, issue)
+	}
+	if withLogs {
+		query += ` AND log_path <> ''`
 	}
 	query += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)

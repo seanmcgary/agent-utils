@@ -38,9 +38,18 @@ type RebaseGit interface {
 // proceeds meanwhile. This is the bound on the whole thing, and it is what a
 // caller passing context.Background() would have left absent.
 //
-// A deadline reached mid-rebase kills the rebase and then the abort, which is
-// the case the destroy-the-worktree path below exists for.
+// A deadline reached mid-rebase kills the rebase. The cleanup that follows
+// runs on its own detached context so it is not killed too; see cleanupBudget.
 const rebaseBudget = 5 * time.Minute
+
+// cleanupBudget bounds the abort, and the removal behind it, on a context
+// detached from the caller's.
+//
+// It is deliberately small. This runs after something already went wrong, and
+// the two commands it covers are local -- no fetch, no network -- so a
+// generous budget would buy nothing and would hold the loop lock past a
+// shutdown that has already been asked for.
+const cleanupBudget = 30 * time.Second
 
 // rebaseOutcome is what gitRebase settled. It is three values rather than a
 // bool because two different outcomes both mean "dispatch no agent" while only
@@ -87,17 +96,25 @@ const (
 //     decision reaching this function has passed it. A rebase under a running
 //     agent is the same hazard as two agents.
 //
-// Two more were considered and deliberately REJECTED by the operator. Do not
-// add them back without asking:
+// One more was considered and deliberately REJECTED by the operator, and does
+// not belong here: commit authorship is not inspected. A branch carrying a
+// human's commits is rebased like any other, because the lease already refuses
+// the push that would lose work.
 //
-//   - Commit authorship is not inspected. A branch carrying a human's commits
-//     is rebased like any other, because the lease already refuses the push
-//     that would lose work.
-//   - A veto label, a stopped session, and a parked issue do NOT stop a clean
-//     replay. A rebase spends no token and writes no label, so a paused issue
-//     still gets a current branch. Those refusals continue to stop every AGENT
-//     dispatch, including this function's own escalation, because Decide
-//     applies them before act runs.
+// # What stops a rebase that this function never sees
+//
+// A veto label, a stopped session, and a parked issue stop the rebase as well
+// as the agent. They are applied by engine.Decide, which is upstream of act:
+// tendDecisions drops a vetoed issue outright, and a stopped issue is marked
+// decided so no tend decision is produced for it. No such issue reaches this
+// function at all, so nothing here can rebase one.
+//
+// That is worth naming because the design intent differs. The operator wanted
+// a clean replay to run regardless -- it spends no token and writes no label,
+// so a paused issue would still get a current branch. Delivering that means a
+// path around the veto and stop filters, which changes what a veto label
+// MEANS, and it is tracked as its own decision rather than smuggled in here.
+// Until then, this comment describes what the code does.
 func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision) (rebaseOutcome, error) {
 	// A loop with no per-issue worktree has no pull-request checkout to rebase
 	// in, and this pass will not create one: the agent path already handles
@@ -143,22 +160,41 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 	}
 
 	if err := deps.Git.Rebase(ctx, path, d.BaseRef); err != nil {
+		// The cleanup runs on a context DETACHED from the one that may have
+		// just failed. The commonest way to reach this line is the rebase
+		// budget expiring or the daemon shutting down, and the worktree
+		// helpers use exec.CommandContext: an already-dead context makes a git
+		// command fail without running git at all. Reusing ctx here would make
+		// the abort fail by construction in exactly the case the abort exists
+		// for, and then make the removal below fail the same way -- and a
+		// half-removed worktree is WORSE than a stuck one. "worktree remove"
+		// would fail, os.RemoveAll would succeed because it takes no context,
+		// and "worktree prune" would fail, leaving the directory gone and its
+		// registration behind. Every later "worktree add" at that path then
+		// fails permanently with "missing but already registered worktree",
+		// and nothing in this program prunes worktrees -- Manager.Fetch prunes
+		// remote refs. One expired deadline would kill that pull request's
+		// tend path for good, agent escalation included, until a human ran
+		// "git worktree prune".
+		//
+		// With a live context the abort usually SUCCEEDS, which repairs the
+		// worktree rather than destroying it.
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
+		defer cancelCleanup()
+
 		// Unconditional, and its own error is logged rather than returned: a
 		// worktree left mid-rebase fails every later pass for this pull
 		// request, and the rebase failure below is the one worth reporting.
-		if abortErr := deps.Git.AbortRebase(ctx, path); abortErr != nil {
-			// The abort itself failed, so the worktree may still hold
-			// .git/rebase-merge. This is reachable, not theoretical: the
-			// worktree helpers use exec.CommandContext, which KILLS the rebase
-			// at the deadline or at shutdown, and the abort then inherits the
-			// same dead context and fails immediately. Worktrees are stable
-			// across ticks, so the broken state would persist -- and an agent
-			// started in it can force-push a half-replayed tree.
+		if abortErr := deps.Git.AbortRebase(cleanupCtx, path); abortErr != nil {
+			// The abort failed on a context that was still alive, so the
+			// worktree really may still hold .git/rebase-merge -- and an agent
+			// started in it can force-push a half-replayed tree. Worktrees are
+			// stable across ticks, so the broken state would persist.
 			//
 			// Destroy it and dispatch nobody. The next pass builds it fresh.
 			slog.Error("could not abort a failed rebase; removing the worktree and dispatching nothing",
 				"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", abortErr)
-			if rmErr := deps.Git.RemoveCtx(ctx, path); rmErr != nil {
+			if rmErr := deps.Git.RemoveCtx(cleanupCtx, path); rmErr != nil {
 				slog.Error("could not remove a worktree left mid-rebase",
 					"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", rmErr)
 			}

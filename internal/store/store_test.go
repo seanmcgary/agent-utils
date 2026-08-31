@@ -704,3 +704,44 @@ func TestRecordFinishedDispatchLandsComplete(t *testing.T) {
 		t.Errorf("running = %d, want 0", len(running))
 	}
 }
+
+// The default `project logs` selection asks for ONE row and needs it to be one
+// with something to show. Filtering in SQL is what removes the horizon: the
+// agent behind any number of rebases is still the first row returned.
+func TestRecentDispatchesWithLogsSkipsRowsWithNoLogFile(t *testing.T) {
+	s := openTemp(t)
+
+	if _, err := s.CreateDispatch(Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 7, Kind: KindTend,
+		SessionID: "s1", LogPath: "/logs/agent.jsonl",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		if err := s.RecordFinishedDispatch(Dispatch{
+			Loop: "execution", Repo: "o/r", Number: 7, Kind: KindRebase,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.RecentDispatchesWithLogs("execution", "o/r", 0, 1)
+	if err != nil {
+		t.Fatalf("RecentDispatchesWithLogs: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+	if got[0].LogPath != "/logs/agent.jsonl" {
+		t.Errorf("LogPath = %q, want the agent's log", got[0].LogPath)
+	}
+
+	// The unfiltered read is unchanged: --list still shows every row.
+	all, err := s.RecentDispatches("execution", "o/r", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 61 {
+		t.Errorf("unfiltered rows = %d, want 61", len(all))
+	}
+}

@@ -3,9 +3,11 @@ package loopcmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 
@@ -26,10 +28,26 @@ const rebaseLoop = "execution"
 // to fail against.
 type fakeGit struct {
 	// dirty, rebaseErr and pushErr choose the branch under test.
-	dirty     bool
-	rebaseErr error
-	pushErr   error
-	abortErr  error
+	dirty      bool
+	rebaseErr  error
+	pushErr    error
+	abortErr   error
+	ensureErr  error
+	headSHAErr error
+
+	// abortNeedsLiveCtx makes the abort fail on a dead context and succeed on
+	// a live one, which is how the real thing behaves: the worktree helpers
+	// use exec.CommandContext, and an expired context fails the command
+	// without running git. It is the difference between the cleanup repairing
+	// the worktree and the cleanup being unable to run at all.
+	abortNeedsLiveCtx bool
+
+	// cleanupSawDeadCtx records that a cleanup command was handed a context
+	// that had already expired. The removal path must never be reached that
+	// way: "worktree remove" fails, os.RemoveAll succeeds because it takes no
+	// context, and "worktree prune" fails, which strands the registration and
+	// kills every later worktree add at that path.
+	cleanupSawDeadCtx bool
 
 	// The counters. Each is the evidence for a property the code must hold:
 	// pushes for "nothing was pushed after a conflict", aborts for "the
@@ -55,6 +73,9 @@ type fakeGit struct {
 func (g *fakeGit) PathForPR(number int) string { return "/wt/pr" }
 
 func (g *fakeGit) EnsurePRCtx(context.Context, int, string) (string, error) {
+	if g.ensureErr != nil {
+		return "", g.ensureErr
+	}
 	g.ensured = true
 	return "/wt/pr", nil
 }
@@ -69,6 +90,9 @@ func (g *fakeGit) DirtyCtx(context.Context, string) (bool, error) {
 // HeadSHA answers a different id before and after the refresh, so a lease read
 // too early is visible in the pushed value rather than passing silently.
 func (g *fakeGit) HeadSHA(context.Context, string) (string, error) {
+	if g.headSHAErr != nil {
+		return "", g.headSHAErr
+	}
 	if g.ensured {
 		return "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nil
 	}
@@ -80,21 +104,42 @@ func (g *fakeGit) Rebase(context.Context, string, string) error {
 	return g.rebaseErr
 }
 
-func (g *fakeGit) AbortRebase(context.Context, string) error {
+func (g *fakeGit) AbortRebase(ctx context.Context, _ string) error {
 	g.aborts++
+	if ctx.Err() != nil {
+		g.cleanupSawDeadCtx = true
+		return ctx.Err()
+	}
+	if g.abortNeedsLiveCtx {
+		return nil
+	}
 	return g.abortErr
 }
 
-func (g *fakeGit) RemoveCtx(context.Context, string) error {
+func (g *fakeGit) RemoveCtx(ctx context.Context, _ string) error {
 	g.removes++
+	if ctx.Err() != nil {
+		g.cleanupSawDeadCtx = true
+		return ctx.Err()
+	}
 	return nil
 }
 
+// PushWithLease mirrors the real lease check. Without it a regression in the
+// lease read would show up only in an equality assertion in one test, while
+// production refuses the push outright.
 func (g *fakeGit) PushWithLease(_ context.Context, _, _, lease string) error {
 	g.pushes++
 	g.lease = lease
+	if !fakeLeaseSHA.MatchString(lease) {
+		return fmt.Errorf("refusing to push with lease %q, which is not a full object id", lease)
+	}
 	return g.pushErr
 }
+
+// fakeLeaseSHA is worktree.leaseSHA, which is unexported. A full lowercase
+// object id in either hash size, and nothing else.
+var fakeLeaseSHA = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 
 // rebaseCheckout builds a real checkout with an "origin" carrying the head and
 // base branches. It is real git because the ESCALATION path is not faked: when
@@ -439,3 +484,89 @@ func TestGitRebaseMakesNoGitHubCall(t *testing.T) {
 }
 
 var _ ghub.Client = (*countingGH)(nil)
+
+// The case the destroy path exists for, and the one that used to break it.
+// The commonest way to reach a failed rebase is the budget expiring or the
+// daemon shutting down, and the worktree helpers fail a command outright on a
+// dead context. Reusing that context would make the abort fail by
+// construction and then half-remove the worktree: directory gone, registration
+// stranded, every later "worktree add" at that path failing forever.
+func TestGitRebaseCleansUpOnAContextTheCallerAlreadyCancelled(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = context.DeadlineExceeded
+	git.abortNeedsLiveCtx = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// gitRebase directly: act's agent fallback would need a live context of
+	// its own, and the property under test is entirely inside gitRebase.
+	outcome, err := gitRebase(ctx, cfg, deps, tendDecision())
+	if err != nil {
+		t.Fatalf("gitRebase: %v", err)
+	}
+	if git.cleanupSawDeadCtx {
+		t.Error("the cleanup ran on the cancelled context; it must be detached from the caller's")
+	}
+	if git.aborts != 1 {
+		t.Errorf("aborts = %d, want 1", git.aborts)
+	}
+	// A live context lets the abort succeed, which REPAIRS the worktree.
+	// Destroying it is the fallback, not the outcome.
+	if git.removes != 0 {
+		t.Errorf("removes = %d, want 0: an abort that succeeds must not destroy the worktree", git.removes)
+	}
+	if outcome != notDone {
+		t.Errorf("outcome = %v, want notDone: a recovered worktree escalates to the agent", outcome)
+	}
+}
+
+// A worktree refresh that fails leaves nothing to rebase in. It is reported
+// and the agent takes over, rather than the sweep abandoning the decision.
+func TestGitRebaseWorktreeRefreshFailureFallsBackToTheAgent(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.ensureErr = errors.New("fetch origin feat/x: exit status 128")
+
+	outcome, err := gitRebase(context.Background(), cfg, deps, tendDecision())
+	if err == nil {
+		t.Fatal("err = nil; a failed worktree refresh must be reported")
+	}
+	if outcome != notDone {
+		t.Errorf("outcome = %v, want notDone", outcome)
+	}
+	if git.rebases != 0 || git.pushes != 0 {
+		t.Errorf("rebases = %d, pushes = %d; want 0 and 0", git.rebases, git.pushes)
+	}
+
+	var sum Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), time.Now(), &sum); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if sum.Tended != 1 {
+		t.Errorf("Tended = %d, want 1: act must log the git failure and dispatch the agent", sum.Tended)
+	}
+}
+
+// An unreadable head means no lease, and no lease means no force-push. The
+// pass must stop before the rebase rather than push unguarded.
+func TestGitRebaseUnreadableHeadNeverPushes(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.headSHAErr = errors.New(`rev-parse HEAD returned "", which is not an object id`)
+
+	outcome, err := gitRebase(context.Background(), cfg, deps, tendDecision())
+	if err == nil {
+		t.Fatal("err = nil; an unreadable head must be reported")
+	}
+	if outcome != notDone {
+		t.Errorf("outcome = %v, want notDone", outcome)
+	}
+	if git.rebases != 0 {
+		t.Errorf("rebases = %d, want 0: the lease is read before the replay", git.rebases)
+	}
+	if git.pushes != 0 {
+		t.Errorf("pushes = %d, want 0: nothing may be force-pushed without a lease", git.pushes)
+	}
+}

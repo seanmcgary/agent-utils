@@ -374,11 +374,16 @@ func TestSelectDispatchSkipsARebaseRowWithNoLog(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Newest, and the one a naive selection would return.
-	if err := s.RecordFinishedDispatch(store.Dispatch{
-		Loop: "execution", Repo: "o/r", Number: 7, Kind: store.KindRebase, PRNumber: 12,
-	}); err != nil {
-		t.Fatal(err)
+	// Newest, and the ones a naive selection would return. There are more of
+	// them than any fixed page a filter-in-Go implementation would fetch: once
+	// most tend work is agent-free, a run of rebases this long is ordinary,
+	// and the last agent must still be findable behind it.
+	for i := 0; i < 60; i++ {
+		if err := s.RecordFinishedDispatch(store.Dispatch{
+			Loop: "execution", Repo: "o/r", Number: 7, Kind: store.KindRebase, PRNumber: 12,
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	got, err := SelectDispatch(s, cfg, LogOptions{})
@@ -392,12 +397,12 @@ func TestSelectDispatchSkipsARebaseRowWithNoLog(t *testing.T) {
 
 	// --dispatch still reaches it, which is where an operator who wants the
 	// rebase row looks.
-	ds, err := s.RecentDispatches("execution", "o/r", 0, 10)
+	ds, err := s.RecentDispatches("execution", "o/r", 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ds) != 2 {
-		t.Fatalf("dispatches = %d, want 2: --list must still show both", len(ds))
+	if len(ds) != 61 {
+		t.Fatalf("dispatches = %d, want 61: --list must still show the rebase rows", len(ds))
 	}
 	byID, err := SelectDispatch(s, cfg, LogOptions{Dispatch: ds[0].ID})
 	if err != nil {

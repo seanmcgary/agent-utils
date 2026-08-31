@@ -53,13 +53,6 @@ const (
 	StreamRunner LogStream = "runner"
 )
 
-// logSelectWindow is how far back a default selection looks for a dispatch
-// that actually has logs. Only rows with no log file are skipped, and the only
-// kind that produces them is a rebase, so this is the number of consecutive
-// agent-free rebases a loop may have made before `project logs` stops finding
-// the last agent behind them.
-const logSelectWindow = 50
-
 // ErrNoDispatch reports that no dispatch matched the selection.
 var ErrNoDispatch = errors.New("no dispatch found")
 
@@ -78,27 +71,20 @@ func SelectDispatch(s *store.Store, cfg *config.Config, opts LogOptions) (store.
 		}
 		return ds[0], nil
 	}
-	// Ask for more than one and skip the rows that have no logs to show. A
-	// rebase row is a record, not a run: git did the work in this process and
-	// wrote no transcript. Selecting it as "the newest dispatch" would answer
+	// The newest dispatch that has something to show, not simply the newest.
+	// A rebase row is a record, not a run: git did the work in this process
+	// and wrote no transcript, so selecting it here would answer
 	// `project logs` with an empty path. It is still listed by --list, and
 	// still selectable by --dispatch, which is where an operator who wants to
 	// see it looks.
 	//
-	// The window is bounded rather than unbounded because a loop that rebases
-	// far more often than it dispatches would otherwise scan its whole
-	// history; past it, "no dispatch found" is the honest answer.
-	recent, err := s.RecentDispatches(cfg.Name, cfg.Repo, opts.Issue, logSelectWindow)
+	// The skip is a WHERE clause rather than a filter over a page of rows, so
+	// there is no horizon: however many rebases a loop has made since its last
+	// agent, this still finds that agent.
+	recent, err := s.RecentDispatchesWithLogs(cfg.Name, cfg.Repo, opts.Issue, 1)
 	if err != nil {
 		return store.Dispatch{}, err
 	}
-	withLogs := recent[:0]
-	for _, d := range recent {
-		if d.LogPath != "" {
-			withLogs = append(withLogs, d)
-		}
-	}
-	recent = withLogs
 	if len(recent) == 0 {
 		if opts.Issue > 0 {
 			return store.Dispatch{}, fmt.Errorf("%w for issue #%d in loop %q",
