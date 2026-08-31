@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
@@ -26,10 +27,11 @@ type TendCheckResult struct {
 // behind its base?
 //
 // It exists so the daemon can ask that question on a timer without paying for
-// it. The GitHub equivalent costs two list calls plus one comparison per pull
-// request, per loop, per project, on every interval. This reads refs the loop's
-// own fetch already updated, so the common case -- nothing is behind -- costs
-// no request at all.
+// it. The GitHub equivalent costs two listings plus one comparison per pull
+// request, per loop, per project, on every interval -- and the listings are
+// PAGINATED at 100, so a busy repository pays two requests per page rather
+// than two requests. This reads refs the loop's own fetch already updated, so
+// the common case -- nothing is behind -- costs no request at all.
 //
 // Three properties are load-bearing. Do not break them.
 //
@@ -96,8 +98,24 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 		return out, err
 	}
 
-	behind := make(map[int]bool, len(links))
-	for number, link := range links {
+	// A sorted slice of the keys, not a range over the map, and both passes
+	// below use it. Go randomises map iteration, so a loop with three failing
+	// compares -- or three rows to delete -- would print the same three lines
+	// in a different order on every interval, and an operator diffing two
+	// passes could not tell a changed state from a reshuffled one.
+	// internal/config.Load records the same rule for the same reason.
+	numbers := make([]int, 0, len(links))
+	for number := range links {
+		numbers = append(numbers, number)
+	}
+	sort.Ints(numbers)
+
+	// A count, not a set. The keys came from a map, so they are unique
+	// already, and nothing reads them back: the only question asked below is
+	// whether anything at all looked behind.
+	behind := 0
+	for _, number := range numbers {
+		link := links[number]
 		n, known, err := deps.Behind(ctx, link.HeadRef, link.BaseRef)
 		if err != nil {
 			// One unusable row must not abandon the pass, for the reason
@@ -112,10 +130,10 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 		if !known || n <= 0 {
 			continue
 		}
-		behind[number] = true
+		behind++
 	}
 
-	if len(behind) == 0 && !force {
+	if behind == 0 && !force {
 		return out, nil
 	}
 
@@ -139,7 +157,8 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 	// before this pass existed, so a database accumulates them -- and the gate
 	// above would count a merged branch as behind its base on every interval,
 	// forever.
-	for number, link := range links {
+	for _, number := range numbers {
+		link := links[number]
 		if open[link.PRNumber] {
 			continue
 		}
