@@ -1003,6 +1003,84 @@ func TestAnUnknownSessionHarnessStillResumes(t *testing.T) {
 	}
 }
 
+// A tend resumes the issue's session too, and needs the same guard. The case
+// that failed on lawndominator #183: the work ran under pi (a harness: label),
+// the tend ran the loop's claude, and claude exits non-zero in about a second
+// on an id it never minted -- "No conversation found with session ID".
+func TestTendDoesNotResumeAnotherHarnessSession(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s-pi", SessionStarted: true, SessionHarness: config.HarnessPi},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	if id := p.Decisions[0].SessionID; id != "" {
+		t.Errorf("session id = %q, want empty so dispatch mints a fresh one", id)
+	}
+}
+
+// The overrides are what make that inheritance safe in the ordinary case: a
+// tend that runs the harness the session was minted under resumes it, so the
+// rebase agent carries the context of the work it is rebasing.
+func TestTendCarriesTheIssuesOverridesAndResumesUnderThatHarness(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review, "harness:pi", "model:sonnet")},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s-pi", SessionStarted: true, SessionHarness: config.HarnessPi},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	d := p.Decisions[0]
+	if d.Overrides.Harness != config.HarnessPi {
+		t.Errorf("harness override = %q, want pi", d.Overrides.Harness)
+	}
+	if d.Overrides.Model != "sonnet" {
+		t.Errorf("model override = %q, want sonnet", d.Overrides.Model)
+	}
+	if d.SessionID != "s-pi" {
+		t.Errorf("session id = %q, want the issue's pi session", d.SessionID)
+	}
+}
+
+// An override the loop cannot parse must not dispatch a tend under the wrong
+// settings. It is skipped rather than stopped: a stale rebase is not the
+// issue's own work, and the trigger path already stops an issue whose labels
+// are invalid where that work would happen.
+func TestTendIsSkippedWhenAnOverrideLabelIsInvalid(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review, "harness:nope")},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{Issues: map[int]store.IssueState{}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none", kinds(p))
+	}
+	if !strings.Contains(p.Skips[1], "harness") {
+		t.Errorf("skip = %q, want it to name the invalid override", p.Skips[1])
+	}
+}
+
 // The retry path resumes too, and needs the same guard: a retry that resumes a
 // session the harness cannot see fails identically every attempt, straight to
 // the cap.

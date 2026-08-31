@@ -446,9 +446,9 @@ func dispatch(
 	dispatchID, err := deps.Store.CreateDispatch(store.Dispatch{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: d.Issue, Kind: kind,
 		SessionID: sessionID, LogPath: logPath, PRNumber: d.PR, Title: d.Title,
-		// A tend decision carries no Overrides -- engine.Decide never sets
-		// them for KindTend -- so this needs no extra branch: the zero value
-		// already matches spec section 6.7.
+		// A tend carries the issue's Overrides like every other dispatch: it
+		// inherits the issue's session, and that session only means something
+		// to the harness that minted it. See spec section 6.7.
 		Model:   d.Overrides.Model,
 		Harness: d.Overrides.Harness,
 		Effort:  d.Overrides.Effort,

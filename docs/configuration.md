@@ -539,10 +539,14 @@ fix the label, or remove it, then run `sessions resume`. See
 
 ### Scope
 
-A valid override applies to every dispatch that works the issue itself: its first run, every
-resume, and every retry. It does not apply to a tend dispatch — the run that rebases a pull
-request against its base branch — because a tend dispatch is not the issue's own work, and a
-loop configures how it runs once, for every issue alike.
+A valid override applies to every dispatch for that issue: its first run, every resume, every
+retry, and the tend dispatch that rebases its pull request. A tend inherits the issue's session,
+and a session identifier only means something to the harness that minted it — a tend running the
+loop default against a session started under `harness:pi` would fail in a second, every tick.
+
+An override label the loop cannot parse **skips** the tend rather than stopping the issue. A
+stale rebase is not the issue's own work, and an invalid label already stops the issue where
+that work would happen.
 
 ### Who controls this
 
@@ -777,8 +781,11 @@ Three safeguards apply:
   out and runs an agent inside it.
 - **An issue with a live agent is never tended**, so a rebase cannot force-push a branch its
   own build agent is committing to.
-- **Tending never changes a label**, and each tend run gets a fresh session, because a rebase
-  is idempotent and needs no memory of an earlier one.
+- **Tending never changes a label.**
+- **A tend resumes the issue's session** when the loop can — it carries the context of the work
+  it is rebasing. When the issue has no started session, or that session was minted by a
+  different harness than this tend will run, the tend gets a fresh session instead: a rebase is
+  idempotent and needs no memory of an earlier one.
 
 **Two things dispatch a tend agent.** A delivery for one issue — the issue carries
 `labels.review`, its linked pull request is behind its base, and the delivery named that issue.
