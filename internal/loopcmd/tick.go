@@ -48,6 +48,11 @@ type Deps struct {
 	// cannot substitute, and because the answer depends on a git checkout no
 	// unit test has. Open wires it to Manager.BehindLocal.
 	Behind func(headRef, baseRef string) (behind int, known bool, err error)
+	// Git is the git the automatic rebase drives. A nil Git disables that path
+	// entirely and every tend decision falls through to the agent, which is
+	// what keeps a Deps built by hand -- every test that predates this field --
+	// working unchanged. Open wires it to WT.
+	Git RebaseGit
 }
 
 // count increments n only when the action succeeded, so the recorded summary
@@ -97,10 +102,14 @@ func isLive(d store.Dispatch, isAlive func(pid int, dispatchID int64) bool, now 
 
 // Summary reports what one tick did.
 type Summary struct {
-	Started  int `json:"started"`
-	Resumed  int `json:"resumed"`
-	Retried  int `json:"retried"`
-	Tended   int `json:"tended"`
+	Started int `json:"started"`
+	Resumed int `json:"resumed"`
+	Retried int `json:"retried"`
+	Tended  int `json:"tended"`
+	// Rebased counts the pull requests git replayed with no agent. It is
+	// separate from Tended so a sweep's line says which of the two happened:
+	// how many rebases cost nothing, and how many needed an agent.
+	Rebased  int `json:"rebased"`
 	Promoted int `json:"promoted"`
 	Parked   int `json:"parked"`
 	// Stopped counts KindStop decisions applied this tick: an operator's
@@ -386,6 +395,25 @@ func act(
 	case engine.KindParkRetryExhausted:
 		return count(&sum.Parked, parkRetryExhausted(ctx, cfg, deps, d))
 	case engine.KindTend:
+		// git first, the agent second. A rebase that replays cleanly needs no
+		// conversation, and this is the common case: the agent exists for the
+		// conflicts. gitRebase reports whether it settled the decision --
+		// including the case where it settled it by declining to act, which is
+		// what a refused lease means.
+		switch outcome, err := gitRebase(ctx, cfg, deps, d); {
+		case err != nil:
+			// Logged, not returned: a git failure must not abandon the rest of
+			// the sweep, and the agent is the fallback this whole path is
+			// built around.
+			slog.Warn("automatic rebase failed; falling back to the tend agent",
+				"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
+		case outcome == doneRebased:
+			sum.Rebased++
+			return nil
+		case outcome == doneNoRebase:
+			// Settled by declining to act. No agent, and nothing counted.
+			return nil
+		}
 		return count(&sum.Tended, dispatch(ctx, cfg, deps, d, now, store.KindTend))
 	case engine.KindResume:
 		return count(&sum.Resumed, dispatch(ctx, cfg, deps, d, now, store.KindResume))

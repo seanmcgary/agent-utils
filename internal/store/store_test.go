@@ -659,3 +659,48 @@ func TestSessionHarnessBackfillLeavesAnUnknownHarnessEmpty(t *testing.T) {
 		t.Errorf("SessionHarness = %q, want empty", got.SessionHarness)
 	}
 }
+
+// The row must land finished. A rebase row left running would read as a live
+// agent to every guard that partitions running rows by kind, and none of them
+// knows how to reap this one.
+func TestRecordFinishedDispatchLandsComplete(t *testing.T) {
+	s := openTemp(t)
+
+	if err := s.RecordFinishedDispatch(Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 7, Kind: KindRebase,
+		PRNumber: 12, Title: "a title",
+	}); err != nil {
+		t.Fatalf("RecordFinishedDispatch: %v", err)
+	}
+
+	ds, err := s.RecentDispatches("execution", "o/r", 0, 10)
+	if err != nil {
+		t.Fatalf("RecentDispatches: %v", err)
+	}
+	if len(ds) != 1 {
+		t.Fatalf("dispatches = %d, want 1", len(ds))
+	}
+	got := ds[0]
+	if got.Status != StatusSucceeded {
+		t.Errorf("Status = %q, want %q", got.Status, StatusSucceeded)
+	}
+	if got.SessionID != "" {
+		t.Errorf("SessionID = %q, want empty", got.SessionID)
+	}
+	if got.FinishedAt.IsZero() {
+		t.Error("FinishedAt is zero; the row must land already finished")
+	}
+	if got.Kind != KindRebase || got.PRNumber != 12 || got.Title != "a title" {
+		t.Errorf("row = %+v; kind, pull request and title must round-trip", got)
+	}
+
+	// The one thing a running row would do: appear in RunningDispatches, where
+	// three separate callers treat a non-tend row as an agent at work.
+	running, err := s.RunningDispatches("execution", "o/r")
+	if err != nil {
+		t.Fatalf("RunningDispatches: %v", err)
+	}
+	if len(running) != 0 {
+		t.Errorf("running = %d, want 0", len(running))
+	}
+}

@@ -283,9 +283,12 @@ func tendDispatch(
 		// carry "issue" and "pr" everywhere else, and a bare count leaves an
 		// operator no way to tell which work is waiting. sum.Tended rather than
 		// len(tends), because act failures are swallowed above and the intended
-		// count would overstate what ran.
+		// count would overstate what ran. The rebases are reported alongside,
+		// because most of a sweep's work now costs no agent at all and a line
+		// naming only the dispatches reads as "nothing happened".
 		slog.Warn("tend sweep hit its per-sweep cap; the rest wait for the next merge",
-			"loop", cfg.Name, "dispatched", sum.Tended, "deferred", deferred)
+			"loop", cfg.Name, "dispatched", sum.Tended, "rebased", sum.Rebased,
+			"deferred", deferred)
 	}
 
 	// Recorded like any other tick -- including on the breaker path, where Tick

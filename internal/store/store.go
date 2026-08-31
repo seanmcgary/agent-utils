@@ -916,6 +916,35 @@ func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
 	return res.LastInsertId()
 }
 
+// RecordFinishedDispatch inserts one dispatch row that is already complete.
+//
+// Every other dispatch row is born running and finished later, because a
+// process backs it. This one has none: git did the work synchronously, in this
+// process, and it is over before the row exists. Two statements would leave a
+// window -- and a PERMANENT stuck row if the second failed -- in which the row
+// reads as a live agent to engine.Decide, to reapDead, and to tendDispatch's
+// reap partition, none of which can reap a kind they do not know about. A
+// single already-finished INSERT makes that state unreachable, which is worth
+// more than reusing CreateDispatch.
+//
+// Only the columns that carry meaning are named. The rest -- pid, exit code,
+// cost, duration, log path -- default to their zero value in the schema, which
+// is the truth for a row no process ever ran. The session identifier is left
+// empty on purpose; see KindRebase.
+func (s *Store) RecordFinishedDispatch(d Dispatch) error {
+	now := time.Now().UTC()
+	_, err := s.db.Exec(`
+		INSERT INTO dispatches (project_id, loop, repo, number, kind,
+		                        status, started_at, finished_at, pr_number, title)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.projectID, d.Loop, d.Repo, d.Number, d.Kind,
+		StatusSucceeded, now, now, d.PRNumber, d.Title)
+	if err != nil {
+		return fmt.Errorf("record finished dispatch: %w", err)
+	}
+	return nil
+}
+
 // SetDispatchProcess records the operating system process for a dispatch.
 func (s *Store) SetDispatchProcess(id int64, pid int, startedAt time.Time) error {
 	_, err := s.db.Exec(
