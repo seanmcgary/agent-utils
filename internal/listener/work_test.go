@@ -1565,6 +1565,123 @@ func TestIsMergeIntoRequiresAMergedBaseRef(t *testing.T) {
 	}
 }
 
+// The same rule IsMergeInto states: an empty branch never matches, even
+// against an empty PushedTo. A loop with no default_branch names no branch,
+// and two absent values are not agreement.
+func TestIsPushToRequiresAPushedBranch(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Delivery
+		arg  string
+		want bool
+	}{
+		{"a push to the branch", Delivery{Repo: "o/r", PushedTo: "master"}, "master", true},
+		{"a push to another branch", Delivery{Repo: "o/r", PushedTo: "master"}, "main", false},
+		{"not a push", Delivery{Repo: "o/r", Number: 7}, "master", false},
+		{"two empty values", Delivery{}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.d.IsPushTo(tc.arg); got != tc.want {
+				t.Errorf("IsPushTo(%q) = %v, want %v", tc.arg, got, tc.want)
+			}
+		})
+	}
+}
+
+// A push names no issue, so the three passes that act on one issue must not
+// run. Only the sweep is armed.
+func TestPushArmsTheSweepAndRunsNoIssuePass(t *testing.T) {
+	h := newHarness(nil)
+	tgt := h.target("planning")
+	tgt.DefaultBranch = "master"
+	tgt.TendPR = true
+	h.targets = []Target{tgt}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", PushedTo: "master"})
+
+	if got := h.ranLoops(); len(got) != 0 {
+		t.Errorf("issue passes = %v, want none for a push", got)
+	}
+	if n := h.timers.len(); n != 1 {
+		t.Fatalf("armed %d timers, want 1", n)
+	}
+	h.timers.at(t, 0).f()
+	if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
+		t.Errorf("tends = %v, want [planning@master]", got)
+	}
+}
+
+// A merge and the push it produces arrive together. armTend already collapses
+// a burst, and this proves the two triggers ride one timer rather than arming
+// two sweeps.
+func TestAMergeAndItsPushProduceOneSweep(t *testing.T) {
+	h := newHarness(nil)
+	tgt := h.target("planning")
+	tgt.DefaultBranch = "master"
+	tgt.TendPR = true
+	h.targets = []Target{tgt}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7, MergedInto: "master"})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", PushedTo: "master"})
+
+	if n := h.timers.len(); n != 1 {
+		t.Fatalf("armed %d timers, want 1: a merge and its push ride one sweep", n)
+	}
+}
+
+// A push to a feature branch must cost nothing: no token read, no SQLite
+// handle, no migration check. Open is the seam that proves it.
+func TestPushToAnotherBranchOpensNothing(t *testing.T) {
+	h := newHarness(nil)
+	tgt := h.target("planning")
+	tgt.DefaultBranch = "master"
+	tgt.TendPR = true
+	h.targets = []Target{tgt}
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", PushedTo: "feat/x"})
+
+	if len(h.opens) != 0 {
+		t.Errorf("Open calls = %d, want 0 for a push to a branch no loop tends", len(h.opens))
+	}
+	if h.tokenCalls != 0 {
+		t.Errorf("token reads = %d, want 0: the push filter runs before access()", h.tokenCalls)
+	}
+}
+
+// A push's Open failure must not enter the issue retry schedule: pending is
+// keyed per loop, not per issue, so entering it would cancel a real issue's
+// pending retry and spend the loop's Open budget on issue 0 for nothing.
+func TestAPushsOpenFailureDoesNotCancelAnIssuesPendingRetry(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.openErr = errors.New("unimported legacy database")
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 7})
+	if n := h.timers.len(); n != 1 {
+		t.Fatalf("armed %d timers, want 1 for the issue's Open failure", n)
+	}
+
+	tgt := h.target("planning")
+	tgt.DefaultBranch = "master"
+	tgt.TendPR = true
+	h.targets = []Target{tgt}
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", PushedTo: "master"})
+
+	if n := h.timers.len(); n != 1 {
+		t.Errorf("armed %d timers after a push's Open failure, want still 1: "+
+			"a push must not enter the issue retry schedule", n)
+	}
+	if h.timers.stopped(t, 0) {
+		t.Error("the issue's pending retry was cancelled by the push's Open failure")
+	}
+}
+
 // The sweep is armed for exactly one case, and the issue pass always runs.
 func TestDeliverArmsATendSweepOnlyOnAMergeIntoTheLoopsDefaultBranch(t *testing.T) {
 	cases := []struct {

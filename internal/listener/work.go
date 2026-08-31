@@ -372,6 +372,15 @@ func (d Delivery) IsMergeInto(branch string) bool {
 	return branch != "" && d.MergedInto == branch
 }
 
+// IsPushTo reports whether this delivery pushed to branch.
+//
+// It follows IsMergeInto's rule exactly: an empty branch never matches, even
+// against an empty PushedTo, because a loop with no default_branch names no
+// branch to compare against.
+func (d Delivery) IsPushTo(branch string) bool {
+	return branch != "" && d.PushedTo == branch
+}
+
 // Deliver evaluates ONE issue of repo in every loop that watches it, and acts
 // wherever a loop decides there is something to do.
 //
@@ -413,16 +422,47 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 	for _, t := range targets {
 		loops = append(loops, t.ProjectName+"/"+t.LoopName)
 	}
-	// EVALUATED, not "acted on". Every watching loop does evaluate the issue,
-	// and this line is what ties the ticks below back to the delivery that
-	// caused them -- but most of those loops decide nothing, because only the
-	// loop whose trigger label the issue carries usually has anything to do.
-	// "Acting on" read as the full repository reconcile this daemon no longer
-	// performs, so an operator reasonably read the line as stale or wrong.
-	// What each loop DECIDED belongs to the per-loop tick line, which carries
-	// a reason now.
-	slog.Info("evaluating this issue in every loop that watches the repository",
-		"repo", d.Repo, "number", d.Number, "loops", loops)
+
+	// The push filter runs BEFORE w.access(), not only before tickOne.
+	// access() reads the token file and builds a client; subscribing to push
+	// multiplies delivery volume by every branch of every watched repository,
+	// so a filter placed after it would read a secret from disk on every
+	// feature-branch push. Build the kept list first, and return when it is
+	// empty.
+	kept := make([]Target, 0, len(targets))
+	for _, t := range targets {
+		// A push names no issue, so the only work it can start is the sweep.
+		if d.Number == 0 && !(t.TendPR && d.IsPushTo(t.DefaultBranch)) {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if len(kept) == 0 {
+		slog.Info("no loop tends the branch this push moved",
+			"repo", d.Repo, "pushed_to", safeText(d.PushedTo))
+		return
+	}
+
+	if d.Number == 0 {
+		// safeText, because PushedTo is attacker-written. SafeRef bounds its
+		// charset but not its length, so a multi-kilobyte branch name would go
+		// verbatim into an unrotated log -- the failure handler.go:185-196
+		// documents. work.go is the same package and gets the same treatment.
+		slog.Info("a push moved a branch; every loop that tends it will sweep",
+			"repo", d.Repo, "pushed_to", safeText(d.PushedTo), "loops", loops)
+	} else {
+		// EVALUATED, not "acted on". Every watching loop does evaluate the
+		// issue, and this line is what ties the ticks below back to the
+		// delivery that caused them -- but most of those loops decide
+		// nothing, because only the loop whose trigger label the issue
+		// carries usually has anything to do. "Acting on" read as the full
+		// repository reconcile this daemon no longer performs, so an
+		// operator reasonably read the line as stale or wrong. What each
+		// loop DECIDED belongs to the per-loop tick line, which carries a
+		// reason now.
+		slog.Info("evaluating this issue in every loop that watches the repository",
+			"repo", d.Repo, "number", d.Number, "loops", loops)
+	}
 
 	// One token read, one client, one memo, for the whole delivery -- created
 	// HERE and dropped when Deliver returns. See access: the lifetime is the
@@ -437,7 +477,7 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 		return
 	}
 
-	for _, t := range targets {
+	for _, t := range kept {
 		// Sequential, and one target's failure never returns early: the
 		// loops that share a repository are separate projects with separate
 		// state, and one broken project must not strand the others.
@@ -564,7 +604,13 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 		// retry runs at OpenRetryDelay rather than at some undefined value.
 		slog.Error("cannot open loop", "loop", t.LoopName, "project", t.ProjectName,
 			"config", t.ConfigPath, "err", err)
-		w.schedule(ctx, t, d.Number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		// A numberless delivery names no issue, so it must not enter the
+		// issue retry schedule: that schedule is keyed per loop and would
+		// cancel a real issue's pending retry. The sweep is not lost -- the
+		// periodic check finds the same stale branches on its next tick.
+		if d.Number > 0 {
+			w.schedule(ctx, t, d.Number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		}
 		return
 	}
 
@@ -575,14 +621,20 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	// Only the ISSUE pass is gated. The passes below decide different things
 	// and state their own timing: tending is already delayed by a timer of its
 	// own, and the epic sweep deliberately is not delayed at all.
-	if w.openIssueWindow(ctx, t, d.Number) {
+	//
+	// d.Number > 0 keeps a push out of this pass entirely: a push names no
+	// issue, so the only work it can start is the sweep armed below.
+	if d.Number > 0 && w.openIssueWindow(ctx, t, d.Number) {
 		w.issuePass(ctx, t, d, cfg, deps, key)
 	}
 
-	// Armed on BOTH paths of the issue pass. The merged pull request's own pass
-	// moves its issue to a terminal state; whether that succeeded says nothing
-	// about the other branches, which are behind because the base moved.
-	if cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch) {
+	// Armed by a merge OR by a push. A merge into the default branch produces
+	// a push event too, so the two overlap; armTend collapses them onto one
+	// timer, which is why the overlap costs nothing and why the merge trigger
+	// stays. It has to stay: a hook that nobody re-registers after this change
+	// still carries the old event list, and the merge path is what keeps
+	// working for it.
+	if cfg.TendPR && (d.IsMergeInto(cfg.DefaultBranch) || d.IsPushTo(cfg.DefaultBranch)) {
 		w.armTend(ctx, t, cfg.DefaultBranch)
 	}
 

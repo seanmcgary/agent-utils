@@ -449,12 +449,14 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			Label struct {
 				Name string `json:"name"`
 			} `json:"label"`
-			// The subject of the delivery. All five subscribed events carry a
-			// number: issues and issue_comment in issue.number, and
+			// The subject of the delivery. Of the six subscribed events, five
+			// carry a number: issues and issue_comment in issue.number, and
 			// pull_request, pull_request_review and pull_request_review_comment
-			// in pull_request.number. Both are decoded because issue_comment
-			// fires on pull requests too, and because a delivery this daemon
-			// cannot attribute to one number is one it cannot act on.
+			// in pull_request.number. The sixth, push, carries neither -- its
+			// subject is a branch, decoded separately as Ref below. Both
+			// fields here are decoded because issue_comment fires on pull
+			// requests too, and because a delivery this daemon cannot
+			// attribute to one number is one it cannot act on.
 			//
 			// The title says which issue this is without a browser round trip,
 			// and the labels are what engine.Decide actually decides from, so
@@ -497,26 +499,30 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// attacker-controlled, it is passed onward as data, and it is logged.
 		// A number that is absent, zero, negative or wider than an int (which
 		// fails the Unmarshal above) names no issue GitHub could have.
-		//
-		// A delivery with no usable number is a 400, never a silent accept. It
-		// names nothing this daemon can act on, and answering 202 would hide a
-		// malformed delivery -- or a subscription to an event that carries no
-		// number -- behind a success the operator never sees.
 		number := body.Issue.Number
 		if number == 0 {
 			number = body.PullRequest.Number
 		}
-		// A push names a branch, not an issue, so it is the one accepted event
-		// with no number. Every other event keeps the rule: a delivery this
-		// daemon cannot attribute to a number is one it cannot act on, and
-		// answering 202 would hide a malformed delivery -- or a subscription
-		// to an event that carries no number -- behind a success the operator
-		// never sees.
+		// A delivery with no usable number is a 400, never a silent accept --
+		// it names nothing this daemon can act on, and answering 202 would
+		// hide a malformed delivery, or a subscription to an event that
+		// carries no number, behind a success the operator never sees. push
+		// is the single exception: its subject is a branch, not an issue, so
+		// a numberless push is the expected shape rather than a malformed one.
 		if number <= 0 && event != "push" {
 			s.rejected(w, deliveryID, "issue number", http.StatusBadRequest)
 			return
 		}
 		if number < 0 {
+			number = 0
+		}
+		// A push carries no issue even if its body also happened to carry a
+		// non-zero issue.number or pull_request.number: only GitHub can
+		// produce a body that passes the HMAC, so this is not
+		// attacker-reachable, but forcing the number to 0 for push is one
+		// line and strictly tighter than trusting a field this event does
+		// not define.
+		if event == "push" {
 			number = 0
 		}
 
