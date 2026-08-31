@@ -468,9 +468,22 @@ otherwise happen. It must not block `KindClearRetry` or
 flag can no longer be cleared is stranded permanently
 (`internal/engine/engine.go:81`).
 
-Overrides do NOT apply to a `tend` dispatch. A tend run rebases a pull
-request. It is not the issue's work, and the reference loops configure it
-once. The documentation states this limit.
+Overrides apply to a `tend` dispatch as well. The original design excluded it
+-- a tend rebases a pull request rather than doing the issue's work -- but a
+tend also INHERITS the issue's session, and a session id only means something
+to the harness that minted it. A tend running the loop default against a
+session minted under a `harness:` override fails in about a second on every
+tick (`No conversation found with session ID: ...`), and the model override
+has to travel with the harness or the pair is incoherent.
+
+An invalid override label SKIPS the tend rather than stopping the issue. A
+stale rebase is not the issue's own work, and the trigger path already stops an
+issue whose labels are invalid where that work would happen.
+
+The session inheritance itself is gated on `resumable`, the same guard the
+trigger and retry paths use: when the recorded session harness differs from the
+one the tend will run, the tend starts a fresh session instead of being handed
+an identifier that harness cannot see.
 
 ## 7. Data model
 

@@ -440,18 +440,32 @@ func tendDecisions(
 			skips[iss.Number] = "the linked pull request is already up to date with its base"
 			continue
 		}
+		// A tend inherits the issue's session, so it must also inherit the
+		// issue's overrides: the session belongs to the harness that minted it,
+		// and a tend running the loop default would be handed an identifier
+		// that harness has never seen.
+		//
+		// An override the loop cannot parse skips the tend rather than stopping
+		// the issue. A stale rebase is not the issue's own work, and the
+		// trigger path already stops an issue whose labels are invalid where
+		// that work would happen.
+		ov, ovErr := config.ParseOverrides(iss.Labels)
+		if ovErr != nil {
+			skips[iss.Number] = ovErr.Error()
+			continue
+		}
 		// Inherit the issue's session, so the rebase agent carries the context
 		// of the work it is rebasing rather than meeting the branch cold.
 		//
-		// SessionStarted is the same gate retryDecision applies, and for the
-		// same reason: an identifier claude never created cannot be resumed,
-		// and "-r" against one fails identically every run. An empty
-		// identifier here tells dispatch to mint a fresh one, which is what a
-		// pull request whose issue has no started session still gets.
+		// resumable is the same gate the trigger and retry paths apply, and for
+		// the same reasons: an identifier the running harness never created
+		// cannot be resumed, and "-r" against one fails identically every run.
+		// An empty identifier here tells dispatch to mint a fresh one, which is
+		// what a pull request whose issue has no started session still gets.
 		sessionID := ""
 		reason := fmt.Sprintf("%s is %d commits behind",
 			describeLink(iss.Number, pr), snap.BehindBy[pr.Number])
-		if s := states[iss.Number]; s.SessionStarted && s.SessionID != "" {
+		if s := states[iss.Number]; resumable(cfg, s, ov) {
 			sessionID = s.SessionID
 			reason += ", resuming the issue's session"
 		}
@@ -463,6 +477,7 @@ func tendDecisions(
 			BaseRef:   pr.BaseRef,
 			SessionID: sessionID,
 			Reason:    reason,
+			Overrides: ov,
 		})
 	}
 	return out

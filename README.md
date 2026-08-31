@@ -178,6 +178,12 @@ an issue that passed through `planning` before `execution` resumes the execution
 not the planning one. An issue whose session was never started still gets a fresh identifier,
 because `-r` against a session claude never created fails every time.
 
+For the same reason, a tend runs the issue's `model:` and `harness:` labels rather than the
+loop's defaults: a session identifier only means something to the harness that minted it. When
+the recorded harness differs from the one the tend would run — the label was removed, or the
+loop's default changed — the tend takes a fresh identifier instead of being handed a
+conversation that harness cannot see.
+
 One consequence is worth knowing: while a tend holds the issue's session, the issue itself is
 not dispatched. Re-applying the trigger label to an issue that is mid-rebase queues the work
 for after it, rather than putting a second `claude` process on one conversation.
