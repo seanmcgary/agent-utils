@@ -347,6 +347,24 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 	pidPath := filepath.Join(dir, pidFileName)
 
 	w := listener.NewWorker(db)
+	// The periodic tend check's interval, read once at startup. It is not
+	// re-read per pass the way the webhook secret is: a Worker's seams and
+	// delays are set before it is shared with the HTTP handler and the wake
+	// loop and never written afterwards (see listener.Worker), so changing
+	// this one under a running daemon would be a data race. Changing the
+	// setting takes a restart.
+	tendEvery := settings.DefaultTendInterval
+	if st, err := settings.Load(); err != nil {
+		// The default rather than a refusal to start: a settings file this
+		// daemon cannot read is already reported by every delivery it fails to
+		// verify, and silently running with the tend check OFF is the worse of
+		// the two ways to be wrong about it.
+		slog.Warn("cannot read the settings; using the default tend check interval",
+			"interval", tendEvery, "err", err)
+	} else {
+		tendEvery = st.TendEvery()
+	}
+	w.TendInterval = tendEvery
 
 	// shuttingDown is cancelled at the very start of drainAndClose, before
 	// anything else. instrumentRetries checks it so a retry timer firing
@@ -437,7 +455,12 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 	// still reports that failure as its outcome rather than this table
 	// becoming the last thing an operator reads.
 	printRoutingTable(out)
-	slog.Info("listener started", "addr", addr, "port", port, "pid", os.Getpid())
+	// tend_interval is in the banner line because it is the one thing about
+	// this daemon an operator cannot see from the routing table: whether the
+	// loops it just listed will have their stale pull requests noticed without
+	// a delivery. Zero means the periodic check is off.
+	slog.Info("listener started", "addr", addr, "port", port, "pid", os.Getpid(),
+		"tend_interval", tendEvery)
 
 	// Whichever happens first -- an operator or launchd sending a signal, or
 	// the server exiting on its own (a bind failure surfacing late, or an

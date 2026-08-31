@@ -2348,3 +2348,268 @@ func TestIssueBusyIsFalseWhenTheDatabaseCannotBeRead(t *testing.T) {
 		t.Error("issueBusy = true on a database it could not read")
 	}
 }
+
+// --- the periodic tend check ---------------------------------------------
+
+// tendCheckHarness returns a harness whose one registered loop tends, with
+// the ScanTargets seam set.
+//
+// Setting that seam is not optional in any test below. It is the ONLY routing
+// seam tendCheckPass uses, and the default reads this machine's real
+// registry: a test that left it alone would find no target, call
+// RunTendCheck never, and then pass while asserting nothing.
+func tendCheckHarness(t *testing.T) *harness {
+	t.Helper()
+	h := newHarness(nil)
+	// The open seam builds cfg from these two, and both are read downstream:
+	// tendCheckOne arms the sweep against cfg.DefaultBranch, and
+	// loopcmd.TendCheck itself refuses a loop with tend_pr false.
+	h.defaultBranch = "master"
+	h.tendPR = true
+	target := h.target("planning")
+	// Set on the TARGET as well as on the config: the pass filters on
+	// Target.TendPR before it opens anything, and the harness's target helper
+	// leaves both fields zero.
+	target.DefaultBranch = "master"
+	target.TendPR = true
+	h.w.ScanTargets = func() (Routes, error) {
+		return Routes{Targets: []Target{target}}, nil
+	}
+	return h
+}
+
+// fireTends runs every armed tend sweep timer, told apart from the other
+// timers by the wait it asked for.
+func fireTends(t *testing.T, h *harness) {
+	t.Helper()
+	for i := 0; i < h.timers.len(); i++ {
+		if h.timers.at(t, i).d == h.w.TendDelay {
+			h.timers.at(t, i).f()
+		}
+	}
+}
+
+// The pass walks the registry, not the deliveries. That is what makes it
+// reach a project whose webhook is missing, which is the failure this
+// periodic check exists for.
+func TestTendCheckPassArmsASweepForEachStaleLoop(t *testing.T) {
+	h := tendCheckHarness(t)
+	var checked []string
+	h.w.RunTendCheck = func(
+		_ context.Context, cfg *config.Config, _ loopcmd.Deps, _ bool,
+	) (loopcmd.TendCheckResult, error) {
+		checked = append(checked, cfg.Name)
+		return loopcmd.TendCheckResult{Stale: 1, Confirmed: true}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if len(checked) != 1 || checked[0] != "planning" {
+		t.Fatalf("checked = %v, want [planning]", checked)
+	}
+	fireTends(t, h)
+	if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
+		t.Errorf("tends = %v, want [planning@master]", got)
+	}
+}
+
+// A loop that finds nothing arms nothing. A pass that armed a sweep anyway
+// would dispatch the agents the gate exists to save.
+func TestTendCheckPassArmsNothingWhenNothingIsStale(t *testing.T) {
+	h := tendCheckHarness(t)
+	h.w.RunTendCheck = func(
+		context.Context, *config.Config, loopcmd.Deps, bool,
+	) (loopcmd.TendCheckResult, error) {
+		return loopcmd.TendCheckResult{}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if h.timers.len() != 0 {
+		t.Errorf("timers armed = %d, want 0", h.timers.len())
+	}
+	fireTends(t, h)
+	if got := h.tendedLoops(); len(got) != 0 {
+		t.Errorf("tends = %v, want none", got)
+	}
+}
+
+// A loop that does not tend is not even opened. Opening it would spend a
+// SQLite handle and a git fetch on a loop whose answer is known.
+func TestTendCheckPassSkipsALoopThatDoesNotTend(t *testing.T) {
+	h := tendCheckHarness(t)
+	target := h.target("planning")
+	h.w.ScanTargets = func() (Routes, error) {
+		return Routes{Targets: []Target{target}}, nil
+	}
+	checks := 0
+	h.w.RunTendCheck = func(
+		context.Context, *config.Config, loopcmd.Deps, bool,
+	) (loopcmd.TendCheckResult, error) {
+		checks++
+		return loopcmd.TendCheckResult{}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if checks != 0 {
+		t.Errorf("checks = %d, want 0", checks)
+	}
+	if opens, _, _ := h.counts(); opens != 0 {
+		t.Errorf("opens = %d, want 0", opens)
+	}
+}
+
+// The first pass after start forces the confirm, so a cold pr_links cache is
+// populated instead of gating forever on rows that do not exist. The second
+// pass does not force it, which is what keeps the interval cheap.
+func TestTendCheckPassForcesTheFirstPassOnly(t *testing.T) {
+	h := tendCheckHarness(t)
+	var forced []bool
+	h.w.RunTendCheck = func(
+		_ context.Context, _ *config.Config, _ loopcmd.Deps, force bool,
+	) (loopcmd.TendCheckResult, error) {
+		forced = append(forced, force)
+		return loopcmd.TendCheckResult{Confirmed: true}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+	h.w.tendCheckPass(context.Background())
+
+	if len(forced) != 2 || !forced[0] || forced[1] {
+		t.Errorf("force flags = %v, want [true false]", forced)
+	}
+}
+
+// Six hours later the confirm runs again, so a row that drifted with no
+// delivery is corrected.
+func TestTendCheckPassForcesTheConfirmEverySixHours(t *testing.T) {
+	h := tendCheckHarness(t)
+	// A clock of its own, because the harness's is frozen: what this test is
+	// about is time passing between two passes.
+	now := workNow
+	h.w.Now = func() time.Time { return now }
+	var forced []bool
+	h.w.RunTendCheck = func(
+		_ context.Context, _ *config.Config, _ loopcmd.Deps, force bool,
+	) (loopcmd.TendCheckResult, error) {
+		forced = append(forced, force)
+		return loopcmd.TendCheckResult{Confirmed: true}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+	now = now.Add(tendConfirmInterval + time.Hour)
+	h.w.tendCheckPass(context.Background())
+
+	if len(forced) != 2 || !forced[1] {
+		t.Errorf("force flags = %v, want the second pass forced too", forced)
+	}
+}
+
+// A pass that never confirmed keeps forcing. Recording the attempt rather
+// than the confirmation would leave a loop whose check errored out gated on
+// rows it never got.
+func TestTendCheckPassKeepsForcingUntilAConfirmHappens(t *testing.T) {
+	h := tendCheckHarness(t)
+	var forced []bool
+	h.w.RunTendCheck = func(
+		_ context.Context, _ *config.Config, _ loopcmd.Deps, force bool,
+	) (loopcmd.TendCheckResult, error) {
+		forced = append(forced, force)
+		return loopcmd.TendCheckResult{}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+	h.w.tendCheckPass(context.Background())
+
+	if len(forced) != 2 || !forced[0] || !forced[1] {
+		t.Errorf("force flags = %v, want both forced", forced)
+	}
+}
+
+// The sweep is armed with the DAEMON's context, never with the bounded one
+// the pass gives its own git and database work.
+//
+// armTend's timer tests ctx.Err() before it sweeps, so arming with the
+// bounded context would cancel the sweep the moment the pass returned -- and
+// the pass returning is exactly what cancels it. Nothing else in this file
+// catches that, because both contexts are alive while the pass runs.
+func TestTendCheckPassArmsWithTheDaemonContextNotItsOwnDeadline(t *testing.T) {
+	h := tendCheckHarness(t)
+	var checkCtx context.Context
+	h.w.RunTendCheck = func(
+		ctx context.Context, _ *config.Config, _ loopcmd.Deps, _ bool,
+	) (loopcmd.TendCheckResult, error) {
+		checkCtx = ctx
+		return loopcmd.TendCheckResult{Stale: 1, Confirmed: true}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if checkCtx == nil {
+		t.Fatal("the check was never run")
+	}
+	if checkCtx.Err() == nil {
+		t.Fatal("the pass's own context outlived the pass; it must be cancelled on return")
+	}
+	fireTends(t, h)
+	if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
+		t.Errorf("tends = %v, want [planning@master]; the sweep was armed with the bounded context", got)
+	}
+}
+
+// A registry that cannot be read stops the pass before it reads the token,
+// and arms nothing.
+func TestTendCheckPassStopsWhenTheScanFails(t *testing.T) {
+	h := tendCheckHarness(t)
+	h.w.ScanTargets = func() (Routes, error) { return Routes{}, errBoom }
+	h.w.RunTendCheck = func(
+		context.Context, *config.Config, loopcmd.Deps, bool,
+	) (loopcmd.TendCheckResult, error) {
+		t.Error("the check ran for a scan that failed")
+		return loopcmd.TendCheckResult{}, nil
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if h.tokenCalls != 0 {
+		t.Errorf("token reads = %d, want 0", h.tokenCalls)
+	}
+}
+
+// Open holds a SQLite handle, and this pass calls Open once per loop per
+// interval for the life of the daemon: a cleanup missed on the error path is
+// one handle leaked every interval, forever.
+func TestTendCheckPassReleasesTheLoopEvenWhenTheCheckFails(t *testing.T) {
+	h := tendCheckHarness(t)
+	h.w.RunTendCheck = func(
+		context.Context, *config.Config, loopcmd.Deps, bool,
+	) (loopcmd.TendCheckResult, error) {
+		return loopcmd.TendCheckResult{}, errBoom
+	}
+
+	h.w.tendCheckPass(context.Background())
+
+	if _, _, cleanups := h.counts(); cleanups != 1 {
+		t.Errorf("cleanups = %d, want 1", cleanups)
+	}
+}
+
+// Zero disables the pass outright.
+//
+// Asserted on the ticker rather than on Serve: Serve returns at its own
+// ctx.Err() guard before it reaches the select, so a cancelled-context test
+// passes identically with the pass enabled.
+func TestTendTickerIsNilOnlyWhenTheIntervalIsZero(t *testing.T) {
+	h := newHarness(nil)
+
+	h.w.TendInterval = 0
+	if ch := h.w.tendTicker(); ch != nil {
+		t.Error("a zero interval must build no ticker; a nil channel blocks forever, which is the disable")
+	}
+
+	h.w.TendInterval = time.Minute
+	if ch := h.w.tendTicker(); ch == nil {
+		t.Error("a non-zero interval must build a ticker")
+	}
+}
