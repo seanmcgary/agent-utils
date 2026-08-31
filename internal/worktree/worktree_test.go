@@ -308,10 +308,13 @@ func TestPushWithLeaseRefusesWhenTheRemoteMoved(t *testing.T) {
 	}
 }
 
-// An empty lease is the dangerous case, not merely an invalid one: git accepts
-// --force-with-lease=<ref>: and degrades it to remote-tracking semantics,
-// which a detached tend worktree cannot supply -- so the push would land
-// unconditionally. It must be refused before git ever sees it.
+// The lease is a rev expression git resolves locally, so the dangerous shapes
+// are the ones that RESOLVE: an abbreviated id, an uppercase id, and a ref
+// name. Each was measured to push and move the branch with the guard removed,
+// because each resolves to the tip the lease is supposed to be pinning. The
+// empty and trailing-newline cases are here for completeness -- git refuses
+// those itself -- and the subtests assert the branch did not move, not merely
+// that an error came back.
 func TestPushWithLeaseRefusesAMalformedLease(t *testing.T) {
 	m, origin := newTestManagerWithRemote(t)
 	path, err := m.EnsurePR(9, "feature")
@@ -449,5 +452,38 @@ func TestHeadSHAReturnsABareObjectID(t *testing.T) {
 	}
 	if !leaseSHA.MatchString(sha) {
 		t.Errorf("HeadSHA = %q, which PushWithLease would refuse", sha)
+	}
+}
+
+// A dead context must not look like a clean worktree.
+//
+// The probes for the rebase state directory fail on an expired context -- the
+// same expired context that would have killed the rebase and left that
+// directory behind. Returning nil there would tell the caller the abort
+// succeeded, and its "abort failed, destroy the worktree" path would never run
+// in the one situation it exists for.
+func TestAbortRebaseFailsOnADeadContext(t *testing.T) {
+	m, _ := newTestManagerWithConflict(t)
+	path, err := m.EnsurePR(9, "feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Rebase(context.Background(), path, "master"); err == nil {
+		t.Fatal("this fixture must conflict")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.AbortRebase(ctx, path); err == nil {
+		t.Error("AbortRebase must not report success on a cancelled context")
+	}
+
+	// The rebase really was still in progress, so the case above is the one
+	// described and not a worktree that happened to be clean already.
+	if err := m.AbortRebase(context.Background(), path); err != nil {
+		t.Fatalf("abort with a live context: %v", err)
+	}
+	if out := gitOut(t, path, "status", "--porcelain"); out != "" {
+		t.Errorf("worktree is not clean after the abort: %q", out)
 	}
 }

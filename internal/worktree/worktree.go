@@ -280,8 +280,16 @@ func (m *Manager) Rebase(ctx context.Context, path, baseRef string) error {
 // command that never started -- and "git rebase --abort" exits non-zero with
 // nothing to abort. Treating that as an error would send every non-conflict
 // failure down the destroy-the-worktree path.
+//
+// A probe that cannot answer is NOT treated as "nothing to abort". The way
+// both probes fail is a dead context -- the same dead context that would have
+// killed the rebase and left its state directory on disk -- so short-circuiting
+// to nil there would report a clean worktree at the exact moment the worktree
+// is stuck, and would make the caller's destroy path unreachable in the one
+// case it exists for. The abort runs instead, and fails loudly.
 func (m *Manager) AbortRebase(ctx context.Context, path string) error {
-	if !m.rebaseInProgress(ctx, path) {
+	inProgress, err := m.rebaseInProgress(ctx, path)
+	if err == nil && !inProgress {
 		return nil
 	}
 	return m.gitC(ctx, path, "rebase", "--abort")
@@ -290,11 +298,14 @@ func (m *Manager) AbortRebase(ctx context.Context, path string) error {
 // rebaseInProgress reports whether git has a rebase state directory for path.
 // Both names are checked because git uses rebase-merge for the default
 // backend and rebase-apply for the older one.
-func (m *Manager) rebaseInProgress(ctx context.Context, path string) bool {
+//
+// A non-nil error means the question went unanswered, which is not the same
+// as a false answer; see AbortRebase for why the difference matters.
+func (m *Manager) rebaseInProgress(ctx context.Context, path string) (bool, error) {
 	for _, name := range []string{"rebase-merge", "rebase-apply"} {
 		out, err := m.gitStdout(ctx, path, "rev-parse", "--git-path", name)
 		if err != nil {
-			continue
+			return false, err
 		}
 		p := strings.TrimSpace(out)
 		if p == "" {
@@ -305,10 +316,10 @@ func (m *Manager) rebaseInProgress(ctx context.Context, path string) bool {
 			p = filepath.Join(path, p)
 		}
 		if exists(p) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // PushWithLease force-pushes HEAD in path to origin's headRef, but only while
@@ -330,15 +341,19 @@ func (m *Manager) PushWithLease(ctx context.Context, path, headRef, lease string
 		"origin", "HEAD:refs/heads/"+headRef)
 }
 
-// leaseSHA matches a full git object id, in either hash size.
+// leaseSHA matches a full lowercase git object id, in either hash size.
 //
-// An abbreviated or otherwise malformed id is refused, and an EMPTY one above
-// all: --force-with-lease with an empty value silently degrades to
-// remote-tracking semantics, and a detached tend worktree has no useful
-// remote-tracking ref -- EnsurePRCtx fetches into FETCH_HEAD, never into
-// refs/remotes/origin/<head>. That degraded form is close to an unconditional
-// force push, and from the outside it looks exactly like the strong one, so
-// the check lives here rather than being trusted from the caller.
+// The value after "<ref>:" is a rev expression git resolves LOCALLY, not a
+// literal object id. Anything that resolves to the branch's current tip makes
+// the lease match trivially and the push land unconditionally: an abbreviated
+// id, an uppercase id, and a ref name such as refs/heads/feature all do, and
+// the last reads like a careful lease while being none at all. Requiring the
+// full lowercase form makes the lease the literal head this pass fetched, so
+// no value can resolve its way past the guard. An empty value is refused here
+// too, though git itself rejects it, reading it as the null object id.
+//
+// The check lives here rather than being trusted from the caller because it is
+// the one guard the automatic rebase rests on.
 var leaseSHA = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 
 // gitTimeout bounds one git command on the automatic rebase path.
