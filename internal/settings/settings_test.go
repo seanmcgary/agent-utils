@@ -38,13 +38,16 @@ func TestLoadWithNoFileReturnsZeroValue(t *testing.T) {
 func TestSaveThenLoadRoundTripsEveryField(t *testing.T) {
 	withHome(t)
 
-	want := &Settings{Webhook: Webhook{
-		Enabled:    true,
-		URL:        "https://example.com/hooks/agent-utils",
-		ListenAddr: "0.0.0.0",
-		ListenPort: 9999,
-		Secret:     "supersecretvalue",
-	}}
+	want := &Settings{
+		Webhook: Webhook{
+			Enabled:    true,
+			URL:        "https://example.com/hooks/agent-utils",
+			ListenAddr: "0.0.0.0",
+			ListenPort: 9999,
+			Secret:     "supersecretvalue",
+		},
+		TendInterval: "30m",
+	}
 	if err := Save(want); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -416,5 +419,86 @@ func TestSettingANonLoopbackListenAddrWarns(t *testing.T) {
 		if out != "" {
 			t.Errorf("Set(%q) wrote %q to stderr, want nothing", addr, out)
 		}
+	}
+}
+
+// The default is applied by WithDefaults, not by Load, exactly as the listen
+// address is: Load must keep returning a true zero value for a machine that
+// has never run `config`.
+func TestTendEveryDefaultsWhenUnset(t *testing.T) {
+	if got := (Settings{}).TendEvery(); got != DefaultTendInterval {
+		t.Errorf("TendEvery() = %v, want %v", got, DefaultTendInterval)
+	}
+}
+
+// Zero disables the periodic check. It must survive, or an operator who turns
+// the pass off gets it back on the next load.
+func TestTendEveryHonoursAnExplicitZero(t *testing.T) {
+	for _, v := range []string{"0", "0s"} {
+		if got := (Settings{TendInterval: v}).TendEvery(); got != 0 {
+			t.Errorf("TendEvery(%q) = %v, want 0", v, got)
+		}
+	}
+}
+
+// An unparsable value falls back to the default rather than disabling the
+// pass. Set already refuses a bad value, so a bad one in the file was
+// hand-written, and silently turning the check off is the worse failure.
+func TestTendEveryFallsBackOnGarbage(t *testing.T) {
+	if got := (Settings{TendInterval: "later"}).TendEvery(); got != DefaultTendInterval {
+		t.Errorf("TendEvery() = %v, want the default", got)
+	}
+}
+
+// The bug this field shape exists to prevent: a settings file saved with no
+// tend_interval must come back with no tend_interval, so the default still
+// applies.
+func TestSaveThenLoadLeavesAnUnsetTendIntervalUnset(t *testing.T) {
+	withHome(t)
+	if err := Save(&Settings{Webhook: Webhook{Enabled: true}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TendInterval != "" {
+		t.Errorf("TendInterval = %q, want empty so the default applies", got.TendInterval)
+	}
+	if got.TendEvery() != DefaultTendInterval {
+		t.Errorf("TendEvery() = %v, want the default", got.TendEvery())
+	}
+}
+
+func TestTendIntervalIsASettableKey(t *testing.T) {
+	var found bool
+	for _, f := range Fields() {
+		if f.Key != "tend_interval" {
+			continue
+		}
+		found = true
+		s := &Settings{}
+		if err := f.Set(s, "30m"); err != nil {
+			t.Fatal(err)
+		}
+		if s.TendInterval != "30m" {
+			t.Errorf("after Set: %q, want 30m", s.TendInterval)
+		}
+		if got := f.Get(s); got != "30m" {
+			t.Errorf("Get = %q, want 30m", got)
+		}
+		if err := f.Set(s, "nonsense"); err == nil {
+			t.Error("an unparsable duration must be refused")
+		}
+		if err := f.Set(s, "-5m"); err == nil {
+			t.Error("a negative duration must be refused")
+		}
+		f.Unset(s)
+		if s.TendInterval != "" {
+			t.Errorf("after Unset: %q, want empty", s.TendInterval)
+		}
+	}
+	if !found {
+		t.Fatal("tend_interval is not a settable key")
 	}
 }

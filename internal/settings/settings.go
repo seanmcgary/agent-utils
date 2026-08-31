@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"gopkg.in/yaml.v3"
@@ -52,9 +53,52 @@ const (
 	DefaultListenPort = 8787
 )
 
+// DefaultTendInterval is how often the listener looks for a pull request that
+// has fallen behind its base. It is applied by TendEvery, not by Load, for the
+// reason WithDefaults states: Load must return a true zero value for a machine
+// that has never run `config`.
+//
+// The check is nearly free when nothing is behind -- it compares local refs
+// the loop already fetched and makes no GitHub call -- so this value is set by
+// how soon an operator wants a stale branch noticed, not by what the check
+// costs.
+const DefaultTendInterval = 15 * time.Minute
+
 // Settings is the machine-wide configuration.
 type Settings struct {
 	Webhook Webhook `yaml:"webhook"`
+	// TendInterval is how often the listener runs its periodic tend check.
+	// "0" disables that check and leaves every other tend trigger unchanged;
+	// an ABSENT value takes DefaultTendInterval.
+	//
+	// It is a string, and it carries omitempty, so those two states stay
+	// distinguishable through a Save. Save marshals the whole struct, so a
+	// typed duration would write "tend_interval: 0s" for a machine that never
+	// set one, and the next Load could not tell that from an operator who
+	// disabled the pass on purpose.
+	//
+	// It is machine-wide rather than per loop because it describes how
+	// attentive the daemon is, not anything about a loop. It applies to every
+	// loop with tend_pr: true, of every registered project.
+	TendInterval string `yaml:"tend_interval,omitempty"`
+}
+
+// TendEvery returns the periodic tend check's interval.
+//
+// An absent value takes the default. An explicit "0" disables the check. A
+// value that does not parse ALSO takes the default rather than disabling the
+// check: Fields refuses a bad value, so a bad one in the file was written by
+// hand, and silently turning off the pass that keeps branches current is the
+// worse of the two failures.
+func (s Settings) TendEvery() time.Duration {
+	if strings.TrimSpace(s.TendInterval) == "" {
+		return DefaultTendInterval
+	}
+	d, err := time.ParseDuration(s.TendInterval)
+	if err != nil || d < 0 {
+		return DefaultTendInterval
+	}
+	return d
 }
 
 // Webhook holds the daemon's listen configuration and the secret GitHub
@@ -423,6 +467,25 @@ func Fields() []Field {
 			// --rotate-secret`, which calls GenerateSecret.
 			Set:   nil,
 			Unset: func(s *Settings) { s.Webhook.Secret = "" },
+		},
+		{
+			Key: "tend_interval",
+			Get: func(s *Settings) string { return s.TendInterval },
+			Set: func(s *Settings, v string) error {
+				d, err := time.ParseDuration(v)
+				if err != nil {
+					return fmt.Errorf("tend_interval must be a duration such as \"15m\": %w", err)
+				}
+				if d < 0 {
+					return fmt.Errorf("tend_interval must not be negative")
+				}
+				// Stored as the operator typed it, not as the parsed value
+				// re-rendered: `config get` should read back what `config set`
+				// was given.
+				s.TendInterval = v
+				return nil
+			},
+			Unset: func(s *Settings) { s.TendInterval = "" },
 		},
 	}
 }
