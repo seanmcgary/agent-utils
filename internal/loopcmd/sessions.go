@@ -9,6 +9,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/registry"
+	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -45,6 +46,16 @@ type Session struct {
 	LastStatus string
 	// LastKind is the kind of the most recent dispatch.
 	LastKind string
+	// Model and Harness are the agent settings the most recent dispatch ran
+	// under: the per-issue label override when the row carried one, else the
+	// value configured for the loop. sessionsFrom fills in the override
+	// alone, and applySettings resolves the rest -- the override columns are
+	// empty for the ordinary case, which is most rows, and "no override" is
+	// not an answer to which model ran. Either may still end up empty, when
+	// the loop's configuration can no longer be read; the renderers print a
+	// dash rather than inventing a default the run may not have used.
+	Model   string
+	Harness string
 	// Live reports that the most recent dispatch's process is still running.
 	Live bool
 	// Orphaned reports a dispatch still marked running whose process is gone.
@@ -86,6 +97,7 @@ func Sessions(p *Project, loopFilter string) ([]Session, error) {
 		return nil, err
 	}
 	applyStopped(out, stoppedSet(stopped, p.Config.ID))
+	applySettings(out, map[string]string{p.Config.ID: p.Dir})
 
 	// Stable, because sessionsFrom returns the rows in the query's id DESC
 	// order. Two sessions can share a Last timestamp -- a resume dispatched
@@ -212,8 +224,10 @@ func AllSessions(f SessionFilter) ([]Session, error) {
 		return nil, err
 	}
 	names := make(map[string]string, len(entries))
+	dirs := make(map[string]string, len(entries))
 	for _, p := range entries {
 		names[p.ID] = p.Name
+		dirs[p.ID] = p.AgentUtilsDir
 	}
 
 	db, err := openCanonical()
@@ -247,6 +261,7 @@ func AllSessions(f SessionFilter) ([]Session, error) {
 		return nil, err
 	}
 	applyStopped(kept, stoppedSet(stopped, projectID))
+	applySettings(kept, dirs)
 
 	nameProjects(kept, names)
 	// Stable, for the reason Sessions is: sessionsFrom returns the rows in the
@@ -288,6 +303,58 @@ func stoppedSet(all []store.StoppedIssue, projectID string) map[stoppedKey]bool 
 		out[stoppedKey{ProjectID: si.ProjectID, Loop: si.Loop, Number: si.Number}] = true
 	}
 	return out
+}
+
+// applySettings resolves each session's Model and Harness against the
+// configuration of the loop that owns it. dirs maps a project id to that
+// project's .agent-utils directory; a session whose project is not in the map
+// keeps whatever override it already carries.
+//
+// It is a separate pass over sessionsFrom's output for the reason applyStopped
+// is: sessionsFrom groups dispatch rows and reads no files, while this needs
+// the loop configuration on disk. Configurations are read once per
+// {project, loop} and cached, because a machine-wide report holds many
+// sessions per loop and this is the only file read in an otherwise
+// database-only path.
+//
+// A configuration that cannot be read is not an error. A loop can be renamed
+// or deleted while its old sessions stay in the database -- FindSession says
+// so in its own error text -- and a report that failed outright because one
+// loop's file is gone would hide every other row. Such a session keeps its
+// override, or shows a dash.
+//
+// runner.Effective is what merges the two, rather than a local "override wins"
+// check: it re-validates each override through config.ParseOverrides and drops
+// what fails, so this table reports the same value the runner would actually
+// have launched with.
+func applySettings(sessions []Session, dirs map[string]string) {
+	type key struct{ ProjectID, Loop string }
+	cache := map[key]*config.Config{}
+
+	for i := range sessions {
+		dir, ok := dirs[sessions[i].ProjectID]
+		if !ok || dir == "" {
+			continue
+		}
+		k := key{sessions[i].ProjectID, sessions[i].Loop}
+		cfg, seen := cache[k]
+		if !seen {
+			if path, err := config.Resolve(dir, sessions[i].Loop); err == nil {
+				if loaded, err := config.Load(path); err == nil {
+					cfg = loaded
+				}
+			}
+			cache[k] = cfg
+		}
+		if cfg == nil {
+			continue
+		}
+		s := runner.Effective(cfg, config.Overrides{
+			Model: sessions[i].Model, Harness: sessions[i].Harness,
+		})
+		sessions[i].Model = s.Model
+		sessions[i].Harness = s.Harness
+	}
 }
 
 // applyStopped marks only the MOST RECENT session for a stopped issue's
@@ -349,6 +416,8 @@ func sessionsFrom(ds []store.Dispatch, loopFilter string) []Session {
 				Last:       d.StartedAt,
 				LastStatus: d.Status,
 				LastKind:   d.Kind,
+				Model:      d.Model,
+				Harness:    d.Harness,
 			}
 			if d.Status == store.StatusRunning {
 				if proc.IsAlive(d.PID, d.RunnerID()) {
@@ -386,8 +455,9 @@ func RenderSessions(p *Project, sessions []Session) string {
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "%-38s %-12s %-6s %-30s %-5s %-9s %-10s %s\n",
-		"SESSION", "LOOP", "ISSUE", "TITLE", "RUNS", "COST", "STATE", "LAST RUN")
+	fmt.Fprintf(&b, "%-38s %-12s %-6s %-24s %-5s %-9s %-24s %-8s %-10s %s\n",
+		"SESSION", "LOOP", "ISSUE", "TITLE", "RUNS", "COST", "MODEL", "HARNESS",
+		"STATE", "LAST RUN")
 	for _, s := range sessions {
 		state := s.LastStatus
 		switch {
@@ -403,9 +473,11 @@ func RenderSessions(p *Project, sessions []Session) string {
 		case s.Orphaned:
 			state = "ORPHANED"
 		}
-		fmt.Fprintf(&b, "%-38s %-12s %-6d %-30s %-5d $%-8.2f %-10s %s\n",
-			s.ID, truncate(s.Loop, 12), s.Issue, truncate(s.Title, 30),
-			s.Dispatches, s.Cost, state, s.Last.Local().Format("2006-01-02 15:04"))
+		fmt.Fprintf(&b, "%-38s %-12s %-6d %-24s %-5d $%-8.2f %-24s %-8s %-10s %s\n",
+			s.ID, truncate(s.Loop, 12), s.Issue, truncate(s.Title, 24),
+			s.Dispatches, s.Cost, truncate(orDash(s.Model), 24),
+			truncate(orDash(s.Harness), 8), state,
+			s.Last.Local().Format("2006-01-02 15:04"))
 	}
 
 	fmt.Fprintf(&b, "\nFollow one with: agent-utils project logs --session <SESSION>\n")
@@ -438,8 +510,9 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "%-16s %-38s %-12s %-6s %-30s %-5s %-9s %-10s %s\n",
-		"PROJECT", "SESSION", "LOOP", "ISSUE", "TITLE", "RUNS", "COST", "STATE", "LAST RUN")
+	fmt.Fprintf(&b, "%-16s %-38s %-12s %-6s %-24s %-5s %-9s %-24s %-8s %-10s %s\n",
+		"PROJECT", "SESSION", "LOOP", "ISSUE", "TITLE", "RUNS", "COST", "MODEL",
+		"HARNESS", "STATE", "LAST RUN")
 	for _, s := range sessions {
 		state := s.LastStatus
 		switch {
@@ -456,10 +529,11 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 		// to type this value back into --name, and registry.Find matches a
 		// name exactly, so an elided name is a selector that cannot resolve.
 		// RenderProjects pads loop names the same way, for the same reason.
-		fmt.Fprintf(&b, "%-16s %-38s %-12s %-6d %-30s %-5d $%-8.2f %-10s %s\n",
+		fmt.Fprintf(&b, "%-16s %-38s %-12s %-6d %-24s %-5d $%-8.2f %-24s %-8s %-10s %s\n",
 			s.Project, s.ID, truncate(s.Loop, 12), s.Issue,
-			truncate(s.Title, 30), s.Dispatches, s.Cost, state,
-			s.Last.Local().Format("2006-01-02 15:04"))
+			truncate(s.Title, 24), s.Dispatches, s.Cost,
+			truncate(orDash(s.Model), 24), truncate(orDash(s.Harness), 8),
+			state, s.Last.Local().Format("2006-01-02 15:04"))
 	}
 
 	// The long form, naming the project. The top-level logs command resolves
