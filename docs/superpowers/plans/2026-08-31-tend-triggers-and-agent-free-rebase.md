@@ -62,8 +62,10 @@ Read from source in this repository at the stated lines.
 - `config.Config` — `internal/config/config.go`. Relevant fields: `Name`, `Repo`,
   `DefaultBranch`, `TendPR bool` (`tend_pr`), `StateDir`, `CheckoutBaseDir`, `Agent.Worktree`,
   `Labels.Review`.
-- `config.Duration` — `internal/config/duration.go:11-31`. It has `UnmarshalYAML` and `Std()`.
-  It has **no** `MarshalYAML`; Task 5 adds one.
+- `config.Duration` — `internal/config/duration.go:11-31`. It has `UnmarshalYAML` and `Std()`
+  and **no** `MarshalYAML`. This plan does not add one, and must not: `internal/wizard/write.go:13-23`
+  carries a ten-line comment that depends on its absence. `settings` uses a plain string instead;
+  see Task 5.
 - `config.WorktreePerIssue` — the `per_issue` worktree mode constant.
 - `ghub.HookEvents` — `internal/ghub/types.go:123-129`. Five events today.
 - `ghub.SafeRef(ref string) bool` — `internal/ghub/types.go:146`.
@@ -1093,6 +1095,8 @@ spends a GitHub call only when the local answer is yes.
 **Files:**
 - Create: `internal/loopcmd/tendcheck.go`
 - Create: `internal/loopcmd/tendcheck_test.go`
+- Modify: `internal/loopcmd/tick.go:23-43` — add `Deps.Behind`
+- Modify: `internal/loopcmd/open.go:205-216` — wire `Deps.Behind` to `deps.WT.BehindLocal`
 
 **Interfaces:**
 - Consumes: `Manager.BehindLocal`, `Store.DeletePRLink` (Task 4), `Deps`, `ghub.Client`.
@@ -1408,7 +1412,7 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 	// loop, and that tick does this pass's work as part of its own: the sweep
 	// it performs is the thing this pass would have armed. Waiting would pin
 	// the Serve goroutine behind an agent dispatch.
-	l, err := lock.TryAcquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
+	l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
 	if errors.Is(err, lock.ErrHeld) {
 		slog.Info("another tick holds the loop lock; skipping this tend check",
 			"loop", cfg.Name)
@@ -1527,11 +1531,10 @@ Imports: `context`, `errors`, `fmt`, `log/slog`, `path/filepath`, plus `config`,
 `ghub`, and `lock` from this module. Confirm `cfg.RepoOwner()` and `cfg.RepoName()` are the
 accessors `tendSnapshot` uses (`internal/loopcmd/tendsweep.go:101`).
 
-**`lock.TryAcquire` may not exist.** Read `internal/lock/` first. `lock.Acquire`
-(`internal/loopcmd/tendsweep.go:83`) is what the package uses today, and `lock.ErrHeld` is
-already referenced by `internal/listener/work.go`. If the package offers only a blocking
-`Acquire`, add a non-blocking variant there, with its own test, as part of this task — a
-blocking acquire on the `Serve` goroutine is exactly the stall this pass must not cause.
+**`lock.Acquire` is already non-blocking** — it uses `LOCK_EX|LOCK_NB` and returns
+`lock.ErrHeld` on `EWOULDBLOCK` (`internal/lock/lock.go:20-38`). No new lock primitive is needed,
+and none should be added. Use `lock.Acquire` and test for `lock.ErrHeld`, exactly as
+`internal/loopcmd/tendsweep.go:83` and `internal/listener/work.go` already do.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
@@ -1568,6 +1571,7 @@ git commit -m "feat(loopcmd): find a stale pull request with local git before ca
   - `Worker.tendCheckPass(ctx)` — one pass over every tending loop.
   - `Worker.tendCheckOne(ctx, t Target, acc *access)` — one loop.
   - `Worker.confirms map[loopKey]time.Time` — guarded by `w.mu`.
+  - `Worker.tendTicker() <-chan time.Time`.
   - `tendConfirmInterval = 6 * time.Hour`.
   - `tendPassTimeout = 10 * time.Minute` — the whole pass's deadline.
 
@@ -1577,9 +1581,29 @@ git commit -m "feat(loopcmd): find a stale pull request with local git before ca
 
 **Helper reality check before you write these.** `internal/listener/work_test.go` builds its
 worker with `newHarness(db)` (`work_test.go:162`) and controls time through a `timers` seam
-(`work_test.go:49`), not with `newTestWorker`/`fireTendTimer`. Use the real helpers, and set
-`w.ScanTargets` to return a fixed `Routes` rather than building a registry on disk. The names
-below are written against that: replace `newTestWorker(t)` with the harness the file already has.
+(`work_test.go:49`), not with `newTestWorker`/`fireTendTimer`. Use the real helpers: replace
+`newTestWorker(t)` with the harness the file already has.
+
+**EVERY test in this task must set `w.ScanTargets`.** Only the first one below shows it, to keep
+the snippets readable — but a test that leaves it unset reads the real registry, finds zero
+targets, never calls `RunTendCheck`, and then passes or fails for a reason unrelated to what it
+claims to check. Write one fixture and use it in all five:
+
+```go
+// stubScan gives the pass one tending loop, so it never reads the machine's
+// real registry.
+func stubScan(cfgPath string) func() (Routes, error) {
+	return func() (Routes, error) {
+		return Routes{Targets: []Target{{
+			ProjectID: "p1", ProjectName: "weather", LoopName: "execution",
+			Repo: "o/r", ConfigPath: cfgPath, DefaultBranch: "master", TendPR: true,
+		}}}, nil
+	}
+}
+```
+
+`cfgPath` is the loop file the harness already writes; take it from whatever `newHarness`
+returns rather than inventing a path.
 
 ```go
 // The pass walks the registry, not the deliveries. That is what makes it reach
@@ -1587,12 +1611,7 @@ below are written against that: replace `newTestWorker(t)` with the harness the 
 func TestTendCheckPassArmsASweepForEachStaleLoop(t *testing.T) {
 	w := newTestWorker(t)
 	w.TendInterval = time.Minute
-	w.ScanTargets = func() (Routes, error) {
-		return Routes{Targets: []Target{{
-			ProjectID: "p1", ProjectName: "weather", LoopName: "execution",
-			Repo: "o/r", ConfigPath: cfgPath, DefaultBranch: "master", TendPR: true,
-		}}}, nil
-	}
+	w.ScanTargets = stubScan(cfgPath)
 	var checked []string
 	w.RunTendCheck = func(_ context.Context, cfg *config.Config, _ loopcmd.Deps, _ bool) (loopcmd.TendCheckResult, error) {
 		checked = append(checked, cfg.Name)
@@ -1745,12 +1764,20 @@ Initialise `confirms` in `NewWorker` and set `RunTendCheck: loopcmd.TendCheck`.
 // armTend, so the periodic trigger and the merge trigger end in the same
 // sweep, on the same timer, holding the same loop lock.
 func (w *Worker) tendCheckPass(ctx context.Context) {
-	// A deadline on the WHOLE pass. This runs on the Serve goroutine, which is
-	// the single wake loop for every project on this machine: it is what fires
-	// retry deadlines. The pass shells out to git, and git talks to a network
-	// it does not control, so an unreachable remote with no deadline here
-	// stops every retry, for every loop, until the daemon is restarted.
-	ctx, cancel := context.WithTimeout(ctx, tendPassTimeout)
+	// TWO contexts, deliberately, and mixing them up is a real bug.
+	//
+	// checkCtx bounds this pass's own git and database work. The pass runs on
+	// the Serve goroutine -- the single wake loop for every project on this
+	// machine, the thing that fires retry deadlines -- and it shells out to
+	// git, which talks to a network it does not control. With no deadline, one
+	// unreachable remote stops every retry for every loop until the daemon is
+	// restarted.
+	//
+	// ctx stays the DAEMON's context, and it is what armTend must receive.
+	// armTend's timer callback tests ctx.Err() before it runs the sweep
+	// (work.go:884-890), so arming with checkCtx would cancel the sweep this
+	// pass just asked for as soon as the pass returned.
+	checkCtx, cancel := context.WithTimeout(ctx, tendPassTimeout)
 	defer cancel()
 
 	routes, err := w.ScanTargets()
@@ -1771,16 +1798,20 @@ func (w *Worker) tendCheckPass(ctx context.Context) {
 		// Checked between loops, not only at the top: the deadline above and a
 		// daemon shutdown both land here, and a pass that ignored them would
 		// keep opening databases through the stop.
-		if ctx.Err() != nil {
+		if checkCtx.Err() != nil {
 			return
 		}
-		w.tendCheckOne(ctx, t, acc)
+		w.tendCheckOne(ctx, checkCtx, t, acc)
 	}
 }
 
 // tendCheckOne runs the check for one loop and arms a sweep when it finds
 // something.
-func (w *Worker) tendCheckOne(ctx context.Context, t Target, acc *access) {
+//
+// It takes both contexts for the reason tendCheckPass states: checkCtx bounds
+// the work this function does, and ctx -- the daemon's -- is what outlives it
+// and must be handed to armTend.
+func (w *Worker) tendCheckOne(ctx, checkCtx context.Context, t Target, acc *access) {
 	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
 		Token: acc.token, GH: acc.gh, RequireGitHub: true,
 		MigrationPolicy: loopcmd.FailOnUnimported,
@@ -1809,7 +1840,7 @@ func (w *Worker) tendCheckOne(ctx context.Context, t Target, acc *access) {
 	w.mu.Unlock()
 	force := !seen || w.Now().Sub(last) >= tendConfirmInterval
 
-	res, err := w.RunTendCheck(ctx, cfg, deps, force)
+	res, err := w.RunTendCheck(checkCtx, cfg, deps, force)
 	if err != nil {
 		// Logged and dropped, for the reason tendPass gives: this pass decides
 		// no issue, so there is no issue whose retry budget could pay for it,
@@ -1849,13 +1880,8 @@ const tendConfirmInterval = 6 * time.Hour
 const tendPassTimeout = 10 * time.Minute
 ```
 
-**`armTend` is called with the pass's context**, which carries `tendPassTimeout`. Check what
-`armTend` does with it (`internal/listener/work.go:855-899`): the timer's callback tests
-`ctx.Err()` before running the sweep, so a context that expires with the pass would cancel the
-sweep it just armed. Pass the **daemon's** context to `armTend`, not the timeout-bounded one —
-keep both in scope in `tendCheckPass` and hand the right one to each callee. This is a real bug
-if you miss it, and no test above catches it; add one that arms a sweep and then lets the pass
-context expire before the timer fires.
+Add a test for the two-context rule, because nothing else catches it: arm a sweep, let the
+pass's `checkCtx` expire, then fire the tend timer and assert the sweep still runs.
 
 - [ ] **Step 5: Add the ticker to `Serve`**
 
@@ -2026,7 +2052,7 @@ func TestRebaseRespectsTheContext(t *testing.T) {
 - [ ] **Step 2: Run the tests and confirm they fail**
 
 Run: `go test ./internal/worktree/ -run 'Rebase|Lease' -v`
-Expected: FAIL — the four methods do not exist.
+Expected: FAIL — the new methods do not exist.
 
 - [ ] **Step 3: Implement the primitives**
 
@@ -2121,7 +2147,10 @@ git commit -m "feat(worktree): bounded rebase, abort, and leased force-push"
 - Produces:
   - `store.KindRebase = "rebase"`
   - `Summary.Rebased int` (`json:"rebased"`)
-  - `func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision) (done bool, err error)`
+  - `type rebaseOutcome int` with `notDone`, `doneRebased`, `doneNoRebase`
+  - `func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision) (rebaseOutcome, error)`
+  - `func recordRebase(cfg *config.Config, deps Deps, d engine.Decision) error`
+  - `store.RecordFinishedDispatch(d store.Dispatch) error`
   - `loopcmd.RebaseGit` — the interface `Deps.Git` holds:
 
 ```go
@@ -2322,11 +2351,26 @@ package loopcmd
 import (
 	"context"
 	"log/slog"
-	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
 	"github.com/seanmcgary/agent-utils/internal/store"
+)
+
+// rebaseOutcome is what gitRebase settled. It is three values rather than a
+// bool because two different outcomes both mean "dispatch no agent" while only
+// one of them rebased anything -- a bool made the caller count a REFUSED push
+// as a completed rebase in the tick summary an operator audits.
+type rebaseOutcome int
+
+const (
+	// notDone: the caller must dispatch the tend agent.
+	notDone rebaseOutcome = iota
+	// doneRebased: git replayed the branch and pushed it.
+	doneRebased
+	// doneNoRebase: this pass settled the decision by declining to act. No
+	// agent, and nothing to count.
+	doneNoRebase
 )
 
 // gitRebase replays a pull request's branch on its base with git alone, and
@@ -2337,13 +2381,14 @@ import (
 // no conversation improves. This function does that case for nothing, and
 // hands the rest to the agent unchanged.
 //
-// done reports that the caller must NOT dispatch an agent. It is true in two
-// cases, and the second is the one worth reading twice:
+// Two outcomes mean "dispatch no agent", and the second is the one worth
+// reading twice:
 //
-//   - the rebase replayed and the push landed;
-//   - the push was REFUSED because the remote moved. The branch this pass
-//     reasoned about is gone, so an agent sent at it now would work from the
-//     same stale premise. The next tick reads the new state and decides again.
+//   - doneRebased: the rebase replayed and the push landed.
+//   - doneNoRebase: the push was REFUSED because the remote moved, or a failed
+//     abort forced the worktree to be destroyed. The branch this pass reasoned
+//     about is gone, so an agent sent at it now would work from the same stale
+//     premise. The next tick reads the new state and decides again.
 //
 // # Guards
 //
@@ -2368,22 +2413,6 @@ import (
 //     still gets a current branch. Those refusals continue to stop every AGENT
 //     dispatch, including this function's own escalation, because Decide
 //     applies them before act runs.
-// rebaseOutcome is what gitRebase settled, and it is three values rather than
-// a bool because two different outcomes both mean "dispatch no agent" while
-// only one of them rebased anything. A bool made the caller count a REFUSED
-// push as a completed rebase in the tick summary.
-type rebaseOutcome int
-
-const (
-	// notDone: the caller must dispatch the tend agent.
-	notDone rebaseOutcome = iota
-	// doneRebased: git replayed the branch and pushed it.
-	doneRebased
-	// doneNoRebase: this pass settled the decision by declining to act. No
-	// agent, and nothing to count.
-	doneNoRebase
-)
-
 func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision) (rebaseOutcome, error) {
 	// A loop with no per-issue worktree has no pull-request checkout to rebase
 	// in, and this pass will not create one: the agent path already handles
@@ -2456,13 +2485,16 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 		// The lease did its job, or the remote is unreachable. Either way this
 		// pass acts no further and dispatches no agent; see the doc comment.
 		//
-		// safeText, because the branch name reaches this line from a webhook
+		// Bounded, because the branch name reaches this line from a webhook
 		// payload by way of a database row, and SafeRef bounds its CHARSET but
-		// not its LENGTH. handler.go:185-196 records the unrotated-log-file
-		// failure that requires it.
+		// not its LENGTH -- handler.go:185-196 records the unrotated-log-file
+		// failure that requires it. handler.go's safeText is unexported and in
+		// package listener, so this uses loopcmd's own truncate
+		// (internal/loopcmd/status.go:16) rather than reaching across the
+		// package boundary.
 		slog.Warn("force-with-lease push refused; leaving this branch alone",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR,
-			"head", safeText(d.HeadRef), "err", err)
+			"head", truncate(d.HeadRef, 120), "err", err)
 		// done, but NOT rebased. The caller must not count this: the summary
 		// is the surface an operator audits unattended force-pushes with, and
 		// nothing was pushed.
@@ -2477,7 +2509,7 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 	}
 	slog.Info("rebased a pull request with git; no agent was dispatched",
 		"loop", cfg.Name, "issue", d.Issue, "pr", d.PR,
-		"head", safeText(d.HeadRef), "base", safeText(d.BaseRef))
+		"head", truncate(d.HeadRef, 120), "base", truncate(d.BaseRef, 120))
 	return doneRebased, nil
 }
 
@@ -2711,7 +2743,7 @@ Recorded here rather than discovered later, following the predecessor plan's pre
 
 | Field     | Value                                                                    |
 |-----------|--------------------------------------------------------------------------|
-| stage     | 2 (plan review)                                                          |
+| stage     | 2 (plan review complete; awaiting the human gate)                        |
 | class     | large (new subsystem, new config surface, automatic force-push)          |
 | profile   | backend                                                                  |
 | branch    | feat/tend-triggers-and-agent-free-rebase                                 |
@@ -2723,3 +2755,26 @@ Recorded here rather than discovered later, following the predecessor plan's pre
 ### Decisions
 
 _None yet._
+
+### Plan review
+
+Three fresh-context reviewers (security, quality, standards) ran against this plan, followed by
+one scoped re-check of the fixes. 46 findings, none rejected. The fixes are in the tasks above;
+the ones that changed the design rather than the wording:
+
+- A `rebase` dispatch row left `running` would freeze its issue against every future decision.
+  Three call sites branch on `Kind != KindTend` and none can reap a fourth kind
+  (`engine.go:29-45`, `tick.go:281`, `tendsweep.go:196-215`). Replaced create-then-finish with a
+  single already-finished INSERT, so the bad state is unreachable.
+- `engine.LinkPR` requires `pr.Trusted` and a closing reference. The first draft's confirm step
+  and every fixture ignored both, which would have let a fork's branch reach the force-push path.
+- `tend_interval` as a typed duration wrote `0s` for an unset value, which the next `Load` read
+  as "disabled" -- silently turning the pass off on any machine that ever ran `config set`.
+- The lease was unvalidated and read through `CombinedOutput`. An empty lease degrades
+  `--force-with-lease` to a materially weaker guard while looking identical.
+- `EnsurePR`'s `git fetch` -- the command most likely to block -- ran unbounded, first on the
+  rebase path, under the loop lock.
+- The dirty-worktree guard ran after `EnsurePR` had already orphaned any unpushed commits.
+
+Deliberately not fixed, and recorded under Known limits: the loop lock is held for the git work.
+See the gate note.
