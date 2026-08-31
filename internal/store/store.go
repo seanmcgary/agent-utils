@@ -153,6 +153,29 @@ CREATE TABLE IF NOT EXISTS webhooks (
   PRIMARY KEY (project_id, repo)
 );
 
+-- One row per issue or pull request this machine knows to be CLOSED.
+--
+-- A row's PRESENCE is the fact; a reopen deletes it. There is no closed=0 row,
+-- because "not closed" and "never heard of" must read the same way: the
+-- sessions report hides a session only when a row says its issue is closed, so
+-- an issue nothing has ever reported on stays visible rather than vanishing on
+-- a default value.
+--
+-- The key omits the loop, unlike every other table here. Closure is a fact
+-- about an issue in a REPOSITORY, and two loops watching one repo see the same
+-- closure; keying it per loop would record the same fact twice and let the
+-- copies disagree. It is also why this is not a column on issues: that table's
+-- rows are per loop, and are absent entirely for issues whose loop was renamed
+-- or whose state was cleaned up, which is exactly the old work the report most
+-- wants to hide.
+CREATE TABLE IF NOT EXISTS closures (
+  project_id TEXT NOT NULL DEFAULT '',
+  repo       TEXT NOT NULL,
+  number     INTEGER NOT NULL,
+  closed_at  TIMESTAMP NOT NULL,
+  PRIMARY KEY (project_id, repo, number)
+);
+
 -- One row per legacy per-loop database this canonical file has imported.
 --
 -- The key is a triple, not a path. Two loops may share one state_dir, so one

@@ -187,7 +187,7 @@ func TestRenderSessionsAggregatesAndFlags(t *testing.T) {
 			Dispatches: 1, Cost: 2.40, LastStatus: store.StatusRunning, Orphaned: true},
 		{ID: "sess-c", Loop: "execution", Issue: 58, Dispatches: 1,
 			LastStatus: store.StatusRunning, Live: true},
-	})
+	}, false)
 
 	for _, want := range []string{"sess-a", "Add zone lookup", "$5.05", "ORPHANED", "running", "--session"} {
 		if !strings.Contains(out, want) {
@@ -198,7 +198,7 @@ func TestRenderSessionsAggregatesAndFlags(t *testing.T) {
 
 func TestRenderSessionsExplainsAnEmptyList(t *testing.T) {
 	p := &Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}
-	if out := RenderSessions(p, nil); !strings.Contains(out, "No sessions yet") {
+	if out := RenderSessions(p, nil, false); !strings.Contains(out, "No sessions yet") {
 		t.Errorf("an empty list must explain itself:\n%s", out)
 	}
 }

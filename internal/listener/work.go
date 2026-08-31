@@ -428,6 +428,17 @@ type Delivery struct {
 	// would sweep the epic of whichever issue happens to carry that number.
 	// The event is checked as well as the action.
 	ClosedIssue bool
+	// Reopened is true when this delivery REOPENED an issue or a pull
+	// request. It is what erases a recorded closure, so a reopened issue's
+	// sessions come back into `sessions list`.
+	//
+	// It is one flag for both events, unlike the two close flags above. Those
+	// arm different work -- an epic sweep and a worktree cleanup -- and the
+	// number space overlap makes answering one as the other actively wrong. A
+	// reopen arms neither: it only deletes a row keyed by {project, repo,
+	// number}, which is GitHub's own number space, shared by issues and pull
+	// requests. Splitting it would give two flags one behaviour.
+	Reopened bool
 }
 
 // IsMergeInto reports whether this delivery merged a pull request into branch.
@@ -554,6 +565,12 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 		slog.Info("evaluating this issue in every loop that watches the repository",
 			"repo", d.Repo, "number", d.Number, "loops", loops)
 	}
+
+	// Recorded BEFORE the token read, and before any loop is opened. A close
+	// or a reopen is a fact this daemon already has in the payload: it needs
+	// no GitHub call, no configuration and no loop lock, so a missing token or
+	// an unopenable loop must not lose it. See recordClosure.
+	w.recordClosure(kept, d)
 
 	// One token read, one client, one memo, for the whole delivery -- created
 	// HERE and dropped when Deliver returns. See access: the lifetime is the
@@ -1760,6 +1777,13 @@ func (w *Worker) Serve(ctx context.Context) {
 	// waiting for the sweep interval would idle the machine for five minutes
 	// after every restart for no reason.
 	w.reapOrphans(ctx)
+
+	// Beside the reap, and for the same reason: a daemon starting is the
+	// moment it discovers what happened while it was not running. A close
+	// reaches this daemon as a delivery, so every issue closed while it was
+	// down is a fact no later delivery will ever carry. Unlike the reap it is
+	// not repeated on a timer -- see reconcileClosed.
+	w.reconcileClosed(ctx)
 
 	// A separate timer from the wake, on its own much longer interval. The two
 	// answer different questions: a wake serves deadlines this daemon wrote

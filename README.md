@@ -126,7 +126,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | Command | Does |
 |---|---|
 | `agent-utils list` | Every project on this machine, with each loop's ticks, live dispatches, cost and last tick |
-| `agent-utils sessions list [--project <p>] [--loop <l>] [--running] [--orphaned]` | Every session on this machine, with its project, issue, runs, cost and state |
+| `agent-utils sessions list [--project <p>] [--loop <l>] [--running] [--orphaned] [--all]` | Every session on this machine, with its project, issue, runs, cost and state |
 | `agent-utils sessions describe <id> [--project <p>]` | One session's runs, what each cost, and why any of them failed |
 | `agent-utils sessions kill --session <id> \| --issue <n> \| --all --yes [--project <p>] [--loop <l>] [--force] [--timeout <d>]` | Stop a running session: signal its runner, mark the issue stopped, and record the outcome |
 | `agent-utils sessions resume --session <id> \| --issue <n> \| --all --yes [--project <p>] [--loop <l>]` | Clear a stopped issue's flags so its next trigger starts fresh |
@@ -207,6 +207,17 @@ bb22-session-two   planning   57     Fix timezone bug    1     $2.40    sonnet  
 aa11-session-one   planning   42     Add zone lookup     3     $5.05    opus    claude   succeeded  2026-08-18 20:52
 ```
 
+A session whose issue or pull request has closed is finished work, so it is left out by
+default; `--all` puts it back, marked `CLOSED` in the STATE column, and a footer line says how
+many rows were hidden. `--all` is on both `agent-utils project sessions list` and
+`agent-utils sessions list`, and is unrelated to the `--all` that `sessions kill` and
+`sessions resume` take.
+
+That hiding needs the listener: a close reaches this machine as a webhook delivery, and the
+daemon also asks GitHub once at startup which of the issues it still believes are open have
+closed since it last ran. On a machine that has never run `agent-utils listener start`, nothing
+is ever marked closed and the report is what it always was.
+
 `ORPHANED` marks a session whose dispatch is still recorded as running but whose process is
 gone. `MODEL` and `HARNESS` are what the most recent dispatch ran under: its `model:` or
 `harness:` label override when it carried one, otherwise the loop's configured values. Both
@@ -232,6 +243,7 @@ Follow one with: agent-utils project --name <PROJECT> logs --session <SESSION>
 | `--loop <name>` | Restrict to loops with this name |
 | `--running` | Only sessions whose agent is still alive |
 | `--orphaned` | Only sessions marked running whose process is gone |
+| `--all` | Include the sessions of closed issues and pull requests |
 
 Pass `--running` and `--orphaned` together to see both. A project the registry no longer names
 shows the first eight characters of its identifier instead, and a row left by the pre-project
@@ -578,6 +590,15 @@ see [`tend_pr`](docs/configuration.md#tend_pr) for what that changes. It is capp
 The fourth exception is on an `issues` delivery reporting a **close**: when the closed issue
 is a sub-issue of an epic, the delivery also sweeps that epic, promoting sibling sub-issues the
 delivery never names — see [Epics](#epics).
+
+Every close and every reopen — of an issue or of a pull request — is also recorded locally,
+which is what lets `sessions list` leave finished work out of its table. It is written before
+the token is read and before any loop is opened, so a delivery whose real work fails still
+records the fact. The listener asks GitHub for the rest once, as it starts: one open-issue and
+one open-pull-request listing per repository, covering everything that closed while it was
+down. It is not repeated on a timer — while the daemon runs, deliveries are the source of
+truth — and it asks only about issues not already known to be closed, so a machine with years
+of history does not re-check that history on every restart.
 
 Otherwise, a delivery says "something about this issue changed, figure out
 what and dispatch the right executor." The daemon fetches that issue and decides it — the epic
