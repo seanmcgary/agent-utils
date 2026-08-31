@@ -44,6 +44,50 @@ func TestParseStreamCapturesAPIError(t *testing.T) {
 	}
 }
 
+// The result line's errors[] is where claude puts the message that says what
+// actually went wrong. A tend resuming a session claude never minted reports
+// api_error_status null and errors ["No conversation found with session ID:
+// ..."], so reading only api_error_status recorded "exit status 1" and threw
+// the one useful sentence away.
+func TestParseStreamCapturesTheResultLineErrors(t *testing.T) {
+	line := `{"type":"result","subtype":"error_during_execution","is_error":true,` +
+		`"api_error_status":null,"errors":["No conversation found with session ID: abc"]}`
+	got, err := ParseStream(strings.NewReader(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.APIError != "No conversation found with session ID: abc" {
+		t.Errorf("APIError = %q, want the errors[] message", got.APIError)
+	}
+}
+
+// Several errors are joined rather than one being picked: the run failed for
+// every reason listed, and an operator reading the row needs all of them.
+func TestParseStreamJoinsSeveralResultLineErrors(t *testing.T) {
+	line := `{"type":"result","subtype":"error","is_error":true,"errors":["first","second"]}`
+	got, err := ParseStream(strings.NewReader(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.APIError != "first; second" {
+		t.Errorf("APIError = %q, want both messages joined", got.APIError)
+	}
+}
+
+// api_error_status is the more specific field, so it wins. It names the HTTP
+// status of a refused call, which errors[] restates in prose at best.
+func TestParseStreamPrefersAPIErrorStatusOverErrors(t *testing.T) {
+	line := `{"type":"result","subtype":"error","is_error":true,` +
+		`"api_error_status":"529","errors":["overloaded"]}`
+	got, err := ParseStream(strings.NewReader(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.APIError != "529" {
+		t.Errorf("APIError = %q, want the api_error_status", got.APIError)
+	}
+}
+
 func TestParseStreamIgnoresNonJSONNoise(t *testing.T) {
 	body := "warning: something\n" + streamFixture
 	got, err := ParseStream(strings.NewReader(body))

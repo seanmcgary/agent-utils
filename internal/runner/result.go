@@ -30,6 +30,10 @@ type resultLine struct {
 	IsError        bool    `json:"is_error"`
 	APIErrorStatus *string `json:"api_error_status"`
 	ResultText     string  `json:"result"`
+	// Errors is where claude puts what actually went wrong when the failure
+	// was not an API status: a refused resume reports api_error_status null
+	// and errors ["No conversation found with session ID: ..."].
+	Errors []string `json:"errors"`
 }
 
 // ParseStream reads a claude stream-json stream and returns the final result.
@@ -92,10 +96,28 @@ func ParseStream(r io.Reader) (Result, error) {
 	if out.SessionID == "" {
 		out.SessionID = sessionID
 	}
-	if last.APIErrorStatus != nil {
+	// api_error_status first: it names the HTTP status of a refused call, which
+	// errors[] only restates in prose. errors[] is the fallback, and it is the
+	// one that carries a refused resume's actual sentence.
+	if last.APIErrorStatus != nil && *last.APIErrorStatus != "" {
 		out.APIError = *last.APIErrorStatus
+	} else if msg := joinErrors(last.Errors); msg != "" {
+		out.APIError = msg
 	}
 	return out, nil
+}
+
+// joinErrors renders a result line's errors[] as one string. Every message is
+// kept: the run failed for each reason listed, and an operator reading the
+// stored row cannot go back to the stream for the ones dropped.
+func joinErrors(errs []string) string {
+	var kept []string
+	for _, e := range errs {
+		if s := strings.TrimSpace(e); s != "" {
+			kept = append(kept, s)
+		}
+	}
+	return strings.Join(kept, "; ")
 }
 
 // piEvent is one line of pi's json event stream. Only the fields the parser

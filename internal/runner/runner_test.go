@@ -111,6 +111,96 @@ func TestSuperviseRecordsFailureOnNonZeroExit(t *testing.T) {
 	}
 }
 
+// stubClaudeWithStderr writes body to stdout and errText to stderr, then exits
+// with exitCode. It is stubClaude for the failures that say what went wrong on
+// stderr rather than in a result line.
+func stubClaudeWithStderr(t *testing.T, exitCode int, body, errText string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\ncat <<'EOF'\n" + body + "\nEOF\n" +
+		"cat >&2 <<'EOF'\n" + errText + "\nEOF\n" +
+		"exit " + strconv.Itoa(exitCode) + "\n"
+	p := filepath.Join(dir, "claude")
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// The failure this whole change exists for: a dispatch dies before writing a
+// result line, and the only account of why is on stderr. Recording
+// "exit status 1" throws it away, and the operator has no way back to it
+// short of reading the log file by hand.
+func TestSuperviseRecordsTheStderrTailWhenThereIsNoResultLine(t *testing.T) {
+	stubClaudeWithStderr(t, 1, "", "No conversation found with session ID: abc")
+
+	s := newStore(t)
+	id, _ := s.CreateDispatch(store.Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 3, Kind: store.KindTend, SessionID: "abc",
+	})
+	d, _ := s.GetDispatch(id)
+
+	cfg := &config.Config{Agent: config.Agent{Model: "opus", Timeout: config.Duration(60e9)}}
+	_ = Supervise(context.Background(), cfg, s, d,
+		Invocation{SessionID: "abc", Prompt: "go"}, t.TempDir(),
+		filepath.Join(t.TempDir(), "run.jsonl"))
+
+	got, _ := s.GetDispatch(id)
+	if got.Status != store.StatusFailed {
+		t.Fatalf("Status = %q, want failed", got.Status)
+	}
+	if got.APIError != "No conversation found with session ID: abc" {
+		t.Errorf("APIError = %q, want the stderr tail", got.APIError)
+	}
+}
+
+// A result line that names the failure outranks the stderr tail: the harness
+// said it deliberately, where stderr is whatever happened to be printed last.
+func TestSuperviseKeepsTheResultLineErrorOverTheStderrTail(t *testing.T) {
+	stubClaudeWithStderr(t, 1,
+		`{"type":"result","subtype":"error_during_execution","is_error":true,`+
+			`"errors":["No conversation found with session ID: abc"]}`,
+		"npm warn deprecated something@1.0.0")
+
+	s := newStore(t)
+	id, _ := s.CreateDispatch(store.Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 4, Kind: store.KindTend, SessionID: "abc",
+	})
+	d, _ := s.GetDispatch(id)
+
+	cfg := &config.Config{Agent: config.Agent{Model: "opus", Timeout: config.Duration(60e9)}}
+	_ = Supervise(context.Background(), cfg, s, d,
+		Invocation{SessionID: "abc", Prompt: "go"}, t.TempDir(),
+		filepath.Join(t.TempDir(), "run.jsonl"))
+
+	got, _ := s.GetDispatch(id)
+	if got.APIError != "No conversation found with session ID: abc" {
+		t.Errorf("APIError = %q, want the result line's errors[]", got.APIError)
+	}
+}
+
+// With nothing on stderr and no result line, the exit status is all there is.
+// It must still be recorded: a blank reason reads as "no failure".
+func TestSuperviseFallsBackToTheExitStatusWhenStderrIsEmpty(t *testing.T) {
+	stubClaudeWithStderr(t, 1, "", "")
+
+	s := newStore(t)
+	id, _ := s.CreateDispatch(store.Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 5, Kind: store.KindStart, SessionID: "abc",
+	})
+	d, _ := s.GetDispatch(id)
+
+	cfg := &config.Config{Agent: config.Agent{Model: "opus", Timeout: config.Duration(60e9)}}
+	_ = Supervise(context.Background(), cfg, s, d,
+		Invocation{SessionID: "abc", Prompt: "go"}, t.TempDir(),
+		filepath.Join(t.TempDir(), "run.jsonl"))
+
+	got, _ := s.GetDispatch(id)
+	if got.APIError == "" {
+		t.Error("APIError is empty; the exit status must still be recorded")
+	}
+}
+
 func TestSuperviseRecordsFailureWhenStreamHasNoResult(t *testing.T) {
 	stubClaude(t, 0, `{"type":"assistant"}`)
 
@@ -460,6 +550,93 @@ func TestSentinelWriterFindsAMarkerSplitAcrossWrites(t *testing.T) {
 	// record of what the agent's stderr said.
 	if got := sink.String(); !strings.Contains(got, windDownNotice+" 600s; terminating.") {
 		t.Errorf("stderr was not passed through intact: %q", got)
+	}
+}
+
+// The last stderr line is what a harness prints on its way out, and for a
+// failure with no result line it is the only sentence naming the cause. It is
+// captured as the stream is written, because the file it lands in can be
+// megabytes of tool noise.
+func TestTailWriterKeepsTheLastNonEmptyLine(t *testing.T) {
+	var sink bytes.Buffer
+	w := newTailWriter(&sink)
+
+	for _, chunk := range []string{
+		"npm warn something\n",
+		"No conversation found with session ID: abc\n",
+		"\n \n",
+	} {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	if got := w.Last(); got != "No conversation found with session ID: abc" {
+		t.Errorf("Last() = %q, want the last non-blank line", got)
+	}
+	if got := sink.String(); !strings.Contains(got, "npm warn something") {
+		t.Errorf("stderr was not passed through intact: %q", got)
+	}
+}
+
+// A line split across writes is the normal case, not the exotic one: which
+// bytes land in which Write is decided by the pipe.
+func TestTailWriterJoinsALineSplitAcrossWrites(t *testing.T) {
+	var sink bytes.Buffer
+	w := newTailWriter(&sink)
+
+	for _, chunk := range []string{"No conversation ", "found with session ID: abc\n"} {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	if got := w.Last(); got != "No conversation found with session ID: abc" {
+		t.Errorf("Last() = %q, want the joined line", got)
+	}
+}
+
+// A harness that exits without a trailing newline still said something.
+func TestTailWriterKeepsAnUnterminatedFinalLine(t *testing.T) {
+	var sink bytes.Buffer
+	w := newTailWriter(&sink)
+
+	if _, err := w.Write([]byte("first\nfatal: no such session")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if got := w.Last(); got != "fatal: no such session" {
+		t.Errorf("Last() = %q, want the unterminated final line", got)
+	}
+}
+
+// Empty stderr must read as empty rather than as a blank reason, so the
+// caller can fall back to the exit status.
+func TestTailWriterReportsNothingForEmptyStderr(t *testing.T) {
+	var sink bytes.Buffer
+	w := newTailWriter(&sink)
+
+	if _, err := w.Write([]byte("   \n\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if got := w.Last(); got != "" {
+		t.Errorf("Last() = %q, want empty", got)
+	}
+}
+
+// A single enormous line must not grow the buffer without bound: this runs for
+// the whole life of an agent that can print megabytes of tool output.
+func TestTailWriterBoundsWhatItRetains(t *testing.T) {
+	var sink bytes.Buffer
+	w := newTailWriter(&sink)
+
+	if _, err := w.Write([]byte(strings.Repeat("x", 64*1024))); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if got := len(w.Last()); got > tailLimit {
+		t.Errorf("Last() kept %d bytes, want at most %d", got, tailLimit)
 	}
 }
 
