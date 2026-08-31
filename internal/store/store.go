@@ -916,6 +916,35 @@ func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
 	return res.LastInsertId()
 }
 
+// RecordFinishedDispatch inserts one dispatch row that is already complete.
+//
+// Every other dispatch row is born running and finished later, because a
+// process backs it. This one has none: git did the work synchronously, in this
+// process, and it is over before the row exists. Two statements would leave a
+// window -- and a PERMANENT stuck row if the second failed -- in which the row
+// reads as a live agent to engine.Decide, to reapDead, and to tendDispatch's
+// reap partition, none of which can reap a kind they do not know about. A
+// single already-finished INSERT makes that state unreachable, which is worth
+// more than reusing CreateDispatch.
+//
+// Only the columns that carry meaning are named. The rest -- pid, exit code,
+// cost, duration, log path -- default to their zero value in the schema, which
+// is the truth for a row no process ever ran. The session identifier is left
+// empty on purpose; see KindRebase.
+func (s *Store) RecordFinishedDispatch(d Dispatch) error {
+	now := time.Now().UTC()
+	_, err := s.db.Exec(`
+		INSERT INTO dispatches (project_id, loop, repo, number, kind,
+		                        status, started_at, finished_at, pr_number, title)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.projectID, d.Loop, d.Repo, d.Number, d.Kind,
+		StatusSucceeded, now, now, d.PRNumber, d.Title)
+	if err != nil {
+		return fmt.Errorf("record finished dispatch: %w", err)
+	}
+	return nil
+}
+
 // SetDispatchProcess records the operating system process for a dispatch.
 func (s *Store) SetDispatchProcess(id int64, pid int, startedAt time.Time) error {
 	_, err := s.db.Exec(
@@ -1026,6 +1055,28 @@ func (s *Store) RunningDispatches(loop, repo string) ([]Dispatch, error) {
 // RecentDispatches returns the most recent dispatches for a loop, newest first.
 // A non-zero issue restricts the result to that issue.
 func (s *Store) RecentDispatches(loop, repo string, issue, limit int) ([]Dispatch, error) {
+	return s.recentDispatches(loop, repo, issue, limit, false)
+}
+
+// RecentDispatchesWithLogs is RecentDispatches restricted to the rows that
+// have a log file, newest first.
+//
+// The restriction is made in SQL rather than by filtering a page of rows in
+// Go, and the difference is not performance. A caller that wants "the newest
+// dispatch an operator can actually read" needs LIMIT 1 against a filtered
+// query; filtering a fixed page afterwards gives it a horizon instead, and a
+// loop whose tend work is mostly agent-free rebases can push its last agent
+// past that horizon and be told it has no dispatches at all.
+//
+// Only a rebase row lacks a log path today -- every dispatch that spawns a
+// process is given one when the row is created -- but the condition is written
+// on the column rather than on the kind, because "has something to show" is
+// the question being asked.
+func (s *Store) RecentDispatchesWithLogs(loop, repo string, issue, limit int) ([]Dispatch, error) {
+	return s.recentDispatches(loop, repo, issue, limit, true)
+}
+
+func (s *Store) recentDispatches(loop, repo string, issue, limit int, withLogs bool) ([]Dispatch, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -1035,6 +1086,9 @@ func (s *Store) RecentDispatches(loop, repo string, issue, limit int) ([]Dispatc
 	if issue > 0 {
 		query += ` AND number = ?`
 		args = append(args, issue)
+	}
+	if withLogs {
+		query += ` AND log_path <> ''`
 	}
 	query += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
@@ -1125,6 +1179,25 @@ func (s *Store) PRLinks(loop, repo string) (map[int]PRLink, error) {
 		out[l.Number] = l
 	}
 	return out, rows.Err()
+}
+
+// DeletePRLink removes one issue-to-pull-request mapping.
+//
+// A row outlives the pull request it names: nothing removed one before this,
+// so a database accumulates a row for every pull request it ever linked. The
+// periodic tend pass counts a merged branch as behind its base forever, so the
+// dead rows would defeat the gate that exists to avoid GitHub calls.
+//
+// Deleting a row that is not there is not an error. The confirm pass deletes
+// what GitHub says is gone, and two passes may agree about the same row.
+func (s *Store) DeletePRLink(loop, repo string, number int) error {
+	_, err := s.db.Exec(
+		`DELETE FROM pr_links WHERE project_id = ? AND loop = ? AND repo = ? AND number = ?`,
+		s.projectID, loop, repo, number)
+	if err != nil {
+		return fmt.Errorf("delete pr link: %w", err)
+	}
+	return nil
 }
 
 // RecordTick appends one tick row and returns its identifier.

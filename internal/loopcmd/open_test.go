@@ -304,3 +304,59 @@ func TestOpenBuildsAnEpicReaderWhenTheCallerSuppliesNone(t *testing.T) {
 		t.Fatal("deps.Epic is nil on the CLI path")
 	}
 }
+
+// Deps.Behind is the GATE of the periodic tend check, and a nil one makes
+// TendCheck return "nothing is behind" without comparing anything. Open is the
+// shipped binary's only wiring of it, so deleting the field there would silence
+// the periodic trigger with no failing test and no operator-visible symptom.
+func TestOpenWiresTheLocalBehindCount(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeOpenConfig(t)
+
+	_, deps, cleanup, err := Open(ProjectRef{}, path, Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+
+	if deps.Behind == nil {
+		t.Fatal("deps.Behind is nil; the periodic tend check compares nothing and every pass reports zero")
+	}
+}
+
+// Deps.Git is the shipped binary's only wiring of the automatic rebase, and a
+// nil one makes gitRebase return notDone for every decision: every tend then
+// dispatches an agent, which is the pre-feature behaviour and reads as normal
+// in the log.
+func TestOpenWiresTheAutomaticRebasesGit(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeOpenConfig(t)
+
+	_, deps, cleanup, err := Open(ProjectRef{}, path, Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+
+	if deps.Git == nil {
+		t.Fatal("deps.Git is nil; every tend falls through to an agent and the agent-free rebase is dead")
+	}
+}
+
+// Deps.Fetch is what updates the refs both of the above read. A nil one leaves
+// every comparison answering from a checkout nothing refreshed, so a branch
+// stays "current" however far its base moves.
+func TestOpenWiresTheFetch(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	path := writeOpenConfig(t)
+
+	_, deps, cleanup, err := Open(ProjectRef{}, path, Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+
+	if deps.Fetch == nil {
+		t.Fatal("deps.Fetch is nil; every branch comparison reads refs nothing updated")
+	}
+}

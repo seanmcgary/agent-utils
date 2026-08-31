@@ -108,7 +108,7 @@ func TestTargetsReturnsBothLoopsForASharedRepo(t *testing.T) {
 	idA, dirA := newProject(t, home, "alpha")
 	idB, dirB := newProject(t, home, "beta")
 	writeLoop(t, dirA, "planning.yaml", minimalConfig("planning", "acme/widgets"))
-	writeLoop(t, dirB, "planning.yaml", minimalConfig("planning", "acme/widgets"))
+	writeLoop(t, dirB, "planning.yaml", minimalConfig("planning", "acme/widgets")+"tend_pr: true\ntend_prompt: rebase\n")
 
 	targets, err := Targets("acme/widgets")
 	if err != nil {
@@ -120,6 +120,18 @@ func TestTargetsReturnsBothLoopsForASharedRepo(t *testing.T) {
 	seen := map[string]bool{}
 	for _, tg := range targets {
 		seen[tg.ProjectID] = true
+		// DefaultBranch and TendPR must survive the trip from config.Entry
+		// into Target, or the push filter and the periodic tend pass have
+		// nothing to test without opening the config file themselves.
+		if tg.DefaultBranch != "master" {
+			t.Errorf("target %+v: DefaultBranch = %q, want master", tg, tg.DefaultBranch)
+		}
+		if tg.ProjectID == idA && tg.TendPR {
+			t.Errorf("target %+v: TendPR = true, want alpha's false", tg)
+		}
+		if tg.ProjectID == idB && !tg.TendPR {
+			t.Errorf("target %+v: TendPR = false, want beta's true", tg)
+		}
 	}
 	if !seen[idA] || !seen[idB] {
 		t.Errorf("targets = %+v, want one loop from each of %s and %s", targets, idA, idB)

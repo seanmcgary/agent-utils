@@ -126,6 +126,11 @@ var HookEvents = []string{
 	"pull_request",
 	"pull_request_review",
 	"pull_request_review_comment",
+	// A push to a loop's default branch makes every open pull request of that
+	// loop stale and names none of them. A merge produces a push too, so the
+	// two overlap -- but a direct push produces no pull_request delivery at
+	// all, and that is the case no other event covers.
+	"push",
 }
 
 // IsHookEvent reports whether name is one this daemon acts on.

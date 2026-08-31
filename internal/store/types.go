@@ -7,6 +7,12 @@ const (
 	KindStart  = "start"
 	KindResume = "resume"
 	KindTend   = "tend"
+	// KindRebase is a rebase git performed with no agent. The row carries no
+	// session identifier, because there is no conversation: it exists so a
+	// force-push has a cause an operator can read in `project logs --list`.
+	// sessionsFrom skips a dispatch with no session, so a rebase never appears
+	// in `sessions list` and never distorts a session's cost.
+	KindRebase = "rebase"
 )
 
 // Dispatch statuses.

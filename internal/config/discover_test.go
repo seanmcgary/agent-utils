@@ -255,6 +255,30 @@ func TestListSortsAndReportsBrokenFiles(t *testing.T) {
 	}
 }
 
+// List already loads each file in full. The two fields below are read off
+// that same load, so the push filter and the periodic tend pass never open a
+// database to learn which branch a loop tends.
+func TestListCarriesTheTendFacts(t *testing.T) {
+	t.Setenv("AGENT_UTILS_DIR", "")
+	dir := mkConfigs(t, t.TempDir(), map[string]string{
+		"planning.yaml": replaceOnce(validYAML, "tend_pr: true", "tend_pr: false"),
+	})
+
+	entries, err := List(dir)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].DefaultBranch != "master" {
+		t.Errorf("DefaultBranch = %q, want master", entries[0].DefaultBranch)
+	}
+	if entries[0].TendPR {
+		t.Errorf("TendPR = true, want the file's false")
+	}
+}
+
 func TestListErrorsWhenThereAreNoConfigs(t *testing.T) {
 	t.Setenv("AGENT_UTILS_DIR", "")
 	dir := mkConfigs(t, t.TempDir(), nil)

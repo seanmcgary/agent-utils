@@ -360,3 +360,80 @@ func TestRendererPiIsolatedFromClaude(t *testing.T) {
 		t.Errorf("pi renderer misread a claude system line as assistant text:\n%s", out)
 	}
 }
+
+// A bare `project logs` must not land on a rebase row. git wrote no transcript
+// for it, so selecting it as "the newest dispatch" answers with an empty path
+// and the operator sees nothing at all instead of the last agent that ran.
+func TestSelectDispatchSkipsARebaseRowWithNoLog(t *testing.T) {
+	s := openLogsStore(t)
+	cfg := &config.Config{Name: "execution", Repo: "o/r"}
+
+	if _, err := s.CreateDispatch(store.Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 7, Kind: store.KindTend,
+		SessionID: "s1", LogPath: "/logs/agent.jsonl",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Newest, and the ones a naive selection would return. There are more of
+	// them than any fixed page a filter-in-Go implementation would fetch: once
+	// most tend work is agent-free, a run of rebases this long is ordinary,
+	// and the last agent must still be findable behind it.
+	for i := 0; i < 60; i++ {
+		if err := s.RecordFinishedDispatch(store.Dispatch{
+			Loop: "execution", Repo: "o/r", Number: 7, Kind: store.KindRebase, PRNumber: 12,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := SelectDispatch(s, cfg, LogOptions{})
+	if err != nil {
+		t.Fatalf("SelectDispatch: %v", err)
+	}
+	if got.Kind != store.KindTend || got.LogPath != "/logs/agent.jsonl" {
+		t.Errorf("selected %s dispatch with log %q; want the tend agent's log",
+			got.Kind, got.LogPath)
+	}
+
+	// --dispatch still reaches it, which is where an operator who wants the
+	// rebase row looks.
+	ds, err := s.RecentDispatches("execution", "o/r", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ds) != 61 {
+		t.Fatalf("dispatches = %d, want 61: --list must still show the rebase rows", len(ds))
+	}
+	byID, err := SelectDispatch(s, cfg, LogOptions{Dispatch: ds[0].ID})
+	if err != nil {
+		t.Fatalf("SelectDispatch by id: %v", err)
+	}
+	if byID.Kind != store.KindRebase {
+		t.Errorf("--dispatch selected %q, want %q", byID.Kind, store.KindRebase)
+	}
+}
+
+// With nothing but rebase rows there is no transcript to show, and the honest
+// answer is the same one an empty loop gets.
+func TestSelectDispatchReportsNoDispatchWhenOnlyRebasesExist(t *testing.T) {
+	s := openLogsStore(t)
+	cfg := &config.Config{Name: "execution", Repo: "o/r"}
+	if err := s.RecordFinishedDispatch(store.Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 7, Kind: store.KindRebase,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SelectDispatch(s, cfg, LogOptions{}); !errors.Is(err, ErrNoDispatch) {
+		t.Errorf("err = %v, want ErrNoDispatch", err)
+	}
+}
+
+func openLogsStore(t *testing.T) *store.Store {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db.Project(testProject)
+}

@@ -71,7 +71,17 @@ func SelectDispatch(s *store.Store, cfg *config.Config, opts LogOptions) (store.
 		}
 		return ds[0], nil
 	}
-	recent, err := s.RecentDispatches(cfg.Name, cfg.Repo, opts.Issue, 1)
+	// The newest dispatch that has something to show, not simply the newest.
+	// A rebase row is a record, not a run: git did the work in this process
+	// and wrote no transcript, so selecting it here would answer
+	// `project logs` with an empty path. It is still listed by --list, and
+	// still selectable by --dispatch, which is where an operator who wants to
+	// see it looks.
+	//
+	// The skip is a WHERE clause rather than a filter over a page of rows, so
+	// there is no horizon: however many rebases a loop has made since its last
+	// agent, this still finds that agent.
+	recent, err := s.RecentDispatchesWithLogs(cfg.Name, cfg.Repo, opts.Issue, 1)
 	if err != nil {
 		return store.Dispatch{}, err
 	}

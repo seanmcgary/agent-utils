@@ -14,24 +14,32 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
-// maxTendPerSweep is how many rebases one merge may dispatch.
+// maxTendPerSweep is how many pull requests one sweep may act on.
 //
-// act applies no ceiling of its own: it calls dispatch once per decision, and
-// each dispatch is a detached agent process with permission prompts disabled,
-// in its own git worktree. A repository with forty stale review pull requests
-// would answer one merge with forty of them. The cap is a constant rather than
-// a configuration field because no operator has needed a different value yet;
-// promote it if one does. What is left over is logged, never dropped silently,
-// and the next merge takes the next batch.
+// act applies no ceiling of its own: it calls gitRebase and then, when that
+// did not settle the decision, dispatch, once per decision. A repository with
+// forty stale review pull requests would answer one trigger with forty of
+// them.
+//
+// Most of a sweep is now agent-free, so the cost this bounds is no longer only
+// the detached agent process with permission prompts disabled. It is what a
+// single trigger may do to the REMOTE: forty force-pushes, each preceded by a
+// fetch and a rebase, on one merge or one push or one tick of the periodic
+// check. The agent dispatches are still the expensive tail of that, and they
+// are still counted against the same ceiling.
+//
+// The cap is a constant rather than a configuration field because no operator
+// has needed a different value yet; promote it if one does. What is left over
+// is logged, never dropped silently, and the next sweep takes the next batch.
 const maxTendPerSweep = 10
 
 // TendSweep rebases the stale pull requests of one loop, and does nothing else.
 //
-// base is the branch the merge landed on. It exists so the pass can enforce the
-// thing that makes it safe rather than assert it: a merge into master says
-// nothing about a pull request targeting release/1.0, and rebasing that branch
-// would be a tend agent dispatched for an unrelated event -- the shape of the
-// incident Worker.Deliver records.
+// base is the branch that moved. It exists so the pass can enforce the thing
+// that makes it safe rather than assert it: a merge into master says nothing
+// about a pull request targeting release/1.0, and rebasing that branch would be
+// a tend agent dispatched for an unrelated event -- the shape of the incident
+// Worker.Deliver records.
 //
 // # Why this is not the reconcile that was removed
 //
@@ -41,8 +49,14 @@ const maxTendPerSweep = 10
 // unrelated issue whose pull request was 16 commits behind. This pass acts on
 // many issues again, so it must not become that. Four things keep it apart:
 //
-//  1. It runs for ONE event -- a pull request merged into the loop's default
-//     branch. Opening an issue, moving a label and commenting arm no sweep.
+//  1. Three things arm it, and all three name the same subject: the loop's
+//     default branch moving. A pull request merged into it, a push to it, and
+//     the periodic tend check finding a pull request behind it. Opening an
+//     issue, moving a label and commenting arm no sweep, and neither does a
+//     merge or a push to any other branch. Adding a FOURTH trigger is fine
+//     only while it keeps that property -- the reconcile that was removed
+//     failed exactly here, by running for events that said nothing about any
+//     branch.
 //  2. It keeps TEND decisions only. Every other kind is dropped below, before
 //     anything is dispatched.
 //  3. It only considers pull requests targeting the branch that actually moved.
@@ -120,8 +134,9 @@ func tendSnapshot(ctx context.Context, cfg *config.Config, deps Deps, base strin
 			continue
 		}
 		// The branch that moved is the only reason this pass exists. A pull
-		// request targeting anything else is behind for reasons this merge
-		// knows nothing about. Skipping here also saves the comparison.
+		// request targeting anything else is behind for reasons the branch
+		// that moved knows nothing about. Skipping here also saves the
+		// comparison.
 		if pr.BaseRef != base {
 			continue
 		}
@@ -162,7 +177,7 @@ func tendDispatch(
 	// dispatch INTO. Unlike Tick, which suppresses tending and still reaps and
 	// retries, this pass has only tending to do, so it stops.
 	if deps.Fetch != nil {
-		if err := deps.Fetch(); err != nil {
+		if err := deps.Fetch(ctx); err != nil {
 			return sum, fmt.Errorf("fetch primary checkout: %w", err)
 		}
 	}
@@ -243,7 +258,8 @@ func tendDispatch(
 	var tends []engine.Decision
 	if !plan.BreakerTripped {
 		for _, d := range plan.Decisions {
-			// The boundary that bounds the blast radius of a merge. It is the
+			// The boundary that bounds the blast radius of whichever trigger
+			// armed this sweep -- a merge, a push, or the periodic check. It is the
 			// counterpart of tickIssue's per-issue check, and it is what keeps
 			// this from being the per-delivery reconcile that was removed. It
 			// must not depend on an invariant living in another package.
@@ -252,7 +268,7 @@ func tendDispatch(
 			}
 		}
 		// Issue order, so a capped sweep takes the low-numbered batch every
-		// time and the next merge takes the next one. engine.Decide guarantees
+		// time and the next sweep takes the next one. engine.Decide guarantees
 		// no ordering of Plan.Decisions, so the batch identity is this sort's
 		// to establish, not something to inherit.
 		sort.Slice(tends, func(i, j int) bool { return tends[i].Issue < tends[j].Issue })
@@ -283,9 +299,12 @@ func tendDispatch(
 		// carry "issue" and "pr" everywhere else, and a bare count leaves an
 		// operator no way to tell which work is waiting. sum.Tended rather than
 		// len(tends), because act failures are swallowed above and the intended
-		// count would overstate what ran.
-		slog.Warn("tend sweep hit its per-sweep cap; the rest wait for the next merge",
-			"loop", cfg.Name, "dispatched", sum.Tended, "deferred", deferred)
+		// count would overstate what ran. The rebases are reported alongside,
+		// because most of a sweep's work now costs no agent at all and a line
+		// naming only the dispatches reads as "nothing happened".
+		slog.Warn("tend sweep hit its per-sweep cap; the rest wait for the next sweep",
+			"loop", cfg.Name, "dispatched", sum.Tended, "rebased", sum.Rebased,
+			"deferred", deferred)
 	}
 
 	// Recorded like any other tick -- including on the breaker path, where Tick

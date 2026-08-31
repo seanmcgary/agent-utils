@@ -11,12 +11,14 @@
 // never changing. Load and Save both probe the file for that shape before
 // touching it; see checkNotProjectDescriptor.
 //
-// Today this file holds one thing: the webhook daemon's listen address and
-// its HMAC secret. That secret is the sole authenticator for an HTTP
-// endpoint that starts an agent, so this package also owns the file's
-// permissions (0600, enforced on every load and every write) and an atomic
-// write path chosen specifically so a crash mid-write cannot leave a
-// wrongly-permissioned copy on disk.
+// It holds the webhook daemon's listen address and its HMAC secret, and the
+// interval of the daemon's periodic tend check (tend_interval). The secret is
+// the sole authenticator for an HTTP endpoint that starts an agent, so this
+// package also owns the file's permissions (0600, enforced on every load and
+// every write) and an atomic write path chosen specifically so a crash
+// mid-write cannot leave a wrongly-permissioned copy on disk. Every setting
+// here is machine-wide: nothing in this file describes one project or one
+// loop.
 package settings
 
 import (
@@ -33,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"gopkg.in/yaml.v3"
@@ -52,9 +55,74 @@ const (
 	DefaultListenPort = 8787
 )
 
+// DefaultTendInterval is how often the listener looks for a pull request that
+// has fallen behind its base. It is applied by TendEvery, not by Load, for the
+// reason WithDefaults states: Load must return a true zero value for a machine
+// that has never run `config`.
+//
+// The check is nearly free when nothing is behind -- it compares local refs
+// the loop already fetched and makes no GitHub call -- so this value is set by
+// how soon an operator wants a stale branch noticed, not by what the check
+// costs.
+const DefaultTendInterval = 15 * time.Minute
+
+// MinTendInterval is the floor under tend_interval, and it exists for the
+// reason listener.defaultMinWakeInterval does: a value that is merely small
+// is a tight loop, not a fast setting. Each pass runs "git fetch origin
+// --prune" and opens the state database once per tending loop of every
+// registered project, so "1s" -- one mistyped unit away from "1m" -- turns the
+// daemon's wake goroutine into a spin that fetches continuously and never
+// finishes a pass.
+//
+// Zero is not below the floor: it is the documented way to disable the check,
+// and it costs nothing at all.
+const MinTendInterval = time.Minute
+
 // Settings is the machine-wide configuration.
 type Settings struct {
 	Webhook Webhook `yaml:"webhook"`
+	// TendInterval is how often the listener runs its periodic tend check.
+	// "0" disables that check and leaves every other tend trigger unchanged;
+	// an ABSENT value takes DefaultTendInterval.
+	//
+	// It is a string, and it carries omitempty, so those two states stay
+	// distinguishable through a Save. Save marshals the whole struct, so a
+	// typed duration would write "tend_interval: 0s" for a machine that never
+	// set one, and the next Load could not tell that from an operator who
+	// disabled the pass on purpose.
+	//
+	// It is machine-wide rather than per loop because it describes how
+	// attentive the daemon is, not anything about a loop. It applies to every
+	// loop with tend_pr: true, of every registered project.
+	TendInterval string `yaml:"tend_interval,omitempty"`
+}
+
+// TendEvery returns the periodic tend check's interval.
+//
+// An absent value takes the default. An explicit "0" disables the check. A
+// value that does not parse ALSO takes the default rather than disabling the
+// check: Fields refuses a bad value, so a bad one in the file was written by
+// hand, and silently turning off the pass that keeps branches current is the
+// worse of the two failures.
+func (s Settings) TendEvery() time.Duration {
+	if strings.TrimSpace(s.TendInterval) == "" {
+		return DefaultTendInterval
+	}
+	d, err := time.ParseDuration(s.TendInterval)
+	if err != nil || d < 0 {
+		return DefaultTendInterval
+	}
+	// The floor is applied HERE as well as in Fields, and both are needed.
+	// Fields refuses a bad value from `config set`; nothing refuses one typed
+	// straight into the file, and that value would otherwise reach
+	// listener.Worker.TendInterval, whose only guard is "<= 0". Taking the
+	// default rather than the floor keeps this consistent with the unparsable
+	// case just above: a value this function cannot honour means the operator
+	// gets the documented default, not a number nobody chose.
+	if d > 0 && d < MinTendInterval {
+		return DefaultTendInterval
+	}
+	return d
 }
 
 // Webhook holds the daemon's listen configuration and the secret GitHub
@@ -76,6 +144,12 @@ type Webhook struct {
 // value unchanged instead of silently rewriting it with a default. The
 // listener command calls WithDefaults; the config command's `show` does not,
 // so it prints what is really in the file.
+//
+// TendInterval is deliberately NOT filled in here. TendEvery owns that
+// decision, because the field distinguishes three states -- absent, "0", and a
+// duration -- and a default written into the struct would collapse the first
+// two: a Save after a WithDefaults would then write "15m" into the file of an
+// operator who had disabled the check on purpose.
 func (s Settings) WithDefaults() Settings {
 	if strings.TrimSpace(s.Webhook.ListenAddr) == "" {
 		s.Webhook.ListenAddr = DefaultListenAddr
@@ -275,10 +349,16 @@ func Save(s *Settings) error {
 	if err != nil {
 		return fmt.Errorf("encode settings: %w", err)
 	}
+	// This text is written into every operator's config.yaml, so it is the
+	// one comment in this package a reader is more likely to meet than the
+	// code. It has to name everything the file holds, or a setting an operator
+	// finds in the file looks like something that does not belong there.
 	header := "# Machine-wide agent-utils settings.\n" +
 		"# This is NOT a project descriptor, even though it shares config.yaml's\n" +
 		"# name; see internal/settings. It holds the webhook daemon's listen\n" +
-		"# address and the HMAC secret GitHub deliveries are signed with.\n"
+		"# address, the HMAC secret GitHub deliveries are signed with, and\n" +
+		"# tend_interval: how often the daemon looks for a pull request that has\n" +
+		"# fallen behind its base (\"0\" disables that check).\n"
 	body := append([]byte(header), raw...)
 
 	if err := writeSecretFile(dir, path, body); err != nil {
@@ -423,6 +503,35 @@ func Fields() []Field {
 			// --rotate-secret`, which calls GenerateSecret.
 			Set:   nil,
 			Unset: func(s *Settings) { s.Webhook.Secret = "" },
+		},
+		{
+			Key: "tend_interval",
+			Get: func(s *Settings) string { return s.TendInterval },
+			Set: func(s *Settings, v string) error {
+				d, err := time.ParseDuration(v)
+				if err != nil {
+					return fmt.Errorf("tend_interval must be a duration such as \"15m\": %w", err)
+				}
+				if d < 0 {
+					return fmt.Errorf("tend_interval must not be negative")
+				}
+				// Refused, not clamped: a mistyped unit ("1s" for "1m",
+				// "15ms" for "15m") is the way this goes wrong, and silently
+				// substituting a minute would leave the operator believing the
+				// value they typed took effect. Exactly zero is allowed
+				// through -- it is how the check is disabled.
+				if d > 0 && d < MinTendInterval {
+					return fmt.Errorf(
+						"tend_interval must be at least %s, or exactly 0 to disable the check; got %s",
+						MinTendInterval, d)
+				}
+				// Stored as the operator typed it, not as the parsed value
+				// re-rendered: `config get` should read back what `config set`
+				// was given.
+				s.TendInterval = v
+				return nil
+			},
+			Unset: func(s *Settings) { s.TendInterval = "" },
 		},
 	}
 }

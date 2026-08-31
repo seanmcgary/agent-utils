@@ -56,7 +56,7 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	// failure flag at all.
 	fetchOK := true
 	if deps.Fetch != nil {
-		if err := deps.Fetch(); err != nil {
+		if err := deps.Fetch(ctx); err != nil {
 			fetchOK = false
 			slog.Error("fetch primary checkout; skipping tend this delivery",
 				"loop", cfg.Name, "issue", number, "err", err)

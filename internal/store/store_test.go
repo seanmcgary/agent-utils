@@ -138,6 +138,34 @@ func TestPRLinkRoundTrip(t *testing.T) {
 	}
 }
 
+// Nothing deleted a pr_links row before this. A row for a pull request that
+// merged days ago is still read by every later pass, and the local gate would
+// count its branch as behind forever.
+func TestDeletePRLink(t *testing.T) {
+	s := openTemp(t)
+	if err := s.PutPRLink(PRLink{
+		Loop: "execution", Repo: "o/r", Number: 7, PRNumber: 9,
+		HeadRef: "feat/x", BaseRef: "master", BehindBy: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeletePRLink("execution", "o/r", 7); err != nil {
+		t.Fatal(err)
+	}
+	links, err := s.PRLinks("execution", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := links[7]; ok {
+		t.Error("the row is still present after DeletePRLink")
+	}
+	// Deleting a row that is not there is not an error: the confirm pass
+	// deletes what it believes is gone, and two passes can agree.
+	if err := s.DeletePRLink("execution", "o/r", 7); err != nil {
+		t.Errorf("a second delete must be a no-op: %v", err)
+	}
+}
+
 func TestTickCountAndCooldown(t *testing.T) {
 	s := openTemp(t)
 	for i := 0; i < 3; i++ {
@@ -629,5 +657,91 @@ func TestSessionHarnessBackfillLeavesAnUnknownHarnessEmpty(t *testing.T) {
 	}
 	if got.SessionHarness != "" {
 		t.Errorf("SessionHarness = %q, want empty", got.SessionHarness)
+	}
+}
+
+// The row must land finished. A rebase row left running would read as a live
+// agent to every guard that partitions running rows by kind, and none of them
+// knows how to reap this one.
+func TestRecordFinishedDispatchLandsComplete(t *testing.T) {
+	s := openTemp(t)
+
+	if err := s.RecordFinishedDispatch(Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 7, Kind: KindRebase,
+		PRNumber: 12, Title: "a title",
+	}); err != nil {
+		t.Fatalf("RecordFinishedDispatch: %v", err)
+	}
+
+	ds, err := s.RecentDispatches("execution", "o/r", 0, 10)
+	if err != nil {
+		t.Fatalf("RecentDispatches: %v", err)
+	}
+	if len(ds) != 1 {
+		t.Fatalf("dispatches = %d, want 1", len(ds))
+	}
+	got := ds[0]
+	if got.Status != StatusSucceeded {
+		t.Errorf("Status = %q, want %q", got.Status, StatusSucceeded)
+	}
+	if got.SessionID != "" {
+		t.Errorf("SessionID = %q, want empty", got.SessionID)
+	}
+	if got.FinishedAt.IsZero() {
+		t.Error("FinishedAt is zero; the row must land already finished")
+	}
+	if got.Kind != KindRebase || got.PRNumber != 12 || got.Title != "a title" {
+		t.Errorf("row = %+v; kind, pull request and title must round-trip", got)
+	}
+
+	// The one thing a running row would do: appear in RunningDispatches, where
+	// three separate callers treat a non-tend row as an agent at work.
+	running, err := s.RunningDispatches("execution", "o/r")
+	if err != nil {
+		t.Fatalf("RunningDispatches: %v", err)
+	}
+	if len(running) != 0 {
+		t.Errorf("running = %d, want 0", len(running))
+	}
+}
+
+// The default `project logs` selection asks for ONE row and needs it to be one
+// with something to show. Filtering in SQL is what removes the horizon: the
+// agent behind any number of rebases is still the first row returned.
+func TestRecentDispatchesWithLogsSkipsRowsWithNoLogFile(t *testing.T) {
+	s := openTemp(t)
+
+	if _, err := s.CreateDispatch(Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 7, Kind: KindTend,
+		SessionID: "s1", LogPath: "/logs/agent.jsonl",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		if err := s.RecordFinishedDispatch(Dispatch{
+			Loop: "execution", Repo: "o/r", Number: 7, Kind: KindRebase,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.RecentDispatchesWithLogs("execution", "o/r", 0, 1)
+	if err != nil {
+		t.Fatalf("RecentDispatchesWithLogs: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+	if got[0].LogPath != "/logs/agent.jsonl" {
+		t.Errorf("LogPath = %q, want the agent's log", got[0].LogPath)
+	}
+
+	// The unfiltered read is unchanged: --list still shows every row.
+	all, err := s.RecentDispatches("execution", "o/r", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 61 {
+		t.Errorf("unfiltered rows = %d, want 61", len(all))
 	}
 }

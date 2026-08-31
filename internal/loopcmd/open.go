@@ -213,7 +213,13 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		Now:        time.Now,
 		Spawn:      runner.Spawn,
 		IsAlive:    proc.IsAlive,
-		Fetch:      wt.Fetch,
+		Fetch:      wt.FetchCtx,
+		Behind:     wt.BehindLocalCtx,
+		// The shipped binary's only wiring of the automatic rebase. A Deps
+		// built without it rebases nothing and dispatches an agent for every
+		// tend, silently -- which is correct for a test and dead on arrival
+		// here.
+		Git: wt,
 	}
 	return cfg, deps, func() { db.Close() }, nil
 }

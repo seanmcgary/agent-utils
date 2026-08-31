@@ -449,12 +449,14 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			Label struct {
 				Name string `json:"name"`
 			} `json:"label"`
-			// The subject of the delivery. All five subscribed events carry a
-			// number: issues and issue_comment in issue.number, and
+			// The subject of the delivery. Of the six subscribed events, five
+			// carry a number: issues and issue_comment in issue.number, and
 			// pull_request, pull_request_review and pull_request_review_comment
-			// in pull_request.number. Both are decoded because issue_comment
-			// fires on pull requests too, and because a delivery this daemon
-			// cannot attribute to one number is one it cannot act on.
+			// in pull_request.number. The sixth, push, carries neither -- its
+			// subject is a branch, decoded separately as Ref below. Both
+			// fields here are decoded because issue_comment fires on pull
+			// requests too, and because a delivery this daemon cannot
+			// attribute to one number is one it cannot act on.
 			//
 			// The title says which issue this is without a browser round trip,
 			// and the labels are what engine.Decide actually decides from, so
@@ -483,6 +485,9 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			Sender struct {
 				Login string `json:"login"`
 			} `json:"sender"`
+			// Ref is the branch a push delivery moved. It is the only subject
+			// a push has: the payload carries no issue and no pull request.
+			Ref string `json:"ref"`
 		}
 		if err := json.Unmarshal(payload, &body); err != nil || !repoFullName.MatchString(body.Repository.FullName) {
 			s.rejected(w, deliveryID, "repository", http.StatusBadRequest)
@@ -494,18 +499,28 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// attacker-controlled, it is passed onward as data, and it is logged.
 		// A number that is absent, zero, negative or wider than an int (which
 		// fails the Unmarshal above) names no issue GitHub could have.
-		//
-		// A delivery with no usable number is a 400, never a silent accept. It
-		// names nothing this daemon can act on, and answering 202 would hide a
-		// malformed delivery -- or a subscription to an event that carries no
-		// number -- behind a success the operator never sees.
 		number := body.Issue.Number
 		if number == 0 {
 			number = body.PullRequest.Number
 		}
-		if number <= 0 {
+		// A delivery with no usable number is a 400, never a silent accept --
+		// it names nothing this daemon can act on, and answering 202 would
+		// hide a malformed delivery, or a subscription to an event that
+		// carries no number, behind a success the operator never sees. push
+		// is the single exception: its subject is a branch, not an issue, so
+		// a numberless push is the expected shape rather than a malformed one.
+		if number <= 0 && event != "push" {
 			s.rejected(w, deliveryID, "issue number", http.StatusBadRequest)
 			return
+		}
+		// A push carries no issue even if its body also happened to carry a
+		// non-zero issue.number or pull_request.number: only GitHub can
+		// produce a body that passes the HMAC, so this is not
+		// attacker-reachable, but forcing the number to 0 for push is one
+		// line and strictly tighter than trusting a field this event does
+		// not define.
+		if event == "push" {
+			number = 0
 		}
 
 		// A merged pull request is the only delivery that arms a sweep. The
@@ -525,6 +540,19 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		if event == "pull_request" && body.Action == "closed" && body.PullRequest.Merged &&
 			ghub.SafeRef(body.PullRequest.Base.Ref) {
 			mergedInto = body.PullRequest.Base.Ref
+		}
+
+		// pushedTo is the branch a push delivery moved, and it arms the same
+		// sweep a merge does. It is shape-checked here, exactly as mergedInto
+		// is: the value reaches git as a branch name, and a ref failing
+		// SafeRef could never have been tended anyway. A ref that is not a
+		// branch (a tag, for example) leaves this empty, and an empty value
+		// arms nothing.
+		var pushedTo string
+		if event == "push" {
+			if ref, ok := strings.CutPrefix(body.Ref, "refs/heads/"); ok && ghub.SafeRef(ref) {
+				pushedTo = ref
+			}
 		}
 
 		// closedPR is what arms worktree cleanup, and it is deliberately wider
@@ -620,8 +648,13 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// see safeText and safeLabels for the unrotated-log-file failure
 			// that requires it.
 			attrs := []any{"delivery", safeDeliveryID(deliveryID),
-				"event", event, "action", safeAction(body.Action), "repo", repo,
-				"number", number}
+				"event", event, "action", safeAction(body.Action), "repo", repo}
+			// The subject of the work, which is a number for every event but
+			// one. A push has no number, and "number=0" reads as a bug rather
+			// than as "this delivery names a branch".
+			if number > 0 {
+				attrs = append(attrs, "number", number)
+			}
 			if body.Label.Name != "" {
 				attrs = append(attrs, "label", safeText(body.Label.Name))
 			}
@@ -639,6 +672,9 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if mergedInto != "" {
 				attrs = append(attrs, "merged_into", safeText(mergedInto))
 			}
+			if pushedTo != "" {
+				attrs = append(attrs, "pushed_to", safeText(pushedTo))
+			}
 			if closedPR {
 				attrs = append(attrs, "closed_pr", true)
 			}
@@ -652,7 +688,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				defer func() { <-s.sem }()
 				defer s.wg.Done()
 				s.Tick(ctx, Delivery{
-					Repo: repo, Number: number, MergedInto: mergedInto,
+					Repo: repo, Number: number, MergedInto: mergedInto, PushedTo: pushedTo,
 					ClosedPR: closedPR, ClosedIssue: closedIssue,
 				})
 			}()
@@ -662,10 +698,15 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// say nothing while looking like it said something. Both are
 			// carried because a dropped merge is lost sweep work and a dropped
 			// close is lost worktree cleanup, not just one lost issue pass.
-			dropped := []any{"delivery", safeDeliveryID(deliveryID),
-				"repo", repo, "number", number}
+			dropped := []any{"delivery", safeDeliveryID(deliveryID), "repo", repo}
+			if number > 0 {
+				dropped = append(dropped, "number", number)
+			}
 			if mergedInto != "" {
 				dropped = append(dropped, "merged_into", safeText(mergedInto))
+			}
+			if pushedTo != "" {
+				dropped = append(dropped, "pushed_to", safeText(pushedTo))
 			}
 			if closedPR {
 				dropped = append(dropped, "closed_pr", true)

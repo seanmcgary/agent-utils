@@ -96,6 +96,18 @@ const orphanClearAfter = 3
 // stands for, which is everything an operator reads out of it.
 const unroutableLogInterval = 10 * time.Minute
 
+// tendConfirmInterval is how often the periodic check calls GitHub even
+// though nothing looks behind. It is what corrects a pr_links row that
+// drifted with no delivery: a pull request that closed, or an issue that lost
+// its review label, leaves a row the local gate would otherwise trust
+// forever.
+const tendConfirmInterval = 6 * time.Hour
+
+// tendPassTimeout bounds one whole tend check across every loop on the
+// machine. See tendCheckPass: the pass runs on the single wake loop, and it
+// shells out to a network git cannot be trusted to return from.
+const tendPassTimeout = 10 * time.Minute
+
 // loopKey identifies one loop of one project. Two projects may run loops of
 // the same name, so the project is part of the key: without it, one
 // project's failure would cancel the other's pending retry.
@@ -227,6 +239,23 @@ type Worker struct {
 	// label writes, which is what makes it safe for a delivery to act on more
 	// than the issue it names. See loopcmd.EpicSweep.
 	RunEpic func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, closed int) (loopcmd.Summary, error)
+	// RunTendCheck answers "is any pull request of this loop behind its base",
+	// as cheaply as it can. Production wires it to loopcmd.TendCheck. It is a
+	// seam because the real one shells out to git and reads a database, and
+	// what this file owns is the scheduling around it.
+	//
+	// force asks it to call GitHub even when nothing looks behind; see
+	// tendCheckOne for when this daemon sets it.
+	RunTendCheck func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, force bool) (loopcmd.TendCheckResult, error)
+	// ScanTargets lists every loop of every registered project. Production
+	// wires it to listener.Scan.
+	//
+	// It is a seam of its own rather than a reuse of Targets or TargetFor:
+	// both of those answer "which loop matches this name", and the periodic
+	// check starts from no name at all -- a repository that sends no delivery
+	// is precisely the case it exists for, so it has to walk the whole
+	// registry.
+	ScanTargets func() (Routes, error)
 	// IssueBusy reports whether an agent of this loop is still running on this
 	// issue. Production wires it to Worker.issueBusy, which answers from the
 	// dispatch rows and the kernel; it is a seam because a test has no agent
@@ -249,6 +278,11 @@ type Worker struct {
 	TendDelay       time.Duration // default 1m
 	IssueDelay      time.Duration // default 2s
 	BusyDelay       time.Duration // default 1m
+	// TendInterval is how often tendCheckPass runs. A value of 0 disables it
+	// and leaves the merge and push triggers untouched. It comes from the
+	// machine-wide settings file, and NewWorker leaves it zero: a Worker built
+	// without one runs no periodic check rather than a surprise one.
+	TendInterval time.Duration
 
 	mu      sync.Mutex
 	pending map[loopKey]*attempt // guarded by mu
@@ -272,6 +306,18 @@ type Worker struct {
 	// second, which is what keeps an issue to one re-look however many
 	// deliveries land on it while its agent runs.
 	busy map[issueKey]*busyTimer // guarded by mu
+	// confirms holds, per loop, when the periodic check last called GitHub.
+	//
+	// It is memory only: a restart costs one forced pass per loop, which is
+	// one ListOpenIssues plus one ListOpenPullRequests -- and both paginate at
+	// 100 per page, so a busy repository costs two REQUESTS PER PAGE, not two
+	// requests. Still cheaper than the column and the migration a durable
+	// version would need, and paid once per loop per restart.
+	//
+	// Pruned in tendCheckPass, like every other map on this struct. Nothing
+	// else removes an entry, and a loop deleted from the registry would
+	// otherwise keep one for the daemon's life; see pruneConfirms.
+	confirms map[loopKey]time.Time // guarded by mu
 	// unroutable throttles the "cannot route this deadline" warning per
 	// loop; it carries its own lock. See warnUnroutable.
 	unroutable *throttledLog
@@ -295,6 +341,8 @@ func NewWorker(db *store.DB) *Worker {
 		RunTend:         loopcmd.TendSweep,
 		RunCleanup:      loopcmd.CleanupClosedPR,
 		RunEpic:         loopcmd.EpicSweep,
+		RunTendCheck:    loopcmd.TendCheck,
+		ScanTargets:     Scan,
 		Now:             time.Now,
 		After:           time.AfterFunc,
 		OpenRetryDelay:  defaultOpenRetryDelay,
@@ -308,6 +356,7 @@ func NewWorker(db *store.DB) *Worker {
 		tends:           make(map[loopKey]*tendTimer),
 		windows:         make(map[issueKey]*issueWindow),
 		busy:            make(map[issueKey]*busyTimer),
+		confirms:        make(map[loopKey]time.Time),
 		unroutable:      newThrottledLog(unroutableLogInterval),
 	}
 	// Bound to the Worker after the literal, like the throttle's clock below:
@@ -340,6 +389,12 @@ type Delivery struct {
 	// repository-wide sweep. See Worker.Deliver for the regression that makes
 	// this the important property of this type.
 	MergedInto string
+	// PushedTo is the branch a push delivery moved, and is empty for every
+	// other delivery. It arms the same tend sweep MergedInto does, for the
+	// case a merge cannot cover: a direct push to the default branch produces
+	// no pull_request delivery, so nothing else tells this daemon that every
+	// open pull request just fell behind.
+	PushedTo string
 	// ClosedPR is true when this delivery closed a pull request, merged or
 	// not. It is what arms worktree cleanup: on any close the pr-<N>
 	// worktree (and, when the pull request closes one, the issue-<M>
@@ -366,10 +421,20 @@ func (d Delivery) IsMergeInto(branch string) bool {
 	return branch != "" && d.MergedInto == branch
 }
 
-// Deliver evaluates ONE issue of repo in every loop that watches it, and acts
-// wherever a loop decides there is something to do.
+// IsPushTo reports whether this delivery pushed to branch.
 //
-// A delivery says "something about this issue changed, figure out what and
+// It follows IsMergeInto's rule exactly: an empty branch never matches, even
+// against an empty PushedTo, because a loop with no default_branch names no
+// branch to compare against.
+func (d Delivery) IsPushTo(branch string) bool {
+	return branch != "" && d.PushedTo == branch
+}
+
+// Deliver evaluates ONE subject of repo -- an issue, a pull request, or (for a
+// push) a branch -- in every loop that watches it, and acts wherever a loop
+// decides there is something to do.
+//
+// A delivery says "something about this subject changed, figure out what and
 // dispatch the correct executor to handle it." It used to trigger a full
 // reconcile of every loop watching the repository instead, which is how
 // opening one unlabelled test issue dispatched a tend agent for an unrelated
@@ -378,9 +443,11 @@ func (d Delivery) IsMergeInto(branch string) bool {
 // thing that changed.
 //
 // number may name a pull request rather than an issue; the two share a number
-// space and three of the five subscribed events carry a pull request. Resolving
-// that is loopcmd.TickIssue's job, because it is the layer with a GitHub
-// client.
+// space, and five of the six subscribed events carry a pull request or issue
+// number. Resolving that is loopcmd.TickIssue's job, because it is the layer
+// with a GitHub client. The sixth event, push, carries no number at all --
+// its subject is a branch, and the only thing it can start is the tend sweep
+// armed in tickOne.
 //
 // The fan-out is still per loop: several projects may watch one repository, and
 // each keeps its own state and spends its own budget. The log lines here and in
@@ -399,24 +466,76 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 		slog.Info("no loop watches this repository", "repo", d.Repo)
 		return
 	}
+	// The push filter runs BEFORE w.access(), not only before tickOne.
+	// access() reads the token file and builds a client; subscribing to push
+	// multiplies delivery volume by every branch of every watched repository,
+	// so a filter placed after it would read a secret from disk on every
+	// feature-branch push. Build the kept list first, and return when it is
+	// empty.
+	kept := make([]Target, 0, len(targets))
+	for _, t := range targets {
+		// A push names no issue, so the only work it can start is the sweep.
+		tends := t.TendPR && d.IsPushTo(t.DefaultBranch)
+		if d.Number == 0 && !tends {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if len(kept) == 0 {
+		// Deliberately SILENT, and the one log line in Deliver that is.
+		//
+		// Every other "nothing to do" here reports something an operator did
+		// not already know. This reports the ordinary case: a developer pushed
+		// a feature branch, which is what feature branches are for. The daemon
+		// subscribes to push for every branch of every watched repository, so
+		// a line here is one line per developer push per repository, forever,
+		// into the unrotated launchd log unroutableLogInterval was invented
+		// for. tendCheckOne states the same rule where it declines to log its
+		// own common case: a line here would bury every line that means
+		// something.
+		//
+		// Throttling was the alternative and was rejected: a throttled line
+		// still says only "somebody pushed a branch nothing tends", which is
+		// not a condition an operator acts on, so the surviving line would be
+		// noise at a slower rate rather than a signal.
+		return
+	}
+
+	// Built from what SURVIVED the filter, and built after it. Naming every
+	// target watching the repository would claim a loop with tend_pr false
+	// will sweep when it never will, and building the list first allocated it
+	// for every feature-branch push this daemon then dropped. An issue
+	// delivery keeps every target, so this is the same list it always was.
+	//
 	// The non-zero case is logged too, not only the zero one. Without it the
 	// only delivery that said anything was the one that did nothing, and the
 	// fan-out -- one delivery, several projects, several agents, on several
 	// token budgets -- was invisible.
-	loops := make([]string, 0, len(targets))
-	for _, t := range targets {
+	loops := make([]string, 0, len(kept))
+	for _, t := range kept {
 		loops = append(loops, t.ProjectName+"/"+t.LoopName)
 	}
-	// EVALUATED, not "acted on". Every watching loop does evaluate the issue,
-	// and this line is what ties the ticks below back to the delivery that
-	// caused them -- but most of those loops decide nothing, because only the
-	// loop whose trigger label the issue carries usually has anything to do.
-	// "Acting on" read as the full repository reconcile this daemon no longer
-	// performs, so an operator reasonably read the line as stale or wrong.
-	// What each loop DECIDED belongs to the per-loop tick line, which carries
-	// a reason now.
-	slog.Info("evaluating this issue in every loop that watches the repository",
-		"repo", d.Repo, "number", d.Number, "loops", loops)
+
+	if d.Number == 0 {
+		// safeText, because PushedTo is attacker-written. SafeRef bounds its
+		// charset but not its length, so a multi-kilobyte branch name would go
+		// verbatim into an unrotated log -- the failure handler.go:185-196
+		// documents. work.go is the same package and gets the same treatment.
+		slog.Info("a push moved a branch; every loop that tends it will sweep",
+			"repo", d.Repo, "pushed_to", safeText(d.PushedTo), "loops", loops)
+	} else {
+		// EVALUATED, not "acted on". Every watching loop does evaluate the
+		// issue, and this line is what ties the ticks below back to the
+		// delivery that caused them -- but most of those loops decide
+		// nothing, because only the loop whose trigger label the issue
+		// carries usually has anything to do. "Acting on" read as the full
+		// repository reconcile this daemon no longer performs, so an
+		// operator reasonably read the line as stale or wrong. What each
+		// loop DECIDED belongs to the per-loop tick line, which carries a
+		// reason now.
+		slog.Info("evaluating this issue in every loop that watches the repository",
+			"repo", d.Repo, "number", d.Number, "loops", loops)
+	}
 
 	// One token read, one client, one memo, for the whole delivery -- created
 	// HERE and dropped when Deliver returns. See access: the lifetime is the
@@ -431,7 +550,7 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 		return
 	}
 
-	for _, t := range targets {
+	for _, t := range kept {
 		// Sequential, and one target's failure never returns early: the
 		// loops that share a repository are separate projects with separate
 		// state, and one broken project must not strand the others.
@@ -517,8 +636,9 @@ func (w *Worker) tickFresh(ctx context.Context, t Target, number int) {
 	}
 	// A retry re-runs the ISSUE pass only. A retry may fire minutes after the
 	// merge that caused it, and a sweep then is not what that merge asked for:
-	// the base has moved again or has not, and the next merge arms a sweep
-	// either way. MergedInto is left empty here on purpose.
+	// the base has moved again or has not, and the next trigger -- a merge, a
+	// push, or the periodic check -- arms a sweep either way. MergedInto is
+	// left empty here on purpose.
 	w.tickOne(ctx, t, Delivery{Repo: t.Repo, Number: number}, acc)
 }
 
@@ -558,7 +678,13 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 		// retry runs at OpenRetryDelay rather than at some undefined value.
 		slog.Error("cannot open loop", "loop", t.LoopName, "project", t.ProjectName,
 			"config", t.ConfigPath, "err", err)
-		w.schedule(ctx, t, d.Number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		// A numberless delivery names no issue, so it must not enter the
+		// issue retry schedule: that schedule is keyed per loop and would
+		// cancel a real issue's pending retry. The sweep is not lost -- the
+		// periodic check finds the same stale branches on its next tick.
+		if d.Number > 0 {
+			w.schedule(ctx, t, d.Number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		}
 		return
 	}
 
@@ -569,14 +695,20 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	// Only the ISSUE pass is gated. The passes below decide different things
 	// and state their own timing: tending is already delayed by a timer of its
 	// own, and the epic sweep deliberately is not delayed at all.
-	if w.openIssueWindow(ctx, t, d.Number) {
+	//
+	// d.Number > 0 keeps a push out of this pass entirely: a push names no
+	// issue, so the only work it can start is the sweep armed below.
+	if d.Number > 0 && w.openIssueWindow(ctx, t, d.Number) {
 		w.issuePass(ctx, t, d, cfg, deps, key)
 	}
 
-	// Armed on BOTH paths of the issue pass. The merged pull request's own pass
-	// moves its issue to a terminal state; whether that succeeded says nothing
-	// about the other branches, which are behind because the base moved.
-	if cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch) {
+	// Armed by a merge OR by a push. A merge into the default branch produces
+	// a push event too, so the two overlap; armTend collapses them onto one
+	// timer, which is why the overlap costs nothing and why the merge trigger
+	// stays. It has to stay: a hook that nobody re-registers after this change
+	// still carries the old event list, and the merge path is what keeps
+	// working for it.
+	if cfg.TendPR && (d.IsMergeInto(cfg.DefaultBranch) || d.IsPushTo(cfg.DefaultBranch)) {
 		w.armTend(ctx, t, cfg.DefaultBranch)
 	}
 
@@ -588,14 +720,25 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	// collapse a merge train into one batch of agents; this writes labels, so a
 	// burst costs a few more API calls and nothing else. A delay would only
 	// postpone the promotion.
-	if d.ClosedIssue {
+	//
+	// d.Number > 0 for the reason the issue pass carries it, and it is not
+	// redundant: this pass reads d.Number as the CLOSED ISSUE, so a push whose
+	// body happened to set ClosedIssue would sweep the epic of issue 0. The
+	// handler never sets it for a push today, which makes this an invariant
+	// living in another file with nothing pinning it. The guard is one
+	// condition and removes the coupling.
+	if d.Number > 0 && d.ClosedIssue {
 		w.epicPass(ctx, t, d, cfg, deps)
 	}
 
 	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
 	// for the operator's decision -- so it is gated on ClosedPR alone, not on
 	// cfg.TendPR or the merge check above.
-	if d.ClosedPR {
+	//
+	// d.Number > 0 for the reason the epic pass carries it: prNumber IS
+	// d.Number here, and a cleanup for pull request 0 would ask the worktree
+	// manager to remove "pr-0".
+	if d.Number > 0 && d.ClosedPR {
 		w.cleanupPass(ctx, t, d, cfg, deps)
 	}
 }
@@ -929,7 +1072,8 @@ func (w *Worker) tendFresh(ctx context.Context, t Target, base string) {
 // Nothing. A failure is logged and dropped, and schedules NO retry: the retry
 // path re-runs the ISSUE pass, so a sweep failure would spend an issue's retry
 // budget on something that issue did not do, and the work is not lost because
-// the next merge arms another sweep.
+// the next trigger arms another sweep: a merge, a push to the default branch,
+// or the periodic tend check, whichever comes first.
 func (w *Worker) tendPass(
 	ctx context.Context, t Target, cfg *config.Config, deps loopcmd.Deps, base string,
 ) {
@@ -949,6 +1093,185 @@ func (w *Worker) tendPass(
 		}
 		slog.Error("tend sweep failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
 	}
+}
+
+// tendCheckPass looks for a pull request that has fallen behind its base, in
+// every loop on this machine that tends.
+//
+// It walks the REGISTRY rather than reacting to a delivery. That is the whole
+// point: a repository whose webhook is missing, broken, or simply quiet sends
+// nothing, and before this pass its stale pull requests waited for a merge
+// that might never arrive.
+//
+// It dispatches nothing itself. A loop with a stale pull request gets an
+// armTend, so the periodic trigger and the merge trigger end in the same
+// sweep, on the same timer, holding the same loop lock.
+func (w *Worker) tendCheckPass(ctx context.Context) {
+	// TWO contexts, deliberately, and mixing them up is a real bug.
+	//
+	// checkCtx bounds this pass's own git and database work. The pass runs on
+	// the Serve goroutine -- the single wake loop for every project on this
+	// machine, the thing that fires retry deadlines -- and it shells out to
+	// git, which talks to a network it does not control. With no deadline one
+	// unreachable remote stops every retry of every loop until the daemon is
+	// restarted.
+	//
+	// ctx stays the DAEMON's context, and it is what armTend must receive.
+	// armTend's timer callback tests ctx.Err() before it runs the sweep, so
+	// arming with checkCtx would cancel the sweep this pass just asked for as
+	// soon as the pass returned.
+	checkCtx, cancel := context.WithTimeout(ctx, tendPassTimeout)
+	defer cancel()
+
+	routes, err := w.ScanTargets()
+	if err != nil {
+		// Logged and dropped, like Deliver's routing failure: the failure is
+		// machine-wide, so there is no single loop to record it against, and
+		// the next interval re-runs the whole pass anyway.
+		slog.Error("cannot scan projects for the tend check", "err", err)
+		return
+	}
+	// ONE access for the whole pass, which bends the lifetime rule access
+	// states, so it is bounded here rather than left to be discovered.
+	// ghub.DeliveryCache memoises Issue and PullRequest, and this cache lives
+	// for every loop of the pass -- up to tendPassTimeout -- where a delivery's
+	// lives for one fan-out. That is safe only because loopcmd.TendCheck reads
+	// ListOpenPullRequests and ListOpenIssues, neither of which is memoised. A
+	// TendCheck that reached for Issue or PullRequest would start deciding
+	// from labels fetched minutes ago, for a different loop; give this pass an
+	// access per loop before making that change.
+	acc, err := w.access()
+	if err != nil {
+		slog.Error("cannot read the github token for the tend check", "err", err)
+		return
+	}
+
+	// Before the loops below, so a scan that named fewer loops than the last
+	// one drops their entries in the same pass that stopped using them.
+	w.pruneConfirms(routes.Targets)
+
+	for _, t := range routes.Targets {
+		if !t.TendPR {
+			continue
+		}
+		// Checked between loops, not only at the top: the deadline above and a
+		// daemon shutdown both land here, and a pass that ignored them would
+		// keep opening databases through the stop.
+		if checkCtx.Err() != nil {
+			return
+		}
+		w.tendCheckOne(ctx, checkCtx, t, acc)
+	}
+}
+
+// pruneConfirms drops the confirm timestamp of every loop the scan no longer
+// names.
+//
+// confirms is the only map on Worker with no removal path of its own -- tends,
+// windows and busy each delete their entry when their timer fires. An entry is
+// two words, so this is a small leak, but it is an unbounded one: a project
+// deleted and re-registered under a new id, or a loop renamed, leaves a key
+// nothing will ever look up again for as long as the daemon runs. Deleting a
+// live loop's entry would cost one forced pass, which is what a restart costs
+// anyway, so the failure mode of being wrong here is bounded too.
+func (w *Worker) pruneConfirms(targets []Target) {
+	live := make(map[loopKey]bool, len(targets))
+	for _, t := range targets {
+		live[loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}] = true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for key := range w.confirms {
+		if !live[key] {
+			delete(w.confirms, key)
+		}
+	}
+}
+
+// tendCheckOne runs the check for one loop and arms a sweep when it finds
+// something.
+//
+// It takes both contexts for the reason tendCheckPass states: checkCtx bounds
+// the work this function does, and ctx -- the daemon's -- outlives it and is
+// what armTend must be handed.
+func (w *Worker) tendCheckOne(ctx, checkCtx context.Context, t Target, acc *access) {
+	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
+		Token: acc.token, GH: acc.gh, RequireGitHub: true,
+		MigrationPolicy: loopcmd.FailOnUnimported,
+	})
+	// Deferred before any branch below can return. Open holds a SQLite
+	// handle, and this pass calls Open once per loop per interval for the life
+	// of the daemon, so a single missed cleanup is not a leak that stops -- it
+	// is one handle every interval, forever. tickOne records the same rule for
+	// the delivery path. The nil check is for the error path, where
+	// loopcmd.Open returns a nil cleanup.
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		// Logged and dropped, with NO retry scheduled. The retry schedule is
+		// keyed per loop and spends an issue's budget; this pass names no
+		// issue, and the next interval re-runs it in full.
+		slog.Error("cannot open loop for the tend check", "loop", t.LoopName,
+			"project", t.ProjectName, "config", t.ConfigPath, "err", err)
+		return
+	}
+
+	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
+	w.mu.Lock()
+	last, seen := w.confirms[key]
+	w.mu.Unlock()
+	// The first pass after start forces the confirm, and so does one every
+	// tendConfirmInterval after that: the local gate can only skip the API
+	// calls when it has rows to trust, so a loop with no rows would otherwise
+	// stay silent forever and a row that drifted would stay wrong forever.
+	force := !seen || w.Now().Sub(last) >= tendConfirmInterval
+
+	res, err := w.RunTendCheck(checkCtx, cfg, deps, force)
+	if err != nil {
+		// Logged and dropped, for the reason tendPass gives: this pass decides
+		// no issue, so there is no issue whose retry budget could pay for it,
+		// and the next interval tries again.
+		slog.Error("tend check failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
+		return
+	}
+	if res.Confirmed {
+		w.mu.Lock()
+		w.confirms[key] = w.Now()
+		w.mu.Unlock()
+	}
+	if res.Stale == 0 {
+		// Deliberately silent. This is the common case, once every interval,
+		// for every loop on the machine; a line here would bury every line
+		// that means something.
+		return
+	}
+	slog.Info("the tend check found a pull request behind its base",
+		"loop", cfg.Name, "project", t.ProjectName, "stale", res.Stale)
+	w.armTend(ctx, t, cfg.DefaultBranch)
+}
+
+// tendTicker returns the channel the periodic tend check fires on and the
+// func that stops it. The channel is nil, and the stop a no-op, when the check
+// is disabled.
+//
+// A nil channel blocks forever in a select, which is exactly what "disabled"
+// means here -- no branch, no flag, nothing for a later reader to get subtly
+// wrong. It is a method rather than four lines inside Serve so that the
+// decision itself can be tested: Serve is a loop around seams, and a test of
+// it would return at its own ctx.Err() guard before ever reaching the select.
+//
+// The stop func is returned rather than left to the garbage collector. An
+// unreachable ticker is collectable on this Go version whether it was stopped
+// or not, so nothing leaks either way -- but that is a language-version
+// property, and handing the caller the same defer every other timer in this
+// file gets costs one line and needs no such argument.
+func (w *Worker) tendTicker() (<-chan time.Time, func()) {
+	if w.TendInterval <= 0 {
+		return nil, func() {}
+	}
+	tk := time.NewTicker(w.TendInterval)
+	return tk.C, tk.Stop
 }
 
 // epicPass promotes the sub-issues the delivery's closed issue unblocked.
@@ -1405,6 +1728,14 @@ func (w *Worker) Serve(ctx context.Context) {
 	}
 	defer timer.Stop()
 
+	// Built once, outside the loop: a ticker rebuilt on every wake would
+	// restart its period on every retry deadline and, on a busy machine, never
+	// reach the interval at all. It is deliberately not folded into the wake
+	// timer above -- that one is driven by retry deadlines and floored at
+	// MinWakeInterval, which is a different schedule entirely.
+	tendC, stopTend := w.tendTicker()
+	defer stopTend()
+
 	for {
 		// Checked before Wake, not only in the select below. Wake is
 		// synchronous and runs a whole tick, so a cancellation that arrived
@@ -1422,6 +1753,10 @@ func (w *Worker) Serve(ctx context.Context) {
 		case <-ctx.Done():
 			w.stopAll()
 			return
+		case <-tendC:
+			// nil when the check is disabled, and a nil channel blocks
+			// forever, so this case simply never fires then.
+			w.tendCheckPass(ctx)
 		case <-timer.C:
 		}
 	}

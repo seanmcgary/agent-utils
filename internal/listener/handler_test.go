@@ -81,6 +81,7 @@ type tickCall struct {
 	repo        string
 	number      int
 	mergedInto  string
+	pushedTo    string
 	closedPR    bool
 	closedIssue bool
 }
@@ -95,7 +96,7 @@ func newServer(t *testing.T, tickCh chan<- tickCall) *Server {
 		Port:   freePort(t),
 		Tick: func(_ context.Context, d Delivery) {
 			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto,
-				closedPR: d.ClosedPR, closedIssue: d.ClosedIssue}
+				pushedTo: d.PushedTo, closedPR: d.ClosedPR, closedIssue: d.ClosedIssue}
 		},
 	})
 	if err != nil {
@@ -1297,6 +1298,78 @@ func TestClosedIssueIsDerivedFromTheEventAndAction(t *testing.T) {
 			}
 			if got.number != 7 {
 				t.Errorf("number = %d, want 7", got.number)
+			}
+		})
+	}
+}
+
+// A push carries no issue number. The rule that rejects a numberless delivery
+// stays for every other event: it is what stops a subscription to an event
+// this daemon cannot act on from being accepted in silence.
+func TestPushIsAcceptedWithoutANumber(t *testing.T) {
+	tickCh := make(chan tickCall, 1)
+	s := newServer(t, tickCh)
+	srv := httptest.NewServer(s.Handler(context.Background()))
+	t.Cleanup(srv.Close)
+
+	body := []byte(`{"ref":"refs/heads/master","repository":{"full_name":"o/r"}}`)
+	resp := doRequest(t, srv.URL+"/webhook", body, map[string]string{
+		github.EventTypeHeader:       "push",
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 200 or 202", resp.StatusCode)
+	}
+
+	got := waitTick(t, tickCh)
+	if got.pushedTo != "master" {
+		t.Errorf("pushedTo = %q, want master", got.pushedTo)
+	}
+	if got.number != 0 {
+		t.Errorf("number = %d, want 0", got.number)
+	}
+}
+
+// The old rule still holds everywhere else.
+func TestIssuesDeliveryWithoutANumberIsStillRejected(t *testing.T) {
+	tickCh := make(chan tickCall, 1)
+	s := newServer(t, tickCh)
+	srv := httptest.NewServer(s.Handler(context.Background()))
+	t.Cleanup(srv.Close)
+
+	body := []byte(`{"action":"opened","repository":{"full_name":"o/r"}}`)
+	resp := doRequest(t, srv.URL+"/webhook", body, map[string]string{
+		github.EventTypeHeader:       "issues",
+		github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	assertNoTick(t, tickCh)
+}
+
+// A ref that is not a branch, or whose name git would read as an option,
+// arms nothing. The value reaches git through the sweep's base comparison.
+func TestPushRefsThatAreNotSafeBranchesLeavePushedToEmpty(t *testing.T) {
+	for _, ref := range []string{"refs/tags/v1", "refs/heads/-oops", "", "refs/heads/"} {
+		t.Run(ref, func(t *testing.T) {
+			tickCh := make(chan tickCall, 1)
+			s := newServer(t, tickCh)
+			srv := httptest.NewServer(s.Handler(context.Background()))
+			t.Cleanup(srv.Close)
+
+			body := []byte(`{"ref":"` + ref + `","repository":{"full_name":"o/r"}}`)
+			resp := doRequest(t, srv.URL+"/webhook", body, map[string]string{
+				github.EventTypeHeader:       "push",
+				github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+			})
+			defer resp.Body.Close()
+
+			got := waitTick(t, tickCh)
+			if got.pushedTo != "" {
+				t.Errorf("ref %q gave pushedTo %q, want empty", ref, got.pushedTo)
 			}
 		})
 	}

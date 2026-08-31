@@ -39,7 +39,31 @@ type Deps struct {
 	// It is a seam so a test can control liveness; production passes proc.IsAlive.
 	IsAlive func(pid int, dispatchID int64) bool
 	// Fetch updates the primary checkout. It is a seam so a test can skip git.
-	Fetch func() error
+	//
+	// It takes a context because it runs "git fetch origin --prune" over the
+	// NETWORK, and the daemon's periodic tend check calls it on the single
+	// wake goroutine while holding the loop lock: unbounded, one unreachable
+	// remote stops every retry of every loop until the daemon is restarted.
+	// The command-line tick may legitimately pass context.Background(); the
+	// daemon must not. Open wires it to Manager.FetchCtx.
+	Fetch func(ctx context.Context) error
+	// Behind counts the commits baseRef has that headRef does not, using only
+	// the local checkout, and reports known=false for a ref that does not
+	// resolve. It is the gate of the periodic tend check.
+	//
+	// It is a seam because WT is a concrete *worktree.Manager that a test
+	// cannot substitute, and because the answer depends on a git checkout no
+	// unit test has. Open wires it to Manager.BehindLocalCtx.
+	//
+	// It takes a context for the reason Fetch does: the periodic check calls
+	// it once per stored link on the wake goroutine, and a git command that
+	// never returns there stalls the whole daemon.
+	Behind func(ctx context.Context, headRef, baseRef string) (behind int, known bool, err error)
+	// Git is the git the automatic rebase drives. A nil Git disables that path
+	// entirely and every tend decision falls through to the agent, which is
+	// what keeps a Deps built by hand -- every test that predates this field --
+	// working unchanged. Open wires it to WT.
+	Git RebaseGit
 }
 
 // count increments n only when the action succeeded, so the recorded summary
@@ -89,10 +113,14 @@ func isLive(d store.Dispatch, isAlive func(pid int, dispatchID int64) bool, now 
 
 // Summary reports what one tick did.
 type Summary struct {
-	Started  int `json:"started"`
-	Resumed  int `json:"resumed"`
-	Retried  int `json:"retried"`
-	Tended   int `json:"tended"`
+	Started int `json:"started"`
+	Resumed int `json:"resumed"`
+	Retried int `json:"retried"`
+	Tended  int `json:"tended"`
+	// Rebased counts the pull requests git replayed with no agent. It is
+	// separate from Tended so a sweep's line says which of the two happened:
+	// how many rebases cost nothing, and how many needed an agent.
+	Rebased  int `json:"rebased"`
 	Promoted int `json:"promoted"`
 	Parked   int `json:"parked"`
 	// Stopped counts KindStop decisions applied this tick: an operator's
@@ -107,12 +135,13 @@ type Summary struct {
 // Tick runs one FULL reconcile and dispatch pass over every open issue.
 //
 // This is the sweep, and it stays: it is what catches the work no webhook
-// event names. GitHub sends no delivery when a pull request falls behind
-// because someone pushed to master (that is a push event, which this daemon
-// does not subscribe to), and none when a retry deadline passes on an issue
-// nobody touched. `project loop tick` under cron runs this; the daemon runs
-// TickIssue for the fast path. Both may run at once -- the per-loop lock in
-// RunTick and TickIssue makes an overlapping pass harmless.
+// event names. GitHub sends no delivery when a retry deadline passes on an
+// issue nobody touched, and the daemon's merge, push, and periodic triggers
+// all cover only a machine that runs it -- a machine with no daemon gets
+// none of the three, so this is the only thing that ever notices a pull
+// request behind its base there. `project loop tick` under cron runs this;
+// the daemon runs TickIssue for the fast path. Both may run at once -- the
+// per-loop lock in RunTick and TickIssue makes an overlapping pass harmless.
 func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	var sum Summary
 	now := deps.Now()
@@ -123,7 +152,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	// runner's issue with no failure flag at all.
 	fetchOK := true
 	if deps.Fetch != nil {
-		if err := deps.Fetch(); err != nil {
+		if err := deps.Fetch(ctx); err != nil {
 			fetchOK = false
 			slog.Error("fetch primary checkout; skipping tend this tick",
 				"loop", cfg.Name, "err", err)
@@ -378,6 +407,25 @@ func act(
 	case engine.KindParkRetryExhausted:
 		return count(&sum.Parked, parkRetryExhausted(ctx, cfg, deps, d))
 	case engine.KindTend:
+		// git first, the agent second. A rebase that replays cleanly needs no
+		// conversation, and this is the common case: the agent exists for the
+		// conflicts. gitRebase reports whether it settled the decision --
+		// including the case where it settled it by declining to act, which is
+		// what a refused lease means.
+		switch outcome, err := gitRebase(ctx, cfg, deps, d); {
+		case err != nil:
+			// Logged, not returned: a git failure must not abandon the rest of
+			// the sweep, and the agent is the fallback this whole path is
+			// built around.
+			slog.Warn("automatic rebase failed; falling back to the tend agent",
+				"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
+		case outcome == doneRebased:
+			sum.Rebased++
+			return nil
+		case outcome == doneNoRebase:
+			// Settled by declining to act. No agent, and nothing counted.
+			return nil
+		}
 		return count(&sum.Tended, dispatch(ctx, cfg, deps, d, now, store.KindTend))
 	case engine.KindResume:
 		return count(&sum.Resumed, dispatch(ctx, cfg, deps, d, now, store.KindResume))
