@@ -502,3 +502,37 @@ func TestTendIntervalIsASettableKey(t *testing.T) {
 		t.Fatal("tend_interval is not a settable key")
 	}
 }
+
+// A value below the floor is a tight loop, not a fast setting: each pass
+// fetches and opens a database per tending loop of every registered project.
+// Zero stays allowed -- it is how the check is disabled.
+func TestTendIntervalRefusesAValueBelowTheFloor(t *testing.T) {
+	f, ok := FieldFor("tend_interval")
+	if !ok {
+		t.Fatal("tend_interval is not a settable key")
+	}
+	for _, v := range []string{"1ns", "1s", "59s"} {
+		if err := f.Set(&Settings{}, v); err == nil {
+			t.Errorf("Set(%q) = nil, want a refusal: it is below %s", v, MinTendInterval)
+		}
+	}
+	for _, v := range []string{"0", "0s", "1m", "15m"} {
+		if err := f.Set(&Settings{}, v); err != nil {
+			t.Errorf("Set(%q) = %v, want it accepted", v, err)
+		}
+	}
+}
+
+// Fields guards `config set`; nothing guards a value typed straight into the
+// file, and that one reaches listener.Worker.TendInterval, whose only check is
+// "<= 0". TendEvery is the second gate.
+func TestTendEveryRefusesAHandWrittenValueBelowTheFloor(t *testing.T) {
+	for _, v := range []string{"1ns", "1s", "59s"} {
+		if got := (Settings{TendInterval: v}).TendEvery(); got != DefaultTendInterval {
+			t.Errorf("TendEvery(%q) = %v, want the default", v, got)
+		}
+	}
+	if got := (Settings{TendInterval: "1m"}).TendEvery(); got != MinTendInterval {
+		t.Errorf("TendEvery(\"1m\") = %v, want 1m: the floor itself is allowed", got)
+	}
+}
