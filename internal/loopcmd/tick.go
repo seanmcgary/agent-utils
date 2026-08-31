@@ -64,6 +64,15 @@ type Deps struct {
 	// what keeps a Deps built by hand -- every test that predates this field --
 	// working unchanged. Open wires it to WT.
 	Git RebaseGit
+	// Force carries `loop tick --force` into engine.Decide, where it suspends
+	// the breaker cooldown, every retry backoff window, and the breaker's own
+	// trip for that one call. See engine.State.Force.
+	//
+	// Only the command-line sweep sets it. TickIssue and the tend sweep leave
+	// it false, so no webhook delivery and no daemon wake can force a tick:
+	// the override is an operator standing at a terminal, and a gate a
+	// delivery could clear on its own would not be a gate.
+	Force bool
 }
 
 // count increments n only when the action succeeded, so the recorded summary
@@ -130,6 +139,9 @@ type Summary struct {
 	Live           int  `json:"live"`
 	Orphans        int  `json:"orphans"`
 	BreakerTripped bool `json:"breaker_tripped"`
+	// Forced records that this tick ran with --force, so the recorded tick
+	// says why it acted inside a cooldown the previous one honoured.
+	Forced bool `json:"forced"`
 }
 
 // Tick runs one FULL reconcile and dispatch pass over every open issue.
@@ -216,11 +228,22 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	if err != nil {
 		return sum, err
 	}
-	st := engine.State{Issues: states, Running: live, CooldownUntil: time.Time{}}
+	st := engine.State{
+		Issues: states, Running: live, CooldownUntil: time.Time{}, Force: deps.Force,
+	}
 	sum.Live = len(live)
+	sum.Forced = deps.Force
 
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
 		return sum, err
+	}
+	// Log the override where it is actually exercised. An unforced tick inside
+	// this window would have halted with no decisions and no explanation of
+	// which deadline stopped it, so a forced one names the deadline it stepped
+	// over -- the operator's receipt for the dispatches that follow.
+	if deps.Force && !st.CooldownUntil.IsZero() && now.Before(st.CooldownUntil) {
+		slog.Warn("forcing this tick past the circuit breaker cooldown",
+			"loop", cfg.Name, "cooldown_until", st.CooldownUntil)
 	}
 
 	plan := engine.Decide(cfg, snap, st, now)

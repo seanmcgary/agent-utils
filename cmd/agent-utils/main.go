@@ -866,7 +866,11 @@ func loopCommand() *cli.Command {
 			{
 				Name:  "tick",
 				Usage: "run one reconcile and dispatch pass, then exit",
-				Flags: []cli.Flag{configFlag(), nameFlag()},
+				Flags: []cli.Flag{configFlag(), nameFlag(), &cli.BoolFlag{
+					Name: "force",
+					Usage: "ignore the circuit breaker cooldown and every retry " +
+						"backoff window for this tick",
+				}},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					p, err := openProject(c)
 					if err != nil {
@@ -885,6 +889,10 @@ func loopCommand() *cli.Command {
 						return err
 					}
 					defer cleanup()
+
+					// Only this command sets it. The daemon builds its own Deps
+					// and never does, so no webhook delivery can force a tick.
+					deps.Force = c.Bool("force")
 
 					_, err = loopcmd.RunTick(ctx, cfg, deps)
 					if errors.Is(err, lock.ErrHeld) {

@@ -15,7 +15,7 @@ import (
 // arguments, it performs no input or output, and it reads no clock. The caller
 // supplies now.
 func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
-	if !st.CooldownUntil.IsZero() && now.Before(st.CooldownUntil) {
+	if !st.Force && !st.CooldownUntil.IsZero() && now.Before(st.CooldownUntil) {
 		return Plan{
 			CooldownUntil: st.CooldownUntil,
 			Halted: fmt.Sprintf("the circuit breaker is in cooldown until %s",
@@ -146,7 +146,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				})
 				continue
 			}
-			d, eligible, skip := retryDecision(cfg, iss.Number, state, ov, now)
+			d, eligible, skip := retryDecision(cfg, iss.Number, state, ov, now, st.Force)
 			// Convert to a stop BEFORE counting toward the breaker. A retry
 			// that becomes a stop never dispatches, so counting it would let
 			// a label push the circuit breaker over its threshold and drop
@@ -243,7 +243,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	// is a separate change. Until then loopcmd.warnBreakerNotEvaluated logs
 	// every scoped retry that was dispatched without this check, so the gap is
 	// visible in the operator's log rather than silent.
-	if eligibleRetries >= cfg.Retry.Breaker.OrphanThreshold {
+	if !st.Force && eligibleRetries >= cfg.Retry.Breaker.OrphanThreshold {
 		// Every dispatch decided above is dropped here, so each one becomes a
 		// skip. Without this an issue the engine WAS going to act on reports
 		// no reason at all, which is the same all-zeros line this change
@@ -290,7 +290,7 @@ func finish(p Plan) Plan {
 // tick a loop at any moment, so a tick count no longer names a stable wait.
 // MarkNeedsRetry stamps the deadline where the failure is recorded.
 func retryDecision(cfg *config.Config, number int, state store.IssueState,
-	ov config.Overrides, now time.Time) (*Decision, bool, string) {
+	ov config.Overrides, now time.Time, force bool) (*Decision, bool, string) {
 	if state.RetryCount >= cfg.Retry.Max {
 		return &Decision{
 			Kind:   KindParkRetryExhausted,
@@ -299,7 +299,7 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 		}, false, ""
 	}
 
-	if !state.RetryAfter.IsZero() && now.Before(state.RetryAfter) {
+	if !force && !state.RetryAfter.IsZero() && now.Before(state.RetryAfter) {
 		// Still inside the backoff window. Take no action and post no comment.
 		// NeedsRetry stays set in the store, so the next tick sees it again.
 		return nil, false, fmt.Sprintf(

@@ -148,7 +148,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils project sessions list` | Every claude session with its issue, runs, cost and state |
 | `agent-utils project sessions describe <id>` | One session's runs, what each cost, and why any of them failed |
 | `agent-utils project logs` | Watch a dispatched agent, live or after the fact |
-| `agent-utils project loop tick --name <loop>` | One reconcile-and-dispatch pass, then exit. This is what cron (and the webhook daemon) runs |
+| `agent-utils project loop tick --name <loop>` | One reconcile-and-dispatch pass, then exit. This is what cron (and the webhook daemon) runs. `--force` runs it past the breaker cooldown and every retry backoff |
 | `agent-utils project loop status --name <loop>` | The reconciled view of one loop: issues, titles, dispatch state, retries |
 | `agent-utils project loop reset --name <loop> --issue <n>` | Drop an issue's stored session and worktree so its next trigger starts fresh |
 | `agent-utils project register-webhook [--name <loop>] [--yes]` | Register this project's repositories with GitHub as webhook delivery targets, and record each hook id |
