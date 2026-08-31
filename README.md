@@ -184,24 +184,27 @@ for after it, rather than putting a second `claude` process on one conversation.
 
 ```
 $ agent-utils project sessions list
-SESSION            LOOP       ISSUE  TITLE                  RUNS  COST     STATE      LAST RUN
-cc33-tend-run      planning   57     Fix timezone bug       1     $0.30    succeeded  2026-08-18 21:17
-bb22-session-two   planning   57     Fix timezone bug       1     $2.40    ORPHANED   2026-08-18 21:12
-aa11-session-one   planning   42     Add zone lookup        3     $5.05    succeeded  2026-08-18 20:52
+SESSION            LOOP       ISSUE  TITLE               RUNS  COST     MODEL   HARNESS  STATE      LAST RUN
+cc33-tend-run      planning   57     Fix timezone bug    1     $0.30    opus    claude   succeeded  2026-08-18 21:17
+bb22-session-two   planning   57     Fix timezone bug    1     $2.40    sonnet  claude   ORPHANED   2026-08-18 21:12
+aa11-session-one   planning   42     Add zone lookup     3     $5.05    opus    claude   succeeded  2026-08-18 20:52
 ```
 
 `ORPHANED` marks a session whose dispatch is still recorded as running but whose process is
-gone.
+gone. `MODEL` and `HARNESS` are what the most recent dispatch ran under: its `model:` or
+`harness:` label override when it carried one, otherwise the loop's configured values. Both
+show `-` when the loop's configuration can no longer be read, which is what a renamed or
+deleted loop leaves behind.
 
 `agent-utils sessions list` is the same report for the whole machine. It adds a PROJECT column
 and reads every registered project in one pass:
 
 ```
 $ agent-utils sessions list
-PROJECT          SESSION                                LOOP         ISSUE  TITLE                          RUNS  COST      STATE      LAST RUN
-lawndominator    9b94f0e1-7d39-4960-8c84-58f2d830217b   execution    51     Fix timezone bug               1     $0.28     succeeded  2026-08-20 10:58
-agent-utils      fbad5873-023d-48a5-8b4f-d8cc4e3e34bf   planning     42     Add zone lookup                3     $5.05     running    2026-08-20 10:55
-agent-utils      3c1d0a77-5e2b-4f18-9a30-6b7c8d9e0f11   planning     42     Add zone lookup                1     $2.40     ORPHANED   2026-08-20 09:12
+PROJECT          SESSION                                LOOP         ISSUE  TITLE                    RUNS  COST      MODEL   HARNESS  STATE      LAST RUN
+lawndominator    9b94f0e1-7d39-4960-8c84-58f2d830217b   execution    51     Fix timezone bug         1     $0.28     opus    claude   succeeded  2026-08-20 10:58
+agent-utils      fbad5873-023d-48a5-8b4f-d8cc4e3e34bf   planning     42     Add zone lookup          3     $5.05     opus    claude   running    2026-08-20 10:55
+agent-utils      3c1d0a77-5e2b-4f18-9a30-6b7c8d9e0f11   planning     42     Add zone lookup          1     $2.40     sonnet  pi       ORPHANED   2026-08-20 09:12
 
 Follow one with: agent-utils project --name <PROJECT> logs --session <SESSION>
 ```
@@ -287,11 +290,14 @@ agents keep writing, and `logs` is how you watch them.
 agent-utils project logs --list                 # recent dispatches and their ids
 agent-utils project logs -f                     # follow the newest one live
 agent-utils project logs --session aa11-...     # a whole session; no --name needed
+agent-utils project logs -f aa11-...            # the same, as a bare argument
 agent-utils project logs --issue 42             # the newest dispatch for one issue
 agent-utils project logs --dispatch 17          # one dispatch exactly
 ```
 
-`--session` needs no `--name`: a session identifier already names its own loop.
+`--session` needs no `--name`: a session identifier already names its own loop. The
+identifier may also be given as a bare argument, which is the shape `logs -f <session>`
+takes; giving both spellings different values is refused rather than resolved by precedence.
 
 The transcript is rendered rather than dumped — session start, the agent's text, each tool
 call and its result, and a closing line with turns, cost and duration. Thinking blocks and

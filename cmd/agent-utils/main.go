@@ -238,6 +238,23 @@ func promptForConfig(entries []config.Entry) (string, error) {
 
 // projectStatusCommand reports every project this tool has been used against.
 // It reads only local state, so it needs no token and works offline.
+// logsSession returns the session identifier the operator gave, from either
+// spelling. Giving both is refused rather than silently resolved: the two
+// values can disagree, and picking one would follow a precedence rule nothing
+// in the help text states.
+func logsSession(c *cli.Command) (string, error) {
+	flag, arg := c.String("session"), c.StringArg("session")
+	if flag != "" && arg != "" && flag != arg {
+		return "", fmt.Errorf(
+			"session given twice and they differ: --session %s and argument %s; pass one",
+			flag, arg)
+	}
+	if flag != "" {
+		return flag, nil
+	}
+	return arg, nil
+}
+
 // listCommand reports every project registered on this machine. It reads only
 // local state, so it needs no token and works offline.
 // projectListCommand prints one project's loop configurations.
@@ -614,6 +631,12 @@ func logsCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "logs",
 		Usage: "show the log of a dispatched agent, live or after the fact",
+		// The session identifier is accepted as a bare argument as well as
+		// through --session, because it is what an operator copies out of
+		// `sessions list` and `agent-utils project logs -f <session>` is the
+		// shape they reach for. The flag stays: it is what the two session
+		// tables tell them to type, and scripts already use it.
+		Arguments: []cli.Argument{&cli.StringArg{Name: "session"}},
 		Flags: []cli.Flag{
 			configFlag(),
 			nameFlag(),
@@ -641,8 +664,12 @@ func logsCommand() *cli.Command {
 			// A session identifier names its own loop, so --session alone is
 			// enough; asking for --name too would demand what the id already
 			// determines.
+			sessionID, err := logsSession(c)
+			if err != nil {
+				return err
+			}
 			var path string
-			if sess := c.String("session"); sess != "" && c.String("name") == "" && c.String("config") == "" {
+			if sess := sessionID; sess != "" && c.String("name") == "" && c.String("config") == "" {
 				_, path, err = loopcmd.FindSession(p, sess)
 			} else {
 				path, err = resolveLoopConfig(c, p.Dir)
@@ -680,7 +707,7 @@ func logsCommand() *cli.Command {
 			}
 
 			opts := loopcmd.LogOptions{
-				Session:  c.String("session"),
+				Session:  sessionID,
 				Issue:    c.Int("issue"),
 				Dispatch: int64(c.Int("dispatch")),
 				Stream:   stream,
