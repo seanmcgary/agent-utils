@@ -937,6 +937,19 @@ How long to dispatch nothing after the breaker trips. A Go duration string.
 Ticks still run during a cooldown; they simply make no decisions. Set it long enough for a
 platform incident to clear — the default in both examples is `30m`.
 
+To dispatch before the cooldown expires — the incident is fixed and you do not want to wait —
+run one tick with `--force`:
+
+```bash
+agent-utils project loop tick --name planning --force
+```
+
+That single tick ignores the cooldown, ignores every issue's retry backoff window, and cannot
+trip the breaker (forcing makes the waiting retries eligible again, so a live breaker would
+just drop them all and re-arm). The stored cooldown is left alone: the next unforced tick,
+including every one the daemon runs, is back under it. The retry cap is not a time gate and
+still applies — a forced tick parks an issue that has exhausted its retries, same as any other.
+
 ```yaml
 cooldown: 30m
 ```

@@ -829,3 +829,39 @@ func TestTickSurvivesAFailedEpicSweep(t *testing.T) {
 		t.Errorf("Promoted = %d, want 0", sum.Promoted)
 	}
 }
+
+// Deps.Force is the whole of `loop tick --force`: everything else is engine
+// behaviour tested in that package. This asserts the wire between them, in
+// both positions, on the gate that halts the entire tick.
+func TestTickForceOverridesCooldown(t *testing.T) {
+	cfg := tickConfig(t)
+	gh := &fakeGH{issues: []ghub.Issue{{Number: 1, Labels: []string{"trigger"}}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+	if err := deps.Store.SetCooldown(cfg.Name, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("SetCooldown: %v", err)
+	}
+
+	sum, err := Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if spawned != 0 {
+		t.Fatalf("spawned = %d, want 0: an unforced tick honours the cooldown", spawned)
+	}
+	if sum.Forced {
+		t.Error("Forced = true, want false on an unforced tick")
+	}
+
+	deps.Force = true
+	sum, err = Tick(context.Background(), cfg, deps)
+	if err != nil {
+		t.Fatalf("forced Tick: %v", err)
+	}
+	if spawned != 1 {
+		t.Errorf("spawned = %d, want 1: --force dispatches inside the cooldown", spawned)
+	}
+	if !sum.Forced {
+		t.Error("Forced = false, want true: the recorded tick must say it was forced")
+	}
+}

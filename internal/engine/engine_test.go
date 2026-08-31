@@ -1101,3 +1101,71 @@ func TestARetryDoesNotResumeAnotherHarnessSession(t *testing.T) {
 		t.Errorf("session id = %q, want empty", id)
 	}
 }
+
+func TestForceOverridesCooldown(t *testing.T) {
+	cfg := testConfig()
+	now := time.Now()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{
+		Issues:        map[int]store.IssueState{},
+		CooldownUntil: now.Add(10 * time.Minute),
+		Force:         true,
+	}
+	p := Decide(cfg, snap, st, now)
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindStart {
+		t.Fatalf("decisions = %v, want the start a forced tick runs during cooldown", kinds(p))
+	}
+	if p.Halted != "" {
+		t.Errorf("Halted = %q, want empty: force skips the cooldown halt", p.Halted)
+	}
+}
+
+func TestForceOverridesRetryBackoff(t *testing.T) {
+	cfg := testConfig()
+	now := time.Now()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.InFlight)}}
+	state := store.IssueState{
+		Number: 1, NeedsRetry: true, RetryCount: 1,
+		RetryAfter: now.Add(15 * time.Minute),
+	}
+
+	// Unforced: the backoff window holds the retry back.
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{1: state}}, now)
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none inside the backoff window", kinds(p))
+	}
+
+	p = Decide(cfg, snap, State{Issues: map[int]store.IssueState{1: state}, Force: true}, now)
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindRetryStart {
+		t.Fatalf("decisions = %v, want the retry a forced tick runs", kinds(p))
+	}
+}
+
+func TestForcedTickDoesNotTripTheBreaker(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{
+		issue(1, cfg.Labels.InFlight),
+		issue(2, cfg.Labels.InFlight),
+		issue(3, cfg.Labels.Trigger),
+	}}
+	st := State{
+		Issues: map[int]store.IssueState{
+			1: {Number: 1, NeedsRetry: true},
+			2: {Number: 2, NeedsRetry: true},
+		},
+		Force: true,
+	}
+	p := Decide(cfg, snap, st, time.Now())
+	// Two eligible retries would trip the breaker on an ordinary tick. Forcing
+	// makes retries eligible again, so a live breaker would drop every dispatch
+	// and leave --force a no-op in exactly the case it exists for.
+	if p.BreakerTripped {
+		t.Fatal("BreakerTripped = true, want false: a forced tick must not trip the breaker")
+	}
+	if !p.CooldownUntil.IsZero() {
+		t.Errorf("CooldownUntil = %v, want zero: a forced tick writes no cooldown", p.CooldownUntil)
+	}
+	if len(p.Decisions) != 3 {
+		t.Errorf("decisions = %v, want both retries and the start", kinds(p))
+	}
+}

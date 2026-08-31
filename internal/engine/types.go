@@ -54,6 +54,21 @@ type State struct {
 	Running []store.Dispatch
 	// CooldownUntil is the time before which the loop must not dispatch.
 	CooldownUntil time.Time
+	// Force is the operator override behind `loop tick --force`. It is the one
+	// field here that is not read from the store: it says this tick was asked
+	// for by a human at a terminal, not by cron or a webhook delivery.
+	//
+	// It suspends all three of the engine's time gates for THIS call -- the
+	// breaker cooldown, each issue's retry backoff window, and the breaker's
+	// own trip -- and changes nothing else. The retry CAP is not a time gate
+	// and still holds: a forced tick parks an issue that has exhausted its
+	// retries exactly as an ordinary one does.
+	//
+	// The trip is suspended along with the rest because forcing makes the
+	// waiting retries eligible again, so a live breaker would count them,
+	// drop every dispatch, and re-arm the cooldown -- leaving --force a no-op
+	// in exactly the situation an operator reaches for it.
+	Force bool
 }
 
 // Decision is one action the tick must perform.
