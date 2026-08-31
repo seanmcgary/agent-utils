@@ -236,9 +236,11 @@ It runs these steps in order:
 2. **Worktree.** Call `deps.WT.EnsurePR(d.PR, d.HeadRef)`. The method fetches the head ref and
    checks it out detached, so the worktree holds exactly what the remote holds.
 3. **Lease.** Record the commit the worktree now points at. This value is the lease for step 7.
-4. **Dirty check.** Call `deps.WT.Dirty(path)`. Return `false` when the worktree is dirty. A
-   dirty tend worktree holds work that a rebase would destroy, and the agent is the right actor
-   for it.
+4. **Dirty check, BEFORE the worktree is refreshed.** `EnsurePR` runs `checkout --detach
+   FETCH_HEAD` on an existing worktree, which orphans any commits an agent left there, and
+   `Dirty`'s unpushed-commit test cannot see anything in a detached worktree anyway. The check
+   therefore runs on the worktree path first, and steps 2 and 3 follow it. A dirty worktree
+   dispatches the agent.
 5. **Rebase.** Run `git rebase origin/<base_ref>`.
 6. **Conflict.** On any failure, run `git rebase --abort` and return `false`. The caller then
    dispatches the agent. The abort is unconditional, so the worktree is never left mid-rebase.
@@ -246,11 +248,15 @@ It runs these steps in order:
    `git push --force-with-lease=<head_ref>:<lease> origin HEAD:refs/heads/<head_ref>`.
    The lease pins the push to the commit this pass fetched. Git refuses the push when the remote
    has moved, so a branch that somebody pushed to in the meantime is never overwritten.
-8. **Refused push.** A refused push returns `false` **and dispatches no agent**. The remote moved
-   while this pass ran, so the branch state this pass reasoned about is gone. The next tick reads
-   the new state and decides again. Sending an agent at a branch somebody is actively pushing to
-   is the more dangerous answer.
-9. **Record.** Write the outcome (see below) and return `true`.
+8. **Refused push.** A refused push settles the decision and **dispatches no agent**, but counts
+   as no rebase. The remote moved while this pass ran, so the branch state this pass reasoned
+   about is gone. The next tick reads the new state and decides again. Sending an agent at a
+   branch somebody is actively pushing to is the more dangerous answer.
+9. **Record.** Write the outcome (see below) and report that git rebased the branch.
+
+The plan returns a three-valued outcome rather than a bool, because "no agent" and "rebased" are
+not the same fact: a refused push means the first and not the second, and reporting it as a
+rebase would overstate what happened in the tick summary an operator audits.
 
 The remotes are SSH (`git@github.com:...`), so the push uses the operator's existing SSH key.
 This adds no credential handling.
@@ -281,8 +287,12 @@ A rebase that runs no agent creates no dispatch row today, so it would appear in
 `agent-utils project logs --list` nor `agent-utils sessions list`. An operator would see a
 force-push with no local record of what caused it.
 
-**The decision: write a dispatch row with a new kind, `store.KindRebase = "rebase"`.** The row
-carries:
+**The decision: write a dispatch row with a new kind, `store.KindRebase = "rebase"`, in a single
+INSERT that is already finished.** Two statements would leave a window, and a permanent stuck row
+if the second failed. That row would not be inert: three separate places treat a running row of
+any kind other than `tend` as a live agent (`internal/engine/engine.go:29-45`,
+`internal/loopcmd/tick.go:281`, `internal/loopcmd/tendsweep.go:196-215`), so a stuck one would
+freeze its issue against every future decision. The row carries:
 
 - the issue number, the pull request number, and the title, as a tend row does;
 - an **empty** session identifier;

@@ -17,6 +17,22 @@ and escalates to the agent on a conflict.
 
 **Spec:** `docs/superpowers/specs/2026-08-31-tend-triggers-and-agent-free-rebase-design.md`
 
+## A note on the test code below
+
+Every `_test.go` file in this repository is in the **same package** as the code it tests
+(`package config`, `package store`, `package settings`, `package loopcmd`, `package listener`,
+`package worktree`) — not an external `_test` package. Several test snippets in this plan are
+written with qualified names (`config.List`, `store.PRLink`, `settings.Fields`). Drop the package
+qualifier when you write them, or they will not compile.
+
+The helper names in the snippets are illustrative. The real ones are: `initRepo`
+(`internal/worktree/worktree_test.go:10`), `openTemp` (`internal/store/store_test.go:15`),
+`newServer` / `doRequest` / `subjectPayload` / `fixedSecret` (`internal/listener/handler_test.go:91,
+135, 66, 29`), `newHarness` plus the `timers` seam (`internal/listener/work_test.go:162, 49`), and
+`writeLoopFiles` / `loopFile` (`internal/loopcmd/epicsweep_test.go:168, 135` — `package loopcmd`
+only, NOT reachable from `internal/config`). Use those; write the ones that genuinely do not
+exist.
+
 ## Global Constraints
 
 This repository has no `CLAUDE.md`, `AGENTS.md`, or `STANDARDS.md`. The binding rules are the
@@ -28,11 +44,11 @@ gates and the conventions the code itself enforces:
   only what the code does. Match the density of the file you edit.
 - A comment must not restate the code. Where a decision has a failure mode, name the failure.
 - `ghub.HookEvents` is the single event list. `register-webhook` and the handler both read it
-  (`internal/ghub/types.go:116-124`). Never add a second list.
+  (`internal/ghub/types.go:123-129`). Never add a second list.
 - A value from a webhook payload is attacker-controlled. Shape-check it before it is stored,
   passed to git, or logged (`internal/listener/handler.go:519-528`).
 - Never pass an unchecked ref to git. Use `ghub.SafeRef` or `worktree.SafeRef`
-  (`internal/worktree/worktree.go:114`).
+  (`internal/worktree/worktree.go:107`).
 - No `Co-Authored-By:` trailer in any commit message.
 - Commit messages use Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`, `chore:`).
 
@@ -49,8 +65,8 @@ Read from source in this repository at the stated lines.
 - `config.Duration` — `internal/config/duration.go:11-31`. It has `UnmarshalYAML` and `Std()`.
   It has **no** `MarshalYAML`; Task 5 adds one.
 - `config.WorktreePerIssue` — the `per_issue` worktree mode constant.
-- `ghub.HookEvents` — `internal/ghub/types.go:118-124`. Five events today.
-- `ghub.SafeRef(ref string) bool` — `internal/ghub/types.go:141-145`.
+- `ghub.HookEvents` — `internal/ghub/types.go:123-129`. Five events today.
+- `ghub.SafeRef(ref string) bool` — `internal/ghub/types.go:146`.
 - `ghub.Client` — `ListOpenIssues(ctx, owner, repo)`, `ListOpenPullRequests(ctx, owner, repo)`,
   `BehindBy(ctx, owner, repo, base, head string) (int, error)`.
 - `ghub.Issue.HasLabel(name string) bool`; `ghub.PullRequest` fields `Number`, `HeadRef`,
@@ -66,7 +82,7 @@ Read from source in this repository at the stated lines.
 - `loopcmd.TendSweep(ctx, cfg, deps, base)` — `internal/loopcmd/tendsweep.go:71`.
 - `listener.Target` — `internal/listener/route.go:16-23`.
 - `listener.Scan() (Routes, error)` — `internal/listener/route.go:120`.
-- `listener.Delivery` — `internal/listener/work.go:329-357`. `IsMergeInto` is at `work.go:366`.
+- `listener.Delivery` — `internal/listener/work.go:329-357`. `IsMergeInto` is at `work.go:365`.
 - `Worker.armTend(ctx, t Target, base string)` — `internal/listener/work.go:855`.
 - `Worker.tickOne` — `internal/listener/work.go:532`. The tend arm is at `work.go:577-579`.
 - `Worker.Serve(ctx)` — `internal/listener/work.go:1398`.
@@ -208,7 +224,7 @@ number. A push payload has no number, so both rules change together. This task t
 authenticated request path, so it is reviewed.
 
 **Files:**
-- Modify: `internal/ghub/types.go:118-124`
+- Modify: `internal/ghub/types.go:123-129`
 - Modify: `internal/listener/handler.go:495-530`, `internal/listener/handler.go:611-660`
 - Test: `internal/listener/handler_test.go`
 
@@ -527,16 +543,30 @@ func (d Delivery) IsPushTo(branch string) bool {
 At the top of `Deliver`'s target loop, before `w.tickOne`:
 
 ```go
+	// The push filter runs BEFORE w.access(), not only before tickOne.
+	// access() reads the token file and builds a client; subscribing to push
+	// multiplies delivery volume by every branch of every watched repository,
+	// so a filter placed after it would read a secret from disk on every
+	// feature-branch push. Build the kept list first, and return when it is
+	// empty.
+	kept := make([]Target, 0, len(targets))
 	for _, t := range targets {
 		// A push names no issue, so the only work it can start is the sweep.
-		// Dropping it HERE, not in tickOne, is what keeps the cost at one
-		// field test: tickOne runs after Open, which reads the token, opens a
-		// SQLite handle and runs the migration check. A repository whose
-		// feature branches are pushed all day would pay all three per push,
-		// per loop, for a delivery no loop can act on.
 		if d.Number == 0 && !(t.TendPR && d.IsPushTo(t.DefaultBranch)) {
 			continue
 		}
+		kept = append(kept, t)
+	}
+	if len(kept) == 0 {
+		slog.Info("no loop tends the branch this push moved",
+			"repo", d.Repo, "pushed_to", safeText(d.PushedTo))
+		return
+	}
+
+	acc, err := w.access()
+	// ... existing error handling ...
+
+	for _, t := range kept {
 		w.tickOne(ctx, t, d, acc)
 	}
 ```
@@ -546,8 +576,12 @@ For a push, log the branch instead:
 
 ```go
 	if d.Number == 0 {
+		// safeText, because PushedTo is attacker-written. SafeRef bounds its
+		// charset but not its length, so a multi-kilobyte branch name would go
+		// verbatim into an unrotated log -- the failure handler.go:185-196
+		// documents. work.go is the same package and gets the same treatment.
 		slog.Info("a push moved a branch; every loop that tends it will sweep",
-			"repo", d.Repo, "pushed_to", d.PushedTo, "loops", loops)
+			"repo", d.Repo, "pushed_to", safeText(d.PushedTo), "loops", loops)
 	} else {
 		slog.Info("evaluating this issue in every loop that watches the repository",
 			"repo", d.Repo, "number", d.Number, "loops", loops)
@@ -581,6 +615,42 @@ Guard the three issue-scoped passes on the number:
 `epicPass` and `cleanupPass` are already gated on `d.ClosedIssue` and `d.ClosedPR`, which a push
 never sets, so they need no change. Confirm that by reading the two branches; do not add a
 redundant condition.
+
+**The `Open` failure path also needs the guard, and this one is a real bug if you miss it.**
+`tickOne` schedules a retry when `Open` fails (`internal/listener/work.go:559`):
+
+```go
+	w.schedule(ctx, t, d.Number, kindOpen, openRetryMax, ...)
+```
+
+`pending` is keyed by `loopKey` — **per loop, not per issue** (`work.go:1044-1065`) — and
+`schedule` stops whatever timer is already armed for that key. So a push whose `Open` failed
+would cancel a real issue's pending retry and spend the loop's `kindOpen` budget on issue 0.
+The retry that eventually fires calls `tickFresh(ctx, t, 0)`, which builds a `Delivery` carrying
+no `PushedTo` (`work.go:511-522` drops it deliberately), so it is then gated out by the
+`d.Number > 0` guard above and accomplishes nothing — while the sweep the push should have armed
+is lost.
+
+Guard it:
+
+```go
+	if err != nil {
+		slog.Error("cannot open loop", "loop", t.LoopName, "project", t.ProjectName,
+			"config", t.ConfigPath, "err", err)
+		// A numberless delivery names no issue, so it must not enter the
+		// issue retry schedule: that schedule is keyed per loop and would
+		// cancel a real issue's pending retry. The sweep is not lost -- the
+		// periodic check finds the same stale branches on its next tick.
+		if d.Number > 0 {
+			w.schedule(ctx, t, d.Number, kindOpen, openRetryMax,
+				func(int) time.Duration { return w.OpenRetryDelay })
+		}
+		return
+	}
+```
+
+Add a test: a push delivery whose `Open` fails must leave an existing issue's pending retry
+armed.
 
 - [ ] **Step 6: Run the tests and confirm they pass**
 
@@ -780,85 +850,115 @@ git commit -m "feat: local behind count and pr_links deletion"
 ## Task 5: the `tend_interval` setting
 
 **Files:**
-- Modify: `internal/config/duration.go`
 - Modify: `internal/settings/settings.go:56-90` and `settings.go:360` (`Fields`)
-- Test: `internal/config/duration_test.go`, `internal/settings/settings_test.go`
+- Modify: `internal/settings/settings_test.go:38-59` (the round-trip test)
+- Test: `internal/settings/settings_test.go`
 
 **Interfaces:**
-- Consumes: `config.Duration` (`internal/config/duration.go:11`).
-- Produces: `settings.Settings.TendInterval config.Duration` (`yaml:"tend_interval"`),
-  `settings.DefaultTendInterval = 15 * time.Minute`, and the `tend_interval` key in
+- Consumes: nothing.
+- Produces: `settings.Settings.TendInterval string` (`yaml:"tend_interval,omitempty"`),
+  `settings.DefaultTendInterval = 15 * time.Minute`,
+  `func (s Settings) TendEvery() time.Duration`, and the `tend_interval` key in
   `settings.Fields()`.
 
 **review: no**
 
+**The field is a string, not a `config.Duration`, and that is deliberate.** Three reasons, each
+of which was a defect in the first draft of this plan:
+
+1. `settings.Save` marshals the whole struct (`internal/settings/settings.go:274`). A typed
+   duration with no `omitempty` writes `tend_interval: 0s` for a machine that never set one. The
+   next `Load` then sees the key, and any "was it set?" flag reads true — so the periodic pass
+   would silently disable itself on every machine that ever ran `agent-utils config set`. A
+   string with `omitempty` is absent when it is empty, so "never set" and "set to zero" stay
+   distinguishable with no second field.
+2. `internal/settings`'s package doc opens by distancing this package from `internal/config`
+   ("It is neither internal/config, which loads one LOOP's configuration file"). Importing
+   `config` for a scalar contradicts it.
+3. `config.Duration` has no `MarshalYAML`, and `internal/wizard/write.go:13-23` carries a
+   ten-line comment that depends on it not having one. Adding it would make that comment false
+   and drag the wizard into this change.
+
 - [ ] **Step 1: Write the failing tests**
 
-In `internal/config/duration_test.go`:
-
-```go
-// Save writes the settings file back. Without MarshalYAML a Duration is
-// marshalled as its integer nanoseconds, so a file written once would no
-// longer parse the next time it is read.
-func TestDurationRoundTripsThroughYAML(t *testing.T) {
-	type holder struct {
-		D config.Duration `yaml:"d"`
-	}
-	out, err := yaml.Marshal(holder{D: config.Duration(15 * time.Minute)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var back holder
-	if err := yaml.Unmarshal(out, &back); err != nil {
-		t.Fatalf("marshalled form does not parse: %q: %v", out, err)
-	}
-	if back.D.Std() != 15*time.Minute {
-		t.Errorf("round trip = %v, want 15m", back.D.Std())
-	}
-}
-```
-
-In `internal/settings/settings_test.go`:
+In `internal/settings/settings_test.go` — the file is `package settings`, so refer to the
+symbols unqualified, as the tests around it do:
 
 ```go
 // The default is applied by WithDefaults, not by Load, exactly as the listen
 // address is: Load must keep returning a true zero value for a machine that
 // has never run `config`.
-func TestWithDefaultsFillsTheTendInterval(t *testing.T) {
-	got := settings.Settings{}.WithDefaults()
-	if got.TendInterval.Std() != settings.DefaultTendInterval {
-		t.Errorf("TendInterval = %v, want %v", got.TendInterval.Std(), settings.DefaultTendInterval)
+func TestTendEveryDefaultsWhenUnset(t *testing.T) {
+	if got := (Settings{}).TendEvery(); got != DefaultTendInterval {
+		t.Errorf("TendEvery() = %v, want %v", got, DefaultTendInterval)
 	}
 }
 
-// Zero disables the periodic check, so WithDefaults must not overwrite a
-// stored zero with the default. A stored value is a decision; an absent value
-// is not.
-func TestWithDefaultsKeepsAnExplicitZeroTendInterval(t *testing.T) {
-	s := settings.Settings{TendIntervalSet: true}
-	if got := s.WithDefaults(); got.TendInterval.Std() != 0 {
-		t.Errorf("TendInterval = %v, want the stored 0", got.TendInterval.Std())
+// Zero disables the periodic check. It must survive, or an operator who turns
+// the pass off gets it back on the next load.
+func TestTendEveryHonoursAnExplicitZero(t *testing.T) {
+	for _, v := range []string{"0", "0s"} {
+		if got := (Settings{TendInterval: v}).TendEvery(); got != 0 {
+			t.Errorf("TendEvery(%q) = %v, want 0", v, got)
+		}
+	}
+}
+
+// An unparsable value falls back to the default rather than disabling the
+// pass. Set already refuses a bad value, so a bad one in the file was
+// hand-written, and silently turning the check off is the worse failure.
+func TestTendEveryFallsBackOnGarbage(t *testing.T) {
+	if got := (Settings{TendInterval: "later"}).TendEvery(); got != DefaultTendInterval {
+		t.Errorf("TendEvery() = %v, want the default", got)
+	}
+}
+
+// The bug this field shape exists to prevent: a settings file saved with no
+// tend_interval must come back with no tend_interval, so the default still
+// applies.
+func TestSaveThenLoadLeavesAnUnsetTendIntervalUnset(t *testing.T) {
+	withHome(t)
+	if err := Save(&Settings{Webhook: Webhook{Enabled: true}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TendInterval != "" {
+		t.Errorf("TendInterval = %q, want empty so the default applies", got.TendInterval)
+	}
+	if got.TendEvery() != DefaultTendInterval {
+		t.Errorf("TendEvery() = %v, want the default", got.TendEvery())
 	}
 }
 
 func TestTendIntervalIsASettableKey(t *testing.T) {
 	var found bool
-	for _, f := range settings.Fields() {
-		if f.Key == "tend_interval" {
-			found = true
-			s := &settings.Settings{}
-			if err := f.Set(s, "30m"); err != nil {
-				t.Fatal(err)
-			}
-			if s.TendInterval.Std() != 30*time.Minute {
-				t.Errorf("after Set: %v, want 30m", s.TendInterval.Std())
-			}
-			if got := f.Get(s); got != "30m0s" {
-				t.Errorf("Get = %q, want 30m0s", got)
-			}
-			if err := f.Set(s, "nonsense"); err == nil {
-				t.Error("an unparsable duration must be refused")
-			}
+	for _, f := range Fields() {
+		if f.Key != "tend_interval" {
+			continue
+		}
+		found = true
+		s := &Settings{}
+		if err := f.Set(s, "30m"); err != nil {
+			t.Fatal(err)
+		}
+		if s.TendInterval != "30m" {
+			t.Errorf("after Set: %q, want 30m", s.TendInterval)
+		}
+		if got := f.Get(s); got != "30m" {
+			t.Errorf("Get = %q, want 30m", got)
+		}
+		if err := f.Set(s, "nonsense"); err == nil {
+			t.Error("an unparsable duration must be refused")
+		}
+		if err := f.Set(s, "-5m"); err == nil {
+			t.Error("a negative duration must be refused")
+		}
+		f.Unset(s)
+		if s.TendInterval != "" {
+			t.Errorf("after Unset: %q, want empty", s.TendInterval)
 		}
 	}
 	if !found {
@@ -867,75 +967,92 @@ func TestTendIntervalIsASettableKey(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the tests and confirm they fail**
-
-Run: `go test ./internal/config/ ./internal/settings/ -run 'Duration|Tend' -v`
-Expected: FAIL — `MarshalYAML` and `TendInterval` do not exist.
-
-- [ ] **Step 3: Add `MarshalYAML` to `config.Duration`**
+**Also extend the existing round-trip test.** `TestSaveThenLoadRoundTripsEveryField`
+(`internal/settings/settings_test.go:38-59`) compares whole structs with `*got != *want`. It is
+this repo's check that a new settings field survives Save/Load, so the fixture must gain the new
+field:
 
 ```go
-// MarshalYAML renders the duration as the string form UnmarshalYAML accepts.
-//
-// Without it, yaml.Marshal writes the underlying int64 nanoseconds, and a file
-// written by settings.Save would fail to load on the next read. The canonical
-// form is what time.Duration prints, so a stored "15m" comes back as "15m0s".
-// That is the same value, and round-tripping correctly matters more than
-// preserving the operator's spelling.
-func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
+	want := &Settings{
+		Webhook: Webhook{
+			Enabled:    true,
+			URL:        "https://example.com/hooks/agent-utils",
+			ListenAddr: "0.0.0.0",
+			ListenPort: 9999,
+			Secret:     "supersecretvalue",
+		},
+		TendInterval: "30m",
+	}
 ```
 
-- [ ] **Step 4: Add the setting**
+- [ ] **Step 2: Run the tests and confirm they fail**
+
+Run: `go test ./internal/settings/ -run Tend -v`
+Expected: FAIL — `TendInterval` and `TendEvery` do not exist.
+
+- [ ] **Step 3: Add the setting**
 
 In `internal/settings/settings.go`:
 
 ```go
 // DefaultTendInterval is how often the listener looks for a pull request that
-// has fallen behind its base. It is applied by WithDefaults, not by Load.
+// has fallen behind its base. It is applied by TendEvery, not by Load, for the
+// reason WithDefaults states: Load must return a true zero value for a machine
+// that has never run `config`.
 //
-// The check is nearly free when nothing is behind -- it reads local git refs
-// the loop already fetched and makes no GitHub call -- so the interval is set
-// by how soon an operator wants a stale branch noticed, not by what the check
+// The check is nearly free when nothing is behind -- it compares local refs
+// the loop already fetched and makes no GitHub call -- so this value is set by
+// how soon an operator wants a stale branch noticed, not by what the check
 // costs.
 const DefaultTendInterval = 15 * time.Minute
 
 // Settings is the machine-wide configuration.
 type Settings struct {
 	Webhook Webhook `yaml:"webhook"`
-	// TendInterval is how often the listener runs its periodic tend check. A
-	// value of 0 disables that check and leaves every other tend trigger
-	// unchanged.
+	// TendInterval is how often the listener runs its periodic tend check.
+	// "0" disables that check and leaves every other tend trigger unchanged;
+	// an ABSENT value takes DefaultTendInterval.
+	//
+	// It is a string, and it carries omitempty, so those two states stay
+	// distinguishable through a Save. Save marshals the whole struct, so a
+	// typed duration would write "tend_interval: 0s" for a machine that never
+	// set one, and the next Load could not tell that from an operator who
+	// disabled the pass on purpose.
 	//
 	// It is machine-wide rather than per loop because it describes how
 	// attentive the daemon is, not anything about a loop. It applies to every
 	// loop with tend_pr: true, of every registered project.
-	TendInterval config.Duration `yaml:"tend_interval"`
-	// TendIntervalSet records that the file carried a tend_interval, so
-	// WithDefaults can tell a stored 0 -- which disables the check -- from an
-	// absent value, which takes DefaultTendInterval. Without it, an operator
-	// who disables the check gets it back on the next load.
-	TendIntervalSet bool `yaml:"-"`
+	TendInterval string `yaml:"tend_interval,omitempty"`
+}
+
+// TendEvery returns the periodic tend check's interval.
+//
+// An absent value takes the default. An explicit "0" disables the check. A
+// value that does not parse ALSO takes the default rather than disabling the
+// check: Fields refuses a bad value, so a bad one in the file was written by
+// hand, and silently turning off the pass that keeps branches current is the
+// worse of the two failures.
+func (s Settings) TendEvery() time.Duration {
+	if strings.TrimSpace(s.TendInterval) == "" {
+		return DefaultTendInterval
+	}
+	d, err := time.ParseDuration(s.TendInterval)
+	if err != nil || d < 0 {
+		return DefaultTendInterval
+	}
+	return d
 }
 ```
 
-Set `TendIntervalSet` where `Load` decodes the file. Decode into a shadow struct with
-`*config.Duration`, or check the decoded YAML node for the key; either is acceptable, but the
-flag must be true only when the key is present.
-
-In `WithDefaults`:
-
-```go
-	if !s.TendIntervalSet && s.TendInterval == 0 {
-		s.TendInterval = config.Duration(DefaultTendInterval)
-	}
-```
+Add `time` to the imports. `WithDefaults` is **not** changed: `TendEvery` owns the default, so
+`Load` and `Save` keep round-tripping the stored text unchanged.
 
 In `Fields()`, add:
 
 ```go
 		{
 			Key: "tend_interval",
-			Get: func(s *Settings) string { return s.TendInterval.Std().String() },
+			Get: func(s *Settings) string { return s.TendInterval },
 			Set: func(s *Settings, v string) error {
 				d, err := time.ParseDuration(v)
 				if err != nil {
@@ -944,23 +1061,25 @@ In `Fields()`, add:
 				if d < 0 {
 					return fmt.Errorf("tend_interval must not be negative")
 				}
-				s.TendInterval = config.Duration(d)
-				s.TendIntervalSet = true
+				// Stored as the operator typed it, not as the parsed value
+				// re-rendered: `config get` should read back what `config set`
+				// was given.
+				s.TendInterval = v
 				return nil
 			},
-			Unset: func(s *Settings) { s.TendInterval = 0; s.TendIntervalSet = false },
+			Unset: func(s *Settings) { s.TendInterval = "" },
 		},
 ```
 
-- [ ] **Step 5: Run the tests and confirm they pass**
+- [ ] **Step 4: Run the tests and confirm they pass**
 
-Run: `go test ./internal/config/ ./internal/settings/ ./cmd/...`
+Run: `go test ./internal/settings/ ./cmd/...`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add internal/config/duration.go internal/config/duration_test.go internal/settings/settings.go internal/settings/settings_test.go
+git add internal/settings/settings.go internal/settings/settings_test.go
 git commit -m "feat(settings): add the machine-wide tend_interval"
 ```
 
@@ -978,6 +1097,12 @@ spends a GitHub call only when the local answer is yes.
 **Interfaces:**
 - Consumes: `Manager.BehindLocal`, `Store.DeletePRLink` (Task 4), `Deps`, `ghub.Client`.
 - Produces:
+  - `Deps.Behind func(headRef, baseRef string) (behind int, known bool, err error)` — a new
+    field on `loopcmd.Deps`, wired in `loopcmd.Open` to `deps.WT.BehindLocal`. It is a seam
+    because `Deps.WT` is a concrete `*worktree.Manager` that a test cannot substitute. `Deps` is
+    also built by hand at several call sites, so a nil value must be treated as "no candidates",
+    the way `Deps.Fetch` is nil-guarded at `internal/loopcmd/tendsweep.go:164`.
+  - `loopcmd.TendCheck` and `loopcmd.TendCheckResult`:
 
 ```go
 // TendCheckResult is what one candidate pass found.
@@ -1124,19 +1249,85 @@ func TestTendCheckDropsACandidateWhoseIssueLostTheReviewLabel(t *testing.T) {
 
 Write `countingGH`, `tendCheckDeps`, `tendCheckConfig`, and `seedPRLink` in the test file. Model
 them on the fakes the package already uses (`fakeGH` in `epicsweep_test.go`). `tendCheckDeps` must
-supply a `Fetch` that records it ran and a worktree seam whose `BehindLocal` answers from the map.
+supply a `Fetch` that records it ran and a `Behind` that answers from the map.
 
-**Note for the implementer:** `Deps.WT` is a concrete `*worktree.Manager`, so a test cannot
-substitute it. Add one seam to `Deps` for this pass:
+**The pull request fixtures above are incomplete as written. Fix them before you start.**
+`engine.LinkPR` (`internal/engine/prlink.go:20-39`) links an issue to a pull request only when
+BOTH hold:
+
+- `pr.Trusted` is true. `ghub.convertPR` sets it only for a head branch in the SAME repository,
+  authored by an OWNER, MEMBER, or COLLABORATOR, with both refs passing `SafeRef`
+  (`internal/ghub/ghub.go:107-118`). It is the guard that stops a fork's pull request from
+  running an agent — or now, from being force-pushed.
+- `pr.Body` carries a closing reference to the issue (`Closes #7` and the other spellings
+  `closingRef` matches).
+
+Every fixture must therefore read:
 
 ```go
-	// Behind counts how far a pull request's head is behind its base, from the
-	// local checkout. It is a seam so a test needs no git repository; production
-	// wires it to worktree.Manager.BehindLocal.
-	Behind func(headRef, baseRef string) (behind int, known bool, err error)
+ghub.PullRequest{
+	Number: 9, HeadRef: "feat/x", BaseRef: "master",
+	Trusted: true, Body: "Closes #7",
+}
 ```
 
-Wire it in `loopcmd.Open` beside `Fetch`, and fall back to `deps.WT.BehindLocal` when it is nil.
+Add one test that proves the trust boundary survives this pass, because it is the property a
+force-push makes expensive to get wrong:
+
+```go
+// An untrusted pull request -- a fork's branch, or an outside contributor's --
+// is not linked, not counted, and never rebased. ghub.convertPR is what sets
+// Trusted, and engine.LinkPR is what enforces it; this test is here so a
+// future refactor of the confirm step cannot quietly drop the check.
+func TestTendCheckIgnoresAnUntrustedPullRequest(t *testing.T) {
+	gh := &countingGH{
+		prs:    []ghub.PullRequest{{Number: 9, HeadRef: "feat/x", BaseRef: "master", Body: "Closes #7"}},
+		issues: []ghub.Issue{{Number: 7, Repo: "o/r", Labels: []string{"status:review"}}},
+	}
+	deps := tendCheckDeps(t, gh, map[string]int{"feat/x": 3})
+	seedPRLink(t, deps, 7, 9, "feat/x", "master")
+
+	got, err := TendCheck(context.Background(), tendCheckConfig(), deps, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Stale != 0 {
+		t.Errorf("Stale = %d, want 0 for an untrusted pull request", got.Stale)
+	}
+}
+```
+
+Two more tests the task needs, both trivial and both currently missing:
+
+```go
+// A loop that does not tend must not fetch, must not read rows, and must not
+// call GitHub.
+func TestTendCheckDoesNothingWhenTheLoopDoesNotTend(t *testing.T) {
+	gh := &countingGH{}
+	deps := tendCheckDeps(t, gh, nil)
+	cfg := tendCheckConfig()
+	cfg.TendPR = false
+
+	got, err := TendCheck(context.Background(), cfg, deps, true)
+	if err != nil || got.Confirmed || gh.calls != 0 {
+		t.Errorf("got %+v, err %v, calls %d; want a no-op", got, err, gh.calls)
+	}
+}
+
+// A failed fetch makes every comparison below it stale, so the pass stops
+// rather than reporting a branch as current after the base moved.
+func TestTendCheckFailsWhenTheFetchFails(t *testing.T) {
+	deps := tendCheckDeps(t, &countingGH{}, nil)
+	deps.Fetch = func() error { return errors.New("no route to host") }
+
+	if _, err := TendCheck(context.Background(), tendCheckConfig(), deps, false); err == nil {
+		t.Error("a failed fetch must fail the pass")
+	}
+}
+```
+
+**Test file placement:** `internal/loopcmd/tendcheck_test.go` is `package loopcmd`, like every
+other test in that directory, so refer to `TendCheck` and `TendCheckResult` unqualified.
 
 - [ ] **Step 2: Run the tests and confirm they fail**
 
@@ -1199,6 +1390,34 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 	if !cfg.TendPR {
 		return out, nil
 	}
+
+	// A seam that a hand-built Deps may leave nil. Deps.Fetch is nil-guarded
+	// the same way at tendsweep.go:164; without this the daemon panics on the
+	// Serve goroutine and takes every project down with it.
+	if deps.Behind == nil {
+		return out, nil
+	}
+
+	// The loop lock, for the same reason every other Fetch in this package is
+	// under one. This pass fetches (which moves the refs a concurrent rebase
+	// resolves) and deletes pr_links rows (which races PutPRLink), and
+	// tendSnapshot's comment records that this package keeps a single writer
+	// under the lock deliberately -- see tendsweep.go:92-98.
+	//
+	// It does NOT wait. A held lock means a tick is already running for this
+	// loop, and that tick does this pass's work as part of its own: the sweep
+	// it performs is the thing this pass would have armed. Waiting would pin
+	// the Serve goroutine behind an agent dispatch.
+	l, err := lock.TryAcquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
+	if errors.Is(err, lock.ErrHeld) {
+		slog.Info("another tick holds the loop lock; skipping this tend check",
+			"loop", cfg.Name)
+		return out, nil
+	}
+	if err != nil {
+		return out, err
+	}
+	defer l.Release()
 
 	// Before every comparison below, because each of them reads a remote
 	// tracking ref this updates. A stale answer is worse than no answer: it
@@ -1263,11 +1482,16 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 			continue
 		}
 		if err := deps.Store.DeletePRLink(cfg.Name, cfg.Repo, number); err != nil {
-			slog.Error("delete a pr link whose pull request is closed",
+			// Named for the failure, like every other Error line in this
+			// package ("decision failed", "retire dead dispatch").
+			slog.Error("could not delete a pr link whose pull request is closed",
 				"loop", cfg.Name, "issue", number, "pr", l.PRNumber, "err", err)
 			continue
 		}
-		slog.Debug("dropped a pr link whose pull request is closed",
+		// Info, not Debug: nothing in this program logs at Debug, no handler
+		// is configured for it, and a row disappearing from the database is a
+		// state change an operator should be able to find afterwards.
+		slog.Info("dropped a pr link whose pull request is closed",
 			"loop", cfg.Name, "issue", number, "pr", l.PRNumber)
 	}
 
@@ -1283,6 +1507,12 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 			// written. Either way this loop no longer tends it.
 			continue
 		}
+		// LinkPR, not a lookup by the row's pr_number, and that is the point.
+		// It links only a TRUSTED pull request -- same repository, an owner,
+		// member or collaborator, both refs safe (internal/ghub/ghub.go:107-118)
+		// -- that names this issue in a closing reference. The stored row
+		// carries none of that, so trusting it would let a fork's branch reach
+		// the rebase path this feature adds.
 		pr, ok := engine.LinkPR(number, prs)
 		if !ok || pr.BaseRef != cfg.DefaultBranch || pr.HeadRef != links[number].HeadRef {
 			continue
@@ -1293,8 +1523,15 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 }
 ```
 
-Add the `fmt` and `ghub` imports. Confirm `cfg.RepoOwner()` and `cfg.RepoName()` are the
+Imports: `context`, `errors`, `fmt`, `log/slog`, `path/filepath`, plus `config`, `engine`,
+`ghub`, and `lock` from this module. Confirm `cfg.RepoOwner()` and `cfg.RepoName()` are the
 accessors `tendSnapshot` uses (`internal/loopcmd/tendsweep.go:101`).
+
+**`lock.TryAcquire` may not exist.** Read `internal/lock/` first. `lock.Acquire`
+(`internal/loopcmd/tendsweep.go:83`) is what the package uses today, and `lock.ErrHeld` is
+already referenced by `internal/listener/work.go`. If the package offers only a blocking
+`Acquire`, add a non-blocking variant there, with its own test, as part of this task — a
+blocking acquire on the `Serve` goroutine is exactly the stall this pass must not cause.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
@@ -1319,15 +1556,30 @@ git commit -m "feat(loopcmd): find a stale pull request with local git before ca
 
 **Interfaces:**
 - Consumes: `loopcmd.TendCheck` (Task 6), `Target.TendPR` (Task 1),
-  `settings.Settings.TendInterval` (Task 5), `Worker.armTend`.
+  `settings.Settings.TendEvery()` (Task 5), `Worker.armTend`.
 - Produces:
   - `Worker.TendInterval time.Duration` — 0 disables the pass.
-  - `Worker.RunTendCheck func(ctx, cfg, deps, force) (loopcmd.TendCheckResult, error)` — the seam.
-  - `Worker.tendCheckPass(ctx)` — one sweep of every loop.
+  - `Worker.RunTendCheck func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, force bool) (loopcmd.TendCheckResult, error)` — the seam.
+  - `Worker.ScanTargets func() (Routes, error)` — the routing seam for this pass, defaulted to
+    the package-level `Scan` in `NewWorker`. **It is required, not optional:** `Scan` reads the
+    real registry, and the `Worker`'s existing routing seams are `Targets` and `TargetFor`
+    (`internal/listener/work.go:191-192`), neither of which this pass can use. Without a seam
+    every test below finds zero loops and asserts nothing.
+  - `Worker.tendCheckPass(ctx)` — one pass over every tending loop.
+  - `Worker.tendCheckOne(ctx, t Target, acc *access)` — one loop.
+  - `Worker.confirms map[loopKey]time.Time` — guarded by `w.mu`.
+  - `tendConfirmInterval = 6 * time.Hour`.
+  - `tendPassTimeout = 10 * time.Minute` — the whole pass's deadline.
 
 **review: yes** — it adds concurrent work to the daemon.
 
 - [ ] **Step 1: Write the failing tests**
+
+**Helper reality check before you write these.** `internal/listener/work_test.go` builds its
+worker with `newHarness(db)` (`work_test.go:162`) and controls time through a `timers` seam
+(`work_test.go:49`), not with `newTestWorker`/`fireTendTimer`. Use the real helpers, and set
+`w.ScanTargets` to return a fixed `Routes` rather than building a registry on disk. The names
+below are written against that: replace `newTestWorker(t)` with the harness the file already has.
 
 ```go
 // The pass walks the registry, not the deliveries. That is what makes it reach
@@ -1335,6 +1587,12 @@ git commit -m "feat(loopcmd): find a stale pull request with local git before ca
 func TestTendCheckPassArmsASweepForEachStaleLoop(t *testing.T) {
 	w := newTestWorker(t)
 	w.TendInterval = time.Minute
+	w.ScanTargets = func() (Routes, error) {
+		return Routes{Targets: []Target{{
+			ProjectID: "p1", ProjectName: "weather", LoopName: "execution",
+			Repo: "o/r", ConfigPath: cfgPath, DefaultBranch: "master", TendPR: true,
+		}}}, nil
+	}
 	var checked []string
 	w.RunTendCheck = func(_ context.Context, cfg *config.Config, _ loopcmd.Deps, _ bool) (loopcmd.TendCheckResult, error) {
 		checked = append(checked, cfg.Name)
@@ -1421,18 +1679,28 @@ func TestTendCheckPassForcesTheConfirmEverySixHours(t *testing.T) {
 }
 
 // Zero disables the pass outright.
-func TestServeRunsNoTendCheckWhenTheIntervalIsZero(t *testing.T) {
+//
+// The cancelled-context version of this test proves nothing: Serve returns at
+// the ctx.Err() guard (work.go:1412-1415) before it reaches the select, so it
+// passes identically with a non-zero interval. Assert on the ticker channel
+// the constructor builds instead.
+func TestServeBuildsNoTendTickerWhenTheIntervalIsZero(t *testing.T) {
 	w := newTestWorker(t)
 	w.TendInterval = 0
-	w.RunTendCheck = func(context.Context, *config.Config, loopcmd.Deps, bool) (loopcmd.TendCheckResult, error) {
-		t.Fatal("the pass must not run when tend_interval is 0")
-		return loopcmd.TendCheckResult{}, nil
+	if ch := w.tendTicker(); ch != nil {
+		t.Error("a zero interval must build no ticker; a nil channel blocks forever, which is the disable")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	w.Serve(ctx) // returns at once on a cancelled context
+
+	w.TendInterval = time.Minute
+	if ch := w.tendTicker(); ch == nil {
+		t.Error("a non-zero interval must build a ticker")
+	}
 }
 ```
+
+Split the ticker construction into a small `tendTicker()` method so `Serve`'s wiring is testable
+at all. `Serve` itself stays untested — it is a loop around seams — but the branch that decides
+whether the pass can ever run must not be.
 
 - [ ] **Step 2: Run the tests and confirm they fail**
 
@@ -1477,7 +1745,15 @@ Initialise `confirms` in `NewWorker` and set `RunTendCheck: loopcmd.TendCheck`.
 // armTend, so the periodic trigger and the merge trigger end in the same
 // sweep, on the same timer, holding the same loop lock.
 func (w *Worker) tendCheckPass(ctx context.Context) {
-	routes, err := Scan()
+	// A deadline on the WHOLE pass. This runs on the Serve goroutine, which is
+	// the single wake loop for every project on this machine: it is what fires
+	// retry deadlines. The pass shells out to git, and git talks to a network
+	// it does not control, so an unreachable remote with no deadline here
+	// stops every retry, for every loop, until the daemon is restarted.
+	ctx, cancel := context.WithTimeout(ctx, tendPassTimeout)
+	defer cancel()
+
+	routes, err := w.ScanTargets()
 	if err != nil {
 		slog.Error("cannot scan projects for the tend check", "err", err)
 		return
@@ -1492,21 +1768,73 @@ func (w *Worker) tendCheckPass(ctx context.Context) {
 		if !t.TendPR {
 			continue
 		}
+		// Checked between loops, not only at the top: the deadline above and a
+		// daemon shutdown both land here, and a pass that ignored them would
+		// keep opening databases through the stop.
 		if ctx.Err() != nil {
 			return
 		}
 		w.tendCheckOne(ctx, t, acc)
 	}
 }
+
+// tendCheckOne runs the check for one loop and arms a sweep when it finds
+// something.
+func (w *Worker) tendCheckOne(ctx context.Context, t Target, acc *access) {
+	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
+		Token: acc.token, GH: acc.gh, RequireGitHub: true,
+		MigrationPolicy: loopcmd.FailOnUnimported,
+	})
+	// Deferred BEFORE any branch below can return. Open holds a SQLite handle,
+	// and this pass calls Open once per loop per interval for the life of the
+	// daemon, so a single missed cleanup is not a leak that stops -- it is one
+	// handle every fifteen minutes, forever. tickOne records the same rule for
+	// the delivery path (work.go:548-553). The nil check is for the error
+	// path, where Open returns a nil cleanup.
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		// Logged and dropped, with NO retry scheduled. The retry schedule is
+		// keyed per loop and spends an issue's budget; this pass names no
+		// issue, and the next interval re-runs it in full.
+		slog.Error("cannot open loop for the tend check", "loop", t.LoopName,
+			"project", t.ProjectName, "config", t.ConfigPath, "err", err)
+		return
+	}
+
+	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}
+	w.mu.Lock()
+	last, seen := w.confirms[key]
+	w.mu.Unlock()
+	force := !seen || w.Now().Sub(last) >= tendConfirmInterval
+
+	res, err := w.RunTendCheck(ctx, cfg, deps, force)
+	if err != nil {
+		// Logged and dropped, for the reason tendPass gives: this pass decides
+		// no issue, so there is no issue whose retry budget could pay for it,
+		// and the next interval tries again.
+		slog.Error("tend check failed", "loop", cfg.Name, "project", t.ProjectName, "err", err)
+		return
+	}
+	if res.Confirmed {
+		w.mu.Lock()
+		w.confirms[key] = w.Now()
+		w.mu.Unlock()
+	}
+	if res.Stale == 0 {
+		// Deliberately silent. This is the common case, once every interval,
+		// for every loop on the machine; a line here would bury every line
+		// that means something.
+		return
+	}
+	slog.Info("the tend check found a pull request behind its base",
+		"loop", cfg.Name, "project", t.ProjectName, "stale", res.Stale)
+	w.armTend(ctx, t, cfg.DefaultBranch)
+}
 ```
 
-`tendCheckOne` opens the loop the way `tendFresh` does, decides `force` from `w.confirms` under
-the mutex, calls `w.RunTendCheck`, records the confirm time when the result reports
-`Confirmed`, and calls `w.armTend(ctx, t, cfg.DefaultBranch)` when `Stale > 0`. Log one line per
-loop that finds something; say nothing for a loop that finds nothing, or the log fills with
-noise every interval.
-
-Add the constant:
+Add the constants:
 
 ```go
 // tendConfirmInterval is how often the check calls GitHub even though nothing
@@ -1514,18 +1842,39 @@ Add the constant:
 // delivery: a pull request that closed, or an issue that lost its review
 // label, leaves a row the local gate would otherwise trust forever.
 const tendConfirmInterval = 6 * time.Hour
+
+// tendPassTimeout bounds one whole tend check across every loop on the
+// machine. See tendCheckPass: the pass runs on the single wake loop, and it
+// shells out to a network git cannot be trusted to return from.
+const tendPassTimeout = 10 * time.Minute
 ```
+
+**`armTend` is called with the pass's context**, which carries `tendPassTimeout`. Check what
+`armTend` does with it (`internal/listener/work.go:855-899`): the timer's callback tests
+`ctx.Err()` before running the sweep, so a context that expires with the pass would cancel the
+sweep it just armed. Pass the **daemon's** context to `armTend`, not the timeout-bounded one —
+keep both in scope in `tendCheckPass` and hand the right one to each callee. This is a real bug
+if you miss it, and no test above catches it; add one that arms a sweep and then lets the pass
+context expire before the timer fires.
 
 - [ ] **Step 5: Add the ticker to `Serve`**
 
 ```go
-	var tendC <-chan time.Time
-	if w.TendInterval > 0 {
-		tend := time.NewTicker(w.TendInterval)
-		defer tend.Stop()
-		tendC = tend.C
+	// tendTicker returns the channel the periodic tend check fires on, or nil
+	// when it is disabled. A nil channel blocks forever in a select, which is
+	// exactly what "disabled" means here -- no branch, no flag, nothing for a
+	// later reader to get subtly wrong.
+	func (w *Worker) tendTicker() <-chan time.Time {
+		if w.TendInterval <= 0 {
+			return nil
+		}
+		return time.NewTicker(w.TendInterval).C
 	}
 ```
+
+In `Serve`, build it once before the loop (keeping the `*time.Ticker` so it can be stopped on
+return), and add `case <-tendC:` to the `select`, which runs `w.tendCheckPass(ctx)` and
+continues.
 
 Add `case <-tendC:` to the `select`, running `w.tendCheckPass(ctx)` and then continuing the loop.
 A nil channel blocks forever, which is exactly what a disabled pass needs. Do **not** fold this
@@ -1534,7 +1883,7 @@ into `Wake`: `Wake` is driven by retry deadlines and floored at `MinWakeInterval
 - [ ] **Step 6: Wire the setting**
 
 In `cmd/agent-utils/listener.go`, where the worker is built, set
-`w.TendInterval = s.TendInterval.Std()` from the loaded settings, after `WithDefaults`. Log the
+`w.TendInterval = s.TendEvery()` from the loaded settings. Log the
 resolved interval in the startup banner, beside the routing table, so an operator can see whether
 the pass is on.
 
@@ -1566,18 +1915,38 @@ hold the loop lock and stall the ticker.
 - Produces:
 
 ```go
+func (m *Manager) EnsurePRCtx(ctx context.Context, number int, headRef string) (string, error)
+func (m *Manager) DirtyCtx(ctx context.Context, path string) (bool, error)
 func (m *Manager) HeadSHA(ctx context.Context, path string) (string, error)
 func (m *Manager) Rebase(ctx context.Context, path, baseRef string) error
 func (m *Manager) AbortRebase(ctx context.Context, path string) error
 func (m *Manager) PushWithLease(ctx context.Context, path, headRef, lease string) error
+func (m *Manager) RemoveCtx(ctx context.Context, path string) error
 ```
+
+**`EnsurePRCtx` and `DirtyCtx` are not optional additions.** The first draft of this plan reused
+the existing `EnsurePR` and `Dirty`, which run through `m.git` → `exec.Command` with **no
+deadline** (`internal/worktree/worktree.go:81, 166-179`). `EnsurePR` runs `git fetch origin
+<headRef>` — the command most likely to block on a network stall — and it runs first on the
+rebase path, while `TendSweep` holds the loop lock. Bounding the push and the rebase while
+leaving the fetch unbounded defeats the whole reason this task exists.
+
+Implement each as the context-taking body, and leave the existing method as a thin wrapper that
+calls it with `context.Background()`, so every current caller keeps compiling and behaving
+exactly as before.
 
 **review: yes** — `PushWithLease` rewrites a remote branch.
 
 - [ ] **Step 1: Write the failing tests**
 
-Build a real repository with an `origin` remote in a temp directory, as the package's other git
-tests do:
+`internal/worktree/worktree_test.go` has `initRepo` (`worktree_test.go:10`), which already
+creates a bare origin — model the new fixtures on it. `newTestManagerWithRemote`,
+`newTestManagerWithConflict`, `gitOut`, and `commitOnBranch` do **not** exist and are part of
+this task's work; the conflict fixture (two branches editing the same line) is the fiddly one.
+Add `context`, `time`, and `regexp` to the file's imports — none of the three is there today
+(`worktree.go:3-10`).
+
+Build a real repository with an `origin` remote in a temp directory:
 
 ```go
 // A clean replay pushes, and the remote then holds the rebased commit.
@@ -1689,14 +2058,36 @@ const gitTimeout = 2 * time.Minute
 
 Then:
 
-- `HeadSHA` runs `rev-parse HEAD` and trims the output.
+- `HeadSHA` runs `rev-parse HEAD` and returns the trimmed object id. **It must read stdout
+  only** — `cmd.Output()`, not the `CombinedOutput` every other helper here uses. `gitCtx`
+  returns stdout and stderr together, so any advice, hook, or fsmonitor warning git prints on
+  success is prepended to the id. A polluted lease makes every push fail forever; the failure is
+  silent, because `gitRebase` treats a refused push as "leave this branch alone". Give `HeadSHA`
+  its own runner, or have `gitCtx` take a flag.
 - `Rebase` checks `SafeRef(baseRef)` and runs `rebase origin/<baseRef>`.
 - `AbortRebase` runs `rebase --abort`. It returns nil when there is no rebase in progress; git
   exits non-zero in that case, and the caller aborts unconditionally.
-- `PushWithLease` checks `SafeRef(headRef)` and runs
-  `push --force-with-lease=<headRef>:<lease> origin HEAD:refs/heads/<headRef>`. Document that the
-  lease is what makes an unattended force-push safe, and that git — not this program — enforces
-  it.
+- `RemoveCtx` is `Remove` with a deadline. It is what `gitRebase` uses when an abort fails, so a
+  worktree left mid-rebase is destroyed rather than handed to an agent.
+- `PushWithLease` checks `SafeRef(headRef)`, **validates the lease**, and runs
+  `push --force-with-lease=<headRef>:<lease> origin HEAD:refs/heads/<headRef>`.
+
+  The lease validation is the one guard the whole feature rests on, so it is checked here rather
+  than trusted from the caller:
+
+```go
+// leaseSHA matches a full git object id, in either hash size. A short or
+// abbreviated id is refused: --force-with-lease with an EMPTY value silently
+// degrades to remote-tracking semantics, and a detached tend worktree has no
+// useful remote-tracking ref -- EnsurePR fetches into FETCH_HEAD, not
+// refs/remotes/origin/<head> (worktree.go:81-88). That degraded form is a
+// materially weaker guard than the fetched id, and it would arrive looking
+// exactly like the strong one.
+var leaseSHA = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
+```
+
+  `PushWithLease` returns an error, and pushes nothing, when the lease fails that pattern. Add a
+  test for the empty lease specifically — it is the case that degrades rather than fails.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
@@ -1718,7 +2109,12 @@ git commit -m "feat(worktree): bounded rebase, abort, and leased force-push"
 - Create: `internal/loopcmd/rebase.go`
 - Create: `internal/loopcmd/rebase_test.go`
 - Modify: `internal/loopcmd/tick.go:91-105` (`Summary`), `tick.go:379` (`act`)
+- Modify: `internal/loopcmd/open.go:205-216` — **wire `Deps.Git`**. Without this the shipped
+  binary has `Deps.Git == nil`, which `gitRebase` treats as "disabled". The feature would be
+  dead on arrival and every test would still pass.
+- Modify: `internal/loopcmd/logs.go:60-99` (`SelectDispatch`) — see Step 6.
 - Modify: `internal/store/types.go:5-10` (the kinds)
+- Modify: `internal/store/store.go` — add `RecordFinishedDispatch` (Step 4)
 
 **Interfaces:**
 - Consumes: the Task 8 primitives, `engine.Decision`, `Deps`.
@@ -1736,11 +2132,13 @@ git commit -m "feat(worktree): bounded rebase, abort, and leased force-push"
 // of its branching must be able to make a push fail without a remote to fail
 // against. *worktree.Manager satisfies it, and Open wires it in.
 type RebaseGit interface {
-	EnsurePR(number int, headRef string) (string, error)
-	Dirty(path string) (bool, error)
+	PathForPR(number int) string
+	EnsurePRCtx(ctx context.Context, number int, headRef string) (string, error)
+	DirtyCtx(ctx context.Context, path string) (bool, error)
 	HeadSHA(ctx context.Context, path string) (string, error)
 	Rebase(ctx context.Context, path, baseRef string) error
 	AbortRebase(ctx context.Context, path string) error
+	RemoveCtx(ctx context.Context, path string) error
 	PushWithLease(ctx context.Context, path, headRef, lease string) error
 }
 ```
@@ -1756,7 +2154,7 @@ type RebaseGit interface {
 
 ```go
 // The point of the feature: a clean replay costs no agent and no tokens.
-func TestTryRebaseCleanReplayDispatchesNoAgent(t *testing.T) {
+func TestGitRebaseCleanReplayDispatchesNoAgent(t *testing.T) {
 	deps, git := rebaseDeps(t) // git is a fake recording the calls
 	git.rebaseErr = nil
 	var sum Summary
@@ -1777,7 +2175,7 @@ func TestTryRebaseCleanReplayDispatchesNoAgent(t *testing.T) {
 
 // A conflict is what an agent is for. The abort must run first, so the next
 // pass does not meet a worktree stuck mid-rebase.
-func TestTryRebaseConflictAbortsAndDispatchesTheAgent(t *testing.T) {
+func TestGitRebaseConflictAbortsAndDispatchesTheAgent(t *testing.T) {
 	deps, git := rebaseDeps(t)
 	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
 	var sum Summary
@@ -1802,7 +2200,7 @@ func TestTryRebaseConflictAbortsAndDispatchesTheAgent(t *testing.T) {
 // A refused push means somebody else moved the branch while this pass ran.
 // Sending an agent at a branch under active work is the more dangerous answer,
 // so this pass does nothing and lets the next one read the new state.
-func TestTryRebaseRefusedPushDispatchesNoAgent(t *testing.T) {
+func TestGitRebaseRefusedPushDispatchesNoAgent(t *testing.T) {
 	deps, git := rebaseDeps(t)
 	git.pushErr = errors.New("stale info")
 	var sum Summary
@@ -1817,7 +2215,7 @@ func TestTryRebaseRefusedPushDispatchesNoAgent(t *testing.T) {
 
 // A dirty worktree holds work a rebase would destroy. The agent is the right
 // actor for it.
-func TestTryRebaseDirtyWorktreeDispatchesTheAgent(t *testing.T) {
+func TestGitRebaseDirtyWorktreeDispatchesTheAgent(t *testing.T) {
 	deps, git := rebaseDeps(t)
 	git.dirty = true
 	var sum Summary
@@ -1834,7 +2232,7 @@ func TestTryRebaseDirtyWorktreeDispatchesTheAgent(t *testing.T) {
 }
 
 // A loop with worktree: none has no pull-request worktree to rebase in.
-func TestTryRebaseWithoutAPerIssueWorktreeDispatchesTheAgent(t *testing.T) {
+func TestGitRebaseWithoutAPerIssueWorktreeDispatchesTheAgent(t *testing.T) {
 	deps, git := rebaseDeps(t)
 	cfg := rebaseConfig()
 	cfg.Agent.Worktree = config.WorktreeNone
@@ -1914,7 +2312,7 @@ In `Summary`, beside `Tended`:
 	Rebased int `json:"rebased"`
 ```
 
-- [ ] **Step 4: Implement `tryRebase` and the git path**
+- [ ] **Step 4: Implement `gitRebase` and the git path**
 
 Create `internal/loopcmd/rebase.go`:
 
@@ -1970,38 +2368,61 @@ import (
 //     still gets a current branch. Those refusals continue to stop every AGENT
 //     dispatch, including this function's own escalation, because Decide
 //     applies them before act runs.
-func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision) (bool, error) {
+// rebaseOutcome is what gitRebase settled, and it is three values rather than
+// a bool because two different outcomes both mean "dispatch no agent" while
+// only one of them rebased anything. A bool made the caller count a REFUSED
+// push as a completed rebase in the tick summary.
+type rebaseOutcome int
+
+const (
+	// notDone: the caller must dispatch the tend agent.
+	notDone rebaseOutcome = iota
+	// doneRebased: git replayed the branch and pushed it.
+	doneRebased
+	// doneNoRebase: this pass settled the decision by declining to act. No
+	// agent, and nothing to count.
+	doneNoRebase
+)
+
+func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision) (rebaseOutcome, error) {
 	// A loop with no per-issue worktree has no pull-request checkout to rebase
 	// in, and this pass will not create one: the agent path already handles
 	// that mode.
 	if cfg.Agent.Worktree != config.WorktreePerIssue || deps.Git == nil {
-		return false, nil
+		return notDone, nil
 	}
 
-	path, err := deps.Git.EnsurePR(d.PR, d.HeadRef)
+	// The dirty check comes FIRST, before the worktree is refreshed, and that
+	// ordering is the whole guard. EnsurePR runs `checkout --detach
+	// FETCH_HEAD` on an existing worktree (worktree.go:81-88), which orphans
+	// any local commits an agent left behind -- so a check made afterwards
+	// asks about a tree the refresh already flattened, and Dirty's
+	// ahead-of-upstream test returns false for a detached worktree by
+	// construction (worktree.go:152-160). Checking the stale path before the
+	// refresh is what lets a crashed agent's unpushed work stop this pass.
+	dirty, err := deps.Git.DirtyCtx(ctx, deps.Git.PathForPR(d.PR))
 	if err != nil {
-		return false, err
-	}
-
-	// The lease. It is read AFTER EnsurePR, which fetches the head ref and
-	// checks it out, so it is the commit the remote had a moment ago -- which
-	// is exactly what the push must be pinned to.
-	lease, err := deps.Git.HeadSHA(ctx, path)
-	if err != nil {
-		return false, err
-	}
-
-	// A dirty tend worktree holds work a rebase would destroy: uncommitted
-	// changes, or commits that were never pushed. The agent is the right actor
-	// for it.
-	dirty, err := deps.Git.Dirty(path)
-	if err != nil {
-		return false, err
+		return notDone, err
 	}
 	if dirty {
-		slog.Info("tend worktree is dirty; leaving this rebase to the agent",
+		slog.Info("tend worktree holds uncommitted or unpushed work; leaving this rebase to the agent",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR)
-		return false, nil
+		return notDone, nil
+	}
+
+	path, err := deps.Git.EnsurePRCtx(ctx, d.PR, d.HeadRef)
+	if err != nil {
+		return notDone, err
+	}
+
+	// The lease. It is read AFTER EnsurePRCtx, which fetches the head ref and
+	// checks it out, so it is the commit the remote had a moment ago -- which
+	// is exactly what the push must be pinned to. PushWithLease refuses an id
+	// that is not a full object hash, so a polluted read fails loudly here
+	// rather than silently degrading the guard.
+	lease, err := deps.Git.HeadSHA(ctx, path)
+	if err != nil {
+		return notDone, err
 	}
 
 	if err := deps.Git.Rebase(ctx, path, d.BaseRef); err != nil {
@@ -2009,20 +2430,43 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 		// worktree left mid-rebase fails every later pass for this pull
 		// request, and the rebase failure below is the one worth reporting.
 		if abortErr := deps.Git.AbortRebase(ctx, path); abortErr != nil {
-			slog.Error("could not abort a failed rebase", "loop", cfg.Name,
-				"issue", d.Issue, "pr", d.PR, "err", abortErr)
+			// The abort itself failed, so the worktree still holds
+			// .git/rebase-merge. This is reachable, not theoretical: gitCtx
+			// uses exec.CommandContext, which KILLS the rebase at the deadline
+			// or at shutdown, and the abort then inherits the same dead
+			// context and fails immediately. Worktrees are stable across ticks
+			// (worktree.go:75-101), so the broken state would persist -- and
+			// an agent started in it can force-push a half-replayed tree.
+			//
+			// Destroy it and dispatch nobody. The next pass builds it fresh.
+			slog.Error("could not abort a failed rebase; removing the worktree and dispatching nothing",
+				"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", abortErr)
+			if rmErr := deps.Git.RemoveCtx(ctx, path); rmErr != nil {
+				slog.Error("could not remove a worktree left mid-rebase",
+					"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", rmErr)
+			}
+			return doneNoRebase, nil
 		}
 		slog.Info("rebase did not replay cleanly; dispatching the tend agent",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
-		return false, nil
+		return notDone, nil
 	}
 
 	if err := deps.Git.PushWithLease(ctx, path, d.HeadRef, lease); err != nil {
 		// The lease did its job, or the remote is unreachable. Either way this
 		// pass acts no further and dispatches no agent; see the doc comment.
+		//
+		// safeText, because the branch name reaches this line from a webhook
+		// payload by way of a database row, and SafeRef bounds its CHARSET but
+		// not its LENGTH. handler.go:185-196 records the unrotated-log-file
+		// failure that requires it.
 		slog.Warn("force-with-lease push refused; leaving this branch alone",
-			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "head", d.HeadRef, "err", err)
-		return true, nil
+			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR,
+			"head", safeText(d.HeadRef), "err", err)
+		// done, but NOT rebased. The caller must not count this: the summary
+		// is the surface an operator audits unattended force-pushes with, and
+		// nothing was pushed.
+		return doneNoRebase, nil
 	}
 
 	if err := recordRebase(cfg, deps, d); err != nil {
@@ -2032,38 +2476,78 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 			"issue", d.Issue, "pr", d.PR, "err", err)
 	}
 	slog.Info("rebased a pull request with git; no agent was dispatched",
-		"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "head", d.HeadRef, "base", d.BaseRef)
-	return true, nil
+		"loop", cfg.Name, "issue", d.Issue, "pr", d.PR,
+		"head", safeText(d.HeadRef), "base", safeText(d.BaseRef))
+	return doneRebased, nil
 }
 
 // recordRebase writes the row that gives a force-push a cause.
 //
 // Without it the only evidence is a force-push in the pull request's timeline
-// and a log line in a daemon an operator may not be watching. The row is
-// written already finished: no process backs it, so nothing may reap it, and
-// FinishDispatch only updates a row that is still running -- which is why the
-// create and the finish are both here rather than split across the pass.
+// and a log line in a daemon an operator may not be watching.
 //
 // The session identifier is empty on purpose. There is no conversation.
-// sessionsFrom skips a dispatch with no session, so a rebase never appears in
-// `sessions list` and never distorts a session's run count or cost, while
-// `project logs --list` shows it like any other dispatch.
+// sessionsFrom skips a dispatch with no session (internal/loopcmd/sessions.go),
+// so a rebase never appears in `sessions list` and never distorts a session's
+// run count or cost, while `project logs --list` shows it like any other
+// dispatch.
 func recordRebase(cfg *config.Config, deps Deps, d engine.Decision) error {
-	id, err := deps.Store.CreateDispatch(store.Dispatch{
+	return deps.Store.RecordFinishedDispatch(store.Dispatch{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: d.Issue, Kind: store.KindRebase,
 		PRNumber: d.PR, Title: d.Title,
-	})
-	if err != nil {
-		return err
-	}
-	return deps.Store.FinishDispatch(id, store.DispatchResult{
-		Status: store.StatusSucceeded, ExitCode: 0, CostUSD: 0,
 	})
 }
 ```
 
-Confirm `store.DispatchResult`'s field names against `internal/store/types.go` before writing the
-literal, and add `FinishedAt` or `DurationMS` if the type requires them.
+**Why a new store method rather than `CreateDispatch` + `FinishDispatch`.** `CreateDispatch`
+always inserts `status = running` (`internal/store/store.go:904-916`). A `rebase` row left
+running is not inert -- three separate places branch on "tend or not", and a rebase row falls on
+the wrong side of all three:
+
+- `internal/engine/engine.go:29-45` puts every running row whose `Kind != store.KindTend` into
+  `liveIssues`, which suppresses **every** decision for that issue: start, resume, retry and
+  tend. The issue would be frozen, with no reaper able to free it.
+- `internal/loopcmd/tick.go:281` guards `MarkNeedsRetry` with the same `!= KindTend` test, so the
+  full `Tick` would reap the orphan and stamp a retry deadline and backoff on an issue whose
+  agent never ran.
+- `internal/loopcmd/tendsweep.go:196-215` partitions running rows into "tend rows, which are
+  reaped" and "everything else, treated as live" -- and says so in as many words.
+
+The first draft of this plan created the row running and then logged-and-continued when the
+finish failed, which produces exactly that stuck row. One INSERT that is already finished when
+it lands makes the bad state unreachable, which is better than teaching three guards about a
+fourth kind:
+
+```go
+// RecordFinishedDispatch inserts one dispatch row that is already complete.
+//
+// Every other dispatch row is born running and finished later, because a
+// process backs it. This one has none: git did the work synchronously, and it
+// is over before the row exists. Two statements would leave a window -- and a
+// PERMANENT stuck row if the second failed -- in which the row reads as a live
+// agent to engine.Decide (engine.go:29-45), to reapDead (tick.go:281), and to
+// tendDispatch's reap partition (tendsweep.go:196-215), none of which can reap
+// a kind they do not know about.
+func (s *Store) RecordFinishedDispatch(d Dispatch) error {
+	now := time.Now().UTC()
+	_, err := s.db.Exec(`
+		INSERT INTO dispatches (project_id, loop, repo, number, kind, session_id,
+		                        status, started_at, finished_at, exit_code,
+		                        cost_usd, duration_ms, log_path, pr_number, title,
+		                        model, harness, effort)
+		VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, 0, 0, 0, '', ?, ?, '', '', '')`,
+		s.projectID, d.Loop, d.Repo, d.Number, d.Kind,
+		StatusSucceeded, now, now, d.PRNumber, d.Title)
+	if err != nil {
+		return fmt.Errorf("record finished dispatch: %w", err)
+	}
+	return nil
+}
+```
+
+Check the column names against `dispatchColumns` and the existing `CreateDispatch` INSERT before
+writing this, and add a store test asserting the row lands with `status = succeeded`, an empty
+session, and a non-zero `finished_at`.
 
 - [ ] **Step 5: Intercept in `act`**
 
@@ -2073,34 +2557,54 @@ Replace `case engine.KindTend:` at `tick.go:379`:
 	case engine.KindTend:
 		// git first, the agent second. A rebase that replays cleanly needs no
 		// conversation, and this is the common case: the agent exists for the
-		// conflicts. tryRebase reports whether it settled the decision --
+		// conflicts. gitRebase reports whether it settled the decision --
 		// including the case where it settled it by declining to act, which is
 		// what a refused lease means.
-		{
-			done, err := gitRebase(ctx, cfg, deps, d)
-			if err != nil {
-				// Logged, not returned: a git failure must not abandon the
-				// rest of the sweep, and the agent is the fallback this whole
-				// path is built around.
-				slog.Warn("automatic rebase failed; falling back to the tend agent",
-					"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
-			} else if done {
-				sum.Rebased++
-				return nil
-			}
+		switch outcome, err := gitRebase(ctx, cfg, deps, d); {
+		case err != nil:
+			// Logged, not returned: a git failure must not abandon the rest of
+			// the sweep, and the agent is the fallback this whole path is
+			// built around.
+			slog.Warn("automatic rebase failed; falling back to the tend agent",
+				"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
+		case outcome == doneRebased:
+			sum.Rebased++
+			return nil
+		case outcome == doneNoRebase:
+			// Settled by declining to act. No agent, and nothing counted.
+			return nil
 		}
 		return count(&sum.Tended, dispatch(ctx, cfg, deps, d, now, store.KindTend))
 ```
 
-- [ ] **Step 6: Run the tests and confirm they pass**
+- [ ] **Step 6: Keep `project logs` working**
+
+`SelectDispatch` with no `--dispatch`, `--session` or `--issue` returns the NEWEST dispatch
+(`internal/loopcmd/logs.go:60-85`). After a clean rebase that is the `rebase` row, whose
+`LogPath` is empty — so a bare `agent-utils project logs` would fail with "no log at  yet".
+
+A rebase row has no log because no process wrote one. Skip it when selecting a default:
+
+```go
+	// A rebase row is a record, not a run: git did the work in this process
+	// and wrote no transcript. Selecting it as "the newest dispatch" would
+	// answer `project logs` with an empty path. It is still listed by --list,
+	// and still selectable by --dispatch, which is where an operator who wants
+	// to see it looks.
+```
+
+Write the test with the rebase row newest and an agent dispatch behind it, and assert the agent's
+log is the one selected. `--list` must still show both.
+
+- [ ] **Step 7: Run the tests and confirm they pass**
 
 Run: `go test ./internal/loopcmd/ ./internal/store/`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add internal/loopcmd/rebase.go internal/loopcmd/rebase_test.go internal/loopcmd/tick.go internal/store/types.go
+git add internal/loopcmd/rebase.go internal/loopcmd/rebase_test.go internal/loopcmd/tick.go internal/loopcmd/open.go internal/loopcmd/logs.go internal/store/types.go internal/store/store.go
 git commit -m "feat(loopcmd): rebase with git and escalate to an agent only on a conflict"
 ```
 
@@ -2108,48 +2612,100 @@ git commit -m "feat(loopcmd): rebase with git and escalate to an agent only on a
 
 ## Task 10: documentation
 
-**Files:**
-- Modify: `README.md` (the Webhooks section, around line 484; the tend paragraph around line 172)
-- Modify: `docs/configuration.md`
+The stale-doc set is larger than "the README's webhook section". Each item below is a sentence
+that this change makes false, found by reading rather than guessing.
 
-**Interfaces:**
-- Consumes: everything above.
-- Produces: no code.
+**Files:**
+- Modify: `internal/loopcmd/tick.go:107-113` — the `Tick` doc comment says GitHub sends no
+  delivery when a pull request falls behind "because someone pushed to master (that is a push
+  event, which this daemon does not subscribe to)". This change subscribes to it. It is CODE
+  documentation, so no other task touches it and no reviewer of the README will catch it.
+- Modify: `README.md:449-450` (the cron section makes the same claim), `README.md:490`
+  ("dispatching tend agents only"), `README.md:531-533` ("a `push` event, which this daemon does
+  not subscribe to"), and the machine-wide settings list around `README.md:555-560`.
+- Modify: `docs/configuration.md:761-767, 780-788, 813-816` — the `tend_pr` section says
+  "**Two things dispatch a tend agent**" (now three), "Dispatch a tend agent **only** if it is
+  behind" (git now goes first), "each tend run gets a fresh session" (a rebase has none), and
+  "**A sweep does not replace a periodic tick**" (there is now a periodic check).
+
+**Interfaces:** none.
 
 **review: no**
 
-- [ ] **Step 1: Update the README's webhook section**
+- [ ] **Step 1: Fix the code comment first**
 
-State the three tend triggers in one place: a merge into the default branch, a push to it, and
-the periodic check. Say plainly that the periodic check runs only while the listener runs, and
-that cron is still the safety net for a machine with no daemon. Say that the check makes no
-GitHub call when nothing is behind.
+Update `internal/loopcmd/tick.go:107-113`. `Tick` is still the full reconcile and cron is still
+the safety net — the only false clause is the parenthetical about not subscribing to push. Say
+what is now true: the daemon subscribes to push, and `Tick` remains the sweep that runs where no
+daemon does.
 
-- [ ] **Step 2: Update the README's tend paragraph**
+- [ ] **Step 2: The three tend triggers, in one place**
 
-Say that git attempts the rebase first, that a clean replay costs no agent, and that a conflict
-dispatches the tend agent as before. Say that a clean rebase writes a `rebase` dispatch row and
-appears in `project logs --list`, not in `sessions list`.
+In the README's webhook section, replace the merge-only description with the three triggers: a
+merge into the default branch, a push to it, and the periodic check. State that the periodic
+check runs only while the listener runs, that it makes no GitHub call when nothing is behind, and
+that cron is still the safety net for a machine with no daemon. Fix `README.md:449-450` and
+`README.md:531-533`, which both assert the opposite today.
 
-- [ ] **Step 3: Document `tend_interval` in `docs/configuration.md`**
+- [ ] **Step 3: The agent-free rebase**
 
-Give the key, the default (`15m`), the meaning of `0`, and the fact that it is machine-wide.
-Name the command that sets it: `agent-utils config set tend_interval 30m`.
+In the README's tend paragraph (around `README.md:172`) and in `docs/configuration.md:761-816`:
+git attempts the rebase first; a clean replay costs no agent and no tokens; a conflict dispatches
+the tend agent as before. Correct the three specific sentences named in Files. Say that a clean
+rebase writes a `rebase` dispatch row, visible in `project logs --list` and deliberately absent
+from `sessions list`.
 
-- [ ] **Step 4: Add the deployment note**
+- [ ] **Step 4: Document `tend_interval` where machine-wide settings live**
+
+**Not in `docs/configuration.md`.** That document is the *loop* configuration reference and says
+in its own text (`docs/configuration.md:127-134`) that the machine-wide file "is never described
+by this document". The machine-wide settings are documented in the README beside
+`webhook.listen_addr` and `webhook.listen_port` (`README.md:555-560`); `tend_interval` goes
+there. Give the default (`15m`), the meaning of `0`, and the command:
+`agent-utils config set tend_interval 30m`.
+
+- [ ] **Step 5: The deployment note**
 
 Record that `push` is a new event, so every repository needs `register-webhook` re-run, and that
-the step needs a token with admin on the repository. Say that until that is done, the merge
+the step needs a token with **admin** on the repository — the token in `~/.agent-utils/env` today
+holds `maintain` and gets a 404 reading its own hooks. Say that until that is done, the merge
 trigger and the periodic check still work.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add README.md docs/configuration.md
+git add README.md docs/configuration.md internal/loopcmd/tick.go
 git commit -m "docs: the three tend triggers, the agent-free rebase, and tend_interval"
 ```
 
 ---
+
+## Known limits
+
+Recorded here rather than discovered later, following the predecessor plan's precedent.
+
+- **The periodic check runs only while the listener runs.** A machine with no daemon has no
+  periodic tend. Cron remains the safety net, and this change does not add one.
+- **`confirms` is memory only.** A daemon restart forces one confirm per tending loop: two API
+  calls each, once. That is the price of adding no column and no migration.
+- **The cold-cache window.** A loop whose `pr_links` rows are empty finds nothing until the first
+  forced confirm, which is the first pass after start. A loop whose rows are stale can be up to
+  six hours out of date on the *link* facts — never on the behind counts, which are read from git
+  every pass.
+- **`maxTendPerSweep` (10) still caps the agent-free rebases.** The cap exists to bound how many
+  agents one merge can start, and a git rebase costs no agent, so applying it to both is
+  conservative. A repository with forty stale pull requests takes four passes — an hour at the
+  default interval. Its log line ("the rest wait for the next merge") is now wrong in a second
+  way and should read "the next sweep".
+- **The loop lock is held longer than before.** `act` runs under it, and the rebase adds a fetch,
+  a rebase, and a push per stale pull request, each bounded at two minutes.
+  `internal/loopcmd/tendsweep.go:53-67` records why that matters: a delivery arriving while the
+  lock is held is dropped by `issuePass` with no retry. The mitigation here is the per-command
+  deadline and the cap above; moving the git work outside the lock is a larger change and is
+  **deliberately not attempted in this plan**. See the gate note.
+- **No separate off-switch for the agent-free rebase.** `tend_interval: 0` disables *detection*,
+  not the rebase, which also runs from the merge trigger, the push trigger, and cron's `Tick`.
+  Turning the rebase off means turning `tend_pr` off for the loop.
 
 ## Pipeline State
 
