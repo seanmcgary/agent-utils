@@ -124,7 +124,7 @@ func TestRenderSessionsShowsStoppedAboveOrphanedBelowRunning(t *testing.T) {
 		{ID: "sess-stopped", Loop: "planning", Issue: 7, Stopped: true, Last: time.Now()},
 		{ID: "sess-live-and-stopped", Loop: "planning", Issue: 8, Live: true, Stopped: true, Last: time.Now()},
 	}
-	out := RenderSessions(&Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}, sessions)
+	out := RenderSessions(&Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}, sessions, false)
 
 	if !strings.Contains(out, "STOPPED") {
 		t.Fatalf("output must show STOPPED for the stopped-only session:\n%s", out)
@@ -248,7 +248,7 @@ func TestRenderersShowModelAndHarness(t *testing.T) {
 			Dispatches: 1, LastStatus: store.StatusSucceeded},
 	}
 	perProject := RenderSessions(
-		&Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}, sessions)
+		&Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}, sessions, false)
 	machine := RenderAllSessions(sessions, SessionFilter{})
 
 	for _, out := range []string{perProject, machine} {

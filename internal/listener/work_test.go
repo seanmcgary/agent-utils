@@ -383,6 +383,17 @@ type deliveryGH struct {
 	mu      sync.Mutex
 	fetched []int
 	err     error
+	// openIssues and openPRs are what the two list calls answer. They are
+	// what the closure reconcile reads: everything a test dispatched against
+	// and did NOT list here is what that pass should mark closed.
+	openIssues []int
+	openPRs    []int
+	// listErr fails both list calls, for the case where one repository cannot
+	// be read and must not stop the others.
+	listErr error
+	// listed records "owner/name" per list call, so a test can prove the pass
+	// asked once per repository rather than once per issue.
+	listed []string
 }
 
 func (f *deliveryGH) Issue(_ context.Context, _, _ string, number int) (ghub.Issue, error) {
@@ -404,11 +415,37 @@ func (f *deliveryGH) fetches() []int {
 func (f *deliveryGH) PullRequest(context.Context, string, string, int) (ghub.PullRequest, error) {
 	return ghub.PullRequest{}, nil
 }
-func (f *deliveryGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
-	return nil, nil
+func (f *deliveryGH) ListOpenIssues(_ context.Context, owner, name string) ([]ghub.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listed = append(f.listed, owner+"/"+name)
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]ghub.Issue, 0, len(f.openIssues))
+	for _, n := range f.openIssues {
+		out = append(out, ghub.Issue{Number: n, State: "open"})
+	}
+	return out, nil
 }
 func (f *deliveryGH) ListOpenPullRequests(context.Context, string, string) ([]ghub.PullRequest, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]ghub.PullRequest, 0, len(f.openPRs))
+	for _, n := range f.openPRs {
+		out = append(out, ghub.PullRequest{Number: n})
+	}
+	return out, nil
+}
+
+// listCalls returns the repositories the list calls were made against.
+func (f *deliveryGH) listCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.listed...)
 }
 func (f *deliveryGH) BehindBy(context.Context, string, string, string, string) (int, error) {
 	return 0, nil

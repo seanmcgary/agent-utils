@@ -25,6 +25,11 @@ type Session struct {
 	// half the grouping key: a session identifier is only unique within a
 	// project.
 	ProjectID string
+	// Repo is the "owner/name" the session's issue lives in, copied from the
+	// dispatch row. It is carried for the closed lookup: a closure is keyed by
+	// repository and number, because two loops watching one repository see the
+	// same closure.
+	Repo string
 	// Project is the project's display name. Only the machine-wide report
 	// fills it in; the per-project report already names the project in its
 	// header.
@@ -60,6 +65,15 @@ type Session struct {
 	Live bool
 	// Orphaned reports a dispatch still marked running whose process is gone.
 	Orphaned bool
+	// Closed reports that the issue or pull request this session worked on is
+	// closed. It is filled in by applyClosed, a separate pass for the reason
+	// applyStopped is one.
+	//
+	// It is a fact about the ISSUE, so it marks EVERY session that ever worked
+	// that issue, unlike Stopped, which marks only the newest. Hiding old work
+	// on a finished issue is the whole point; leaving the first of five
+	// sessions on a closed issue in the table would defeat it.
+	Closed bool
 	// Stopped reports that the issue this session belongs to is stopped --
 	// by an operator's `sessions kill`, or by an invalid override label. It
 	// is filled in by applyStopped, a separate pass over sessionsFrom's
@@ -97,6 +111,12 @@ func Sessions(p *Project, loopFilter string) ([]Session, error) {
 		return nil, err
 	}
 	applyStopped(out, stoppedSet(stopped, p.Config.ID))
+
+	closures, err := db.Closures()
+	if err != nil {
+		return nil, err
+	}
+	applyClosed(out, closedSet(closures, p.Config.ID))
 	applySettings(out, map[string]string{p.Config.ID: p.Dir})
 
 	// Stable, because sessionsFrom returns the rows in the query's id DESC
@@ -121,6 +141,17 @@ type SessionFilter struct {
 	Loop     string
 	Running  bool
 	Orphaned bool
+	// All keeps the sessions of closed issues and pull requests in the report.
+	// They are hidden by default: an issue that is closed is work that is
+	// over, and a machine that has been running loops for months has far more
+	// of that than of anything an operator is looking for.
+	//
+	// It is NOT one of the state flags above, and does not go through
+	// keepState. Those name which states to report; this one only says whether
+	// finished work is included, and it is applied by the renderer so that
+	// FindSession, `sessions kill` and `sessions describe` keep resolving a
+	// closed issue's session by name.
+	All bool
 }
 
 // filtered reports that the operator narrowed the report.
@@ -132,6 +163,85 @@ type SessionFilter struct {
 // in step with this file.
 func (f SessionFilter) filtered() bool {
 	return f.Project != "" || f.Loop != "" || f.Running || f.Orphaned
+}
+
+// closedKey identifies one issue for the closed lookup. It carries the project
+// and the repository but NOT the loop, matching the closures table: two loops
+// watching one repository see the same closure, and a key with a loop in it
+// would need the same fact recorded once per loop.
+type closedKey struct {
+	ProjectID string
+	Repo      string
+	Number    int
+}
+
+// closedSet builds the lookup applyClosed uses, from DB.Closures(). projectID
+// narrows it to one project, exactly as stoppedSet does, and an empty
+// projectID keeps every project.
+func closedSet(all []store.Closure, projectID string) map[closedKey]bool {
+	out := make(map[closedKey]bool, len(all))
+	for _, c := range all {
+		if projectID != "" && c.ProjectID != projectID {
+			continue
+		}
+		out[closedKey{ProjectID: c.ProjectID, Repo: c.Repo, Number: c.Number}] = true
+	}
+	return out
+}
+
+// applyClosed marks every session whose issue is closed.
+//
+// EVERY session, not just the newest -- the one place it deliberately differs
+// from applyStopped. See Session.Closed.
+//
+// A session whose issue nothing has reported on stays unmarked, and therefore
+// visible. The two writers of the closures table are the listener's close
+// deliveries and its startup reconcile, so a machine that has never run the
+// daemon marks nothing and its report is exactly what it was before.
+func applyClosed(sessions []Session, closed map[closedKey]bool) {
+	for i := range sessions {
+		key := closedKey{
+			ProjectID: sessions[i].ProjectID,
+			Repo:      sessions[i].Repo,
+			Number:    sessions[i].Issue,
+		}
+		sessions[i].Closed = closed[key]
+	}
+}
+
+// visible splits sessions into the ones a report shows and a count of the ones
+// it hid, so the footer can say how much it is not showing.
+//
+// all short-circuits rather than filtering to the same slice, because "hid
+// nothing" and "was not asked to hide" print differently: with --all there is
+// no hidden count to report at all.
+func visible(sessions []Session, all bool) ([]Session, int) {
+	if all {
+		return sessions, 0
+	}
+	kept := make([]Session, 0, len(sessions))
+	hidden := 0
+	for _, s := range sessions {
+		if s.Closed {
+			hidden++
+			continue
+		}
+		kept = append(kept, s)
+	}
+	return kept, hidden
+}
+
+// hiddenNote is the footer line that says how many closed sessions a report
+// left out. It is empty when none were.
+func hiddenNote(hidden int) string {
+	if hidden == 0 {
+		return ""
+	}
+	noun := "sessions"
+	if hidden == 1 {
+		noun = "session"
+	}
+	return fmt.Sprintf("\n%d closed %s hidden (--all to show)\n", hidden, noun)
 }
 
 // keepState reports whether a session survives the state flags.
@@ -261,6 +371,15 @@ func AllSessions(f SessionFilter) ([]Session, error) {
 		return nil, err
 	}
 	applyStopped(kept, stoppedSet(stopped, projectID))
+
+	// Machine-wide for the reason StoppedIssues is read machine-wide here:
+	// projectID is "" unless --project narrowed it, and closedSet treats "" as
+	// every project.
+	closures, err := db.Closures()
+	if err != nil {
+		return nil, err
+	}
+	applyClosed(kept, closedSet(closures, projectID))
 	applySettings(kept, dirs)
 
 	nameProjects(kept, names)
@@ -410,6 +529,7 @@ func sessionsFrom(ds []store.Dispatch, loopFilter string) []Session {
 			cur = &Session{
 				ID:         d.SessionID,
 				ProjectID:  d.ProjectID,
+				Repo:       d.Repo,
 				Loop:       d.Loop,
 				Issue:      d.Number,
 				Title:      d.Title,
@@ -445,11 +565,24 @@ func sessionsFrom(ds []store.Dispatch, loopFilter string) []Session {
 }
 
 // RenderSessions formats sessions for a terminal.
-func RenderSessions(p *Project, sessions []Session) string {
+//
+// all keeps the sessions of closed issues, which are hidden otherwise. The
+// hiding happens HERE rather than in Sessions so that FindSession -- and
+// therefore `project logs --session` and `sessions describe` -- can still
+// resolve a closed issue's session by name. A report is the only place the
+// distinction matters.
+func RenderSessions(p *Project, sessions []Session, all bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "project %s  (%s)\n\n", p.Config.Name, p.Root)
 
-	if len(sessions) == 0 {
+	shown, hidden := visible(sessions, all)
+	if len(shown) == 0 {
+		if hidden > 0 {
+			// Distinct from the never-ran text below: this project HAS
+			// sessions, and every one of them is finished work.
+			fmt.Fprintf(&b, "No open sessions.%s", hiddenNote(hidden))
+			return b.String()
+		}
 		fmt.Fprintf(&b, "No sessions yet. A session is created the first time a loop\n")
 		fmt.Fprintf(&b, "dispatches an agent for an issue, and is reused on every resume.\n")
 		return b.String()
@@ -458,7 +591,7 @@ func RenderSessions(p *Project, sessions []Session) string {
 	fmt.Fprintf(&b, "%-38s %-12s %-6s %-24s %-5s %-9s %-24s %-8s %-10s %s\n",
 		"SESSION", "LOOP", "ISSUE", "TITLE", "RUNS", "COST", "MODEL", "HARNESS",
 		"STATE", "LAST RUN")
-	for _, s := range sessions {
+	for _, s := range shown {
 		state := s.LastStatus
 		switch {
 		case s.Live:
@@ -472,6 +605,11 @@ func RenderSessions(p *Project, sessions []Session) string {
 			state = "STOPPED"
 		case s.Orphaned:
 			state = "ORPHANED"
+		case s.Closed:
+			// Below ORPHANED: a closed issue whose agent never recorded an
+			// outcome is still an orphan to recover, and the row is only
+			// visible at all because --all asked for it.
+			state = "CLOSED"
 		}
 		fmt.Fprintf(&b, "%-38s %-12s %-6d %-24s %-5d $%-8.2f %-24s %-8s %-10s %s\n",
 			s.ID, truncate(s.Loop, 12), s.Issue, truncate(s.Title, 24),
@@ -480,6 +618,7 @@ func RenderSessions(p *Project, sessions []Session) string {
 			s.Last.Local().Format("2006-01-02 15:04"))
 	}
 
+	fmt.Fprint(&b, hiddenNote(hidden))
 	fmt.Fprintf(&b, "\nFollow one with: agent-utils project logs --session <SESSION>\n")
 	return b.String()
 }
@@ -499,7 +638,15 @@ func RenderSessions(p *Project, sessions []Session) string {
 func RenderAllSessions(sessions []Session, f SessionFilter) string {
 	var b strings.Builder
 
-	if len(sessions) == 0 {
+	shown, hidden := visible(sessions, f.All)
+	if len(shown) == 0 {
+		if hidden > 0 {
+			// Checked before f.filtered(): "nothing matched that filter" is
+			// misleading when what actually happened is that every match was
+			// finished work, and --all is the flag that answers it.
+			fmt.Fprintf(&b, "No open sessions.%s", hiddenNote(hidden))
+			return b.String()
+		}
 		if f.filtered() {
 			fmt.Fprintf(&b, "No sessions matched that filter.\n")
 			return b.String()
@@ -513,7 +660,7 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 	fmt.Fprintf(&b, "%-16s %-38s %-12s %-6s %-24s %-5s %-9s %-24s %-8s %-10s %s\n",
 		"PROJECT", "SESSION", "LOOP", "ISSUE", "TITLE", "RUNS", "COST", "MODEL",
 		"HARNESS", "STATE", "LAST RUN")
-	for _, s := range sessions {
+	for _, s := range shown {
 		state := s.LastStatus
 		switch {
 		case s.Live:
@@ -524,6 +671,8 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 			state = "STOPPED"
 		case s.Orphaned:
 			state = "ORPHANED"
+		case s.Closed:
+			state = "CLOSED"
 		}
 		// Project is padded but never truncated. The footer asks the operator
 		// to type this value back into --name, and registry.Find matches a
@@ -540,6 +689,7 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 	// the project from the working directory, and this table is read from
 	// anywhere, so the short form the per-project report prints would fail for
 	// most of the rows here.
+	fmt.Fprint(&b, hiddenNote(hidden))
 	fmt.Fprintf(&b, "\nFollow one with: agent-utils project --name <PROJECT> logs --session <SESSION>\n")
 	return b.String()
 }

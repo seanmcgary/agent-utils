@@ -310,6 +310,8 @@ func projectSessionsCommand() *cli.Command {
 				Usage: "list every session with its issue, runs, cost and state",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "name", Usage: "restrict to one loop"},
+					&cli.BoolFlag{Name: "all",
+						Usage: "include the sessions of closed issues and pull requests"},
 				},
 				Action: func(_ context.Context, c *cli.Command) error {
 					p, err := openProject(c)
@@ -320,7 +322,7 @@ func projectSessionsCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					fmt.Print(loopcmd.RenderSessions(p, sessions))
+					fmt.Print(loopcmd.RenderSessions(p, sessions, c.Bool("all")))
 					return nil
 				},
 			},
@@ -395,6 +397,14 @@ func sessionsCommand() *cli.Command {
 						Usage: "restrict to sessions whose agent is still alive"},
 					&cli.BoolFlag{Name: "orphaned",
 						Usage: "restrict to sessions marked running whose process is gone"},
+					// --all is spelled the same here as on `project sessions
+					// list`, and means the same thing. It is unrelated to the
+					// --all that `sessions kill` and `sessions resume` carry:
+					// there it widens a target from one issue to every issue,
+					// which is why that one is a dangerous flag and this one
+					// is not.
+					&cli.BoolFlag{Name: "all",
+						Usage: "include the sessions of closed issues and pull requests"},
 				},
 				Action: func(_ context.Context, c *cli.Command) error {
 					filter := loopcmd.SessionFilter{
@@ -402,6 +412,7 @@ func sessionsCommand() *cli.Command {
 						Loop:     c.String("loop"),
 						Running:  c.Bool("running"),
 						Orphaned: c.Bool("orphaned"),
+						All:      c.Bool("all"),
 					}
 					sessions, err := loopcmd.AllSessions(filter)
 					if err != nil {

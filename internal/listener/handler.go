@@ -569,6 +569,13 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// the only layer that has it.
 		closedIssue := event == "issues" && body.Action == "closed"
 
+		// reopened covers BOTH events, unlike the two close flags. It arms
+		// neither the epic sweep nor the worktree cleanup -- it only erases a
+		// recorded closure, which is keyed by GitHub's own number space, and
+		// issues and pull requests share that. See Delivery.Reopened.
+		reopened := (event == "issues" || event == "pull_request") &&
+			body.Action == "reopened"
+
 		// 9. GitHub redelivers on timeout and on manual "Redeliver," and the
 		// plaintext hop behind a reverse proxy makes a captured delivery
 		// replayable forever. A repeat is answered 200 without a second Tick.
@@ -681,6 +688,9 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if closedIssue {
 				attrs = append(attrs, "closed_issue", true)
 			}
+			if reopened {
+				attrs = append(attrs, "reopened", true)
+			}
 			slog.Info("accepted delivery", attrs...)
 
 			s.wg.Add(1)
@@ -689,7 +699,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				defer s.wg.Done()
 				s.Tick(ctx, Delivery{
 					Repo: repo, Number: number, MergedInto: mergedInto, PushedTo: pushedTo,
-					ClosedPR: closedPR, ClosedIssue: closedIssue,
+					ClosedPR: closedPR, ClosedIssue: closedIssue, Reopened: reopened,
 				})
 			}()
 		default:
