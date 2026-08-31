@@ -48,6 +48,13 @@ type Entry struct {
 	Path string
 	// Repo is the repository the loop watches. It is empty when Err is set.
 	Repo string
+	// DefaultBranch and TendPR are copied off the same Load that fills in Repo.
+	// The listener needs both to answer a push delivery without opening a
+	// database: a push to a branch no loop tends must cost one field test, not
+	// a token read, a SQLite handle, and a migration check. They are empty and
+	// false when Err is set, like Repo.
+	DefaultBranch string
+	TendPR        bool
 	// Err records why the file could not be loaded. Listing reports a broken
 	// configuration rather than hiding it, because a file that silently does
 	// not appear is harder to debug than one that appears with its error.
@@ -173,6 +180,8 @@ func List(agentUtilsDir string) ([]Entry, error) {
 		} else {
 			entry.Name = cfg.Name
 			entry.Repo = cfg.Repo
+			entry.DefaultBranch = cfg.DefaultBranch
+			entry.TendPR = cfg.TendPR
 		}
 		out = append(out, entry)
 	}
