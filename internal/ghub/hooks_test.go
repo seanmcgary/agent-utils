@@ -203,8 +203,8 @@ func TestIsHookEvent(t *testing.T) {
 			t.Errorf("IsHookEvent(%q) = false, want true", e)
 		}
 	}
-	if IsHookEvent("push") {
-		t.Error(`IsHookEvent("push") = true, want false`)
+	if IsHookEvent("star") {
+		t.Error(`IsHookEvent("star") = true, want false`)
 	}
 }
 

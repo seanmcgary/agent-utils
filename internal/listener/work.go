@@ -340,6 +340,12 @@ type Delivery struct {
 	// repository-wide sweep. See Worker.Deliver for the regression that makes
 	// this the important property of this type.
 	MergedInto string
+	// PushedTo is the branch a push delivery moved, and is empty for every
+	// other delivery. It arms the same tend sweep MergedInto does, for the
+	// case a merge cannot cover: a direct push to the default branch produces
+	// no pull_request delivery, so nothing else tells this daemon that every
+	// open pull request just fell behind.
+	PushedTo string
 	// ClosedPR is true when this delivery closed a pull request, merged or
 	// not. It is what arms worktree cleanup: on any close the pr-<N>
 	// worktree (and, when the pull request closes one, the issue-<M>

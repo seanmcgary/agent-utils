@@ -483,6 +483,9 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			Sender struct {
 				Login string `json:"login"`
 			} `json:"sender"`
+			// Ref is the branch a push delivery moved. It is the only subject
+			// a push has: the payload carries no issue and no pull request.
+			Ref string `json:"ref"`
 		}
 		if err := json.Unmarshal(payload, &body); err != nil || !repoFullName.MatchString(body.Repository.FullName) {
 			s.rejected(w, deliveryID, "repository", http.StatusBadRequest)
@@ -503,9 +506,18 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		if number == 0 {
 			number = body.PullRequest.Number
 		}
-		if number <= 0 {
+		// A push names a branch, not an issue, so it is the one accepted event
+		// with no number. Every other event keeps the rule: a delivery this
+		// daemon cannot attribute to a number is one it cannot act on, and
+		// answering 202 would hide a malformed delivery -- or a subscription
+		// to an event that carries no number -- behind a success the operator
+		// never sees.
+		if number <= 0 && event != "push" {
 			s.rejected(w, deliveryID, "issue number", http.StatusBadRequest)
 			return
+		}
+		if number < 0 {
+			number = 0
 		}
 
 		// A merged pull request is the only delivery that arms a sweep. The
@@ -525,6 +537,19 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		if event == "pull_request" && body.Action == "closed" && body.PullRequest.Merged &&
 			ghub.SafeRef(body.PullRequest.Base.Ref) {
 			mergedInto = body.PullRequest.Base.Ref
+		}
+
+		// pushedTo is the branch a push delivery moved, and it arms the same
+		// sweep a merge does. It is shape-checked here, exactly as mergedInto
+		// is: the value reaches git as a branch name, and a ref failing
+		// SafeRef could never have been tended anyway. A ref that is not a
+		// branch (a tag, for example) leaves this empty, and an empty value
+		// arms nothing.
+		var pushedTo string
+		if event == "push" {
+			if ref, ok := strings.CutPrefix(body.Ref, "refs/heads/"); ok && ghub.SafeRef(ref) {
+				pushedTo = ref
+			}
 		}
 
 		// closedPR is what arms worktree cleanup, and it is deliberately wider
@@ -620,8 +645,13 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// see safeText and safeLabels for the unrotated-log-file failure
 			// that requires it.
 			attrs := []any{"delivery", safeDeliveryID(deliveryID),
-				"event", event, "action", safeAction(body.Action), "repo", repo,
-				"number", number}
+				"event", event, "action", safeAction(body.Action), "repo", repo}
+			// The subject of the work, which is a number for every event but
+			// one. A push has no number, and "number=0" reads as a bug rather
+			// than as "this delivery names a branch".
+			if number > 0 {
+				attrs = append(attrs, "number", number)
+			}
 			if body.Label.Name != "" {
 				attrs = append(attrs, "label", safeText(body.Label.Name))
 			}
@@ -639,6 +669,9 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if mergedInto != "" {
 				attrs = append(attrs, "merged_into", safeText(mergedInto))
 			}
+			if pushedTo != "" {
+				attrs = append(attrs, "pushed_to", safeText(pushedTo))
+			}
 			if closedPR {
 				attrs = append(attrs, "closed_pr", true)
 			}
@@ -652,7 +685,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				defer func() { <-s.sem }()
 				defer s.wg.Done()
 				s.Tick(ctx, Delivery{
-					Repo: repo, Number: number, MergedInto: mergedInto,
+					Repo: repo, Number: number, MergedInto: mergedInto, PushedTo: pushedTo,
 					ClosedPR: closedPR, ClosedIssue: closedIssue,
 				})
 			}()
@@ -662,10 +695,15 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// say nothing while looking like it said something. Both are
 			// carried because a dropped merge is lost sweep work and a dropped
 			// close is lost worktree cleanup, not just one lost issue pass.
-			dropped := []any{"delivery", safeDeliveryID(deliveryID),
-				"repo", repo, "number", number}
+			dropped := []any{"delivery", safeDeliveryID(deliveryID), "repo", repo}
+			if number > 0 {
+				dropped = append(dropped, "number", number)
+			}
 			if mergedInto != "" {
 				dropped = append(dropped, "merged_into", safeText(mergedInto))
+			}
+			if pushedTo != "" {
+				dropped = append(dropped, "pushed_to", safeText(pushedTo))
 			}
 			if closedPR {
 				dropped = append(dropped, "closed_pr", true)
