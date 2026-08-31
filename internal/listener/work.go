@@ -381,10 +381,11 @@ func (d Delivery) IsPushTo(branch string) bool {
 	return branch != "" && d.PushedTo == branch
 }
 
-// Deliver evaluates ONE issue of repo in every loop that watches it, and acts
-// wherever a loop decides there is something to do.
+// Deliver evaluates ONE subject of repo -- an issue, a pull request, or (for a
+// push) a branch -- in every loop that watches it, and acts wherever a loop
+// decides there is something to do.
 //
-// A delivery says "something about this issue changed, figure out what and
+// A delivery says "something about this subject changed, figure out what and
 // dispatch the correct executor to handle it." It used to trigger a full
 // reconcile of every loop watching the repository instead, which is how
 // opening one unlabelled test issue dispatched a tend agent for an unrelated
@@ -393,9 +394,11 @@ func (d Delivery) IsPushTo(branch string) bool {
 // thing that changed.
 //
 // number may name a pull request rather than an issue; the two share a number
-// space and three of the five subscribed events carry a pull request. Resolving
-// that is loopcmd.TickIssue's job, because it is the layer with a GitHub
-// client.
+// space, and five of the six subscribed events carry a pull request or issue
+// number. Resolving that is loopcmd.TickIssue's job, because it is the layer
+// with a GitHub client. The sixth event, push, carries no number at all --
+// its subject is a branch, and the only thing it can start is the tend sweep
+// armed in tickOne.
 //
 // The fan-out is still per loop: several projects may watch one repository, and
 // each keeps its own state and spends its own budget. The log lines here and in
@@ -432,7 +435,8 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 	kept := make([]Target, 0, len(targets))
 	for _, t := range targets {
 		// A push names no issue, so the only work it can start is the sweep.
-		if d.Number == 0 && !(t.TendPR && d.IsPushTo(t.DefaultBranch)) {
+		tends := t.TendPR && d.IsPushTo(t.DefaultBranch)
+		if d.Number == 0 && !tends {
 			continue
 		}
 		kept = append(kept, t)
@@ -444,12 +448,20 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 	}
 
 	if d.Number == 0 {
+		// keptLoops, not loops: loops names every target watching the
+		// repository, including ones with tend_pr false that the filter
+		// above just dropped. Naming those here would claim they will sweep
+		// when they never will.
+		keptLoops := make([]string, 0, len(kept))
+		for _, t := range kept {
+			keptLoops = append(keptLoops, t.ProjectName+"/"+t.LoopName)
+		}
 		// safeText, because PushedTo is attacker-written. SafeRef bounds its
 		// charset but not its length, so a multi-kilobyte branch name would go
 		// verbatim into an unrotated log -- the failure handler.go:185-196
 		// documents. work.go is the same package and gets the same treatment.
 		slog.Info("a push moved a branch; every loop that tends it will sweep",
-			"repo", d.Repo, "pushed_to", safeText(d.PushedTo), "loops", loops)
+			"repo", d.Repo, "pushed_to", safeText(d.PushedTo), "loops", keptLoops)
 	} else {
 		// EVALUATED, not "acted on". Every watching loop does evaluate the
 		// issue, and this line is what ties the ticks below back to the
