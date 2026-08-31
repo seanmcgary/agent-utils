@@ -244,6 +244,11 @@ type streamLine struct {
 	NumTurns       int     `json:"num_turns"`
 	IsError        bool    `json:"is_error"`
 	APIError       *string `json:"api_error_status"`
+	// Errors carries what the harness said went wrong when the failure was not
+	// an API status. A refused resume reports api_error_status null and one
+	// error here, so a renderer that reads only APIError shows the run failing
+	// and never says why.
+	Errors []string `json:"errors"`
 }
 
 func (r *renderer) line(raw string) {
@@ -303,6 +308,11 @@ func (r *renderer) line(raw string) {
 			(time.Duration(l.DurationMS) * time.Millisecond).Round(time.Second))
 		if l.APIError != nil && *l.APIError != "" {
 			r.printf("   api error: %s\n", *l.APIError)
+		}
+		for _, e := range l.Errors {
+			if s := strings.TrimSpace(e); s != "" {
+				r.printf("   error: %s\n", s)
+			}
 		}
 		if s := strings.TrimSpace(l.Result); s != "" {
 			r.printf("   %s\n", s)

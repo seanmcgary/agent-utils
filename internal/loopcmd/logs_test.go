@@ -85,6 +85,28 @@ func TestRendererReportsAnAPIError(t *testing.T) {
 	}
 }
 
+// The result line's errors[] is where a refused resume says so. Rendering the
+// line without it printed "result: error_during_execution turns=0" and left
+// the operator to open the log file by hand.
+func TestRendererReportsTheResultLineErrors(t *testing.T) {
+	out := render(t, LogOptions{},
+		`{"type":"result","subtype":"error_during_execution","is_error":true,`+
+			`"errors":["No conversation found with session ID: abc"]}`)
+	if !strings.Contains(out, "No conversation found with session ID: abc") {
+		t.Errorf("the result line's errors must be surfaced:\n%s", out)
+	}
+}
+
+func TestRendererReportsEveryResultLineError(t *testing.T) {
+	out := render(t, LogOptions{},
+		`{"type":"result","subtype":"error","is_error":true,"errors":["first","second"]}`)
+	for _, want := range []string{"first", "second"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("error %q was dropped:\n%s", want, out)
+		}
+	}
+}
+
 func TestTailReadsAWholeFileWithoutFollow(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.jsonl")

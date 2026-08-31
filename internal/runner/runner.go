@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -189,10 +190,13 @@ func Supervise(
 	// of tool noise, and a post-hoc read would have to choose between reading
 	// all of it and reading a tail that the notice may not be in.
 	abandoned := newSentinelWriter(errFile, windDownNotice)
-	// Chained, so one stderr stream is watched for both markers. Each writer
+	// Chained, so one stderr stream is watched for every marker. Each writer
 	// passes every byte through to the next, so the log is unchanged.
 	inUse := newPatternWriter(abandoned, sessionInUse)
-	cmd.Stderr = inUse
+	// Last in the chain and last resort in the reporting: whatever the harness
+	// said on its way out, for the failures the two markers above do not name.
+	tail := newTailWriter(inUse)
+	cmd.Stderr = tail
 
 	if err := cmd.Start(); err != nil {
 		return finish(cfg, st, d, store.DispatchResult{
@@ -281,6 +285,14 @@ func Supervise(
 	case waitErr != nil:
 		res.Status = store.StatusFailed
 		res.ExitCode = exitCodeOf(waitErr)
+		// Order matters: the parsed result line first (the harness naming its
+		// own failure), then the last line of stderr, and only then the exit
+		// status. "exit status 1" is true and says nothing, and it is what the
+		// operator was left with for every dispatch that died before writing a
+		// result line -- a refused resume, a harness that could not start.
+		if res.APIError == "" {
+			res.APIError = tail.Last()
+		}
 		if res.APIError == "" {
 			res.APIError = waitErr.Error()
 		}
@@ -479,6 +491,68 @@ func (s *sentinelWriter) Write(p []byte) (int, error) {
 // Seen reports whether the marker has appeared. Call it only after Wait: the
 // writer is used from the goroutine that copies the child's stderr.
 func (s *sentinelWriter) Seen() bool { return s.seen }
+
+// tailLimit bounds how much of an unterminated line the tail writer retains. A
+// harness's last words are one line; anything longer is tool output that
+// happens to be last, and holding it for the life of the run buys nothing.
+const tailLimit = 4096
+
+// tailWriter passes writes through to w and remembers the last non-blank line
+// of the stream.
+//
+// It is the third writer in the stderr chain, and it exists for the failures
+// the other two do not name. sentinelWriter and patternWriter each answer one
+// yes-or-no question about a known message; this one carries whatever the
+// harness actually said, so a dispatch that dies before writing a result line
+// records a reason rather than "exit status 1".
+//
+// Read as the stream is written, not by re-reading the file afterwards: the
+// stderr log can be megabytes of tool noise, and a post-hoc tail would have to
+// guess how much of the end to read.
+type tailWriter struct {
+	w io.Writer
+	// last is the most recent complete non-blank line, and pending is the
+	// bytes since the newline that closed it. A line split across two writes
+	// is the normal case: which bytes land in which Write is decided by the
+	// pipe, not by the child.
+	last    string
+	pending []byte
+}
+
+func newTailWriter(w io.Writer) *tailWriter {
+	return &tailWriter{w: w}
+}
+
+func (t *tailWriter) Write(b []byte) (int, error) {
+	joined := append(t.pending, b...)
+	for {
+		i := bytes.IndexByte(joined, '\n')
+		if i < 0 {
+			break
+		}
+		if s := strings.TrimSpace(string(joined[:i])); s != "" {
+			t.last = s
+		}
+		joined = joined[i+1:]
+	}
+	// Keep only the tail of an unterminated line. A single line larger than
+	// this is tool output, and retaining all of it would grow without bound.
+	if len(joined) > tailLimit {
+		joined = joined[len(joined)-tailLimit:]
+	}
+	t.pending = append(t.pending[:0], joined...)
+	return t.w.Write(b)
+}
+
+// Last reports the final non-blank line of the stream, including one the child
+// left unterminated. Call it only after Wait: the writer is used from the
+// goroutine that copies the child's stderr.
+func (t *tailWriter) Last() string {
+	if s := strings.TrimSpace(string(t.pending)); s != "" {
+		return s
+	}
+	return t.last
+}
 
 // patternWriter passes writes through to w and records whether re holds a
 // match anywhere in the stream.
