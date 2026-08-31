@@ -256,6 +256,17 @@ type Worker struct {
 	// is precisely the case it exists for, so it has to walk the whole
 	// registry.
 	ScanTargets func() (Routes, error)
+	// ReapOrphans retires one loop's dispatches whose runner process is gone
+	// and queues the retry each is owed, taking the loop's lock itself.
+	// Production wires it to loopcmd.ReapOrphans.
+	//
+	// It is what makes a machine that went down recover on its own. The
+	// scheduler below wakes on retry DEADLINES, and only a reap writes one, so
+	// a row left running by a crash is invisible to it until some delivery
+	// happens to tick that loop. This is the sweep that finds them.
+	//
+	// It dispatches nothing, by design. See Worker.reapOrphans.
+	ReapOrphans func(cfg *config.Config, deps loopcmd.Deps) (loopcmd.Summary, error)
 	// IssueBusy reports whether an agent of this loop is still running on this
 	// issue. Production wires it to Worker.issueBusy, which answers from the
 	// dispatch rows and the kernel; it is a seam because a test has no agent
@@ -283,6 +294,10 @@ type Worker struct {
 	// machine-wide settings file, and NewWorker leaves it zero: a Worker built
 	// without one runs no periodic check rather than a surprise one.
 	TendInterval time.Duration
+	// OrphanSweepInterval is how often Serve re-sweeps for dispatches whose
+	// runner is gone, after the sweep it runs at start. Read through
+	// orphanSweepEvery, which floors it.
+	OrphanSweepInterval time.Duration // default 5m
 
 	mu      sync.Mutex
 	pending map[loopKey]*attempt // guarded by mu
@@ -343,6 +358,7 @@ func NewWorker(db *store.DB) *Worker {
 		RunEpic:         loopcmd.EpicSweep,
 		RunTendCheck:    loopcmd.TendCheck,
 		ScanTargets:     Scan,
+		ReapOrphans:     loopcmd.ReapOrphans,
 		Now:             time.Now,
 		After:           time.AfterFunc,
 		OpenRetryDelay:  defaultOpenRetryDelay,
@@ -358,6 +374,8 @@ func NewWorker(db *store.DB) *Worker {
 		busy:            make(map[issueKey]*busyTimer),
 		confirms:        make(map[loopKey]time.Time),
 		unroutable:      newThrottledLog(unroutableLogInterval),
+
+		OrphanSweepInterval: defaultOrphanSweepInterval,
 	}
 	// Bound to the Worker after the literal, like the throttle's clock below:
 	// the default reads w.DB, which the literal is still building.
@@ -1736,6 +1754,22 @@ func (w *Worker) Serve(ctx context.Context) {
 	tendC, stopTend := w.tendTicker()
 	defer stopTend()
 
+	// Swept BEFORE the first wake, because a daemon starting is the moment a
+	// crash is discovered. The rows a machine leaves behind carry no retry
+	// deadline -- only a reap writes one -- so Wake cannot see them, and
+	// waiting for the sweep interval would idle the machine for five minutes
+	// after every restart for no reason.
+	w.reapOrphans(ctx)
+
+	// A separate timer from the wake, on its own much longer interval. The two
+	// answer different questions: a wake serves deadlines this daemon wrote
+	// and knows are coming, and a sweep looks for rows nothing wrote a
+	// deadline for. Folding the sweep into the wake would run a machine-wide
+	// query every thirty seconds to find something that appears when a process
+	// dies without recording an outcome.
+	sweep := time.NewTicker(w.orphanSweepEvery())
+	defer sweep.Stop()
+
 	for {
 		// Checked before Wake, not only in the select below. Wake is
 		// synchronous and runs a whole tick, so a cancellation that arrived
@@ -1757,6 +1791,12 @@ func (w *Worker) Serve(ctx context.Context) {
 			// nil when the check is disabled, and a nil channel blocks
 			// forever, so this case simply never fires then.
 			w.tendCheckPass(ctx)
+		case <-sweep.C:
+			// Falls through to the top of the loop, which calls Wake. That is
+			// deliberate: the sweep has just stamped deadlines that are due
+			// now, and waiting a wake interval to serve the first of them
+			// would add latency to exactly the case this exists for.
+			w.reapOrphans(ctx)
 		case <-timer.C:
 		}
 	}

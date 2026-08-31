@@ -125,8 +125,19 @@ type harness struct {
 	tendFn        func(cfg *config.Config) error // guarded by mu
 	cleanupFn     func(cfg *config.Config) error // guarded by mu
 
-	tokenErr     error
-	openErr      error
+	tokenErr error
+	openErr  error
+	// reapErr is what the ReapOrphans seam returns. lock.ErrHeld is the one
+	// worth setting: it is the ordinary outcome when a tick is already
+	// running, not a failure.
+	reapErr error
+	// reaped records the loop of each ReapOrphans call, in order, guarded by
+	// mu like ran and tends.
+	reaped []string
+	// onReap fires after each recorded reap. It is how a Serve test observes
+	// a sweep without polling: Serve runs in its own goroutine, and the sweep
+	// is the only thing it does that a test can otherwise see.
+	onReap       func()
 	tokenCalls   int
 	clients      int
 	targetsCalls int
@@ -181,6 +192,7 @@ func newHarness(db *store.DB) *harness {
 	w.RunIssue = h.runIssue
 	w.RunTend = h.runTend
 	w.RunCleanup = h.runCleanup
+	w.ReapOrphans = h.reap
 	w.IssueBusy = h.issueBusy
 	w.Targets = h.targetsSeam
 	w.TargetFor = func(projectID, loop string) (Target, Routing, error) {
@@ -241,6 +253,29 @@ func (h *harness) token() (string, error) {
 		return "", h.tokenErr
 	}
 	return "gh-token", nil
+}
+
+// reap is the ReapOrphans seam. It records the loop it was asked to reap and
+// reports whatever the test set, without touching a database.
+func (h *harness) reap(cfg *config.Config, _ loopcmd.Deps) (loopcmd.Summary, error) {
+	h.mu.Lock()
+	h.reaped = append(h.reaped, cfg.Name)
+	err, notify := h.reapErr, h.onReap
+	h.mu.Unlock()
+
+	// Outside the lock: a test's callback may do anything, and holding mu
+	// across it would deadlock the moment one reads the harness.
+	if notify != nil {
+		notify()
+	}
+	return loopcmd.Summary{}, err
+}
+
+// reapedLoops returns the loops ReapOrphans was called for, in order.
+func (h *harness) reapedLoops() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.reaped...)
 }
 
 func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error) {
