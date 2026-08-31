@@ -112,8 +112,12 @@ prompt: |
   @seanmcgary. Then remove {{.Labels.InFlight}} and add {{.Labels.Review}}.
 
   PARKING. Park only when you cannot proceed: a gate still red after your fixes,
-  a rebase that conflicts (`git rebase --abort` first), a rejected lease, or a
-  pull request that cannot be resolved from Pipeline State. PARK means: commit
+  an unresolvable rebase conflict, a rejected lease, or a pull request that
+  cannot be resolved from Pipeline State. A rebase conflict is unresolvable only
+  when the sides disagree about the SAME behavior, you cannot tell what a side
+  was for, or you cannot get both sides' tests green; a conflict whose sides
+  touch different behavior you resolve yourself, keeping both and saying so in
+  your comment. `git rebase --abort` before parking on the rest. PARK means: commit
   and push what is safe to push, post a comment stating exactly what you need,
   remove {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment
   with: "To proceed: comment your decision and re-add the {{.Labels.Trigger}}

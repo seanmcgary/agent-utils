@@ -51,8 +51,13 @@ prompt: |
   detached at the default branch. Resolve the branch yourself as build-feature's
   phase 0 describes: check out the EXISTING remote feature branch if one exists
   and never re-create it over the design assets, then rebase onto the default
-  branch. If the rebase conflicts, PARK with a comment listing the conflicted
-  files. Never force and never guess.
+  branch. A rebase conflict is ordinary work: resolve it yourself when you can
+  say what each side changes and why, the two sides touch different behavior so
+  keeping both is coherent, and both sides' tests over the conflicted files pass
+  after your resolution. State the resolution and its reasoning in your next
+  comment. PARK with a comment listing the conflicted files only when the sides
+  disagree about the SAME behavior, you cannot tell what a side was for, or you
+  cannot get both sides' tests green. Never force and never guess.
   At the END of every phase AND before every park: commit and
   `git push -u origin <branch>`. Your worktree may be removed before your next
   dispatch, so unpushed work is lost.
@@ -107,8 +112,14 @@ tend_prompt: |
      `git push --force-with-lease origin HEAD:refs/heads/{{.PR.HeadRef}}`.
      Use --force-with-lease, never plain --force. If the lease check REJECTS the
      push, another run touched the branch: change nothing and stop.
-  3. If the rebase CONFLICTS, run `git rebase --abort`, then PARK with a comment
-     listing the conflicted files. Never resolve a conflict by guessing.
+  3. If the rebase CONFLICTS, resolve it yourself when all three hold: you can
+     say what each side changes and why, the two sides touch different behavior
+     so keeping both is coherent, and both sides' tests over the conflicted
+     files pass after your resolution. Then push as step 2 describes and state
+     the resolution and its reasoning in your comment. Otherwise -- the sides
+     disagree about the SAME behavior, you cannot tell what a side was for, or
+     you cannot get both sides' tests green -- run `git rebase --abort` and PARK
+     with a comment listing the conflicted files. Never resolve by guessing.
 
   PARK means: post the comment, remove {{.Labels.Review}}, add
   {{.Labels.Blocked}}, and stop. End with: "To proceed: comment your decision and
