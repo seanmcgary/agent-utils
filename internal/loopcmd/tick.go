@@ -19,6 +19,47 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 )
 
+// resolveProviders returns the pi provider serving each issue's next dispatch,
+// keyed by issue number.
+//
+// It is built here rather than inside the engine because resolution shells out
+// and engine.Decide is pure. Only a pi dispatch has a provider worth
+// comparing: claude reaches one vendor one way, so there is nothing a provider
+// comparison could say about it, and resolving would spend a subprocess to
+// learn "".
+//
+// One resolution per distinct MODEL, not per issue. A loop of thirty issues
+// almost always runs one model, and `pi --list-models` is a process spawn.
+func resolveProviders(ctx context.Context, cfg *config.Config, issues []ghub.Issue) map[int]string {
+	out := make(map[int]string, len(issues))
+	byModel := map[string]string{}
+	for _, iss := range issues {
+		// A label this loop cannot parse is not this function's problem: Decide
+		// turns it into a KindStop, and an unresolved provider changes nothing
+		// about that.
+		ov, err := config.ParseOverrides(iss.Labels)
+		if err != nil {
+			continue
+		}
+		if engine.EffectiveHarness(cfg, ov) != config.HarnessPi {
+			continue
+		}
+		model := runner.Effective(cfg, ov).Model
+		if model == "" {
+			continue
+		}
+		provider, seen := byModel[model]
+		if !seen {
+			provider = runner.ResolveProvider(ctx, model)
+			byModel[model] = provider
+		}
+		if provider != "" {
+			out[iss.Number] = provider
+		}
+	}
+	return out
+}
+
 // Deps holds everything a tick needs. Each field is replaceable in a test.
 type Deps struct {
 	Store *store.Store
@@ -230,6 +271,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	}
 	st := engine.State{
 		Issues: states, Running: live, CooldownUntil: time.Time{}, Force: deps.Force,
+		Providers: resolveProviders(ctx, cfg, snap.Issues),
 	}
 	sum.Live = len(live)
 	sum.Forced = deps.Force
@@ -561,10 +603,8 @@ func dispatch(
 		if harness == "" {
 			harness = config.HarnessClaude
 		}
-		// The provider is resolved by the engine's caller and travels on the
-		// decision; it is wired in with engine.Decision.Provider.
 		if err := deps.Store.BeginDispatch(cfg.Name, cfg.Repo, d.Issue, sessionID,
-			harness, "", isRetry, now); err != nil {
+			harness, d.Provider, isRetry, now); err != nil {
 			return err
 		}
 	}

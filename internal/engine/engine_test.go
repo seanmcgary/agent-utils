@@ -1260,6 +1260,112 @@ func TestUnknownDispatchHarnessDoesNotRetire(t *testing.T) {
 	}
 }
 
+// piConfig is a loop whose configured harness is pi, which is the only harness
+// a provider comparison can say anything about.
+func piConfig() *config.Config {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessPi
+	cfg.Agent.Model = "deepseek/deepseek-v4-flash-0731"
+	return cfg
+}
+
+// openrouter is out of credits; openai-codex is a different account with its
+// own balance, so the failures stop being evidence.
+func TestProviderChangeRetiresTheRetryCap(t *testing.T) {
+	cfg := piConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{
+		Issues: map[int]store.IssueState{
+			1: {
+				SessionStarted:   true,
+				DispatchHarness:  config.HarnessPi,
+				DispatchProvider: "openrouter",
+				NeedsRetry:       true,
+				RetryCount:       3,
+			},
+		},
+		Providers: map[int]string{1: "openai-codex"},
+	}
+
+	p := Decide(cfg, snap, st, time.Now())
+
+	if got := kinds(p); len(got) != 1 || got[0] != KindStart {
+		t.Fatalf("kinds = %v, want [%v]", got, KindStart)
+	}
+	if !strings.Contains(p.Decisions[0].Reason, "provider") {
+		t.Errorf("Reason = %q, want it to name the provider change", p.Decisions[0].Reason)
+	}
+}
+
+// Swapping one OpenRouter model for another while OpenRouter is out of credits
+// changes nothing the failures were about.
+func TestSameProviderStillParksAtTheCap(t *testing.T) {
+	cfg := piConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{
+		Issues: map[int]store.IssueState{
+			1: {
+				SessionStarted:   true,
+				DispatchHarness:  config.HarnessPi,
+				DispatchProvider: "openrouter",
+				NeedsRetry:       true,
+				RetryCount:       3,
+			},
+		},
+		Providers: map[int]string{1: "openrouter"},
+	}
+
+	p := Decide(cfg, snap, st, time.Now())
+
+	if got := kinds(p); len(got) != 1 || got[0] != KindParkRetryExhausted {
+		t.Fatalf("kinds = %v, want [%v]", got, KindParkRetryExhausted)
+	}
+}
+
+// An unresolved provider must not retire anything. Fail closed.
+func TestUnresolvedProviderDoesNotRetire(t *testing.T) {
+	cfg := piConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{
+		Issues: map[int]store.IssueState{
+			1: {
+				SessionStarted:   true,
+				DispatchHarness:  config.HarnessPi,
+				DispatchProvider: "openrouter",
+				NeedsRetry:       true,
+				RetryCount:       3,
+			},
+		},
+		Providers: map[int]string{},
+	}
+
+	p := Decide(cfg, snap, st, time.Now())
+
+	if got := kinds(p); len(got) != 1 || got[0] != KindParkRetryExhausted {
+		t.Fatalf("kinds = %v, want [%v]", got, KindParkRetryExhausted)
+	}
+}
+
+// Every dispatch decision carries the provider it resolved to, so the tick can
+// stamp it without resolving a second time.
+func TestStartCarriesTheResolvedProvider(t *testing.T) {
+	cfg := piConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{
+		Issues:    map[int]store.IssueState{},
+		Providers: map[int]string{1: "openrouter"},
+	}
+
+	p := Decide(cfg, snap, st, time.Now())
+
+	if len(p.Decisions) != 1 {
+		t.Fatalf("decisions = %v, want one start", kinds(p))
+	}
+	if p.Decisions[0].Provider != "openrouter" {
+		t.Errorf("Provider = %q, want %q", p.Decisions[0].Provider, "openrouter")
+	}
+}
+
 // The same harness failing again is the case the cap was written for.
 func TestSameHarnessStillParksAtTheCap(t *testing.T) {
 	cfg := testConfig()

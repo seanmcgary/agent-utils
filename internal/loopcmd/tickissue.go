@@ -130,7 +130,12 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	// because the pass is; `loop status` reads the store, not this number.
 	sum.Live = len(live)
 
-	st := engine.State{Issues: states, Running: live}
+	// Scoped to this issue's snapshot, so a webhook-driven tick spawns at most
+	// one `pi --list-models` rather than one per issue in the loop.
+	st := engine.State{
+		Issues: states, Running: live,
+		Providers: resolveProviders(ctx, cfg, snap.Issues),
+	}
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
 		return sum, err
 	}

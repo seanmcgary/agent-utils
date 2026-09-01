@@ -231,6 +231,9 @@ func tendDispatch(
 	live = append(live, liveTend...)
 	sum.Live = len(live)
 
+	// No Providers. The sweep only tends: it makes no retry decision, so it can
+	// never retire a cap, and resolving would spend a subprocess per model to
+	// produce a map nothing here reads.
 	st := engine.State{Issues: states, Running: live}
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
 		return sum, err
