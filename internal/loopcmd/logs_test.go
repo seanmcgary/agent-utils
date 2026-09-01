@@ -248,6 +248,70 @@ func TestRenderAllSessionsShowsTheProjectColumnAndFlagsAnOrphan(t *testing.T) {
 	}
 }
 
+// Two things used to break this table: a project name wider than the fixed
+// PROJECT column, and any cell spending more bytes than columns (an accented
+// title, truncate's three-byte ellipsis), which fmt's byte-counted %-Ns pads
+// too narrow. Either one slid every column to its right out of line.
+func TestRenderAllSessionsAlignsLongNamesAndMultibyteCells(t *testing.T) {
+	out := RenderAllSessions([]Session{
+		{ID: "sess-a", Project: "projectwrangler-monorepo", Loop: "planning",
+			Issue: 42, Title: "A title far too long to fit inside the column",
+			Dispatches: 3, Cost: 5.05, Model: "deepseek/deepseek-v4-flash-preview",
+			Harness: "claude", LastStatus: store.StatusSucceeded},
+		{ID: "sess-b", Project: "atlas", Loop: "planning", Issue: 57,
+			Title: "Short", Dispatches: 1, Cost: 2.40, Model: "opus",
+			Harness: "pi", LastStatus: store.StatusSucceeded},
+		// A title that fits the column but spends more bytes than columns
+		// doing it -- what byte-counted padding gets wrong even with nothing
+		// truncated.
+		{ID: "sess-c", Project: "atlas", Loop: "planning", Issue: 58,
+			Title: "caf\u00e9 na\u00efve r\u00e9sum\u00e9", Dispatches: 1, Cost: 1.00,
+			Model: "opus", Harness: "pi", LastStatus: store.StatusSucceeded},
+	}, SessionFilter{})
+
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	// Column starts are counted in runes, not bytes: a terminal lays out
+	// columns, and the ellipsis is one column wide however many bytes it takes.
+	// Each anchor is searched for after the previous one, so a value that also
+	// appears in an earlier column cannot match the wrong cell.
+	starts := func(line string, anchors []string) []int {
+		t.Helper()
+		r := []rune(line)
+		at := make([]int, 0, len(anchors))
+		from := 0
+		for _, a := range anchors {
+			i := strings.Index(string(r[from:]), a)
+			if i < 0 {
+				t.Fatalf("no %q at or after column %d in %q", a, from, line)
+			}
+			from += len([]rune(string(r[from:])[:i])) + len([]rune(a))
+			at = append(at, from-len([]rune(a)))
+		}
+		return at
+	}
+	want := starts(lines[0], []string{"SESSION", "LOOP", "ISSUE", "TITLE",
+		"RUNS", "COST", "MODEL", "HARNESS", "STATE", "LAST RUN"})
+	rows := [][]string{
+		{"sess-a", "planning", "42", "A title", "3", "$5.05", "deepseek", "claude", "succeeded", "0"},
+		{"sess-b", "planning", "57", "Short", "1", "$2.40", "opus", "pi", "succeeded", "0"},
+		{"sess-c", "planning", "58", "caf", "1", "$1.00", "opus", "pi", "succeeded", "0"},
+	}
+	for i, anchors := range rows {
+		got := starts(lines[i+1], anchors)
+		for j := range want {
+			if got[j] != want[j] {
+				t.Fatalf("column %q starts at %d in row %d and %d in the header:\n%s",
+					anchors[j], got[j], i, want[j], out)
+			}
+		}
+	}
+	// The name has to survive whole: the footer asks the operator to type it
+	// back into --name, and an elided name will not resolve.
+	if !strings.Contains(out, "projectwrangler-monorepo ") {
+		t.Errorf("a long project name must not be truncated:\n%s", out)
+	}
+}
+
 func TestRenderAllSessionsExplainsAnEmptyList(t *testing.T) {
 	out := RenderAllSessions(nil, SessionFilter{})
 	if !strings.Contains(out, "No sessions yet") {

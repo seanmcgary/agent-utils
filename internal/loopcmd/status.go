@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/proc"
@@ -23,6 +24,22 @@ func truncate(s string, width int) string {
 	}
 	return string(r[:width-1]) + "\u2026"
 }
+
+// pad right-pads s to width display columns, counting runes rather than bytes.
+// fmt's %-Ns pads by byte length, so a cell holding truncate's ellipsis (one
+// column, three bytes) comes out two columns short and drags every column to
+// its right out of alignment.
+func pad(s string, width int) string {
+	n := utf8.RuneCountInString(s)
+	if n >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-n)
+}
+
+// fit renders a cell exactly width columns wide: truncated if too long, padded
+// if too short.
+func fit(s string, width int) string { return pad(truncate(s, width), width) }
 
 // Status renders the reconciled view. It changes nothing.
 func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) {
