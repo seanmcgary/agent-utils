@@ -92,7 +92,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// very issue it was told to stop.
 		//
 		// decided MUST be set here. tendDecisions skips only decided issues
-		// (engine.go:259), and a stopped issue awaiting review with a behind
+		// (see tendDecisions), and a stopped issue awaiting review with a behind
 		// pull request would otherwise get a tend agent force-pushing the
 		// branch of the session the operator just killed.
 		if state.Stopped {
@@ -351,11 +351,11 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 	// reuse one ("Session ID <uuid> is already in use"), so passing the old id
 	// would make every retry fail in under a second and then park the issue with
 	// a comment blaming the platform.
-	// store.KindStart: act maps both KindRetryStart and KindRetryResume onto
-	// store.KindStart before dispatching (tick.go:498-505). There is no
-	// store.KindRetryStart or store.KindRetryResume -- a retry is a start or a
-	// resume that happens to be attempt N, not a dispatch kind of its own --
-	// so this is the same resolution the dispatch itself will use.
+	// store.KindStart, because the only thing this kind selects is whether the
+	// tend: section applies, and a retry is never a tend. act maps
+	// KindRetryStart onto store.KindStart and KindRetryResume onto
+	// store.KindResume (see act's retry cases), so neither reaches
+	// store.KindTend and either would resolve the same harness here.
 	if resumable(cfg, store.KindStart, state, ov) {
 		return &Decision{
 			Kind:      KindRetryResume,

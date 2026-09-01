@@ -22,7 +22,6 @@ type countingGH struct {
 	compares       int
 	comments       int
 	edits          int
-	logins         int
 	reviewActivity int
 }
 
@@ -66,11 +65,6 @@ func (f *countingGH) ListOpenPullRequests(context.Context, string, string) ([]Pu
 func (f *countingGH) BehindBy(context.Context, string, string, string, string) (int, error) {
 	f.compares++
 	return 16, nil
-}
-
-func (f *countingGH) AuthenticatedLogin(context.Context) (string, error) {
-	f.logins++
-	return "loop-bot", nil
 }
 
 func (f *countingGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
@@ -174,26 +168,6 @@ func TestDeliveryCacheFetchesAPullRequestOnceAndKeepsItsTrust(t *testing.T) {
 	}
 	if !first.Trusted || !second.Trusted || second.HeadRepo != "o/r" || second.Body != "Closes #51" {
 		t.Errorf("the memoised pull request differs from the fetched one: %+v then %+v", first, second)
-	}
-}
-
-// AuthenticatedLogin is memoised for the process, not just the delivery: the
-// token this cache wraps is a process-wide constant.
-func TestDeliveryCacheFetchesAuthenticatedLoginOnce(t *testing.T) {
-	gh := &countingGH{}
-	c := NewDeliveryCache(gh)
-
-	for range 3 {
-		login, err := c.AuthenticatedLogin(context.Background())
-		if err != nil {
-			t.Fatalf("AuthenticatedLogin: %v", err)
-		}
-		if login != "loop-bot" {
-			t.Errorf("AuthenticatedLogin = %q, want loop-bot", login)
-		}
-	}
-	if gh.logins != 1 {
-		t.Errorf("AuthenticatedLogin reached the client %d times, want 1", gh.logins)
 	}
 }
 

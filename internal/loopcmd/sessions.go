@@ -475,6 +475,13 @@ func applySettings(sessions []Session, dirs map[string]string) {
 		// and the session's most recent run may be exactly that tend. Reading
 		// the wrong kind here would report agent.model for a session whose
 		// last run actually used tend.model.
+		//
+		// It is still ONE answer for the whole session, which is an
+		// approximation: a session whose build ran agent.model and whose last
+		// run was a tend under tend.model reports the tend's settings for both.
+		// `sessions list` is a per-session summary and has one column for each,
+		// so a per-run answer has nowhere to go here. `session describe`
+		// resolves each run separately (describe.go) and is the accurate view.
 		s := runner.Effective(cfg, sessions[i].LastKind, config.Overrides{
 			Model: sessions[i].Model, Harness: sessions[i].Harness,
 		})

@@ -49,7 +49,7 @@ type Snapshot struct {
 	// request number is what LastTend below is keyed by too, so the two maps
 	// compare directly without a lookup through LinkPR. A pull request absent
 	// from this map has no known review activity, which a failed GitHub read
-	// also produces -- see tendDecisions' failure-direction comment.
+	// also produces -- see the failure-direction comments in loopcmd.Tick and loopcmd.tickIssue.
 	ReviewedAt map[int]time.Time
 }
 

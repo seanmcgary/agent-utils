@@ -70,11 +70,6 @@ func (c *countingGH) BehindBy(context.Context, string, string, string, string) (
 	return 0, nil
 }
 
-func (c *countingGH) AuthenticatedLogin(context.Context) (string, error) {
-	c.calls++
-	return "loop-bot", nil
-}
-
 func (c *countingGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
 	c.calls++
 	return time.Time{}, nil

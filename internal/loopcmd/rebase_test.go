@@ -563,7 +563,7 @@ func TestGitRebaseCleansUpOnAContextTheCallerAlreadyCancelled(t *testing.T) {
 
 	// gitRebase directly: act's agent fallback would need a live context of
 	// its own, and the property under test is entirely inside gitRebase.
-	outcome, err := gitRebase(ctx, cfg, deps, tendDecision(), time.Now())
+	outcome, _, err := gitRebase(ctx, cfg, deps, tendDecision(), time.Now())
 	if err != nil {
 		t.Fatalf("gitRebase: %v", err)
 	}
@@ -590,7 +590,7 @@ func TestGitRebaseWorktreeRefreshFailureFallsBackToTheAgent(t *testing.T) {
 	deps, git := rebaseDeps(t, cfg)
 	git.ensureErr = errors.New("fetch origin feat/x: exit status 128")
 
-	outcome, err := gitRebase(context.Background(), cfg, deps, tendDecision(), time.Now())
+	outcome, _, err := gitRebase(context.Background(), cfg, deps, tendDecision(), time.Now())
 	if err == nil {
 		t.Fatal("err = nil; a failed worktree refresh must be reported")
 	}
@@ -617,7 +617,7 @@ func TestGitRebaseUnreadableHeadNeverPushes(t *testing.T) {
 	deps, git := rebaseDeps(t, cfg)
 	git.headSHAErr = errors.New(`rev-parse HEAD returned "", which is not an object id`)
 
-	outcome, err := gitRebase(context.Background(), cfg, deps, tendDecision(), time.Now())
+	outcome, _, err := gitRebase(context.Background(), cfg, deps, tendDecision(), time.Now())
 	if err == nil {
 		t.Fatal("err = nil; an unreadable head must be reported")
 	}
@@ -1064,5 +1064,73 @@ func TestConflictedPathsAreReadOnTheDetachedContext(t *testing.T) {
 	}
 	if row.SeenCount != 1 {
 		t.Errorf("SeenCount = %d, want 1", row.SeenCount)
+	}
+}
+
+// The tiers escalate 1h, 6h, 24h and then CLAMP at 24h.
+//
+// Nothing else drives count past 2, so without this the whole 24h tier and the
+// clamp are unexecuted -- and an out-of-range index there is a panic in the
+// unattended daemon, on the path that exists precisely because a conflict keeps
+// repeating.
+func TestConflictBackoffTiersEscalateThenClampAtTwentyFourHours(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+
+	now := time.Now()
+	// One dispatch per tier, each after the previous deadline has passed. The
+	// fingerprint is stable across all of them: same head, same paths.
+	for i, want := range []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour, 24 * time.Hour} {
+		var sum Summary
+		if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum); err != nil {
+			t.Fatal(err)
+		}
+		if sum.Tended != 1 {
+			t.Fatalf("sighting %d: Tended = %d, want 1", i+1, sum.Tended)
+		}
+		row, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12)
+		if err != nil || !ok {
+			t.Fatalf("sighting %d: TendConflict ok=%v err=%v", i+1, ok, err)
+		}
+		if row.SeenCount != i+1 {
+			t.Errorf("sighting %d: SeenCount = %d, want %d", i+1, row.SeenCount, i+1)
+		}
+		if got := row.RetryAfter.Sub(now); (got - want).Abs() > time.Second {
+			t.Errorf("sighting %d: wait = %v, want %v", i+1, got, want)
+		}
+		// Step past the deadline this sighting just wrote.
+		now = row.RetryAfter.Add(time.Minute)
+	}
+}
+
+// A dispatch that fails records no sighting.
+//
+// seen_count counts agent dispatches that HAPPENED. dispatch can fail after the
+// backoff gate has already decided -- a worktree it cannot build, a spawn that
+// will not start -- and no agent runs then. Counting it would let a repeating
+// worktree or spawn failure walk a pull request to the 24h tier without the
+// agent ever having seen the conflict, which is the same failure the
+// failed-abort path refuses to cause, reached by a different route.
+func TestFailedDispatchRecordsNoConflictSighting(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	deps.Spawn = func(string, int64, string, string, string) (int, error) {
+		return 0, errors.New("spawn refused")
+	}
+
+	var sum Summary
+	err := act(context.Background(), cfg, deps, tendDecision(), time.Now(), &sum)
+	if err == nil {
+		t.Fatal("act returned no error for a failed spawn")
+	}
+	if sum.Tended != 0 {
+		t.Errorf("Tended = %d, want 0: the spawn failed", sum.Tended)
+	}
+	if _, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12); err != nil || ok {
+		t.Errorf("TendConflict: ok=%v err=%v, want no row: no agent was dispatched", ok, err)
 	}
 }

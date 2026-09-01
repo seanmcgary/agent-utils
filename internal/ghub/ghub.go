@@ -24,10 +24,6 @@ type Client interface {
 	PullRequest(ctx context.Context, owner, repo string, number int) (PullRequest, error)
 	ListOpenPullRequests(ctx context.Context, owner, repo string) ([]PullRequest, error)
 	BehindBy(ctx context.Context, owner, repo, base, head string) (int, error)
-	// AuthenticatedLogin returns the login of the account this client's token
-	// belongs to. LatestReviewActivity uses it to recognise, and discard, the
-	// loop's own review comments -- see LatestReviewActivity.
-	AuthenticatedLogin(ctx context.Context) (string, error)
 	// LatestReviewActivity returns the time of the most recent review or
 	// review comment on a pull request that was NOT written by this loop and
 	// was written by a trusted repository member. See the GitHubClient
@@ -264,6 +260,12 @@ func (g *GitHubClient) BehindBy(ctx context.Context, owner, repo, base, head str
 }
 
 // AuthenticatedLogin returns the login of the account this client's token
+// belongs to.
+//
+// It is deliberately NOT on the Client interface. Only LatestReviewActivity
+// below consumes it, and it does so on the concrete receiver, so putting it
+// on the interface bought nothing and cost every fake in the test tree a
+// method it never answers. The original
 // belongs to, fetched once and cached for the life of the process.
 //
 // Users.Get(ctx, "") with an empty user name answers the AUTHENTICATED user,
@@ -279,6 +281,14 @@ func (g *GitHubClient) AuthenticatedLogin(ctx context.Context) (string, error) {
 	u, _, err := g.c.Users.Get(ctx, "")
 	if err != nil {
 		return "", fmt.Errorf("get authenticated user: %w", err)
+	}
+	// An empty login is an ERROR, not an answer. countsAsReviewActivity
+	// compares an author against this value, and "" matches no author, so
+	// returning it would silently disable the self-filter while every caller
+	// believed it had one. Every other new failure in this path reports
+	// itself; this one must too.
+	if u.GetLogin() == "" {
+		return "", errors.New("the authenticated user has no login")
 	}
 	g.login = u.GetLogin()
 	return g.login, nil
@@ -304,10 +314,18 @@ const maxReviewPages = 10
 //
 //  1. Activity written by this loop's own authenticated login is skipped.
 //     The tend prompt tells the agent to comment (examples/execution.yaml
-//     118,124), so the agent's own reply is newer than the dispatch that
-//     produced it. Without this filter the feature is a money loop: every
-//     later pass sees pending review activity from the loop's own last
-//     comment and dispatches again, forever, at about $0.75 a turn.
+//     tend_prompt), so a reply the loop itself wrote must never read as
+//     feedback awaiting an answer.
+//
+//     This filter is DEFENCE IN DEPTH, not the money-loop guard, and the
+//     difference matters. The agent runs with GITHUB_TOKEN stripped from its
+//     environment (runner.agentEnv), so its gh calls authenticate as whatever
+//     ~/.config/gh holds -- on the ordinary deployment a human's login, not
+//     the daemon's bot. This comparison therefore MISSES the agent's own
+//     comments on exactly the setup it was written for. What actually closes
+//     the loop is store.LastTendAt returning the dispatch's FINISH time, so a
+//     comment written during the dispatch is older than it whoever wrote it.
+//
 //  2. An author whose AuthorAssociation is not OWNER, MEMBER, or COLLABORATOR
 //     is skipped -- the same three values convertPR requires before it will
 //     trust a pull request (see convertPR). A review comment can be written by

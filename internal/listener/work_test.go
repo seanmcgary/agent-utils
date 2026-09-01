@@ -450,9 +450,6 @@ func (f *deliveryGH) listCalls() []string {
 func (f *deliveryGH) BehindBy(context.Context, string, string, string, string) (int, error) {
 	return 0, nil
 }
-func (f *deliveryGH) AuthenticatedLogin(context.Context) (string, error) {
-	return "loop-bot", nil
-}
 func (f *deliveryGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
 	return time.Time{}, nil
 }

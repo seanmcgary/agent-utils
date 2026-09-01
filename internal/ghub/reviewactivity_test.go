@@ -221,3 +221,37 @@ func nextPage(page string) string {
 	}
 	return strconv.Itoa(n + 1)
 }
+
+// The self-filter folds case, and this is the fixture that proves it.
+//
+// A GitHub login is case-insensitive, and the two sides reach the comparison by
+// different routes: self from Users.Get, author from the review payload. With a
+// case-sensitive compare the loop stops recognising its own comments the moment
+// the two spellings differ. A test using one spelling for both passes either
+// way, so the spellings here differ deliberately.
+func TestCountsAsReviewActivityFoldsTheSelfLoginCase(t *testing.T) {
+	if countsAsReviewActivity("loop-bot", "Loop-Bot", "OWNER") {
+		t.Error("activity by the loop's own login in different case counted as somebody else's")
+	}
+	if !countsAsReviewActivity("loop-bot", "a-reviewer", "OWNER") {
+		t.Error("activity by a different OWNER did not count")
+	}
+}
+
+// An empty login is an error, not an answer. countsAsReviewActivity compares an
+// author against this value, and "" matches no author, so returning it would
+// silently disable the self-filter while every caller believed it had one.
+func TestAuthenticatedLoginRejectsAnEmptyLogin(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&github.User{Login: github.Ptr("")})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	gh := newTestClient(t, srv)
+
+	if _, err := gh.AuthenticatedLogin(context.Background()); err == nil {
+		t.Error("AuthenticatedLogin returned no error for an empty login")
+	}
+}

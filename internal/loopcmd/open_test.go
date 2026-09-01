@@ -133,11 +133,6 @@ func (f *noCallGH) BehindBy(context.Context, string, string, string, string) (in
 	return 0, nil
 }
 
-func (f *noCallGH) AuthenticatedLogin(context.Context) (string, error) {
-	f.t.Fatal("AuthenticatedLogin called; RunTick should have returned before Tick started")
-	return "", nil
-}
-
 func (f *noCallGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
 	f.t.Fatal("LatestReviewActivity called; RunTick should have returned before Tick started")
 	return time.Time{}, nil

@@ -121,9 +121,6 @@ func (f *fakeGH) BehindBy(_ context.Context, _, _, _, head string) (int, error) 
 	}
 	return 0, nil
 }
-func (f *fakeGH) AuthenticatedLogin(context.Context) (string, error) {
-	return "loop-bot", nil
-}
 func (f *fakeGH) LatestReviewActivity(_ context.Context, _, _ string, number int) (time.Time, error) {
 	f.reviewActivityCalls++
 	if err := f.reviewActivityErr[number]; err != nil {

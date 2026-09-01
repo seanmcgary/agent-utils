@@ -24,7 +24,7 @@ func TestLastTendAtReturnsAFinishedTendRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.IsZero() {
-		t.Fatal("LastTendAt = zero time, want the finished dispatch's start time")
+		t.Fatal("LastTendAt = zero time, want the finished dispatch's finish time")
 	}
 	if time.Since(got) > time.Minute {
 		t.Errorf("LastTendAt = %v, want close to now", got)
@@ -137,7 +137,7 @@ func TestLastTendByPRGroupsByPullRequest(t *testing.T) {
 	}
 	for _, pr := range []int{31, 42} {
 		if got[pr].IsZero() {
-			t.Errorf("LastTendByPR[%d] = zero, want the finished tend's start time", pr)
+			t.Errorf("LastTendByPR[%d] = zero, want the finished tend's finish time", pr)
 		}
 	}
 	if !got[53].IsZero() {
@@ -178,5 +178,62 @@ func TestLastTendByPRIsScopedByProject(t *testing.T) {
 	}
 	if !atB.IsZero() {
 		t.Errorf("project b's LastTendAt = %v, want zero", atB)
+	}
+}
+
+// LastTendAt returns the dispatch's FINISH time, not its start time, and this
+// test is the guard on the whole review-activity trigger.
+//
+// The tend prompt tells the agent to reply on the review threads it answers, so
+// the agent's own comment is created between the dispatch's start and its
+// finish. Compared against the START time that comment looks like unanswered
+// feedback, the trigger re-fires on the agent's own output, and the loop
+// dispatches forever at roughly $0.75 a turn. The identity filter in
+// ghub.LatestReviewActivity does not save it: the agent runs with GITHUB_TOKEN
+// stripped (runner.agentEnv), so it comments as whatever ~/.config/gh holds,
+// which on the ordinary deployment is not the daemon's account.
+//
+// The gap is forced open by hand because a real dispatch starts and finishes
+// within the same clock tick.
+func TestLastTendAtReturnsTheFinishTimeNotTheStartTime(t *testing.T) {
+	s := openTemp(t)
+	id, err := s.CreateDispatch(Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 7, Kind: KindTend, PRNumber: 31,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishDispatch(id, DispatchResult{Status: StatusSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now().UTC().Add(-time.Hour)
+	finished := started.Add(30 * time.Minute)
+	if _, err := s.db.Exec(
+		`UPDATE dispatches SET started_at = ?, finished_at = ? WHERE id = ?`,
+		started, finished, id); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.LastTendAt("execution", "o/r", 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Sub(finished).Abs() > time.Second {
+		t.Errorf("LastTendAt = %v, want the finish time %v (start was %v)", got, finished, started)
+	}
+
+	// The comment the agent itself wrote mid-dispatch must NOT read as newer.
+	agentComment := started.Add(15 * time.Minute)
+	if agentComment.After(got) {
+		t.Error("a comment written during the dispatch reads as newer than the last tend: the trigger would re-fire on the agent's own output")
+	}
+
+	byPR, err := s.LastTendByPR("execution", "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byPR[31].Sub(finished).Abs() > time.Second {
+		t.Errorf("LastTendByPR[31] = %v, want the finish time %v", byPR[31], finished)
 	}
 }

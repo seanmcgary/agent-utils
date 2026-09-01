@@ -144,6 +144,7 @@ tend_prompt: |
   {{.Labels.Blocked}}, and stop. End with: "To proceed: comment your decision and
   re-add the {{.Labels.Trigger}} label."
 
-  If the branch turns out to be current and {{.PR.ReviewPending}} is not set,
-  post NO comment and make NO push. Silence is the correct output for a quiet
-  pull request.
+  {{if not .PR.ReviewPending}}
+  If the branch turns out to be current, post NO comment and make NO push.
+  Silence is the correct output for a quiet pull request.
+  {{end}}

@@ -761,6 +761,18 @@ tend:
   harness: claude
 ```
 
+**Setting `tend.harness: pi` almost always means setting `tend.model` too.** The two fields fall
+back independently, so `tend.harness: pi` on its own leaves the tend running pi against
+`agent.model` — a claude alias like `opus`, which pi cannot resolve. Nothing rejects the pair at
+load time (the model is free text for both harnesses, exactly as `agent.model` is), so the
+mismatch surfaces as a failed dispatch. Give pi a `provider/id`:
+
+```yaml
+tend:
+  harness: pi
+  model: anthropic/claude-haiku-4-5
+```
+
 **Changing the harness starts a new session; it never resumes the issue's.** A session belongs
 to the harness that minted it, and pi does not refuse a session id it has never seen — it starts
 a fresh session under it and carries on, so resuming across harnesses would lose the earlier
@@ -970,6 +982,10 @@ backoff starts over from the first sighting. One exception: a decision carrying 
 is never backed off, because the backoff's evidence is a repeated rebase conflict and says
 nothing about whether a reviewer's comment has since been answered.
 
+The backoff needs `agent.worktree: per_issue`. The fingerprint is built from the conflicted
+paths, and those only exist in a worktree this program rebased itself, so a loop running
+`agent.worktree: none` hands the same conflict to the agent on every tick as before.
+
 ```yaml
 tend_pr: true
 ```
@@ -1109,7 +1125,7 @@ rather than inside a detached process three hours later.
 |---|---|
 | `prompt` | An issue starts for the first time, or restarts because its previous attempt never created a session |
 | `resume_prompt` | An issue resumes an existing session |
-| `tend_prompt` | A stale pull request is rebased |
+| `tend_prompt` | A pull request is tended: it is behind its base, or it carries review activity newer than the last tend |
 
 `prompt` and `resume_prompt` are always required. `tend_prompt` is required only when
 `tend_pr` is true.

@@ -1152,58 +1152,77 @@ func (s *Store) RunningDispatches(loop, repo string) ([]Dispatch, error) {
 	return scanDispatches(rows)
 }
 
-// LastTendAt returns the start time of the most recently FINISHED tend
-// dispatch for one pull request, and the zero time when it has never been
-// tended.
+// LastTendAt returns the FINISH time of the most recent finished tend dispatch
+// for one pull request, and the zero time when it has never been tended.
 //
-// Three choices here are deliberate, and each is load-bearing on its own:
+// The finish time, not the start time, and this is the whole reason the
+// review-activity trigger cannot become a dispatch loop. The tend prompt tells
+// the agent to reply on the review threads it answers, so the agent's own
+// comment is created DURING its own dispatch. Compared against the start time
+// that comment is newer, so the next pass reads it as unanswered feedback and
+// dispatches again -- forever, at roughly $0.75 a turn. Compared against the
+// finish time it is older, and the loop cannot start.
+//
+// ghub.LatestReviewActivity also filters out activity written by the loop's own
+// token identity, and that filter is NOT what makes this safe. The agent runs
+// with GITHUB_TOKEN stripped from its environment (runner.agentEnv), so its gh
+// calls authenticate as whatever ~/.config/gh holds -- on the ordinary
+// deployment, a human's login rather than the daemon's bot. The identity filter
+// is defence in depth for the case where the two DO match; this comparison is
+// what holds when they do not.
+//
+// The cost is that a review comment written while a tend is running is not seen
+// as pending afterwards. That is the conservative direction: the next comment
+// re-arms the trigger, and a bounded loss of one round beats an unbounded spend.
+//
+// Three further choices are deliberate:
 //
 //   - kind = 'tend' only. A kind = 'rebase' row records a rebase git performed
 //     with no conversation, so it read no review and answered no comment.
 //     Counting it would suppress the first tend after every automatic rebase,
 //     which is exactly the feedback the review-activity trigger exists to
 //     answer.
-//   - finished_at IS NOT NULL. dispatch writes the row before the agent starts
-//     (internal/loopcmd/tick.go, dispatch), and engine.Decide's liveTendPRs already
-//     suppresses a second pass while one runs (internal/engine/engine.go, liveTendPRs). Counting a
-//     running row here would be a second, weaker copy of that guard.
+//   - finished_at IS NOT NULL. A running tend has no finish time to compare
+//     against, and engine.Decide's liveTendPRs already suppresses a second pass
+//     while one runs, so counting a running row here would be a second, weaker
+//     copy of that guard.
 //   - A FAILED tend still counts. The alternative -- counting only a succeeded
 //     tend, so a crashed agent gets another turn at the same feedback -- was
-//     rejected: runner.finish deliberately writes no retry state for a tend
-//     (internal/runner/runner.go:353), so nothing would bound how many times a
-//     persistently failing tend is redispatched, and unbounded unattended spend
-//     is the failure this whole change exists to remove. The cost is that
-//     feedback which met a crashed agent waits for the next review comment; the
-//     dispatch row records the failure, and `project logs --list` shows it.
+//     rejected: runner.finish deliberately writes no retry state for a tend, so
+//     nothing would bound how many times a persistently failing tend is
+//     redispatched, and unbounded unattended spend is the failure this whole
+//     change exists to remove. The cost is that feedback which met a crashed
+//     agent waits for the next review comment; the dispatch row records the
+//     failure, and `project logs --list` shows it.
 //
-// A plain SELECT of started_at, not a SELECT of MAX(started_at). Both LastTendAt
-// and LastTendByPR use a MAX only inside a WHERE clause, as a text comparison
-// against the stored ISO-8601 value, and select the started_at COLUMN itself
-// as the output. modernc.org/sqlite carries a column's declared type
+// A plain SELECT of finished_at, not a SELECT of MAX(finished_at). Both
+// LastTendAt and LastTendByPR use a MAX only inside a WHERE clause, as a text
+// comparison against the stored ISO-8601 value, and select the finished_at
+// COLUMN itself as the output. modernc.org/sqlite carries a column's declared type
 // (TIMESTAMP) to the scan converter only for a bare column reference; an
 // aggregate expression's result column carries none, and Scan then either
 // fails outright (into time.Time or sql.NullTime) or -- worse -- silently
 // hands back the driver's own %v-formatted string ("2026-09-01 14:58:35 +0000
 // UTC") rather than the stored ISO-8601 text, which no further parsing here
-// recovers. Comparing MAX(started_at) against started_at in a WHERE clause
+// recovers. Comparing MAX(finished_at) against finished_at in a WHERE clause
 // sidesteps the conversion entirely: SQLite compares the two as text, which
 // sorts and compares correctly because ISO-8601 timestamps do.
 //
 // A row that matches is returned like LastTick's ORDER BY ... LIMIT 1: no row
 // means the zero time via sql.ErrNoRows, compared with errors.Is.
 //
-// dispatches is indexed only on (project_id, loop, repo, status)
-// (store.go:199), and pr_number is not part of that index, so this scans.
+// dispatches is indexed only on (project_id, loop, repo, status) (see
+// schemaIndexes), and pr_number is not part of that index, so this scans.
 // That is accepted at current volumes; add an index when a loop's dispatch
 // history makes it matter.
 func (s *Store) LastTendAt(loop, repo string, prNumber int) (time.Time, error) {
 	var t time.Time
 	err := s.db.QueryRow(
-		`SELECT started_at FROM dispatches d
+		`SELECT finished_at FROM dispatches d
 		 WHERE project_id = ? AND loop = ? AND repo = ? AND pr_number = ?
 		   AND kind = ? AND finished_at IS NOT NULL
-		   AND started_at = (
-		     SELECT MAX(started_at) FROM dispatches
+		   AND finished_at = (
+		     SELECT MAX(finished_at) FROM dispatches
 		     WHERE project_id = d.project_id AND loop = d.loop AND repo = d.repo
 		       AND pr_number = d.pr_number AND kind = d.kind AND finished_at IS NOT NULL
 		   )`,
@@ -1217,23 +1236,23 @@ func (s *Store) LastTendAt(loop, repo string, prNumber int) (time.Time, error) {
 	return t.UTC(), nil
 }
 
-// LastTendByPR returns the start time of the most recently finished tend
+// LastTendByPR returns the finish time of the most recently finished tend
 // dispatch for every pull request this loop has tended, keyed by pull request
 // number.
 //
 // It exists so a pass deciding many issues issues one query instead of one
 // per pull request -- the same reasoning CostByIssue groups by number for. The
-// three choices documented on LastTendAt apply here identically. The
+// reasoning documented on LastTendAt applies here identically. The
 // self-join replaces GROUP BY for the reason given above LastTendAt: a
 // GROUP BY pr_number, MAX(started_at) would select the aggregate as an output
 // column, and lose the declared type the same way.
 func (s *Store) LastTendByPR(loop, repo string) (map[int]time.Time, error) {
 	rows, err := s.db.Query(
-		`SELECT d.pr_number, d.started_at FROM dispatches d
+		`SELECT d.pr_number, d.finished_at FROM dispatches d
 		 WHERE project_id = ? AND loop = ? AND repo = ?
 		   AND kind = ? AND finished_at IS NOT NULL
-		   AND started_at = (
-		     SELECT MAX(started_at) FROM dispatches
+		   AND finished_at = (
+		     SELECT MAX(finished_at) FROM dispatches
 		     WHERE project_id = d.project_id AND loop = d.loop AND repo = d.repo
 		       AND pr_number = d.pr_number AND kind = d.kind AND finished_at IS NOT NULL
 		   )`,

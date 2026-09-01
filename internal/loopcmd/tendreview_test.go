@@ -124,16 +124,8 @@ func TestTickSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
 	spawned := 0
 	deps, dbPath := newDepsAt(t, cfg, gh, &spawned)
 
-	// Break the last-tend read, and only that read, by removing the table it
-	// selects from.
-	raw, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	if _, err := raw.Exec("DROP TABLE dispatches"); err != nil {
-		t.Fatal(err)
-	}
+	// Break the last-tend read, and only that read.
+	dropDispatches(t, dbPath)
 
 	// The tick itself fails afterwards, when it reads running dispatches from
 	// the same table. That is expected and is not what this test asserts: the
@@ -143,6 +135,59 @@ func TestTickSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
 
 	if gh.reviewActivityCalls != 0 {
 		t.Errorf("LatestReviewActivity was called %d times, want 0: an unknown last-tend time must suppress the review trigger, not be read around",
+			gh.reviewActivityCalls)
+	}
+	if spawned != 0 {
+		t.Errorf("spawned = %d, want 0", spawned)
+	}
+}
+
+// dropDispatches removes the table LastTendAt and LastTendByPR select from, so
+// a test can fail exactly that read.
+//
+// Deps.Store is a concrete type with no seam to inject a failure through, and
+// introducing an interface for two tests would be a wider change than the
+// property is worth. The pass under test fails later, when it reads running
+// dispatches from the same table; the tests assert what happened BEFORE that,
+// while the pass still had a choice about spending a GitHub call.
+func dropDispatches(t *testing.T, dbPath string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec("DROP TABLE dispatches"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The delivery fast path fails closed the same way the full tick does, and for
+// the same reason: an unset lastTend entry reads as the zero time, so any
+// review activity is After(zero). TickIssue orders the store read FIRST and
+// skips the GitHub read when it fails; without that ordering a failed store
+// read would manufacture a reason to dispatch an agent.
+func TestTickIssueSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
+	cfg := tickConfig(t)
+	cfg.TendPR = true
+	gh := &fakeGH{
+		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
+		prs: []ghub.PullRequest{
+			{Number: 108, HeadRef: "feat/51", BaseRef: "master", Body: "Closes #51", Trusted: true},
+		},
+		behind: map[int]int{108: 0},
+		// The read would report activity if it ran. It must not run.
+		reviewActivity: map[int]time.Time{108: time.Now()},
+	}
+	spawned := 0
+	deps, dbPath := newDepsAt(t, cfg, gh, &spawned)
+
+	dropDispatches(t, dbPath)
+
+	_, _ = TickIssue(context.Background(), cfg, deps, 108)
+
+	if gh.reviewActivityCalls != 0 {
+		t.Errorf("LatestReviewActivity was called %d times, want 0: an unknown last-tend time must suppress the review trigger",
 			gh.reviewActivityCalls)
 	}
 	if spawned != 0 {

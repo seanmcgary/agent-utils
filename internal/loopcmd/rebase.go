@@ -176,12 +176,20 @@ func conflictFingerprint(headSHA string, paths []string) string {
 // path around the veto and stop filters, which changes what a veto label
 // MEANS, and it is tracked as its own decision rather than smuggled in here.
 // Until then, this comment describes what the code does.
-func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision, now time.Time) (rebaseOutcome, error) {
+func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision, now time.Time) (rebaseOutcome, *store.TendConflict, error) {
 	// A loop with no per-issue worktree has no pull-request checkout to rebase
 	// in, and this pass will not create one: the agent path already handles
 	// that mode.
+	//
+	// The repeat-conflict backoff is inert for such a loop, and that is a real
+	// limitation rather than an oversight. The fingerprint is built from the
+	// conflicted paths, which only exist in a worktree this pass rebased, so a
+	// loop running agent.worktree: none still hands the same conflict to the
+	// agent on every tick. Fixing it means fingerprinting a conflict this pass
+	// never produced, which is a different feature; docs/configuration.md says
+	// so where it documents the schedule.
 	if cfg.Agent.Worktree != config.WorktreePerIssue || deps.Git == nil {
-		return notDone, nil
+		return notDone, nil, nil
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, rebaseBudget)
@@ -197,17 +205,17 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 	// this pass.
 	dirty, err := deps.Git.DirtyCtx(ctx, deps.Git.PathForPR(d.PR))
 	if err != nil {
-		return notDone, err
+		return notDone, nil, err
 	}
 	if dirty {
 		slog.Info("tend worktree holds uncommitted or unpushed work; leaving this rebase to the agent",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR)
-		return notDone, nil
+		return notDone, nil, nil
 	}
 
 	path, err := deps.Git.EnsurePRCtx(ctx, d.PR, d.HeadRef)
 	if err != nil {
-		return notDone, err
+		return notDone, nil, err
 	}
 
 	// The lease. It is read AFTER EnsurePRCtx, which fetches the head ref and
@@ -217,7 +225,7 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 	// rather than silently degrading the guard.
 	lease, err := deps.Git.HeadSHA(ctx, path)
 	if err != nil {
-		return notDone, err
+		return notDone, nil, err
 	}
 
 	if err := deps.Git.Rebase(ctx, path, d.BaseRef); err != nil {
@@ -270,18 +278,19 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 			// dispatches; committing it would let repeated abort failures
 			// escalate a pull request to the 24h tier without the agent ever
 			// having seen the conflict once.
-			return doneNoRebase, nil
+			return doneNoRebase, nil, nil
 		}
 		if backedOff {
-			return doneBackedOff, nil
+			return doneBackedOff, nil, nil
 		}
-		// The agent IS about to be dispatched, and the abort succeeded, so
-		// this pass really is a dispatch at this fingerprint. Only now is the
-		// sighting committed.
-		recordConflictDispatch(cfg, deps, d, pendingConflict)
+		// The abort succeeded and the agent is the answer to this conflict, so
+		// the prepared row is handed back for the caller to commit. It is NOT
+		// committed here: dispatch can still fail -- a worktree it cannot
+		// build, a spawn that will not start -- and no agent runs then. See
+		// act's KindTend case.
 		slog.Info("rebase did not replay cleanly; dispatching the tend agent",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
-		return notDone, nil
+		return notDone, pendingConflict, nil
 	}
 
 	if err := deps.Git.PushWithLease(ctx, path, d.HeadRef, lease); err != nil {
@@ -297,7 +306,7 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 		// done, but NOT rebased. The caller must not count this: the summary
 		// is the surface an operator audits unattended force-pushes with, and
 		// nothing was pushed.
-		return doneNoRebase, nil
+		return doneNoRebase, nil, nil
 	}
 
 	if err := recordRebase(cfg, deps, d); err != nil {
@@ -317,13 +326,17 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 	slog.Info("rebased a pull request with git; no agent was dispatched",
 		"loop", cfg.Name, "issue", d.Issue, "pr", d.PR,
 		"head", truncate(d.HeadRef, 120), "base", truncate(d.BaseRef, 120))
-	return doneRebased, nil
+	return doneRebased, nil, nil
 }
 
 // checkConflictBackoff is the repeat-conflict backoff gate. It reports
 // whether this pass must decline to dispatch the agent at the conflict d's
-// rebase just met, and it is the ONLY place that writes tend_conflicts on the
-// conflict path.
+// rebase just met.
+//
+// It WRITES nothing. It returns the row that should be recorded if the agent
+// really is dispatched, and recordConflictDispatch commits it once the caller
+// has committed to dispatching -- see the comment on the return below for the
+// failed-abort case that forces the split.
 //
 // The gate fails OPEN: a read it could not make -- the conflicted-path list
 // or the stored row -- dispatches the agent, because a gate that declines to
@@ -427,6 +440,16 @@ func checkConflictBackoff(
 	return false, &newRow
 }
 
+// A row this function writes is deleted when git replays the branch cleanly,
+// when TendCheck drops a closed pull request's pr_links row, and when the
+// closed-pull-request cleanup runs. It is NOT deleted when the AGENT resolves
+// the conflict and pushes: the pull request is then current, so no tend
+// decision is produced, and gitRebase never runs again to notice. The row
+// survives until the pull request closes. That is harmless -- the agent's push
+// moved the head, so the fingerprint no longer matches and the backoff cannot
+// suppress anything -- but it is state nothing prunes, so do not read the
+// deletion sites as "the row always follows the conflict out".
+//
 // recordConflictDispatch commits the row checkConflictBackoff prepared, at the
 // point the caller has committed to dispatching the agent.
 //

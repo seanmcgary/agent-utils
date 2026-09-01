@@ -54,16 +54,9 @@ type DeliveryCache struct {
 	mu     sync.Mutex
 	issues map[numberKey]issueAnswer
 	prs    map[numberKey]prAnswer
-	// login and loginFetched memoise AuthenticatedLogin the same way GitHubClient
-	// itself does: the token is a process-wide constant, not a per-delivery
-	// fact, so this is safe to keep even though everything else on this type
-	// is scoped to one delivery.
-	loginFetched bool
-	login        string
-	loginErr     error
 	// reviewActivity memoises LatestReviewActivity per pull request, for the
-	// reason PullRequest is memoised at :104-115 and BehindBy deliberately is
-	// NOT at :131-136: several loops of several projects answer one delivery
+	// reason PullRequest is memoised below and BehindBy deliberately is not:
+	// several loops of several projects answer one delivery
 	// about the same pull request, the two REST reads behind this method
 	// return the same answer for all of them at the same instant, and this
 	// cache's lifetime is exactly one delivery -- so caching it can never
@@ -134,22 +127,6 @@ func (d *DeliveryCache) PullRequest(ctx context.Context, owner, repo string, num
 	pr, err := d.c.PullRequest(ctx, owner, repo, number)
 	d.prs[key] = prAnswer{pr: pr, err: err}
 	return pr, err
-}
-
-// AuthenticatedLogin returns the delivery's answer for the loop's own login,
-// fetching it at most once per DeliveryCache. It is memoised the same way
-// GitHubClient itself memoises it (a sync.Once there, a lock here): the token
-// this cache wraps does not change while the daemon runs, so the identity it
-// names is a process-wide constant, not a fact scoped to one delivery.
-func (d *DeliveryCache) AuthenticatedLogin(ctx context.Context) (string, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.loginFetched {
-		return d.login, d.loginErr
-	}
-	login, err := d.c.AuthenticatedLogin(ctx)
-	d.login, d.loginErr, d.loginFetched = login, err, true
-	return login, err
 }
 
 // LatestReviewActivity returns the delivery's answer for one pull request's
