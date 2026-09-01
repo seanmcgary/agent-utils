@@ -10,10 +10,11 @@ conflict it already lost, and let the tend dispatches that remain run a cheaper 
 **Architecture:** Four changes on one path, in dependency order. A new `tend:` configuration
 section gives a tend dispatch its own harness, model, and effort, and `runner.Effective` and
 `engine.effectiveHarness` both learn the dispatch kind so the session-continuity rule still
-holds. A new GitHub read reports the latest review activity on a pull request, a new store read
-reports the last tend dispatch for it, and `engine.tendDecisions` treats "review activity is
-newer" as a second reason to tend. A new `tend_conflicts` table fingerprints a rebase conflict,
-and `loopcmd` refuses to dispatch the agent at a fingerprint that already defeated it.
+holds. A new GitHub read reports the latest review activity on a pull request by somebody other
+than the loop itself, a new store read reports the last finished tend dispatch for it, and
+`engine.tendDecisions` treats "review activity is newer" as a second reason to tend. A new
+`tend_conflicts` table fingerprints a rebase conflict, and `loopcmd` refuses to dispatch the agent
+at a fingerprint that already defeated it.
 
 **Tech Stack:** Go 1.25, `urfave/cli/v3`, `gopkg.in/yaml.v3`, `go-github/v77`, SQLite through
 `internal/store`, git through `os/exec`.
@@ -42,42 +43,58 @@ and `loopcmd` refuses to dispatch the agent at a fingerprint that already defeat
 The request asks for four changes. Pull request #18 (`7184c75`) landed the clean-rebase fast
 path after the request's log sample was taken.
 
-- **(c) is complete.** `loopcmd.gitRebase` (`internal/loopcmd/rebase.go:126`) rebases with git,
+- **(c) is complete.** `loopcmd.gitRebase` (`internal/loopcmd/rebase.go:118`) rebases with git,
   pushes with `--force-with-lease` pinned to the commit it fetched, and dispatches the agent only
   on a conflict. This plan changes it only to add the backoff outcome and the review-pending
   fall-through.
 - **(b) is half complete.** `engine.tendDecisions` already refuses to decide a pull request that
-  is not behind its base (`internal/engine/engine.go:381`). This plan adds the review-activity
+  is not behind its base (`internal/engine/engine.go:438`). This plan adds the review-activity
   half.
 
 ## Global Constraints
 
 The repository has no `AGENTS.md`, `CLAUDE.md`, or `CONTRIBUTING.md`. The binding rules for this
-change come from the code and from `README.md`:
+change come from the code, from `.golangci.yml`, and from `README.md`:
 
 - **Session continuity per harness.** A session belongs to the harness that minted it. Enforced by
-  `engine.resumable` (`internal/engine/engine.go:302`) and documented in
+  `engine.resumable` (`internal/engine/engine.go:354`) and documented in
   `docs/configuration.md#tend_pr`. Changing the harness must START a session, never resume one.
 - **Every `_test.go` file is in the SAME package as the code it tests.** Write unqualified names.
-- **A test must not be run in parallel across packages.** `make test` passes `-p 1`; do not add
-  `t.Parallel()` to a test that shells out to git or spawns a process.
-- **A new NOT NULL column carries a literal DEFAULT.** Stated at
-  `internal/store/store.go:30`. A wall-clock deadline is stored as Unix seconds in an INTEGER,
-  because no literal `TIMESTAMP` default reads back as the zero time
-  (`internal/store/store.go:53`).
-- **A new column added after the first release must also be listed in `addedColumns`**
-  (`internal/store/store.go:365`). `CREATE TABLE IF NOT EXISTS` does nothing to a database that
-  already exists.
+- **Tests are not run in parallel across packages.** `make test` passes `-p 1` and `-count=1`
+  (`Makefile:148-160`). Do not add `t.Parallel()` to a test that shells out to git or spawns a
+  process.
+- **A new NOT NULL column carries a literal DEFAULT** (`internal/store/store.go:30`). A
+  wall-clock deadline is stored as Unix seconds in an INTEGER, because no literal `TIMESTAMP`
+  default reads back as the zero time (`internal/store/store.go:53`).
+- **A new COLUMN added after the first release must also be listed in `addedColumns`**
+  (`internal/store/store.go:365`). A new TABLE must not: `CREATE TABLE IF NOT EXISTS` creates it,
+  and it has no older rows.
 - **Every scoped read and write carries `project_id`.** `internal/store/scope_test.go` proves it.
 - **Map iteration is never a log or an error order.** Sort the keys; `internal/config.Load` and
   `loopcmd.TendCheck` both record the rule.
 - **`--force-with-lease`, never plain `--force`.** Enforced by `worktree.Manager.PushWithLease`.
 - **Rebase a feature branch onto its base; never merge the base into it.** Repository owner's
   standing rule.
+- **Commit messages are Conventional Commits**: `type(scope): subject`, lowercase, imperative
+  (`feat(sessions):`, `fix(listener):`, `docs(worktree,loopcmd):`, `test(loopcmd):`, `chore:`).
 - **No `Co-Authored-By:` trailer on any commit.** Repository owner's standing rule; it overrides
   any skill template.
-- **Comment style.** This codebase explains invariants and rejected alternatives in prose above the
-  code. Read the neighbouring file before you write a comment, and say WHY, not what.
+- **Do not bump `VERSION`.** It is bumped in standalone `chore: bump to vX.Y.0` commits on master,
+  separately from a feature branch (`11a0224`, `23197f0`, `c08ebe6`).
+- **Lint.** `.golangci.yml` enables `errcheck`, `errorlint`, `govet`, `ineffassign`,
+  `staticcheck`, `unused`. Two consequences for this change: an error that is deliberately ignored
+  must be handled explicitly (`if err := ...; err != nil { slog.Error(...) }`), never `_ =`,
+  except for the `Close`/`Release` exclusions already listed; and a sentinel error is compared
+  with `errors.Is`, never `==` (this includes `sql.ErrNoRows`).
+- **Nothing logs at Debug.** No handler is configured for it, so a Debug line is a line nobody
+  reads (`internal/loopcmd/tendcheck.go:172-174`).
+- **Externally-influenced text is bounded before it is logged.** See
+  `internal/listener/handler.go:69,76` (`maxLoggedTextRunes`, `maxLoggedLabels`) and
+  `internal/loopcmd/rebase.go:211-215` (`truncate(d.HeadRef, 120)`, with the comment saying
+  `SafeRef` bounds a ref's charset but not its length).
+- **Comment idiom.** This codebase writes: the invariant, the alternative that was rejected, and
+  the concrete failure that motivated the rule. Read the neighbouring file before writing a
+  comment. Every step below that says "say why" means a comment of that shape.
 
 ## Verified external API (do not re-derive)
 
@@ -91,22 +108,49 @@ func (s *PullRequestsService) ListReviews(ctx context.Context, owner, repo strin
 // github/pulls_comments.go:80
 func (s *PullRequestsService) ListComments(ctx context.Context, owner, repo string, number int,
     opts *PullRequestListCommentsOptions) ([]*PullRequestComment, *Response, error)
+
+// github/users.go:95 — an empty user name returns the AUTHENTICATED user.
+func (s *UsersService) Get(ctx context.Context, user string) (*User, *Response, error)
 ```
 
-- `PullRequestReview.SubmittedAt` is a `*Timestamp`. Read it with `GetSubmittedAt().Time`.
-- `PullRequestComment.CreatedAt` and `.UpdatedAt` are `*Timestamp`. Read them the same way.
-- `PullRequestListCommentsOptions` carries `Sort` (`"created"` or `"updated"`), `Direction`
-  (`"asc"` or `"desc"`), and an embedded `ListOptions`. `ListReviews` takes a bare `ListOptions`
-  and has NO sort option: its results are oldest first, so the last page holds the newest review.
+- `PullRequestReview` carries `SubmittedAt *Timestamp` (`pulls_reviews.go:22`),
+  `AuthorAssociation *string` (`:33`), and `User *User`.
+- `PullRequestComment` carries `CreatedAt *Timestamp` (`pulls_comments.go:36`),
+  `AuthorAssociation *string` (`:44`), and `User *User` (`:34`).
+- Read a `*Timestamp` with `GetSubmittedAt().Time` / `GetCreatedAt().Time`; read a login with
+  `GetUser().GetLogin()`.
+- `PullRequestListCommentsOptions` carries `Sort` (`"created"`/`"updated"`), `Direction`
+  (`"asc"`/`"desc"`), and an embedded `ListOptions`. `ListReviews` takes a bare `ListOptions` and
+  has NO sort option: its results are oldest first.
 
-Repository-internal facts this plan depends on:
+Repository-internal facts this plan depends on. Every line number below was re-verified against
+the current tree.
 
-- `runner.Effective` — `internal/runner/args.go:59`. Callers: `args.go:102,142`,
-  `runner.go:145,365`, `loopcmd/sessions.go:472`, `loopcmd/describe.go:82`.
+- `runner.Effective` — `internal/runner/args.go:59`. Production callers: `args.go:102,142`,
+  `runner.go:145,365`, `loopcmd/sessions.go:472`, `loopcmd/describe.go:82`. Test callers:
+  `internal/runner/args_test.go:165,179,190,201,208,224,235`.
 - `runner.Invocation` is built in exactly one production place: `internal/loopcmd/tick.go:786`.
-- `engine.effectiveHarness` — `internal/engine/engine.go:317`. Callers: `engine.go:243,295,309`.
+- `engine.resumable` — `internal/engine/engine.go:354`. Callers: `engine.go:201,317,468`.
+- `engine.effectiveHarness` — `internal/engine/engine.go:368`. Direct callers besides
+  `resumable` (`:361`): `engine.go:220,331`.
+- The tend staleness gate is `engine.go:438`; the tend session gate is `engine.go:468`.
 - `store.KindTend` / `store.KindRebase` — `internal/store/types.go:9,14`.
 - `worktree.Manager.gitStdout` — `internal/worktree/worktree.go:412`, bounded by `gitTimeout`.
+- `loopcmd.gitRebase` — `internal/loopcmd/rebase.go:118`; `RebaseGit` — `rebase.go:19`; the
+  detached `cleanupCtx` — `rebase.go:182`; `recordRebase` — `rebase.go:245`.
+- `loopcmd.Summary` — `internal/loopcmd/tick.go:124`. Every field carries an explicit
+  snake_case `json:` tag, because `Summary` is marshalled into `ticks.summary_json`.
+- `loopcmd.Session.LastKind` — `internal/loopcmd/sessions.go:53`, set at `:539` from the newest
+  dispatch of the session.
+- `ghub.DeliveryCache` (`internal/ghub/deliverycache.go`) is a PRODUCTION implementation of
+  `ghub.Client` that forwards every method by hand. `BehindBy` is passed through (`:134`);
+  `PullRequest` is memoised (`:126-136`). The daemon passes it to `loopcmd`
+  (`internal/listener/work.go:210,353`).
+- Test fixtures to reuse rather than reinvent: `initRepo`
+  (`internal/worktree/worktree_test.go:39`) and `initRepoWithOrigin` (`:45`); `openTemp`
+  (`internal/store/store_test.go:15`), `openTempAt` (`:20`), `openTempDB`
+  (`internal/store/closures_test.go:11`); `loopFile` (`internal/loopcmd/epicsweep_test.go:135`)
+  and `writeLoopFiles` (`:168`).
 
 ## Task 1 — the `tend:` configuration section
 
@@ -115,8 +159,6 @@ Repository-internal facts this plan depends on:
 - [ ] Add `TendAgent` to `internal/config/config.go`:
 
   ```go
-  // TendAgent is the agent section for a tend dispatch. Every field is
-  // optional and falls back to the same field of Agent.
   type TendAgent struct {
       Harness string `yaml:"harness"`
       Model   string `yaml:"model"`
@@ -126,60 +168,62 @@ Repository-internal facts this plan depends on:
 
   Add `Tend TendAgent \`yaml:"tend"\`` to `Config`, directly under `Agent`.
 
-- [ ] Explain in a comment above `TendAgent` why only three fields are here, and not
-  `permission_mode`, `worktree`, `max_budget_usd`, `timeout`, or `background_tasks`: those say how
-  this program runs an agent, not which agent runs, and a tend has no reason to differ in them.
-  Repeating them would give an operator two places to set one thing.
+- [ ] Comment above `TendAgent` in the house idiom. The invariant: only the three fields that say
+  WHICH agent runs are here. The rejected alternative: repeating `permission_mode`, `worktree`,
+  `max_budget_usd`, `timeout`, and `background_tasks`. The failure that rejects it: two places to
+  set one thing, and an operator who sets a timeout in one of them gets the other's.
 
 - [ ] Validate in `Config.validate`, beside the existing `agent.harness` and `agent.effort`
-  switches, using the same enums and the same message shape. `tend.model` is NOT required: an
+  switches, using the same enums and the same message shape (`tend.harness must be "claude" or
+  "pi", got %q`; `tend.effort %q is not a valid effort level`). `tend.model` is NOT required: an
   empty value means "use `agent.model`", and requiring it would force every tending loop to repeat
   a value it already set.
 
 - [ ] `Load` must NOT default `cfg.Tend.Harness`. `Load` defaults `cfg.Agent.Harness` to
-  `HarnessClaude` because a harness must always resolve; an empty `tend.harness` is the signal to
-  fall back, so defaulting it here would silently pin every tend to claude on a `harness: pi` loop.
-  Say that in a comment beside the existing default.
+  `HarnessClaude` (`internal/config/config.go:165-166`) because a harness must always resolve; an
+  empty `tend.harness` is the signal to fall back, so defaulting it here would silently pin every
+  tend to claude on a `harness: pi` loop. Say that in a comment beside the existing default.
 
 **Acceptance:** `go test ./internal/config/...` passes with new tests that (1) load a config with
 a full `tend:` section, (2) load one with a partial `tend:` section, (3) reject
 `tend.harness: bogus` with a message naming `tend.harness`, (4) reject `tend.effort: turbo` with a
-message naming `tend.effort`, and (5) confirm `Load` leaves an absent `tend.harness` empty. Check
-`internal/config/docs_test.go` and `examples_test.go` — if either asserts over the documented field
-set, extend it rather than working around it.
+message naming `tend.effort`, and (5) confirm `Load` leaves an absent `tend.harness` empty.
+`TestEveryConfigFieldIsDocumented` (`internal/config/docs_test.go:14-53`) walks nested structs, so
+it will fail until Task 10 lands — that is expected; do not work around it.
 
 ## Task 2 — `runner.Effective` learns the dispatch kind
 
 **review: no**
 
 - [ ] Change the signature to `Effective(cfg *config.Config, kind string, ov config.Overrides)
-  Settings`. `kind` is a `store.Kind*` value.
+  Settings`. `kind` is a `store.Kind*` value. `internal/runner` already imports `internal/store`
+  (`runner.go:22`), and `kind` is a plain string, so `args.go` needs no new import.
 
 - [ ] Build the base settings from `cfg.Agent`, then overlay each non-empty `cfg.Tend` field when
   `kind == store.KindTend`, then overlay the validated label overrides exactly as today. Do not
   re-order the existing override re-validation; it is the last line of defence before a value
   becomes an argv element, and its doc comment says so.
 
-- [ ] Document the three layers and their order in the doc comment, and state why the label wins:
-  `tend:` is a default for a class of dispatch, and a label is an instruction about one issue.
+- [ ] Document the three layers and their order, and say why the label wins: `tend:` is a default
+  for a class of dispatch, and a label is an instruction about one issue.
 
-- [ ] Add `Kind string` to `runner.Invocation`, with a comment saying it selects the
-  configuration layer and that an empty value means "not a tend", which is the correct reading for
-  a hand-built `Invocation` in a test.
+- [ ] Add `Kind string` to `runner.Invocation`, with a comment saying it selects the configuration
+  layer and that an empty value means "not a tend", which is the correct reading for a hand-built
+  `Invocation` in a test.
 
 - [ ] Update every caller:
-  - `args.go:102,142` — pass `inv.Kind`.
-  - `runner.go:145` — pass `inv.Kind`.
-  - `runner.go:365` — pass `d.Kind`. This one records the harness that minted a session, and the
-    branch it sits in already excludes `store.KindTend`, so the value is a non-tend kind either
-    way; pass it for the same single-source reason the rest do.
+  - `args.go:102,142` and `runner.go:145` — pass `inv.Kind`.
+  - `runner.go:365` — pass `d.Kind`.
   - `loopcmd/tick.go:786` — set `Kind: d.Kind` on the `runner.Invocation`, where `d` is the
     dispatch row.
-  - `loopcmd/sessions.go:472` and `loopcmd/describe.go:82` — these render what a dispatch RAN
-    with. `describe.go` has `d.Kind` on the row; pass it. `sessions.go` aggregates a session, so
-    pass the kind of the dispatch the model and harness were read from; if the aggregate does not
-    carry one, pass `store.KindResume` and say in a comment that a session never aggregates a
-    tend-only run.
+  - `loopcmd/describe.go:82` — pass `d.Kind` from the dispatch row.
+  - `loopcmd/sessions.go:472` — pass `sessions[i].LastKind` (`sessions.go:53`, set at `:539`). A
+    tend that inherits the issue's session shares its `session_id`, so `sessionsFrom` DOES group a
+    tend into a session, and `describe.go:35-37` describes exactly that case. Hard-coding a
+    non-tend kind here would make `sessions list` report `agent.model` for a session whose last
+    run used `tend.model`.
+  - `internal/runner/args_test.go:165,179,190,201,208,224,235` — the package does not compile
+    until these are updated.
 
 **Acceptance:** `go test ./internal/runner/... ./internal/loopcmd/...` passes with new tests
 proving: `KindTend` prefers `tend.model` over `agent.model`; an absent `tend.model` falls back to
@@ -190,21 +234,27 @@ proving: `KindTend` prefers `tend.model` over `agent.model`; an absent `tend.mod
 **review: yes** (this is the session-continuity invariant)
 
 - [ ] Change `engine.effectiveHarness(cfg *config.Config, kind string, ov config.Overrides)
-  string`. Resolve in the same order `runner.Effective` does: label override, then `cfg.Tend.Harness`
-  when `kind == store.KindTend`, then `cfg.Agent.Harness`, then `config.HarnessClaude`.
+  string`. Resolve in the same order `runner.Effective` does: label override, then
+  `cfg.Tend.Harness` when `kind == store.KindTend`, then `cfg.Agent.Harness`, then
+  `config.HarnessClaude`.
 
 - [ ] Change `engine.resumable(cfg *config.Config, kind string, state store.IssueState, ov
   config.Overrides) bool` to pass the kind through.
 
-- [ ] Update the three call sites. The trigger path (`engine.go:243,295`) passes `store.KindStart`;
-  the retry path (`engine.go:309`) passes the kind it is about to produce; `tendDecisions` passes
-  `store.KindTend`.
+- [ ] Update all five call sites. `kind` is a `store.Kind*` STRING, not an `engine.Kind`; the two
+  are different types and there is no `store` counterpart for `KindRetryStart` or
+  `KindRetryResume` — `act` maps both onto `store.KindStart`/`store.KindResume`
+  (`internal/loopcmd/tick.go:498-505`). Only `store.KindTend` changes behaviour, so:
+  - `engine.go:201` (`resumable`, trigger path) — `store.KindStart`.
+  - `engine.go:220` (`effectiveHarness`, the trigger path's "why" string) — `store.KindStart`.
+  - `engine.go:317` (`resumable`, retry path) — `store.KindStart`.
+  - `engine.go:331` (`effectiveHarness`, the retry path's "why" string) — `store.KindStart`.
+  - `engine.go:468` (`resumable`, `tendDecisions`) — `store.KindTend`.
 
 - [ ] Extend `resumable`'s doc comment with the tend case: a loop whose `tend.harness` differs from
-  its `agent.harness` must START the tend's session, never resume the issue's. pi does not refuse an
-  identifier it has never seen — it creates a fresh session under it and carries on — so a resume
-  across harnesses loses the conversation silently. That is what this gate exists to stop, and the
-  `tend:` section is a new way to reach it.
+  its `agent.harness` must START the tend's session, never resume the issue's. pi does not refuse
+  an identifier it has never seen — it creates a fresh session under it and carries on — so a
+  resume across harnesses loses the conversation silently.
 
 **Acceptance:** `go test ./internal/engine/...` passes with new tests proving: with
 `agent.harness: claude` and `tend.harness: pi`, a tend decision for an issue with a started claude
@@ -213,99 +263,191 @@ a `harness:` label on the issue still beats `tend.harness`.
 
 ## Task 4 — read the latest review activity from GitHub
 
-**review: no**
+**review: yes** (it decides whether to spend money, from attacker-writable input)
 
-- [ ] Add to `ghub.Client`:
+- [ ] Add two methods to `ghub.Client`:
 
   ```go
+  // AuthenticatedLogin returns the login of the account this client's token
+  // belongs to.
+  AuthenticatedLogin(ctx context.Context) (string, error)
+
+  // LatestReviewActivity returns the time of the most recent review or review
+  // comment on a pull request that this loop did not write itself.
   LatestReviewActivity(ctx context.Context, owner, repo string, number int) (time.Time, error)
   ```
 
-- [ ] Implement it on `GitHubClient` in `internal/ghub/ghub.go`, beside `BehindBy`. Read the
-  newest review comment with `ListComments` and `PullRequestListCommentsOptions{Sort: "created",
-  Direction: "desc", ListOptions: github.ListOptions{PerPage: 1}}`. Read the newest review by
-  walking `ListReviews` — it has no sort option, so ask for `PerPage: 100` and take the maximum
-  `SubmittedAt` over the pages, stopping at `Response.NextPage == 0`. Return the later of the two,
-  and the zero time when there is neither.
+- [ ] Implement both on `GitHubClient` in `internal/ghub/ghub.go`, beside `BehindBy`.
+  `AuthenticatedLogin` calls `Users.Get(ctx, "")` and MEMOISES the answer on the client behind a
+  `sync.Once`-style guard: the token does not change while the process runs, and a call per tend
+  candidate would spend a request to learn a constant.
 
-- [ ] Say in the doc comment why the two reads differ: `ListComments` accepts a sort, so one page
-  of one is enough; `ListReviews` does not, so the whole list is walked. Say why a review with no
-  `submitted_at` (a pending review, which only its author can see) is skipped rather than counted
-  as now.
+- [ ] `LatestReviewActivity` applies two filters, and BOTH are load-bearing:
 
-- [ ] Update every fake `ghub.Client` in the test tree so the package still compiles. Grep for the
-  existing method set rather than guessing which files hold one.
+  1. **Skip activity written by this loop itself** — an author login equal to
+     `AuthenticatedLogin`. Without it the feature is a money loop: the tend prompt tells the agent
+     to comment (`examples/execution.yaml:118,124`), the agent's comment is newer than the
+     dispatch that produced it, and every later pass sees pending review activity and dispatches
+     again, forever, at about $0.75 a turn.
+  2. **Skip an author whose `AuthorAssociation` is not `OWNER`, `MEMBER`, or `COLLABORATOR`** —
+     the same three values `convertPR` requires before it will trust a pull request
+     (`internal/ghub/ghub.go:113`). A review comment can be written by anyone with read access, so
+     without this filter a stranger can spend the loop's budget at will and put chosen text in
+     front of an agent that holds push rights on the branch.
 
-**Acceptance:** `go test ./internal/ghub/...` passes with a table test over a stubbed HTTP
-transport (follow `internal/ghub/single_test.go`) proving: comments only; reviews only; both, with
-the later one winning; neither, returning the zero time; a review with no `submitted_at` ignored.
+  Say both, and the failure each prevents, in the doc comment.
+
+- [ ] Read the newest review comment with `ListComments` and
+  `PullRequestListCommentsOptions{Sort: "created", Direction: "desc", ListOptions:
+  github.ListOptions{PerPage: 100}}`. Read reviews by walking `ListReviews` at `PerPage: 100` and
+  taking the maximum `SubmittedAt` over the pages. Cap the walk at a package constant
+  (`maxReviewPages = 10`) and stop there, treating what was seen as the answer: any user who can
+  review can post thousands of reviews, and an unbounded walk holds the loop lock while it
+  exhausts the daemon's rate limit for every project on the machine. Say why the two reads differ
+  — `ListComments` accepts a sort, `ListReviews` does not.
+
+  A page of comments is read rather than a single row because the newest comment may be one this
+  loop wrote; the filters above then have candidates left to consider.
+
+- [ ] Skip a review with no `SubmittedAt` — a pending review, which only its author can see —
+  rather than counting it as now. Say so.
+
+- [ ] Add both methods to `ghub.DeliveryCache` (`internal/ghub/deliverycache.go`). It is a
+  PRODUCTION implementation, not a test fake, and the daemon build breaks without it
+  (`internal/listener/work.go:210,353`). MEMOISE both, the way `PullRequest` is memoised at
+  `deliverycache.go:126-136` and unlike `BehindBy`'s pass-through at `:134`: several loops of
+  several projects answer one delivery, the answer is the same instant for all of them, and the
+  cache's lifetime is one delivery. State that reasoning in the comment, as
+  `deliverycache.go:14-48` requires.
+
+- [ ] Update every fake `ghub.Client` in the test tree. Grep for an existing method name rather
+  than guessing which files hold one.
+
+**Acceptance:** `go test ./internal/ghub/... ./internal/listener/...` passes with a table test over
+a stubbed HTTP transport (follow `internal/ghub/single_test.go`) proving: comments only; reviews
+only; both, with the later one winning; neither, returning the zero time; a review with no
+`submitted_at` ignored; activity by the authenticated login ignored; activity by a
+`CONTRIBUTOR`/`NONE` author ignored; the review walk stops at the page cap.
 
 ## Task 5 — read the last tend dispatch from the store
 
 **review: no**
 
-- [ ] Add `func (s *Store) LastTendAt(loop, repo string, prNumber int) (time.Time, error)` to
-  `internal/store/store.go`, beside `RunningDispatches`. Select `MAX(started_at)` over `dispatches`
-  where `project_id`, `loop`, `repo` and `pr_number` match and `kind = 'tend'`. Return the zero time
-  when there is no row; use a `sql.NullTime` so no row and a NULL both read as zero.
+- [ ] Add to `internal/store/store.go`, beside `RunningDispatches`:
 
-- [ ] Say in the doc comment why it counts `kind = 'tend'` only: a `kind = 'rebase'` row records a
-  rebase git performed with no conversation, so it read no review and answered no comment. Counting
-  it would suppress the first tend after every automatic rebase, which is exactly the feedback the
-  new trigger exists to answer.
+  ```go
+  func (s *Store) LastTendAt(loop, repo string, prNumber int) (time.Time, error)
+  func (s *Store) LastTendByPR(loop, repo string) (map[int]time.Time, error)
+  ```
 
-- [ ] Add `func (s *Store) LastTendByPR(loop, repo string) (map[int]time.Time, error)` for the
-  passes that decide many issues at once, so a sweep does not issue one query per pull request.
-  Return a map keyed by `pr_number`.
+  Both select `MAX(started_at)` over `dispatches` where `project_id`, `loop`, `repo` match,
+  `kind = 'tend'`, and `finished_at IS NOT NULL`. `LastTendByPR` groups by `pr_number` so a pass
+  deciding many issues issues one query, not one per pull request. Use `sql.NullTime` so no row
+  and a NULL both read as the zero time; compare any sentinel with `errors.Is`, never `==`
+  (`errorlint` is enabled).
 
-**Acceptance:** `go test ./internal/store/...` passes with tests proving: a `tend` row is
-returned; a `rebase` row is ignored; another project's row is invisible; no row reads as the zero
-time; `LastTendByPR` agrees with `LastTendAt` for every key.
+- [ ] Document three choices in the house idiom:
+  - **`kind = 'tend'` only.** A `kind = 'rebase'` row records a rebase git performed with no
+    conversation, so it read no review and answered no comment. Counting it would suppress the
+    first tend after every automatic rebase, which is the feedback the new trigger exists to
+    answer.
+  - **`finished_at IS NOT NULL`.** A running tend is excluded because `dispatch` writes the row
+    before the agent starts (`internal/loopcmd/tick.go:562`); `engine.Decide`'s `liveTendPRs`
+    already suppresses a second pass while one runs (`engine.go:26-30,434`), so counting a running
+    row here would be a second, weaker copy of that guard.
+  - **A FAILED tend still counts.** The alternative — counting only a succeeded tend, so a crashed
+    agent gets another turn at the same feedback — was rejected: `runner.finish` deliberately
+    writes no retry state for a tend (`internal/runner/runner.go:353`), so nothing bounds how many
+    times a persistently failing tend is redispatched, and unbounded unattended spend is the
+    failure this whole change exists to remove. The cost is that feedback which met a crashed
+    agent waits for the next review comment. The dispatch row records the failure, and
+    `project logs --list` shows it.
+
+- [ ] Note in the doc comment that `dispatches` is indexed only on
+  `(project_id, loop, repo, status)` (`internal/store/store.go:199`), so both reads scan. That is
+  accepted at current volumes; add an index when a loop's dispatch history makes it matter.
+
+**Acceptance:** `go test ./internal/store/...` passes with tests proving: a finished `tend` row is
+returned; a `rebase` row is ignored; a running `tend` row (`finished_at` NULL) is ignored; a
+failed but finished `tend` row IS returned; another project's row is invisible to BOTH methods
+(assert `project_id` scoping explicitly for `LastTendByPR`, not only that it agrees with
+`LastTendAt`); no row reads as the zero time.
 
 ## Task 6 — review activity becomes a tend trigger
 
 **review: yes** (it adds a reason to spend money)
 
 - [ ] Add `ReviewedAt map[int]time.Time` to `engine.Snapshot`, `LastTend map[int]time.Time` to
-  `engine.State`, and `ReviewPending bool` to `engine.Decision`. Document each: the first two are
+  `engine.State`, and `ReviewPending bool` to `engine.Decision`. Document that the two maps are
   keyed by PULL REQUEST number, not issue number, because review activity and a tend dispatch are
   both facts about a pull request.
 
-- [ ] In `tendDecisions`, replace the `snap.BehindBy[pr.Number] <= 0` skip with the two-reason
-  gate. A decision is produced when the pull request is behind, or when
-  `snap.ReviewedAt[pr.Number].After(st.LastTend[pr.Number])`. Set `ReviewPending` on the decision
-  when the second holds. Extend `Decision.Reason` so the log says which reason fired; keep the
-  existing "N commits behind" wording for the first.
+- [ ] In `tendDecisions`, replace the `snap.BehindBy[pr.Number] <= 0` skip (`engine.go:438`) with a
+  two-reason gate. Produce a decision when the pull request is behind, or when
+  `snap.ReviewedAt[pr.Number].After(st.LastTend[pr.Number])`. Set `ReviewPending` when the second
+  holds. Extend `Decision.Reason` so the log says which reason fired; keep the existing
+  "N commits behind" wording for the first.
 
-- [ ] Replace the skip reason with one that names both halves, so an operator reading "nothing
+- [ ] Replace the skip reason with one naming both halves, so an operator reading "nothing
   happened" learns which of the two questions came back no.
 
-- [ ] Fill the two maps in all three callers. Each one reads review activity only for a pull
-  request it has already accepted as a tend candidate — the issue carries `labels.review` and
-  `engine.LinkPR` trusted the pull request — so a pass with no candidates costs no extra call:
+- [ ] Fill the two maps in TWO callers only:
   - `internal/loopcmd/tickissue.go` — beside the existing `BehindBy` call, using `LastTendAt`.
-  - `internal/loopcmd/tendsweep.go` (`tendSnapshot`) — beside the existing `BehindBy` call, using
-    `LastTendByPR` read once. A failed read logs and skips that pull request, exactly as a failed
-    compare does today; one unusable pull request must not abandon the pass.
-  - `internal/loopcmd/tick.go` — the full tick's snapshot, the same way.
+  - `internal/loopcmd/tick.go` — the full tick's snapshot, using `LastTendByPR` read once.
 
-- [ ] Do NOT touch `internal/loopcmd/tendcheck.go`. Add a short comment there saying why: its
-  contract is zero GitHub calls when nothing is behind, review activity is invisible to a local
-  checkout, and a review already produces a `pull_request_review` delivery that reaches
-  `tickIssue`. The delivery path is this trigger's fast path and cron's full `Tick` is its safety
-  net.
+  In both, ask GitHub only for a pull request already accepted as a tend candidate: the issue
+  carries `labels.review` and `engine.LinkPR` trusted the pull request. A pass with no candidates
+  costs nothing.
 
-- [ ] In `loopcmd.act`, make `doneRebased` fall through to the dispatch when
-  `d.ReviewPending` is set. Count the rebase first, so the summary still reports it. Leave
-  `doneNoRebase` returning without an agent, and say in a comment that the branch that pass
-  reasoned about is gone, so its premise is stale whatever the feedback says.
+- [ ] Do NOT add the review read to `internal/loopcmd/tendsweep.go`, and say why in a comment
+  beside `TendSweep`'s existing property list (`tendsweep.go:50-58`). That list states the sweep's
+  first invariant: everything arming it names one subject, the loop's default branch moving, and
+  a fourth trigger is acceptable only while it keeps that property. Review activity is not that
+  subject, so a merge to master must not dispatch agents at pull requests that are current and
+  merely carry comments. Review activity reaches the loop by its own route — a
+  `pull_request_review` or `pull_request_review_comment` delivery lands in `tickIssue` — and cron's
+  full `Tick` is its safety net. Keeping it out of the sweep also keeps the sweep's GitHub cost
+  where it is.
 
-**Acceptance:** `go test ./internal/engine/... ./internal/loopcmd/...` passes with tests proving:
-a current pull request with review activity newer than the last tend produces a `KindTend`
-decision with `ReviewPending` true; the same pull request with the last tend NEWER than the
-activity produces no decision and the new skip reason; a behind pull request with no review
-activity produces a decision with `ReviewPending` false; a clean rebase on a `ReviewPending`
-decision counts the rebase AND dispatches the agent.
+- [ ] Do NOT add any GitHub call to `internal/loopcmd/tendcheck.go`. Add a comment there saying
+  why: its contract is zero GitHub calls when nothing is behind, and review activity is invisible
+  to a local checkout. (Task 8 does add a store DELETE to that file; that is not a GitHub call and
+  does not break the contract.)
+
+- [ ] **Error direction, stated per call site.** A trigger that spends money fails CLOSED. A failed
+  `LatestReviewActivity` or `LastTendAt`/`LastTendByPR` logs and leaves the entry unset, so the
+  pull request is judged on staleness alone. Do not abandon the pass and do not proceed with an
+  empty map treated as "everything is pending" — that would answer one failed read with a burst of
+  dispatches, the opposite of the goal. In `tickissue.go` keep the pull request in the snapshot
+  with the entry unset, matching how a failed `BehindBy` behaves there (`tickissue.go:83-87`); in
+  `tick.go` do the same.
+
+- [ ] Carry `ReviewPending` to the detached runner, which never sees the tick's snapshot. Add
+  `review_pending INTEGER NOT NULL DEFAULT 0` to `pr_links` in `schemaTables`, add the
+  `{"pr_links", "review_pending", "INTEGER NOT NULL DEFAULT 0"}` entry to `addedColumns`
+  (`internal/store/store.go:365`), add `ReviewPending bool` to `store.PRLink`, and read and write
+  it in `PRLinks` and `PutPRLink`. This is the same transport `BehindBy` already uses, and the
+  same reason: `runner.RunAgent` renders the prompt from the `pr_links` row
+  (`internal/loopcmd/tick.go:753-762`).
+
+- [ ] Add `ReviewPending bool` to `runner.PromptPR` and render it from the link row, so a
+  `tend_prompt` can branch on it. Without this the feature buys nothing: the shipped tend prompt is
+  a pure rebase instruction, and a `ReviewPending` dispatch on a current pull request would render
+  "It is 0 commits behind" and tell the agent to rebase and stop.
+
+- [ ] In `loopcmd.act`, make `doneRebased` fall through to the dispatch when `d.ReviewPending` is
+  set. Count the rebase first, so the summary still reports it. Leave `doneNoRebase` returning
+  without an agent, and say in a comment that the branch that pass reasoned about is gone, so its
+  premise is stale whatever the feedback says.
+
+**Acceptance:** `go test ./internal/engine/... ./internal/loopcmd/... ./internal/store/...` passes
+with tests proving: a current pull request with review activity newer than the last tend produces
+a `KindTend` decision with `ReviewPending` true; the same pull request with the last tend NEWER
+than the activity produces no decision and the new skip reason; a behind pull request with no
+review activity produces a decision with `ReviewPending` false; a failed review read leaves the
+decision on staleness alone and dispatches nothing for a current pull request; a clean rebase on a
+`ReviewPending` decision counts the rebase AND dispatches the agent; `PutPRLink`/`PRLinks`
+round-trip `ReviewPending`; a `tend_prompt` containing `{{.PR.ReviewPending}}` renders.
 
 ## Task 7 — read the conflicted paths from git
 
@@ -313,52 +455,74 @@ decision counts the rebase AND dispatches the agent.
 
 - [ ] Add `func (m *Manager) ConflictedPaths(ctx context.Context, path string) ([]string, error)`
   to `internal/worktree/worktree.go`, beside `AbortRebase`. Run
-  `git diff --name-only --diff-filter=U` through `gitStdout`, split the output on newlines, drop
-  empty lines, and sort the result.
+  `git diff -z --name-only --diff-filter=U` through `gitStdout`, split on NUL, drop empty entries,
+  and sort.
+
+- [ ] Split on NUL, not on newline, and say why: `--name-only` C-quotes an unusual path only while
+  `core.quotePath` is true, so a repository that turned it off makes a path containing a newline
+  split into two entries — which changes the fingerprint's shape and defeats the backoff. NUL is
+  the one byte a path cannot hold, which is why the fingerprint joins on it too.
 
 - [ ] Sort inside this function, not at the call site. The fingerprint is a hash, so an unstable
   order would make one conflict look like a different conflict on the next pass and defeat the
-  backoff completely. Say that in the doc comment.
+  backoff completely.
 
 - [ ] Return an empty slice and no error on a clean worktree. A rebase can fail for reasons that
   leave no conflicted path — a dead context, a bad ref — and the caller must be able to tell that
   from a real conflict.
 
-**Acceptance:** `go test ./internal/worktree/...` passes with tests, built on the existing
-`initRepo` helper (`internal/worktree/worktree_test.go:10`), proving: a real conflicted rebase
-reports its conflicted files, sorted; a clean worktree reports an empty slice.
+- [ ] Say in the doc comment that the returned paths are never passed back to git and never
+  interpolated into a command, so a later change does not quietly do it.
+
+**Acceptance:** `go test ./internal/worktree/...` passes with tests, built on `initRepoWithOrigin`
+(`internal/worktree/worktree_test.go:45`), proving: a real conflicted rebase reports its
+conflicted files, sorted; a clean worktree reports an empty slice and no error.
 
 ## Task 8 — the conflict table
 
 **review: yes** (new schema)
 
 - [ ] Add the `tend_conflicts` table to `schemaTables` in `internal/store/store.go`, in the shape
-  the spec gives, with comments in the style of the tables around it. State on `retry_after` why it
-  is Unix seconds in an INTEGER rather than a `TIMESTAMP`, citing the same reason
-  `issues.retry_after` gives. State on the primary key why there is one row per pull request rather
-  than one per fingerprint.
+  the spec gives, with comments in the style of the tables around it.
+  - On the PRIMARY KEY: one row per pull request, not one per fingerprint. A new fingerprint
+    replaces the row, so the table cannot grow without a bound and a changed conflict cannot
+    inherit an old conflict's backoff.
+  - On `retry_after`: Unix seconds in an INTEGER, because no literal `TIMESTAMP` default reads
+    back as the zero time (`internal/store/store.go:53`), and because it matches
+    `issues.retry_after`, the other wall-clock deadline in this schema. Do NOT cite the
+    `addedColumns` reason `issues.retry_after` gives — this is a new table, and that reason does
+    not apply here.
+  - `project_id TEXT NOT NULL DEFAULT ''` first in the key.
 
-- [ ] `tend_conflicts` is a NEW table, so it needs no `addedColumns` entry and no rebuild.
-  `CREATE TABLE IF NOT EXISTS` creates it on the next open of any existing database.
+- [ ] `tend_conflicts` is a NEW table, so it needs no `addedColumns` entry, no `rebuilt` entry, no
+  `schemaIndexes` entry (every read is by the full primary key), and no work in
+  `internal/store/legacy.go` — `stampInPlace` (`legacy.go:372`) claims pre-project rows in the
+  five tables that predate the project era, and this table cannot hold one.
 
-- [ ] Add `store.TendConflict` to `internal/store/types.go`, and three methods:
-  - `TendConflict(loop, repo string, prNumber int) (TendConflict, bool, error)`
-  - `RecordTendConflict(c TendConflict) error` — upsert. When the stored fingerprint differs, the
-    row is REPLACED with `seen_count = 1`; when it matches, `seen_count` is incremented and
-    `last_seen_at` and `retry_after` are updated. Spend the count in SQL, not by reading it back
-    and writing it, for the reason `BeginDispatch` gives: another process can write between the
-    read and the write.
+- [ ] Add `store.TendConflict` to `internal/store/types.go` and three methods:
+  - `TendConflict(loop, repo string, prNumber int) (TendConflict, bool, error)` — the second
+    result reports whether a row exists.
+  - `PutTendConflict(c TendConflict) error` — a plain upsert that writes exactly the row it is
+    given, including `seen_count` and `retry_after`. It does NOT compute either. The backoff
+    schedule is a `loopcmd` constant the store cannot see, so a count spent in SQL could not
+    derive the deadline that goes with it; every caller holds the loop lock (`act` runs under it
+    in all three passes), so read-then-write here is not the racy pattern `BeginDispatch` exists
+    to avoid. Say that in the doc comment.
   - `DeleteTendConflict(loop, repo string, prNumber int) error` — deleting a row that is not there
     is not an error.
 
-- [ ] Call `DeleteTendConflict` where `TendCheck` deletes a `pr_links` row for a pull request that
-  is no longer open (`internal/loopcmd/tendcheck.go`), so the two rows about one dead pull request
-  disappear together.
+- [ ] Delete the row wherever a pull request stops being tendable, so the table follows the pull
+  request out. Two places, both logging and continuing on failure rather than returning — one
+  failed row must not abandon a pass (`internal/loopcmd/tendcheck.go:166-177`):
+  - beside the `pr_links` delete in `internal/loopcmd/tendcheck.go`;
+  - in the closed-pull-request cleanup in `internal/loopcmd/cleanup.go`, which is the only path a
+    cron-only machine reaches.
 
-**Acceptance:** `go test ./internal/store/...` passes with tests proving: a first record writes
-`seen_count = 1`; a second record of the SAME fingerprint writes `seen_count = 2` and keeps
-`first_seen_at`; a record of a DIFFERENT fingerprint resets `seen_count` to 1 and moves
-`first_seen_at`; delete is idempotent; another project cannot see the row.
+**Acceptance:** `go test ./internal/store/... ./internal/loopcmd/...` passes with tests proving:
+`PutTendConflict` then `TendConflict` round-trips every field; a second `PutTendConflict` for the
+same pull request replaces the row; `TendConflict` reports `false` for an absent row;
+`DeleteTendConflict` is idempotent; another project cannot see the row; closing a pull request
+deletes it on both cleanup paths.
 
 ## Task 9 — the repeat-conflict backoff
 
@@ -373,74 +537,137 @@ reports its conflicted files, sorted; a clean worktree reports an empty slice.
   func conflictFingerprint(headSHA string, paths []string) string
   ```
 
-  SHA-256 over `headSHA` and the sorted paths, joined with `"\x00"` — a byte a path cannot hold.
-  Return the hex digest. Document why the BASE commit is excluded: a tend sweep is armed by the
-  base moving, so a fingerprint carrying the base would be new on every sweep and would suppress
-  nothing. Name finding 5 — one pull request, the same `CLAUDE.md` conflict, four sweeps, five
-  hours — as the case that requires it.
+  SHA-256 over `headSHA` and the sorted paths, joined with `"\x00"`. Return the hex digest.
+  Document why the BASE commit is excluded: a tend sweep is armed by the base moving, so a
+  fingerprint carrying the base would be new on every sweep and would suppress nothing. Name
+  finding 5 — one pull request, the same `CLAUDE.md` conflict, four sweeps, five hours — as the
+  case that requires it. `headSHA` is the value `gitRebase` already reads as the push lease
+  (`rebase.go:145-152`): it is read after `EnsurePRCtx` checked out `FETCH_HEAD`, so it is the
+  remote head of the branch, and it is read before `Rebase`, so a mid-rebase HEAD does not pollute
+  it.
 
-- [ ] Add the backoff schedule as a package constant beside `maxTendPerSweep`, with the same
-  reasoning that comment gives for being a constant rather than a configuration field:
+- [ ] Add the schedule as a package variable beside `maxTendPerSweep`, with the same reasoning that
+  comment gives for being a constant rather than a configuration field:
 
   ```go
-  var conflictBackoff = []time.Duration{0, time.Hour, 6 * time.Hour, 24 * time.Hour}
+  // conflictBackoff[n-1] is the wait after the nth agent dispatch at one
+  // fingerprint. Index n-1, not n: a pull request with no row has never had an
+  // agent sent at this conflict, and the agent is the right answer to a
+  // conflict it has not seen, so the first sighting dispatches with no wait and
+  // consults no entry here.
+  var conflictBackoff = []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour}
   ```
 
-  Index by `seen_count`, clamped to the last entry. Say that the first sighting always dispatches,
-  because the agent is the right answer to a conflict it has not seen, and the backoff begins only
-  once the agent has already failed at this exact conflict.
+  Clamp the index to the last entry.
 
-- [ ] In `gitRebase`, on the conflict branch and BEFORE the abort — the abort clears the conflicted
-  paths — read `deps.Git.ConflictedPaths`, build the fingerprint from it and the lease, and record
-  it. Then decide:
-  - No paths, or the read failed: log and fall through to `notDone`. A rebase that failed with no
-    conflicted path is not a conflict this gate understands, and refusing to dispatch on it would
-    be a silent stall.
-  - The recorded row's fingerprint matches and `now` is before its `retry_after`: return
-    `doneBackedOff`. Log one line naming the loop, the issue, the pull request, the sighting count,
-    the deadline, and the conflicted paths.
-  - Otherwise: return `notDone` so the agent runs.
+- [ ] Extend `RebaseGit` with `ConflictedPaths(ctx context.Context, path string) ([]string, error)`.
+  It is an interface so a test can drive this branch without a remote; keep that property.
 
-- [ ] Extend `RebaseGit` with `ConflictedPaths`. It is an interface so a test can drive this branch
-  without a remote; keep that property.
+- [ ] In `gitRebase`, on the conflict branch, in this exact order:
 
-- [ ] Delete the conflict row on the success path of `gitRebase`, beside `recordRebase`. A branch
-  that replayed cleanly has no conflict left to remember. A failed delete is logged, not returned:
-  the rebase HAPPENED, and reporting it as undone would send an agent at an already-current branch.
+  1. Read `deps.Git.ConflictedPaths` on the DETACHED `cleanupCtx`, not on `ctx`, and before the
+     abort. Before the abort because the abort clears the conflicted paths. On the detached
+     context because the commonest way to reach this branch is `rebaseBudget` expiring, and
+     `exec.CommandContext` on a dead context fails without running git — the same reasoning the
+     abort's own comment gives (`rebase.go:158-180`). Build `cleanupCtx` above this read so the
+     abort can share it.
+  2. If the read failed, or returned no paths, log and fall through to `notDone`. A rebase that
+     failed with no conflicted path is not a conflict this gate understands, and refusing to
+     dispatch on it would be a silent stall.
+  3. Compute the fingerprint. Read the stored row with `deps.Store.TendConflict`. If that read
+     failed, log and fall through to `notDone` — a gate that declines to spend money must fail OPEN
+     on unreadable state, or an unreadable row would strand the pull request.
+  4. If a row exists, its fingerprint matches, and `now` is before its `retry_after`: return
+     `doneBackedOff` WITHOUT writing anything. Do not advance `seen_count` and do not move
+     `retry_after`. A sweep is armed by every merge and every push, so a write here would push the
+     deadline forward more often than it arrives and the agent would never be dispatched again;
+     `seen_count` is a count of agent dispatches that failed at this conflict, not of passes that
+     saw it.
+  5. Otherwise the agent is about to be dispatched. Compute the new count — `1` when no row exists
+     or the fingerprint changed, else `seen_count + 1` — and write the row with
+     `retry_after = now + conflictBackoff[min(count, len)-1]`. A failed write is logged, not
+     returned: the agent still runs, and losing one backoff round is better than abandoning the
+     pass. Return `notDone`.
 
-- [ ] Handle `doneBackedOff` in `loopcmd.act`: return with no agent and no count, like
-  `doneNoRebase`. Add a `Backoff` counter to `Summary` so the tick summary an operator audits says
-  a pull request was skipped rather than silently reporting nothing.
+  Note that the failed-abort path below still returns `doneNoRebase` and writes nothing, which is
+  consistent: no agent was dispatched, so no sighting is counted.
+
+- [ ] Log one Info line on the backoff naming the loop, the issue, the pull request, the sighting
+  count, the deadline, and the conflict. Log the NUMBER of conflicted paths, plus the joined list
+  through `truncate(..., 200)`: a conflicted rebase can list thousands of paths of arbitrary UTF-8,
+  and every other externally-influenced string on this path is bounded before it is logged
+  (`rebase.go:211-215`). Not Debug — nothing in this program logs at Debug.
+
+- [ ] Delete the conflict row on the success path of `gitRebase`, beside `recordRebase`
+  (`rebase.go:245`). A branch that replayed cleanly has no conflict left to remember. Handle the
+  error explicitly and log it — `errcheck` is enabled and a bare `_ =` is not an option — but do
+  not return it: the rebase HAPPENED, and reporting it as undone would send an agent at an
+  already-current branch.
+
+- [ ] Handle `doneBackedOff` in `loopcmd.act`. It dispatches no agent, EXCEPT when
+  `d.ReviewPending` is set, in which case it falls through to the dispatch exactly as `doneRebased`
+  does. The backoff's evidence is a repeated rebase conflict; that says nothing about whether a
+  reviewer's comment has been answered, and letting an unrelated conflict silence a reviewer for
+  24 hours is not a trade this change is making. Say that in the comment.
+
+- [ ] Add `Backoff int \`json:"backoff"\`` to `loopcmd.Summary` (`tick.go:124`) — every field there
+  carries an explicit snake_case tag because `Summary` is marshalled into `ticks.summary_json` —
+  and count it on the backed-off path, so the summary an operator audits says a pull request was
+  skipped rather than reporting nothing. Add it to the sweep's cap warning line
+  (`tendsweep.go:306`) beside `dispatched` and `rebased`.
 
 **Acceptance:** `go test ./internal/loopcmd/...` passes with tests proving: a first conflict
-dispatches the agent and writes a row; the same fingerprint within the window dispatches nothing
-and increments nothing beyond the recorded count; the same fingerprint after `retry_after`
-dispatches; a moved head produces a new fingerprint and dispatches; a clean rebase deletes the
-row; a rebase failure with no conflicted paths dispatches.
+dispatches the agent and writes a row with `seen_count = 1` and a one-hour deadline; the same
+fingerprint within the window returns `doneBackedOff`, dispatches nothing, and leaves
+`seen_count` and `retry_after` UNCHANGED; the same fingerprint after `retry_after` dispatches and
+writes `seen_count = 2` with a six-hour deadline; a moved head produces a new fingerprint and
+writes `seen_count = 1`; a clean rebase deletes the row; a rebase failure with no conflicted paths
+dispatches; an unreadable conflict row dispatches; a `ReviewPending` decision dispatches even when
+backed off.
 
 ## Task 10 — documentation
 
 **review: no**
 
-- [ ] `docs/configuration.md`: add a `tend:` section after `agent`, with its own `## tend`
-  heading, its three fields, the three-layer precedence, and the session-continuity warning. Add
-  the three fields to the Quick reference table and `tend` to the Contents list.
+- [ ] `docs/configuration.md`: add a `## tend` section after `## agent`, with its three fields,
+  the three-layer precedence, and the session-continuity warning. `TestEveryConfigFieldIsDocumented`
+  (`internal/config/docs_test.go:20-29,34-56`) asserts only that the DOTTED path appears
+  BACKTICKED somewhere in the file — so `` `tend.harness` ``, `` `tend.model` ``, and
+  `` `tend.effort` `` must each appear in exactly that form. A section writing bare `` `harness` ``
+  satisfies nothing. Add all three to the Quick reference table
+  (`docs/configuration.md:176-211`) in that form, and add `tend` to the Contents list
+  (`:163-175`).
 
-- [ ] `docs/configuration.md`, `## tend_pr`: replace "Version 1 rebases only. It does not reply to
-  review feedback." with the two tend triggers — behind its base, or review activity newer than the
-  last tend dispatch — and add the repeat-conflict backoff and its schedule.
+- [ ] `docs/configuration.md`, the Validation rules table (`:1015-1035`): add the two new rules,
+  `tend.harness` enum and `tend.effort` enum, beside `agent.effort` and `agent.permission_mode`.
+
+- [ ] `docs/configuration.md`, `## tend_pr` (`:762`): replace "Version 1 rebases only. It does not
+  reply to review feedback." with the two tend triggers — behind its base, or review activity newer
+  than the last finished tend dispatch — the fact that only a trusted repository member's activity
+  counts and the loop's own comments never do, the repeat-conflict backoff and its schedule, and
+  the note that answering feedback needs a `tend_prompt` that branches on `{{.PR.ReviewPending}}`.
+  State that the tend SWEEP still triggers on staleness alone.
+
+- [ ] `docs/configuration.md`, Template variables (`:988`): add `PR.ReviewPending`.
 
 - [ ] `README.md`, `## Configuration`: one paragraph naming `tend:` and linking to the new
-  reference section. `README.md`, the `tend_interval` subsection: one sentence saying the periodic
-  check still gates on staleness alone, and that review activity reaches the loop through its own
-  delivery.
+  reference section. `README.md`, the `tend_interval` subsection (`:664`): one sentence saying the
+  periodic check still gates on staleness alone, and that review activity reaches the loop through
+  its own delivery.
 
-- [ ] `examples/execution.yaml`: add a commented-out `tend:` block showing a cheaper model, so an
-  operator can see the shape without reading the reference. Do NOT enable it — changing an example
-  loop's behaviour is not this change's business.
+- [ ] `examples/execution.yaml`: add a commented-out `tend:` block showing a cheaper model, and
+  extend the `tend_prompt` to branch on `{{.PR.ReviewPending}}` — when it is set, read the
+  unresolved review threads and answer them; when it is not, the existing rebase instruction is
+  unchanged. Do NOT enable the `tend:` block.
 
-**Acceptance:** `go test ./internal/config/...` passes — `docs_test.go` checks the documentation
-against the config struct, so an undocumented field fails there. Every anchor link resolves.
+- [ ] Make the same edit to `internal/wizard/templates/execution.yaml`.
+  `TestExamplesMatchTheEmbeddedTemplates` (`internal/wizard/templates_test.go:65-81`) requires
+  `examples/<name>.yaml` to be BYTE-IDENTICAL to `internal/wizard/templates/<name>.yaml` for every
+  name in `templateNames` (`internal/wizard/templates.go:23`). Check whether `pi.yaml` and the
+  other templates carry a `tend_prompt` that needs the same treatment.
+
+**Acceptance:** `go test ./internal/config/... ./internal/wizard/...` passes. Every anchor link
+resolves.
 
 ## Task 11 — gates
 
