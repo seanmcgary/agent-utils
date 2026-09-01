@@ -25,18 +25,36 @@ at a fingerprint that already defeated it.
 
 | Field   | Value |
 |---------|-------|
-| stage   | 3 (implementation) |
+| stage   | 5 (pr feedback loop) |
 | class   | large (new config section, new table, new GitHub read, new gate before a dispatch) |
 | profile | backend |
 | branch  | feat/tend-cost-controls |
 | pr      | #25 |
 | gate    | approved 2026-09-01 |
-| round   | 0 |
-| decisions | 0 |
+| round   | 1 |
+| decisions | 5 (see Decisions below) |
 
 ### Decisions
 
-(none yet)
+Every entry is rendered in the pull request body under "Deviations from the approved plan".
+
+1. **Task 6 — `ReviewPending` transport.** The plan put it on `pr_links`. It travels on the
+   DISPATCH row instead. Every `PutPRLink` call site runs before `engine.Decide` produces the
+   value, so none could set it, and `PutPRLink`'s upsert rewrites every column, so the tend sweep
+   would overwrite a set flag with a zero before the runner read it.
+2. **Task 6 — where the review read happens.** The plan named `tickissue.go` and `tick.go`; an
+   earlier draft also named `tendsweep.go`. The sweep is excluded, because `TendSweep`'s doc
+   comment requires every trigger arming it to name one subject, the default branch moving.
+   Review activity reaches the loop through its own delivery instead.
+3. **Not in the plan — `maxTendPerSweep` now applies to the full `Tick`.** The review trigger
+   removes the bound the staleness check provided, and on the first tick after install every
+   review pull request qualifies at once because none has a finished tend row yet.
+4. **Task 5 — the comparison point.** The plan compared review activity against the last tend's
+   START time. It compares against the FINISH time: the agent's own reply is written during its
+   own dispatch, and the identity filter cannot catch it because the agent runs with
+   GITHUB_TOKEN stripped and authenticates as the machine's gh login.
+5. **Not in the plan — `project logs` resolves the harness from the dispatch.** Out of scope, but
+   this change is what makes the mismatch reachable from configuration alone.
 
 ## What is already done
 
