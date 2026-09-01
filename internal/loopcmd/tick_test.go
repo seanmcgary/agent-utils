@@ -63,6 +63,11 @@ type fakeGH struct {
 	// the pull request judged on staleness alone, never treated as pending.
 	reviewActivity    map[int]time.Time
 	reviewActivityErr map[int]error
+	// reviewActivityCalls counts LatestReviewActivity reads, so a test can
+	// prove the read was SKIPPED. Skipping it is how the trigger fails closed
+	// when the last-tend time is unknown, and a test that only checked the
+	// decision could not tell "skipped" from "read and ignored".
+	reviewActivityCalls int
 }
 
 func (f *fakeGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
@@ -120,6 +125,7 @@ func (f *fakeGH) AuthenticatedLogin(context.Context) (string, error) {
 	return "loop-bot", nil
 }
 func (f *fakeGH) LatestReviewActivity(_ context.Context, _, _ string, number int) (time.Time, error) {
+	f.reviewActivityCalls++
 	if err := f.reviewActivityErr[number]; err != nil {
 		return time.Time{}, err
 	}
@@ -176,7 +182,18 @@ const testProject = "11111111-1111-1111-1111-111111111111"
 
 func newDeps(t *testing.T, cfg *config.Config, gh ghub.Client, spawned *int) Deps {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+	deps, _ := newDepsAt(t, cfg, gh, spawned)
+	return deps
+}
+
+// newDepsAt is newDeps plus the database's PATH, for the one test that has to
+// break a single store read from outside. Deps.Store is a concrete type with
+// no seam to inject a failure through, and introducing an interface for one
+// test would be a wider change than the property is worth.
+func newDepsAt(t *testing.T, cfg *config.Config, gh ghub.Client, spawned *int) (Deps, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "s.db")
+	db, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +215,7 @@ func newDeps(t *testing.T, cfg *config.Config, gh ghub.Client, spawned *int) Dep
 		// that wants the failure path overrides this.
 		IsAlive: func(int, int64) bool { return true },
 		Fetch:   nil,
-	}
+	}, path
 }
 
 func TestTickStartsTriggeredIssue(t *testing.T) {

@@ -241,11 +241,22 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 
 		// One query for every pull request this tick might tend, not one per
 		// row: LastTendByPR groups by pull request so a pass deciding many
-		// issues issues one query. A failed read is logged and leaves
-		// lastTend empty rather than abandoning the tick -- see the
-		// per-pull-request failure handling below, which is where the
-		// consequence of an unset entry actually lands.
+		// issues issues one query.
+		//
+		// lastTendOK is what makes a failed read fail CLOSED, and it is
+		// load-bearing. An unset lastTend entry reads as the zero time, and
+		// any review activity at all is After(zero) -- so leaving the map
+		// empty and still reading review activity would mark EVERY
+		// review-labelled pull request in the repository as review-pending
+		// and answer one broken store read with a burst of agent dispatches.
+		// That is the opposite of what this whole change exists to do. So a
+		// failed read suppresses the review trigger for this tick entirely:
+		// the pull requests are judged on staleness alone, which is exactly
+		// the behaviour this loop had before the trigger existed. It also
+		// spends no GitHub call on an answer that could not be used.
+		lastTendOK := true
 		if m, err := deps.Store.LastTendByPR(cfg.Name, cfg.Repo); err != nil {
+			lastTendOK = false
 			slog.Warn("read last tend times; judging every pull request on staleness alone",
 				"loop", cfg.Name, "err", err)
 		} else {
@@ -284,11 +295,13 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 			// LinkPR-trusted pull request -- so a pass with no candidates
 			// costs nothing. See tendsweep.go and tendcheck.go for why this
 			// read is deliberately absent from both of those passes.
-			if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
-				slog.Warn("read review activity; judging this pull request on staleness alone",
-					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
-			} else if !activity.IsZero() {
-				snap.ReviewedAt[pr.Number] = activity
+			if lastTendOK {
+				if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
+					slog.Warn("read review activity; judging this pull request on staleness alone",
+						"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
+				} else if !activity.IsZero() {
+					snap.ReviewedAt[pr.Number] = activity
+				}
 			}
 		}
 	}

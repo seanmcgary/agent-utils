@@ -105,17 +105,31 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 			// here -- so it, and Tick's full sweep as the safety net, are the
 			// only two places this read happens; see tendsweep.go and
 			// tendcheck.go for why it is deliberately absent from both.
-			if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
-				slog.Warn("read review activity; judging this pull request on staleness alone",
-					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
-			} else if !activity.IsZero() {
-				snap.ReviewedAt[pr.Number] = activity
-			}
-			if last, err := deps.Store.LastTendAt(cfg.Name, cfg.Repo, pr.Number); err != nil {
+			//
+			// The last-tend read comes FIRST, and a failure skips the review
+			// read entirely. That ordering is the fail-closed guard, not a
+			// preference: an unset lastTend entry reads as the zero time, and
+			// any review activity at all is After(zero), so reading activity
+			// without a last-tend answer would mark the pull request
+			// review-pending on the strength of a store read that failed --
+			// dispatching an agent precisely because the loop could not tell
+			// whether one had already answered. It also spends no GitHub call
+			// on an answer that could not be used.
+			last, lastErr := deps.Store.LastTendAt(cfg.Name, cfg.Repo, pr.Number)
+			switch {
+			case lastErr != nil:
 				slog.Warn("read last tend time; judging this pull request on staleness alone",
-					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
-			} else if !last.IsZero() {
-				lastTend[pr.Number] = last
+					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", lastErr)
+			default:
+				if !last.IsZero() {
+					lastTend[pr.Number] = last
+				}
+				if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
+					slog.Warn("read review activity; judging this pull request on staleness alone",
+						"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
+				} else if !activity.IsZero() {
+					snap.ReviewedAt[pr.Number] = activity
+				}
 			}
 		}
 	}
