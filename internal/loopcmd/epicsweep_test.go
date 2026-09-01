@@ -13,6 +13,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
+	"github.com/seanmcgary/agent-utils/internal/project"
 )
 
 // fakeEpic is a ghub.EpicReader. It is narrow -- four methods -- which is the
@@ -131,15 +132,15 @@ func epicParent(n int) ghub.Issue {
 }
 
 // loopFile renders one loop configuration. The fields Load requires are all
-// present; only the parts EntryLoop reads vary between cases.
-func loopFile(name, trigger, review, terminal string) string {
+// present; nothing in it is read by EpicLoop, which resolves from the project
+// descriptor -- these exist because the sweep loads every file for real.
+func loopFile(name, trigger, terminal string) string {
 	s := "name: " + name + "\nrepo: o/r\n" +
 		"checkout_base_dir: /tmp/checkout\nworktree_dir: /tmp/worktrees\n" +
 		"state_dir: /tmp/state\ndefault_branch: master\nlabels:\n" +
 		"  trigger: " + trigger + "\n" +
 		"  in_flight: status:in-flight-" + name + "\n" +
-		"  blocked: status:blocked-" + name + "\n" +
-		"  review: " + review + "\n"
+		"  blocked: status:blocked-" + name + "\n"
 	if terminal != "" {
 		s += "  terminal: " + terminal + "\n"
 	}
@@ -148,28 +149,38 @@ func loopFile(name, trigger, review, terminal string) string {
 		"prompt: p\nresume_prompt: rp\n"
 }
 
-// referenceLoopFiles is the planning/execution pair. planning's terminal label
-// IS execution's trigger, so execution is downstream and planning is the entry.
+// referenceLoopFiles is the planning/execution pair. The chaining -- planning's
+// terminal being execution's trigger -- is here for realism only; the sweep's
+// guard comes from the project descriptor naming planning, not from the labels.
 func referenceLoopFiles() map[string]string {
 	return map[string]string{
 		"planning.yaml": loopFile("planning",
-			"status:ready-for-spec", "status:plan-ready-for-review", "status:ready-for-execution"),
+			"status:ready-for-spec", "status:ready-for-execution"),
 		"execution.yaml": loopFile("execution",
-			"status:ready-for-execution", "status:ready-for-review", ""),
+			"status:ready-for-execution", "status:ready-for-pr-review"),
 	}
 }
 
-// writeLoopFiles creates a .agent-utils/configs directory holding files, and
-// returns the path of the one named `loop`.
+// writeLoopFilesFor creates a .agent-utils directory holding a project
+// descriptor that declares epicLoop, plus the given loop files, and returns the
+// path of the one named `loop`. Pass "" for epicLoop to write a descriptor that
+// declares none.
 //
-// The files are REAL, because EpicSweep derives the entry loop by loading them.
-// A fixture that faked the derivation would not test the guard that stops the
-// execution loop promoting past the planning stage.
-func writeLoopFiles(t *testing.T, loop string, files map[string]string) string {
+// Everything is REAL, because EpicSweep resolves the epic loop by reading the
+// descriptor and loading every loop file. A fixture that faked the resolution
+// would not test the guard that stops the execution loop promoting past the
+// planning stage.
+func writeLoopFilesFor(t *testing.T, loop, epicLoop string, files map[string]string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), config.DirName)
 	cfgDir := config.ConfigsDir(dir)
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := project.Save(dir, &project.Config{
+		Name: "p", ID: "00000000-0000-0000-0000-000000000009",
+		Epic: project.Epic{Loop: epicLoop},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	for name, b := range files {
@@ -187,14 +198,23 @@ func fixtureFor(t *testing.T, loop string) (*config.Config, Deps, *fakeEpic, *fa
 }
 
 // fixtureWithFiles is fixtureFor with the loop files chosen by the caller, so a
-// test can arrange an unresolvable derivation.
+// test can arrange an unresolvable declaration.
 //
 // It reuses tickConfig and newDeps from tick_test.go rather than inventing a
 // second fixture shape for this package. Only the things the sweep reads are
-// overridden: the labels, the config path (the entry-loop derivation walks up
-// from it), and the reader.
+// overridden: the labels, the config path (the epic-loop resolution walks up
+// from it to find the project descriptor), and the reader.
 func fixtureWithFiles(
 	t *testing.T, loop string, files map[string]string,
+) (*config.Config, Deps, *fakeEpic, *fakeGH) {
+	t.Helper()
+	return fixtureWithFilesFor(t, loop, "planning", files)
+}
+
+// fixtureWithFilesFor is fixtureWithFiles with the DECLARED epic loop chosen by
+// the caller, which is the only way to make the resolution fail now.
+func fixtureWithFilesFor(
+	t *testing.T, loop, epicLoop string, files map[string]string,
 ) (*config.Config, Deps, *fakeEpic, *fakeGH) {
 	t.Helper()
 	cfg := tickConfig(t)
@@ -202,12 +222,10 @@ func fixtureWithFiles(
 	switch loop {
 	case "planning":
 		cfg.Labels.Trigger = "status:ready-for-spec"
-		cfg.Labels.Review = "status:plan-ready-for-review"
 		cfg.Labels.Terminal = "status:ready-for-execution"
 	case "execution":
 		cfg.Labels.Trigger = "status:ready-for-execution"
-		cfg.Labels.Review = "status:ready-for-review"
-		cfg.Labels.Terminal = ""
+		cfg.Labels.Terminal = "status:ready-for-pr-review"
 	default:
 		t.Fatalf("fixtureFor: unknown loop %q", loop)
 	}
@@ -216,7 +234,7 @@ func fixtureWithFiles(
 	gh := &fakeGH{}
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
-	deps.ConfigPath = writeLoopFiles(t, loop, files)
+	deps.ConfigPath = writeLoopFilesFor(t, loop, epicLoop, files)
 
 	f := newFakeEpic()
 	deps.Epic = f
@@ -555,49 +573,52 @@ func TestEpicSweepRefusesWhenThisLoopIsNotTheEntry(t *testing.T) {
 	}
 }
 
-// An unresolvable derivation is a no-op, NOT an error. It is a permanent
+// An unresolvable declaration is a no-op, NOT an error. It is a permanent
 // misconfiguration: returning an error would schedule retries of something no
-// retry can fix. Three ways it can be unresolvable, all of them a quiet skip.
-func TestEpicSweepIsANoOpWhenTheEntryLoopCannotBeResolved(t *testing.T) {
+// retry can fix.
+//
+// The failure modes changed shape when the epic loop stopped being derived from
+// labels. There is no longer a cycle to have, or two candidates to choose
+// between: what is left is a declaration that is missing, wrong, or unreadable
+// because a loop file is broken. Fewer ways to fail is the point of the change,
+// not a gap in this test.
+func TestEpicSweepIsANoOpWhenTheEpicLoopCannotBeResolved(t *testing.T) {
 	cases := []struct {
-		name  string
-		files map[string]string
+		name     string
+		epicLoop string
+		files    map[string]string
 	}{
 		{
-			// Every loop downstream of another: a cycle.
-			name: "no entry loop",
-			files: map[string]string{
-				"planning.yaml":  loopFile("planning", "status:x", "status:review-a", "status:y"),
-				"execution.yaml": loopFile("execution", "status:y", "status:review-b", "status:x"),
-			},
+			name:     "no epic loop declared",
+			epicLoop: "",
+			files:    referenceLoopFiles(),
 		},
 		{
-			name: "two entry loops",
-			files: map[string]string{
-				"planning.yaml":  loopFile("planning", "status:ready-for-spec", "status:review-a", ""),
-				"execution.yaml": loopFile("execution", "status:ready-for-other", "status:review-b", ""),
-			},
+			name:     "declares a loop that does not exist",
+			epicLoop: "planing",
+			files:    referenceLoopFiles(),
 		},
 		{
-			name: "a loop file that does not load",
+			name:     "a loop file that does not load",
+			epicLoop: "planning",
 			files: map[string]string{
 				"planning.yaml": loopFile("planning",
-					"status:ready-for-spec", "status:plan-ready-for-review", "status:ready-for-execution"),
+					"status:ready-for-spec", "status:ready-for-execution"),
 				"broken.yaml": "name: broken\nrepo: o/r\nthis is not: [valid",
 			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, deps, f, _ := fixtureWithFiles(t, "planning", tc.files)
+			cfg, deps, f, _ := fixtureWithFilesFor(t, "planning", tc.epicLoop, tc.files)
 			f.parents[71] = epicParent(69)
 			f.children[69] = []ghub.Issue{closedIssue(71), openIssue(73)}
 
 			if _, err := EpicSweep(context.Background(), cfg, deps, 71); err != nil {
-				t.Fatalf("an unresolvable derivation must not be an error: %v", err)
+				t.Fatalf("an unresolvable declaration must not be an error: %v", err)
 			}
 			if got := f.promotedNumbers(); len(got) != 0 {
-				t.Fatalf("promoted %v with no resolvable entry loop", got)
+				t.Fatalf("promoted %v with no resolvable epic loop", got)
 			}
 		})
 	}

@@ -43,7 +43,7 @@ func validLoopConfig(name string) *config.Config {
 		DefaultBranch:   "main",
 		Labels: config.Labels{
 			Trigger: "status:trigger", InFlight: "status:in-flight",
-			Blocked: "status:blocked", Review: "status:review",
+			Blocked: "status:blocked", Terminal: "status:done",
 			Veto: []string{"blocked:*"},
 		},
 		Agent: config.Agent{

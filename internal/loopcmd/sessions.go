@@ -482,7 +482,7 @@ func applySettings(sessions []Session, dirs map[string]string) {
 		// `sessions list` is a per-session summary and has one column for each,
 		// so a per-run answer has nowhere to go here. `session describe`
 		// resolves each run separately (describe.go) and is the accurate view.
-		s := runner.Effective(cfg, sessions[i].LastKind, config.Overrides{
+		s := runner.Effective(cfg, config.Overrides{
 			Model: sessions[i].Model, Harness: sessions[i].Harness,
 		})
 		sessions[i].Model = s.Model

@@ -30,7 +30,13 @@ func tickCompleteLine(t *testing.T, out string) string {
 // seam reports as alive.
 func liveDispatch(t *testing.T, cfg *config.Config, deps Deps, d store.Dispatch) {
 	t.Helper()
-	d.Loop, d.Repo = cfg.Name, cfg.Repo
+	// The loop is DEFAULTED, not forced: a tend test seeds rows belonging to
+	// other loops of the same project, which is exactly the state the tend
+	// dispatcher's project-wide guards read.
+	if d.Loop == "" {
+		d.Loop = cfg.Name
+	}
+	d.Repo = cfg.Repo
 	id, err := deps.Store.CreateDispatch(d)
 	if err != nil {
 		t.Fatalf("create dispatch: %v", err)
@@ -126,55 +132,6 @@ func TestTickIssueLogsWhyItDecidedNothing(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "awaiting review with no pull request",
-			want: "no trusted pull request is linked",
-			setup: func(_ *testing.T, cfg *config.Config, gh *fakeGH, _ Deps) {
-				cfg.TendPR = true
-				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
-			},
-		},
-		{
-			name: "a live tend",
-			want: "a tend dispatch is already live for the linked pull request",
-			setup: func(t *testing.T, cfg *config.Config, gh *fakeGH, deps Deps) {
-				cfg.TendPR = true
-				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
-				gh.prs = []ghub.PullRequest{{
-					Number: 108, HeadRef: "feat/thing", BaseRef: "master",
-					Body: "Closes #7", Trusted: true,
-				}}
-				gh.behind = map[int]int{108: 3}
-				if err := deps.Store.PutPRLink(store.PRLink{
-					Loop: cfg.Name, Repo: cfg.Repo, Number: issue,
-					PRNumber: 108, HeadRef: "feat/thing", BaseRef: "master",
-				}); err != nil {
-					t.Fatalf("put pr link: %v", err)
-				}
-				liveDispatch(t, cfg, deps, store.Dispatch{
-					Number: issue, Kind: store.KindTend, PRNumber: 108,
-				})
-			},
-		},
-		{
-			name: "the pull request is current",
-			want: "the linked pull request is up to date with its base and carries no review activity since the last tend",
-			setup: func(t *testing.T, cfg *config.Config, gh *fakeGH, deps Deps) {
-				cfg.TendPR = true
-				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
-				gh.prs = []ghub.PullRequest{{
-					Number: 108, HeadRef: "feat/thing", BaseRef: "master",
-					Body: "Closes #7", Trusted: true,
-				}}
-				gh.behind = map[int]int{108: 0}
-				if err := deps.Store.PutPRLink(store.PRLink{
-					Loop: cfg.Name, Repo: cfg.Repo, Number: issue,
-					PRNumber: 108, HeadRef: "feat/thing", BaseRef: "master",
-				}); err != nil {
-					t.Fatalf("put pr link: %v", err)
-				}
-			},
-		},
 	}
 
 	for _, c := range cases {
@@ -207,6 +164,110 @@ func TestTickIssueLogsWhyItDecidedNothing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The same contract for the TEND dispatcher: a pass that decided nothing must
+// say which of several quite different situations it was.
+//
+// It is a separate table from the loop's rather than a mode of it, because the
+// two passes decide different things from different state. What they share is
+// the rule -- the reason comes from the PLAN, never re-derived by the caller,
+// so a second copy of the skip rules cannot disagree with the one that decided.
+func TestTendIssueLogsWhyItDecidedNothing(t *testing.T) {
+	const issue = 7
+
+	cases := []struct {
+		name  string
+		want  string
+		setup func(t *testing.T, cfg *config.Config, gh *fakeGH, deps Deps)
+	}{
+		{
+			name: "awaiting review with no pull request",
+			want: "no trusted pull request is linked",
+			setup: func(_ *testing.T, cfg *config.Config, gh *fakeGH, _ Deps) {
+				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
+			},
+		},
+		{
+			name: "a live tend",
+			want: "a tend dispatch is already live for the linked pull request",
+			setup: func(t *testing.T, cfg *config.Config, gh *fakeGH, deps Deps) {
+				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
+				gh.prs = []ghub.PullRequest{{
+					Number: 108, HeadRef: "feat/thing", BaseRef: "master",
+					Body: "Closes #7", Trusted: true,
+				}}
+				gh.behind = map[int]int{108: 3}
+				if err := deps.Store.PutPRLink(store.PRLink{
+					Loop: cfg.Name, Repo: cfg.Repo, Number: issue,
+					PRNumber: 108, HeadRef: "feat/thing", BaseRef: "master",
+				}); err != nil {
+					t.Fatalf("put pr link: %v", err)
+				}
+				liveDispatch(t, cfg, deps, store.Dispatch{
+					Number: issue, Kind: store.KindTend, PRNumber: 108,
+				})
+			},
+		},
+		{
+			name: "the pull request is current",
+			want: "the linked pull request is up to date with its base and carries no review activity since the last tend",
+			setup: func(t *testing.T, cfg *config.Config, gh *fakeGH, deps Deps) {
+				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
+				gh.prs = []ghub.PullRequest{{
+					Number: 108, HeadRef: "feat/thing", BaseRef: "master",
+					Body: "Closes #7", Trusted: true,
+				}}
+				gh.behind = map[int]int{108: 0}
+				if err := deps.Store.PutPRLink(store.PRLink{
+					Loop: cfg.Name, Repo: cfg.Repo, Number: issue,
+					PRNumber: 108, HeadRef: "feat/thing", BaseRef: "master",
+				}); err != nil {
+					t.Fatalf("put pr link: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := sweepConfig(t)
+			gh := &fakeGH{}
+			spawned := 0
+			deps := newDeps(t, cfg, gh, &spawned)
+			c.setup(t, cfg, gh, deps)
+
+			logs := captureTickLogs(t)
+			sum, err := TendIssue(context.Background(), cfg, deps, issue)
+			if err != nil {
+				t.Fatalf("TendIssue: %v", err)
+			}
+
+			if spawned != 0 {
+				t.Fatalf("spawned = %d, want 0: this case must decide nothing", spawned)
+			}
+			if sum.Tended != 0 {
+				t.Fatalf("summary = %+v, want no tend", sum)
+			}
+
+			line := tendCompleteLine(t, logs.String())
+			if !strings.Contains(line, c.want) {
+				t.Errorf("the tend line does not say why nothing happened.\nwant reason containing %q\ngot: %s", c.want, line)
+			}
+		})
+	}
+}
+
+// tendCompleteLine is tickCompleteLine for the tend dispatcher's own line.
+func tendCompleteLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "tend delivery complete") {
+			return line
+		}
+	}
+	t.Fatalf("no \"tend delivery complete\" line in the log:\n%s", out)
+	return ""
 }
 
 // The other half: a tick that DID decide something must not also carry a

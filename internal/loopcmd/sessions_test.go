@@ -169,7 +169,7 @@ func writeSettingsLoop(t *testing.T, loop, harness, model string) string {
 		"checkout_base_dir: /tmp/checkout\nworktree_dir: /tmp/worktrees\n"+
 		"state_dir: /tmp/state\ndefault_branch: master\n"+
 		"labels:\n  trigger: status:go\n  in_flight: status:doing\n"+
-		"  blocked: status:blocked\n  review: status:review\n"+
+		"  blocked: status:blocked\n"+
 		"agent: {harness: %s, model: %s, worktree: per_issue, timeout: 1h}\n"+
 		"retry: {max: 1, backoff: [0s], breaker: {orphan_threshold: 2, cooldown: 1m}}\n"+
 		"prompt: p\nresume_prompt: rp\n", loop, harness, model)

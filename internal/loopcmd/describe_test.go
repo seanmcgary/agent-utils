@@ -231,15 +231,30 @@ func TestDescribeSessionCollectsEveryRunAndThePullRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := db.Project("proj-a")
+	// Each row is finished before the next is created. These are three runs of
+	// one issue OVER TIME, which is the situation the report describes, and
+	// store.CreateDispatch refuses to open a second live dispatch across the
+	// tend/loop divide -- so leaving them all running would be asking the store
+	// to record the very state it exists to prevent.
+	var prev int64
 	for _, d := range []store.Dispatch{
 		{Loop: "execution", Repo: "o/r", Number: 9, Kind: store.KindStart, SessionID: "sess-1"},
 		{Loop: "execution", Repo: "o/r", Number: 9, Kind: store.KindTend,
 			SessionID: "sess-1", PRNumber: 186},
 		{Loop: "execution", Repo: "o/r", Number: 9, Kind: store.KindStart, SessionID: "other"},
 	} {
-		if _, err := st.CreateDispatch(d); err != nil {
+		if prev != 0 {
+			if err := st.FinishDispatch(prev, store.DispatchResult{
+				Status: store.StatusSucceeded,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		id, err := st.CreateDispatch(d)
+		if err != nil {
 			t.Fatal(err)
 		}
+		prev = id
 	}
 	db.Close()
 

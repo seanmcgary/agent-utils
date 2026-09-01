@@ -1,3 +1,14 @@
+# The review half of PR review. This loop finds and decides; it does not fix.
+# exec-pr-review-findings.yaml is the other half, and the two are joined by a
+# findings comment on the pull request.
+#
+# It used to do both, and the measurement is why it no longer does. Over eight
+# real sessions the reviewer fan-out cost $8.39 in total -- about $1.05 a
+# session -- and the remediation that followed cost $90.86. The cheap, effective
+# 8% was subsidising a 92% that ran in the same accumulating context, so the two
+# could not be tuned, budgeted, or retried separately. Splitting them is what
+# lets this loop keep the strongest model at a small budget while the fixing
+# runs cheaper.
 name: pr-review
 repo: mcgarylabs/lawndominator-monorepo
 
@@ -14,47 +25,69 @@ labels:
   trigger:   status:ready-for-pr-review
   in_flight: status:pr-reviewing
   blocked:   status:needs-review-input
-  review:    status:ready-for-review
-  # No terminal label. This loop's last act is to hand a green pull request to
-  # the human by applying labels.review; merging is the human's decision and
-  # there is no later state for this loop to approve.
+  # TERMINAL. Applied by this loop's agent as its strictly final action, and
+  # nothing else follows it. The remediation loop triggers on the same state.
+  terminal:  status:ready-for-findings-exec
   veto:
     - "blocked:*"
     # The states the EXECUTION loop owns. An issue still being built must never
     # be reviewed underneath the agent building it.
     - status:ready-for-execution
     - status:executing
+    # The states the REMEDIATION loop owns, for the same reason: a branch being
+    # rewritten by fixes is not a branch to review. The first is this loop's own
+    # terminal, listed here because labels.terminal changes NO engine behaviour
+    # on its own -- listing it under veto is what actually makes an issue leave
+    # this loop, so a stale or hand-re-applied trigger cannot pull back an issue
+    # already handed downstream.
+    - status:ready-for-findings-exec
+    - status:fixing-findings
 
 agent:
   # The point of this loop is a REVIEWER stronger than whatever wrote the code.
   # An execution loop may run a cheap model, or pi with a third-party provider,
-  # by configuration or by a model:/harness: label. This one runs the strongest
-  # model at the highest effort, always.
+  # by configuration or by a model:/harness: label. This one always runs the
+  # stronger model, and it is the only loop in the chain that does.
+  #
+  # The split makes that MORE true, not less. This loop's output is no longer a
+  # set of fixes; it is a specification a cheaper model executes without
+  # re-deriving anything. Every bit of MODEL strength saved here is paid for
+  # twice downstream, by an executor that has to work out what the finding meant.
+  #
+  # Effort is medium rather than high, and it is the one axis that moved. The
+  # expensive part of the old loop was never the reviewing; it was the 92% spent
+  # fixing afterwards. What this loop now has to do -- read a diff against a
+  # rubric and write down what is wrong and where -- is bounded work that the
+  # stronger model does well without the extra effort budget. The two axes buy
+  # different things: the model is what makes the judgement good, the effort is
+  # what pays for long chains of reasoning this phase no longer runs.
   model: opus
-  effort: high
+  effort: medium
   permission_mode: bypassPermissions
   worktree: per_issue
-  max_budget_usd: 50
-  timeout: 4h
+  # No cost ceiling, and written out rather than omitted so it reads as a
+  # decision. A budget cap does not stop an expensive run; it stops it PART WAY
+  # THROUGH, which is the one outcome worth avoiding. The dispatch is recorded
+  # failed with its work half-applied and unpushed, the loop retries it from a
+  # resumed session, and the retry re-spends what the cap just refused. Cost is
+  # controlled here by model and effort, which shape the whole run, and by the
+  # findings artifact that keeps the expensive half short -- not by a ceiling
+  # that lands mid-edit.
+  #
+  # 0 means no ceiling: internal/runner/args.go omits --max-budget-usd for it.
+  # A negative value is rejected, because it would reach that same "> 0" gate
+  # and be silently identical to no cap.
+  max_budget_usd: 0
+  # Omitting this would default it to 24h; it is written out for the same reason
+  # as the line above. This is a last-resort bound on a wedged process, not a
+  # budget: a stuck dispatch is caught by the orphan breaker and `loop kill`,
+  # both of which act on evidence rather than a clock. Guessing low is the
+  # expensive mistake, because a killed dispatch is recorded FAILED and retried,
+  # so a real long run looks like a flaky agent.
+  timeout: 24h
 
 i_understand_bypass_permissions: true
 
-# Tending is an EXECUTION-loop duty, and this loop must never do it.
-# reviewing-commits rebases the branch itself (--fixup plus --autosquash), so a
-# tend agent rebasing the same branch would race the review's own force-push.
-#
-# Be clear about what that leaves, because it is a trade and not a free win.
-# A loop tends whatever ITS labels.review names, and for the execution loop
-# feeding this one that is this loop's TRIGGER. So a pull request WAITING on
-# this loop is tended, and one this loop has already handed to the human is
-# not. Setting tend_pr true here (its labels.review being the human's queue)
-# moves tending to the other end instead; it cannot be in both places, because
-# labels.review is one field doing both jobs.
-#
-# Whichever end tends, it must not be vetoed: labels.veto is checked before
-# tend decisions too (internal/engine/engine.go), so vetoing a label would
-# silently disable tending on it as well as dispatching.
-tend_pr: false
 
 retry:
   max: 3
@@ -64,16 +97,19 @@ retry:
     cooldown: 30m
 
 prompt: |
-  Run the /reviewing-commits skill against the open pull request for GitHub
-  issue #{{.Issue.Number}}, repo {{.Repo}}. The issue carries
+  Run the /producing-review-findings skill against the open pull request for
+  GitHub issue #{{.Issue.Number}}, repo {{.Repo}}. The issue carries
   {{.Labels.Trigger}}: an execution agent has finished and its branch is ready
-  to be reviewed. Follow reviewing-commits EXACTLY, with these overrides.
+  to be reviewed. Follow producing-review-findings EXACTLY, with these
+  overrides.
 
   YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
   {{.Labels.InFlight}}.
 
-  RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so {{.PR.Number}}
-  and {{.PR.HeadRef}} are EMPTY here and you must not use them. Read the
+  RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so the pull
+  request template fields are unset for this dispatch and you must not use them:
+  .PR.HeadRef renders empty and .PR.Number renders as 0, which is a valid-looking
+  issue number and will silently address the wrong thing. Read the
   "## Pipeline State" block in the issue's plan comment and take its `pr` field,
   then confirm it with `gh pr view <n> --json number,headRefName,baseRefName,state`.
   The pull request must be OPEN and must close this issue. If Pipeline State
@@ -86,15 +122,41 @@ prompt: |
 
   A FRESH WORKTREE HAS NO node_modules. Run `pnpm install` before any Node gate.
 
-  YOU FIX WHAT YOU FIND. reviewing-commits is not a report: run the mechanical
-  gates, commit their fixes, dispatch the reviewers, then triage every finding
-  as Fix, Reject or Defer and APPLY the fixes as commits on the branch. Do not
-  post findings for someone else to act on, and do not park because a fix is
-  large or structural. Reject and Defer are decisions you make and justify in
-  the table, not questions for the human.
+  YOU DO NOT FIX WHAT YOU FIND. This is the one instruction that reverses the
+  loop's old behaviour, so it is worth stating plainly: run the mechanical gates
+  and commit THEIR fixes -- format, lint, a red test -- because a broken branch
+  is not worth reviewing and those fixes are mechanical and cheap. Then dispatch
+  the reviewers, triage every finding as Fix, Reject or Defer, and write the
+  findings artifact. Apply NO reviewer finding. Reject and Defer are still
+  decisions you make and justify, not questions for the human; what changed is
+  that Fix is now a decision too, executed by the next loop rather than by you.
 
-  PUSHING. Folding fixes in with --fixup and `git rebase --autosquash` REWRITES
-  the branch, so the push is
+  DISPATCH THE REVIEWERS IN ONE MESSAGE. Background tasks are disabled for this
+  dispatch, so a subagent is an ordinary blocking tool call: several sent in one
+  turn run concurrently, one sent per turn runs strictly serially.
+
+  THE FINDINGS ARTIFACT IS THE PRODUCT OF THIS RUN. Write it in the format the
+  skills define (feature-pipeline/review-findings.md): Fix findings grouped BY
+  FILE, each with its line, severity, dimension, cited rule, and a PRESCRIBED
+  FIX naming the symbol, the line and the concrete change; a `Tests:` line per
+  file group giving the narrowest command that covers it; and the Reject and
+  Defer tables with their one-line reasons.
+  The prescribed fix is the whole point. Write it so an agent that has never
+  seen this diff can apply it after reading only the named file. "Consider",
+  "improve", "ensure", "handle properly" and "review" are banned words: each one
+  hands the derivation you were dispatched to do back to a cheaper model that
+  will do it worse. If you cannot write a fix that specifically, the finding
+  goes in Defer with your reasoning, not in Fix.
+  Group by FILE and not per finding: forty findings collide on far fewer files,
+  and the next loop puts one subagent on each group, so two groups naming one
+  file is a lost write.
+  A comment body is capped at 262,144 characters -- verified; the API's own 422
+  message claims 65,536 and is wrong. Budget 200,000. If the artifact exceeds
+  it, split at file-group boundaries and never inside a group, post the parts,
+  then post a manifest LAST carrying the summary, the Reject and Defer tables,
+  and a "### Parts" list of the part comment IDs.
+
+  PUSHING. The mechanical gates' fixes are commits and must reach the branch:
   `git push --force-with-lease origin HEAD:refs/heads/<head ref>`.
   Use --force-with-lease, never plain --force. If the lease check REJECTS the
   push, another run touched the branch while you worked: change nothing, push
@@ -105,23 +167,35 @@ prompt: |
   HEADLESS. Never ask the human through the CLI and never block on a reply. All
   human interaction is issue and pull request comments plus label transitions.
 
-  ON COMPLETION. Post the findings-disposition table as a pull request comment --
-  every finding, including the ones you Rejected and Deferred, with the one-line
-  reason for each. That table is the whole record of what this run decided, and
-  it is what the human reads instead of re-reviewing the diff. @-mention
-  @seanmcgary. Then remove {{.Labels.InFlight}} and add {{.Labels.Review}}.
+  ON COMPLETION, IN THIS ORDER. The order is the whole safety property of the
+  handoff, because {{.Labels.Terminal}} is another loop's trigger and applying
+  it early puts a second agent on a branch you are still writing to.
+    1. Push everything.
+    2. Post the findings artifact with
+       `gh pr comment <n> --body-file <file>` and read back its numeric comment
+       ID. It must be a CONVERSATION comment, not a review comment: the next loop
+       fetches it from /issues/comments/<id>, which does not resolve a review
+       comment, so a `gh pr review` posting 404s there and strands the round.
+    3. Write that ID into the "## Pipeline State" block's `findings comment`
+       field. If you split the artifact into parts, write the MANIFEST's ID --
+       never a part's. The next loop reads the manifest to learn the parts, so a
+       part ID there loses every group the manifest would have named. The next loop fetches exactly that one comment by ID and never
+       searches, so an unwritten or stale ID strands the round.
+    4. @-mention @seanmcgary.
+    5. Remove {{.Labels.InFlight}}.
+    6. Add {{.Labels.Terminal}}. THIS IS YOUR LAST ACTION. Nothing follows it.
+  {{.Labels.Terminal}} is the ONLY label you add at the end. In particular do not
+  add status:ready-for-review: that means the whole pipeline is finished and it
+  is the human's turn to merge, and only the remediation loop after you applies
+  it.
 
-  PARKING. Park only when you cannot proceed: a gate still red after your fixes,
-  an unresolvable rebase conflict, a rejected lease, or a pull request that
-  cannot be resolved from Pipeline State. A rebase conflict is unresolvable only
-  when the sides disagree about the SAME behavior, you cannot tell what a side
-  was for, or you cannot get both sides' tests green; a conflict whose sides
-  touch different behavior you resolve yourself, keeping both and saying so in
-  your comment. `git rebase --abort` before parking on the rest. PARK means: commit
-  and push what is safe to push, post a comment stating exactly what you need,
-  remove {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment
-  with: "To proceed: comment your decision and re-add the {{.Labels.Trigger}}
-  label."
+  PARKING. Park only when you cannot proceed: a mechanical gate still red after
+  your fixes, a rejected lease, or a pull request that cannot be resolved from
+  Pipeline State. A finding you cannot fix is NOT a reason to park -- you are not
+  fixing anything. PARK means: commit and push what is safe to push, post a
+  comment stating exactly what you need, remove {{.Labels.InFlight}}, add
+  {{.Labels.Blocked}}, and stop. End the comment with: "To proceed: comment your
+  decision and re-add the {{.Labels.Trigger}} label."
 
   NEVER MERGE. You never merge or close the pull request, and you never mark a
   draft ready. Merging is the human's decision, at every stage, without exception.
@@ -129,18 +203,25 @@ prompt: |
 resume_prompt: |
   Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
   in the SAME session you used before, so you already know which pull request you
-  were reviewing and what you had found. Remove {{.Labels.Trigger}} and add
-  {{.Labels.InFlight}} as your first action.
+  were reviewing and what you had found. As your first action remove
+  {{.Labels.Trigger}}, remove {{.Labels.Terminal}} IF IT IS STILL PRESENT, and
+  add {{.Labels.InFlight}}. The terminal removal matters: an issue carrying both
+  {{.Labels.Trigger}} and {{.Labels.Terminal}} is vetoed by this loop AND by the
+  remediation loop, which vetoes {{.Labels.Trigger}} for its own reasons. Neither
+  will touch it and nothing logs why. You are being re-dispatched for a NEW
+  round, so the previous round's handoff label is stale.
 
   Read the comments added since your last message. They answer the blocker you
   parked on, or they ask for another pass on a branch you already reviewed.
 
   Re-check out the pull request's head ref and `git fetch origin` before you
-  continue: the branch may have moved since your last dispatch. Resume from where
-  your findings table left off rather than re-reviewing what you already
-  dispositioned. All other rules from your original instructions still apply,
-  including that you fix what you find, that pushes use --force-with-lease, and
-  that you never merge.
+  continue: the branch may have moved since your last dispatch, and if the
+  remediation loop has already run, it has moved a lot. Resume from where your
+  findings left off rather than re-reviewing what you already dispositioned. A
+  second round posts a NEW findings comment and overwrites `findings comment` in
+  Pipeline State with the new ID; it never edits the previous round's comment,
+  which is the record of what that round decided.
 
-tend_prompt: |
-  Tending is disabled for the pr-review loop. This template is never rendered.
+  All other rules from your original instructions still apply, including that you
+  fix nothing you find, that pushes use --force-with-lease, that
+  {{.Labels.Terminal}} is your strictly last action, and that you never merge.

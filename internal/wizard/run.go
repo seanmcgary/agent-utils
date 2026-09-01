@@ -43,7 +43,6 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	cfg := &config.Config{
 		Prompt:       tmpl.Prompt,
 		ResumePrompt: tmpl.ResumePrompt,
-		TendPrompt:   tmpl.TendPrompt,
 	}
 
 	// 1. name
@@ -150,13 +149,6 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	cfg.Labels.Blocked, err = p.Ask(Question{
 		Key: "labels.blocked", Label: "Blocked label",
 		Help: "Applied when the loop parks waiting on a human.", Default: tmpl.Labels.Blocked,
-	})
-	if err != nil {
-		return nil, err
-	}
-	cfg.Labels.Review, err = p.Ask(Question{
-		Key: "labels.review", Label: "Review label",
-		Help: "Applied when the loop parks for human review.", Default: tmpl.Labels.Review,
 	})
 	if err != nil {
 		return nil, err
@@ -284,7 +276,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	} else {
 		budgetAnswer, err := p.Ask(Question{
 			Key: "agent.max_budget_usd", Label: "Agent max budget (USD)",
-			Help: "Dispatch stops if the agent's session cost exceeds this; 0 means no limit.", Default: "25",
+			Help: "Dispatch stops if the agent's session cost exceeds this; 0 means no limit, which is the recommended value.", Default: "0",
 			Validate: validateNonNegativeFloat,
 		})
 		if err != nil {
@@ -299,7 +291,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	// 19. agent.timeout
 	timeoutAnswer, err := p.Ask(Question{
 		Key: "agent.timeout", Label: "Agent timeout",
-		Help: "Maximum wall time for one dispatch, e.g. 3h.", Default: "3h",
+		Help: "Last-resort bound on a wedged dispatch, not a budget; a stuck run is caught by the orphan breaker. Guessing low makes real long runs look flaky.", Default: "24h",
 		Validate: validatePositiveDuration,
 	})
 	if err != nil {
@@ -310,15 +302,11 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, fmt.Errorf("agent.timeout: %w", err)
 	}
 
-	// 20. tend_pr, defaulted from the chosen template.
-	cfg.TendPR, err = p.Confirm(
-		"Tend open pull requests?",
-		"Rebase and push this loop's own pull request when its base branch moves ahead of it.",
-		tmpl.TendPR,
-	)
-	if err != nil {
-		return nil, err
-	}
+	// Tending is NOT asked here any more. It is a project-level policy in
+	// .agent-utils/config.yaml -- which pull requests to keep fresh, and which
+	// loop hosts the dispatches -- because it describes a repository's pull
+	// requests rather than one loop's issue lifecycle. Asking it per loop is how
+	// two loops used to end up rebasing one branch.
 
 	// 21. retry.max
 	maxAnswer, err := p.Ask(Question{

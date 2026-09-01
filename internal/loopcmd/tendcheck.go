@@ -23,14 +23,21 @@ type TendCheckResult struct {
 	Confirmed bool
 }
 
-// TendCheck answers one question: has any of this loop's pull requests fallen
-// behind its base?
+// TendCheck answers one question: has any of this project's pull requests
+// fallen behind its base?
+//
+// It runs on the tend dispatcher's own configuration, so the rows it reads and
+// the lock it takes are the dispatcher's, not any loop's. It is called once per
+// PROJECT per interval rather than once per loop, which is a real saving as
+// well as a correction: before tending had a dispatcher, every loop of every
+// project was opened on every interval so that all but one of them could
+// discover it did not tend.
 //
 // It exists so the daemon can ask that question on a timer without paying for
 // it. The GitHub equivalent costs two listings plus one comparison per pull
-// request, per loop, per project, on every interval -- and the listings are
+// request, per project, on every interval -- and the listings are
 // PAGINATED at 100, so a busy repository pays two requests per page rather
-// than two requests. This reads refs the loop's own fetch already updated, so
+// than two requests. This reads refs the dispatcher's own fetch already updated, so
 // the common case -- nothing is behind -- costs no request at all.
 //
 // Three properties are load-bearing. Do not break them.
@@ -62,9 +69,6 @@ type TendCheckResult struct {
 // would stay wrong forever.
 func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (TendCheckResult, error) {
 	var out TendCheckResult
-	if !cfg.TendPR {
-		return out, nil
-	}
 
 	// A seam that a hand-built Deps may leave nil, the way Deps.Fetch is
 	// nil-guarded in tendDispatch. Without this the daemon panics on the Serve
@@ -73,19 +77,19 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 		return out, nil
 	}
 
-	// The loop lock, for the same reason every other Fetch in this package is
-	// under one. This pass fetches -- which moves the refs a concurrent rebase
-	// resolves -- and deletes pr_links rows, which races PutPRLink; tendSnapshot
-	// records that this package keeps a single writer under the lock
-	// deliberately.
+	// The tend dispatcher's lock, for the same reason every other Fetch in this
+	// package is under one. This pass fetches -- which moves the refs a
+	// concurrent rebase resolves -- and deletes pr_links rows, which races
+	// PutPRLink; tendSnapshot records that this package keeps a single writer
+	// under the lock deliberately.
 	//
-	// It does NOT wait. A held lock means a tick is already running for this
-	// loop, and that tick does this pass's work as part of its own: the sweep it
-	// performs is the thing this pass would have armed. Waiting would pin the
-	// caller's goroutine behind an agent dispatch.
+	// It does NOT wait. A held lock means a tend pass is already running, and
+	// that pass does this one's work as part of its own: the sweep it performs
+	// is the thing this pass would have armed. Waiting would pin the caller's
+	// goroutine behind an agent dispatch.
 	l, err := lock.Acquire(filepath.Join(cfg.StateDir, cfg.Name+".lock"))
 	if errors.Is(err, lock.ErrHeld) {
-		slog.Info("another tick holds the loop lock; skipping this tend check",
+		slog.Info("another tend pass holds the dispatcher's lock; skipping this tend check",
 			"loop", cfg.Name)
 		return out, nil
 	}
@@ -200,7 +204,7 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 	// pass after the daemon starts -- would otherwise confirm nothing and report
 	// zero, which is the one case force exists to cover.
 	for _, iss := range issues {
-		if !iss.HasLabel(cfg.Labels.Review) {
+		if !iss.HasLabel(cfg.Tend.Label) {
 			continue
 		}
 		// LinkPR, not a lookup by a row's pr_number, and that is the point. It
@@ -214,7 +218,7 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 			continue
 		}
 		// The same boundary TendSweep enforces: a pull request targeting
-		// release/1.0 is behind for reasons this loop's default branch knows
+		// release/1.0 is behind for reasons the project's default branch knows
 		// nothing about, and rebasing it would be a tend nobody asked for.
 		if pr.BaseRef != cfg.DefaultBranch {
 			continue

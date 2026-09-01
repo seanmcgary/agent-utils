@@ -1,0 +1,251 @@
+# The remediation half of PR review. pr-review.yaml finds and decides; this loop
+# fixes. They are two loops rather than one phase because of what the split
+# costs and what it saves.
+#
+# Measured over eight real pr-review sessions, back when one loop did both: the
+# reviewer fan-out cost $8.39 in total, and the remediation that followed cost
+# $90.86 -- 92%. Remediation was expensive for two reasons, and the split
+# addresses one while the findings artifact addresses the other. It ran inside
+# the reviewing session, whose context had already absorbed the whole diff and
+# every reviewer's output and grew from 66k to 321k tokens while it worked. And
+# a quarter of its tool calls were re-reading and re-searching code the
+# reviewers had already read, because findings arrived as prose and the fixer
+# had to re-locate every one of them.
+#
+# So this loop is a separate dispatch (a fresh context, at a cheaper tier), and
+# its input is an artifact anchored to file and line and carrying a prescribed
+# fix per finding. Neither half works without the other: a fresh context given
+# prose findings just re-does the search somewhere cheaper.
+name: exec-pr-review-findings
+repo: mcgarylabs/lawndominator-monorepo
+
+checkout_base_dir: /Users/seanmcgary/Code/lawndominator
+worktree_dir: .agent-utils/worktrees
+# state_dir is optional. When omitted it defaults to
+# <project>/.agent-utils/state/<name>, which keeps this loop's tick
+# lock and its logs beside the project. Loop state itself lives in
+# one database at ~/.agent-utils/state.db, keyed by project, so it
+# is not affected by this. Set it only to override that.
+default_branch: master
+
+labels:
+  trigger:   status:ready-for-findings-exec
+  in_flight: status:fixing-findings
+  blocked:   status:needs-findings-input
+  # TERMINAL. Applied by this loop's agent as its strictly final action. It is
+  # the last loop in the chain, so no loop triggers on this state -- which is
+  # exactly what makes it the human's gate. The issue leaves it when its pull
+  # request merges, and merging is the human's decision.
+  #
+  # It is also the project's tend.label: a pull request sitting here is the one
+  # that must not go stale, because it is waiting on a person rather than on a
+  # machine that will pick it up within a tick.
+  terminal:  status:ready-for-review
+  veto:
+    - "blocked:*"
+    # The states the EXECUTION loop owns. An issue still being built has no
+    # findings to execute.
+    - status:ready-for-execution
+    - status:executing
+    # The states the REVIEW loop owns. An issue queued for another review round,
+    # or being reviewed right now, will get a NEW findings comment when that run
+    # finishes; acting on the previous round's artifact meanwhile fixes the wrong
+    # round, and every round's artifact looks alike.
+    - status:ready-for-pr-review
+    - status:pr-reviewing
+
+agent:
+  # The reviewer must be stronger than whatever wrote the code (see
+  # pr-review.yaml). The executor does not have to be, and that is the point of
+  # having produced a prescriptive artifact: a finding that names the symbol,
+  # the line and the change is a well-specified task, and a well-specified task
+  # does not need the strongest model. The strength was already spent, upstream,
+  # writing the specification this loop consumes.
+  #
+  # If this loop starts producing bad fixes, the fix is a more prescriptive
+  # findings artifact -- a stronger reviewer, or a sharper triage -- not a more
+  # expensive executor here. That is the same trade the feature pipeline makes
+  # between planning and execution.
+  model: sonnet
+  effort: medium
+  permission_mode: bypassPermissions
+  worktree: per_issue
+  # No cost ceiling, and written out rather than omitted so it reads as a
+  # decision. A budget cap does not stop an expensive run; it stops it PART WAY
+  # THROUGH, which is the one outcome worth avoiding. The dispatch is recorded
+  # failed with its work half-applied and unpushed, the loop retries it from a
+  # resumed session, and the retry re-spends what the cap just refused. Cost is
+  # controlled here by model and effort, which shape the whole run, and by the
+  # findings artifact that keeps the expensive half short -- not by a ceiling
+  # that lands mid-edit.
+  #
+  # 0 means no ceiling: internal/runner/args.go omits --max-budget-usd for it.
+  # A negative value is rejected, because it would reach that same "> 0" gate
+  # and be silently identical to no cap.
+  max_budget_usd: 0
+  # Omitting this would default it to 24h; it is written out for the same reason
+  # as the line above. This is a last-resort bound on a wedged process, not a
+  # budget: a stuck dispatch is caught by the orphan breaker and `loop kill`,
+  # both of which act on evidence rather than a clock. Guessing low is the
+  # expensive mistake, because a killed dispatch is recorded FAILED and retried,
+  # so a real long run looks like a flaky agent.
+  timeout: 24h
+
+i_understand_bypass_permissions: true
+
+# THIS LOOP DOES NOT TEND, and neither does any other. Tending is the PROJECT's
+# own dispatcher -- its own name, its own agent, its own session per dispatch,
+# its own worktrees -- and it is described entirely in the project descriptor,
+# .agent-utils/config.yaml, because it is about a repository's open pull
+# requests rather than any loop's issue lifecycle:
+#
+#   tend:
+#     enabled:         true
+#     label:           status:ready-for-review
+#     model:           sonnet
+#     permission_mode: bypassPermissions
+#     i_understand_bypass_permissions: true
+#     prompt: |
+#       ...
+#
+# `label` is this loop's terminal, which is the human's queue. Tending it is the
+# whole point: every earlier wait in the chain is a machine that picks the issue
+# up within a tick, and only this one lasts long enough for the base branch to
+# move.
+#
+# There is no `tend.loop`, and there is no `tend_prompt` in this file. There
+# used to be both, because the tend work ran inside this loop's ticks and its
+# rows had to be keyed by some loop's name. They are gone: the dispatcher keys
+# its rows by the reserved name "tend", which no loop may take, and it carries
+# its own prompt. `agent-utils project loop tick --name tend`,
+# `... loop status --name tend` and `... logs --name tend` all address it.
+#
+# The window in which this loop is REWRITING the branch is excluded by the
+# issue leaving status:ready-for-review while it works, and by the project-wide
+# live-dispatch guard the tend dispatcher applies. A tend and a findings run on
+# one branch is the same hazard as two agents in it.
+
+retry:
+  max: 3
+  backoff: [0s, 15m, 30m]
+  breaker:
+    orphan_threshold: 2
+    cooldown: 30m
+
+prompt: |
+  Run the /executing-review-findings skill against the open pull request for
+  GitHub issue #{{.Issue.Number}}, repo {{.Repo}}. The issue carries
+  {{.Labels.Trigger}}: a review agent has finished, decided every finding, and
+  posted a findings comment. Your job is to apply it. Follow
+  executing-review-findings EXACTLY, with these overrides.
+
+  YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
+  {{.Labels.InFlight}}.
+
+  RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so the pull
+  request template fields are unset for this dispatch and you must not use them:
+  .PR.HeadRef renders empty and .PR.Number renders as 0, which is a valid-looking
+  issue number and will silently address the wrong thing. Read the
+  "## Pipeline State" block in the issue's plan comment and take its `pr` field,
+  then confirm it with `gh pr view <n> --json number,headRefName,baseRefName,state`.
+  The pull request must be OPEN and must close this issue. If Pipeline State
+  names no pull request, or the one it names is closed or belongs to another
+  issue, PARK: that is a broken handoff, not something to guess your way past.
+
+  FETCH THE FINDINGS BY ID, NEVER BY SEARCH. Pipeline State also carries a
+  `findings comment` field holding one numeric comment ID. Fetch exactly that
+  comment:
+  `gh api repos/{{.Repo}}/issues/comments/<id> --jq .body`.
+  If its body carries a "### Parts" list, fetch each listed ID in order and
+  concatenate them: that is how a round too large for one comment is stored. Do
+  NOT list the pull request's comments and search for a findings table. This
+  pull request carries bot reviews, human comments and possibly an earlier
+  round's artifact, and every round looks alike, so a search silently fixes the
+  wrong one. No `findings comment` field, or the comment it names does not
+  exist: PARK.
+
+  WORKTREE. You run in an isolated git worktree, checked out detached at the
+  default branch. `git fetch origin`, then check out the pull request's head ref
+  before anything else. Every fix and every test reads THAT branch.
+
+  A FRESH WORKTREE HAS NO node_modules. Run `pnpm install` before any Node gate.
+
+  YOU DO NOT RE-REVIEW. The artifact is the whole of your input. Do not re-read
+  the diff hunting for what the reviewers missed, do not overturn a Reject, and
+  do not promote a Defer. A finding you believe is WRONG -- the code does not say
+  what it says the code says -- you leave unapplied and report by number with
+  your reasoning. Everything else in the Fix section, you apply.
+
+  ONE SUBAGENT PER FILE GROUP, DISPATCHED IN ONE MESSAGE. The artifact is
+  already grouped by file. Send every Agent call in a SINGLE message: background
+  tasks are disabled for this dispatch, so a subagent is an ordinary blocking
+  tool call and several sent in one turn run concurrently, while one sent per
+  turn runs strictly serially and rebuilds the accumulating session this loop
+  exists to replace. Grouping is BY FILE and not per finding, because forty
+  findings collide on far fewer files and two subagents editing one file is a
+  lost write that nothing here will report. Before you dispatch, list every file
+  across every group and confirm no file appears twice.
+
+  TESTS. Each subagent runs ONLY the tests covering its own group -- the
+  `Tests:` command its group carries -- and fixes until they pass. Its group is
+  its blast radius. After every group has returned, YOU run the full suite
+  ONCE, and you fix what that surfaces yourself: a cross-group failure belongs
+  to no single group, so there is nobody to send it back to. Then re-run format
+  and lint and commit their output.
+
+  COMMITTING. The subagents do not commit; you do, once per group as it returns.
+  Concurrent subagents sharing one git index is the same lost-write hazard as
+  sharing a file.
+
+  PUSHING. The push is
+  `git push --force-with-lease origin HEAD:refs/heads/<head ref>`.
+  Use --force-with-lease, never plain --force. If the lease check REJECTS the
+  push, another run touched the branch while you worked: change nothing, push
+  nothing, and PARK saying so. Push at the END of every phase and before every
+  park; your worktree may be removed before your next dispatch, so unpushed work
+  is lost.
+
+  HEADLESS. Never ask the human through the CLI and never block on a reply. All
+  human interaction is issue and pull request comments plus label transitions.
+
+  ON COMPLETION. Post ONE pull request comment covering the round: every Fix
+  finding by number, applied or not applied with the reason; every finding a
+  subagent reported wrong, with your decision; the deferred TODOs you placed;
+  and the full suite's result. Do not restate the review's Reject and Defer
+  reasoning -- the findings comment already carries it and the human has read
+  it. Link to that comment instead. @-mention @seanmcgary. Then remove
+  {{.Labels.InFlight}} and add {{.Labels.Terminal}} as your LAST action. That
+  label is the human's merge queue: nothing follows it, and no loop triggers on
+  it.
+
+  PARKING. Park only when you cannot proceed: no findings comment, a full suite
+  still red after your fixes, a group that cannot be fixed without editing a
+  file another group holds, a rejected lease, or a pull request that cannot be
+  resolved from Pipeline State. PARK means: commit and push what is safe to
+  push, post a comment stating exactly what you need, remove
+  {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment
+  with: "To proceed: comment your decision and re-add the {{.Labels.Trigger}}
+  label." Parking never turns into a re-review.
+
+  NEVER MERGE. You never merge or close the pull request, and you never mark a
+  draft ready. Merging is the human's decision, at every stage, without
+  exception.
+
+resume_prompt: |
+  Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
+  in the SAME session you used before, so you already know which findings you
+  were applying and which groups had returned. Remove {{.Labels.Trigger}} and add
+  {{.Labels.InFlight}} as your first action.
+
+  Read the comments added since your last message. They answer the blocker you
+  parked on, or the review loop has posted a NEW findings comment for a later
+  round.
+
+  Re-read Pipeline State's `findings comment` field before you assume anything:
+  a new round means a new comment ID, and your memory holds the old one. Then
+  re-check out the pull request's head ref and `git fetch origin`; the branch may
+  have moved since your last dispatch. Resume from the findings you had already
+  applied rather than re-applying them. All other rules from your original
+  instructions still apply, including that you never re-review, that pushes use
+  --force-with-lease, and that you never merge.
+

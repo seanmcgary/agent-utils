@@ -7,7 +7,10 @@
 #     (for example anthropic/claude-sonnet-4-5 or openrouter/...).
 #   - agent.permission_mode is claude-only and must be omitted.
 #   - agent.max_budget_usd is claude-only; for pi it is accepted but has no
-#     effect. It is omitted here.
+#     effect. It is omitted here. It would be 0 either way -- see
+#     execution.yaml for why the reference loops set no cost ceiling.
+#   - tending is not configured in any loop file. It is a project-level policy
+#     in .agent-utils/config.yaml, which names the loop that hosts it.
 name: pi
 repo: mcgarylabs/lawndominator-monorepo
 
@@ -19,18 +22,23 @@ labels:
   trigger:   status:ready-for-execution
   in_flight: status:executing
   blocked:   status:needs-execution-input
-  review:    status:ready-for-review
+  # Mirrors execution.yaml exactly. This loop is a drop-in replacement for it,
+  # so its labels must be the same ones: a swap that changed the terminal would
+  # hand the branch to nothing.
+  terminal:  status:ready-for-pr-review
   veto:
     - "blocked:*"
+    - status:ready-for-pr-review
+    - status:pr-reviewing
+    - status:fixing-findings
 
 agent:
   harness: pi
   model: anthropic/claude-sonnet-4-5
   effort: high
   worktree: per_issue
-  timeout: 4h
-
-tend_pr: false
+  # Matches execution.yaml. Omitting it would default to the same 24h.
+  timeout: 24h
 
 retry:
   max: 3
@@ -45,14 +53,12 @@ prompt: |
   {{.Labels.InFlight}} first. Run in the isolated worktree given by
   {{.Worktree}}. Self-contained; never ask the human through the CLI. On a
   blocker, park: comment and add {{.Labels.Blocked}}. On success, remove
-  {{.Labels.InFlight}} and add {{.Labels.Review}}. Never merge.
+  {{.Labels.InFlight}}, and only after your final push add {{.Labels.Terminal}}
+  as your strictly last action -- the review loop triggers on that state, so
+  applying it while you are still working starts a second agent on your branch.
+  Never merge.
 
 resume_prompt: |
   Resume issue #{{.Issue.Number}} in {{.Repo}} in the SAME session. Remove
   {{.Labels.Trigger}} and add {{.Labels.InFlight}}. Read any new comments and
   continue from where you left off.
-
-tend_prompt: |
-  You are tending pull request #{{.PR.Number}} for issue #{{.Issue.Number}} in
-  {{.Repo}}, {{.PR.BehindBy}} commits behind {{.PR.BaseRef}}. Rebase onto
-  {{.PR.BaseRef}}, push with --force-with-lease, and never merge.

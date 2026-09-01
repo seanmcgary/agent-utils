@@ -93,7 +93,7 @@ type Settings struct {
 	//
 	// It is machine-wide rather than per loop because it describes how
 	// attentive the daemon is, not anything about a loop. It applies to every
-	// loop with tend_pr: true, of every registered project.
+	// tending loop of every registered project.
 	TendInterval string `yaml:"tend_interval,omitempty"`
 }
 

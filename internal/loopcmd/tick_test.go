@@ -151,7 +151,6 @@ func tickConfig(t *testing.T) *config.Config {
 			Trigger:  "trigger",
 			InFlight: "in-flight",
 			Blocked:  "blocked",
-			Review:   "review",
 			Terminal: "terminal",
 		},
 		Agent: config.Agent{

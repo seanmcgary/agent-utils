@@ -23,8 +23,8 @@ func validConfig(name string) *config.Config {
 		DefaultBranch:   "main",
 		Labels: config.Labels{
 			Trigger: "status:trigger", InFlight: "status:in-flight",
-			Blocked: "status:blocked", Review: "status:review",
-			Veto: []string{"blocked:*"},
+			Blocked: "status:blocked",
+			Veto:    []string{"blocked:*"},
 		},
 		Agent: config.Agent{
 			Model: "opus", Effort: "high", PermissionMode: "acceptEdits",
@@ -106,9 +106,9 @@ func TestWriteRefusesToOverwriteAndNamesTheFile(t *testing.T) {
 // config.Load itself and returns its error, so the reload afterwards is a
 // tautology. Seven deliberate mis-mappings -- Blocked taking the review label,
 // a hardcoded model, a dropped veto list, a hardcoded budget, Prompt taking
-// resume_prompt, TendPR forced false, a dropped bypass acknowledgement --
-// survived the whole suite. A blocked/review swap alone would ship a wizard
-// that applies the wrong label to every issue it parks.
+// resume_prompt, a dropped bypass acknowledgement -- survived the whole suite.
+// A blocked/terminal swap alone would ship a wizard that applies the wrong
+// label to every issue it parks.
 //
 // So: reload the written file and require it to equal what went in, field for
 // field. A new field added to config.Config and forgotten in toYAMLDoc fails
@@ -128,8 +128,6 @@ func TestWriteRoundTripsEveryValue(t *testing.T) {
 	cfg.Agent.Harness = config.HarnessClaude
 	cfg.Agent.PermissionMode = "bypassPermissions"
 	cfg.AcknowledgeBypassPermissions = true
-	cfg.TendPR = true
-	cfg.TendPrompt = "rebase #{{.Issue.Number}}"
 	cfg.Retry.Max = 3
 	cfg.Retry.Backoff = []config.Duration{
 		config.Duration(0),

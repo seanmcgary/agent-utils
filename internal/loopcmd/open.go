@@ -88,7 +88,24 @@ type Options struct {
 // state database; the daemon calls Open once per delivery, so skipping cleanup
 // leaks one database handle per delivery.
 func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps, func(), error) {
-	cfg, err := config.Load(configPath)
+	// One seam for the tend dispatcher, here and nowhere else.
+	//
+	// Tending has no configuration FILE, but every path into a dispatch takes
+	// one: this function, the detached runner's --config, and the four operator
+	// commands that resolve a loop before they open anything. Rather than give
+	// each of them a second shape, the tend dispatcher is addressed by the
+	// PROJECT DESCRIPTOR's own path, and this is where that path stops meaning
+	// "parse a loop file" and starts meaning "build the tend configuration".
+	// Everything below -- the state directory, the worktree manager, the
+	// migration check, Deps -- is then identical for a loop and for tending,
+	// which is the point: one dispatch path, one runner, one set of rules.
+	load := config.Load
+	if config.IsTendPath(configPath) {
+		load = func(path string) (*config.Config, error) {
+			return config.LoadTend(filepath.Dir(path))
+		}
+	}
+	cfg, err := load(configPath)
 	if err != nil {
 		return nil, Deps{}, nil, err
 	}

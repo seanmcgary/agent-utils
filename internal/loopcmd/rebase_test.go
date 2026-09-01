@@ -15,6 +15,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 	_ "modernc.org/sqlite"
@@ -234,23 +235,27 @@ func rebaseCheckout(t *testing.T, root string) string {
 	return checkout
 }
 
-// rebaseConfig is a loop that tends in a per-issue worktree, which is the only
-// mode the automatic rebase runs in.
+// rebaseConfig is the TEND DISPATCHER, in a per-issue worktree, which is the
+// only mode the automatic rebase runs in. Its name is the reserved one, its
+// prompt is the project's tend prompt, and it carries the policy directly --
+// which is what config.LoadTend produces.
 func rebaseConfig(t *testing.T) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	return &config.Config{
-		Name:            rebaseLoop,
-		Repo:            "o/r",
-		DefaultBranch:   "master",
-		TendPR:          true,
-		TendPrompt:      "rebase #{{.Issue.Number}}",
+		Name:          rebaseLoop,
+		Repo:          "o/r",
+		DefaultBranch: "master",
+		Tend: project.Tend{
+			Enabled: true, Label: "status:review",
+			Model: "sonnet", Prompt: "rebase #{{.Issue.Number}}",
+		},
 		CheckoutBaseDir: rebaseCheckout(t, dir),
 		WorktreeDir:     filepath.Join(dir, "wt"),
 		StateDir:        filepath.Join(dir, "state"),
 		Labels: config.Labels{
 			Trigger: "status:todo", InFlight: "status:doing",
-			Blocked: "status:blocked", Review: "status:review", Terminal: "status:done",
+			Blocked: "status:blocked", Terminal: "status:done",
 		},
 		Agent: config.Agent{
 			Model: "opus", Worktree: config.WorktreePerIssue,

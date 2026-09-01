@@ -11,14 +11,13 @@ import (
 )
 
 // The review trigger fails CLOSED: a failed LatestReviewActivity read leaves
-// the pull request's entry unset, so tendDecisions judges it on staleness
+// the pull request's entry unset, so DecideTend judges it on staleness
 // alone. A current pull request with no other reason to tend must therefore
 // still dispatch nothing, even though the read failed -- treating a failed
 // read as "everything is pending" would answer one broken call with a burst
 // of dispatches, the opposite of the goal.
-func TestTickDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T) {
-	cfg := tickConfig(t)
-	cfg.TendPR = true
+func TestTendTickDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T) {
+	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -30,20 +29,19 @@ func TestTickDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T) {
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
 
-	sum, err := Tick(context.Background(), cfg, deps)
+	sum, err := TendTick(context.Background(), cfg, deps)
 	if err != nil {
-		t.Fatalf("Tick: %v", err)
+		t.Fatalf("TendTick: %v", err)
 	}
 	if sum.Tended != 0 {
 		t.Errorf("Tended = %d, want 0: a failed review read must not manufacture a reason to dispatch", sum.Tended)
 	}
 }
 
-// Same property through the delivery fast path, TickIssue, which reads
+// Same property through the delivery fast path, TendIssue, which reads
 // LatestReviewActivity beside its own BehindBy call.
-func TestTickIssueDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T) {
-	cfg := tickConfig(t)
-	cfg.TendPR = true
+func TestTendIssueDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T) {
+	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -55,9 +53,9 @@ func TestTickIssueDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
 
-	sum, err := TickIssue(context.Background(), cfg, deps, 108)
+	sum, err := TendIssue(context.Background(), cfg, deps, 108)
 	if err != nil {
-		t.Fatalf("TickIssue: %v", err)
+		t.Fatalf("TendIssue: %v", err)
 	}
 	if sum.Tended != 0 {
 		t.Errorf("Tended = %d, want 0: a failed review read must not manufacture a reason to dispatch", sum.Tended)
@@ -67,9 +65,8 @@ func TestTickIssueDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T
 // The positive case beside the failure one: review activity newer than the
 // last tend produces a tend dispatch for a pull request that is otherwise
 // current, and the dispatch row carries ReviewPending.
-func TestTickTendsACurrentPullRequestWithNewReviewActivity(t *testing.T) {
-	cfg := tickConfig(t)
-	cfg.TendPR = true
+func TestTendTickTendsACurrentPullRequestWithNewReviewActivity(t *testing.T) {
+	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -81,9 +78,9 @@ func TestTickTendsACurrentPullRequestWithNewReviewActivity(t *testing.T) {
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
 
-	sum, err := Tick(context.Background(), cfg, deps)
+	sum, err := TendTick(context.Background(), cfg, deps)
 	if err != nil {
-		t.Fatalf("Tick: %v", err)
+		t.Fatalf("TendTick: %v", err)
 	}
 	if sum.Tended != 1 {
 		t.Fatalf("Tended = %d, want 1: review activity with no prior tend is pending", sum.Tended)
@@ -109,9 +106,8 @@ func TestTickTendsACurrentPullRequestWithNewReviewActivity(t *testing.T) {
 // of agent dispatches, at roughly $0.75 each. Judging on staleness alone is
 // exactly the behaviour this loop had before the trigger existed, so failing
 // closed costs nothing that was ever promised.
-func TestTickSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
-	cfg := tickConfig(t)
-	cfg.TendPR = true
+func TestTendTickSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
+	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -127,11 +123,11 @@ func TestTickSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
 	// Break the last-tend read, and only that read.
 	dropDispatches(t, dbPath)
 
-	// The tick itself fails afterwards, when it reads running dispatches from
+	// The pass itself fails afterwards, when it reads running dispatches from
 	// the same table. That is expected and is not what this test asserts: the
 	// property is what happened BEFORE that, while the pass still had a
 	// choice about spending a GitHub call.
-	_, _ = Tick(context.Background(), cfg, deps)
+	_, _ = TendTick(context.Background(), cfg, deps)
 
 	if gh.reviewActivityCalls != 0 {
 		t.Errorf("LatestReviewActivity was called %d times, want 0: an unknown last-tend time must suppress the review trigger, not be read around",
@@ -162,14 +158,13 @@ func dropDispatches(t *testing.T, dbPath string) {
 	}
 }
 
-// The delivery fast path fails closed the same way the full tick does, and for
+// The delivery fast path fails closed the same way the full pass does, and for
 // the same reason: an unset lastTend entry reads as the zero time, so any
-// review activity is After(zero). TickIssue orders the store read FIRST and
+// review activity is After(zero). TendIssue orders the store read FIRST and
 // skips the GitHub read when it fails; without that ordering a failed store
 // read would manufacture a reason to dispatch an agent.
-func TestTickIssueSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
-	cfg := tickConfig(t)
-	cfg.TendPR = true
+func TestTendIssueSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
+	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -184,7 +179,7 @@ func TestTickIssueSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
 
 	dropDispatches(t, dbPath)
 
-	_, _ = TickIssue(context.Background(), cfg, deps, 108)
+	_, _ = TendIssue(context.Background(), cfg, deps, 108)
 
 	if gh.reviewActivityCalls != 0 {
 		t.Errorf("LatestReviewActivity was called %d times, want 0: an unknown last-tend time must suppress the review trigger",

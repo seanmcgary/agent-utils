@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
-	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
@@ -51,22 +50,25 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	var sum Summary
 	now := deps.Now()
 
-	// Same reasoning as Tick: a failed fetch makes branch comparisons stale, so
-	// it suppresses TENDING only. Reaping and retrying have nothing to do with
-	// git, and abandoning the pass would leave a dead runner's issue with no
-	// failure flag at all.
-	fetchOK := true
+	// Same reasoning as Tick: the fetch keeps the primary checkout current for
+	// the worktrees this pass may create, and nothing here decides from a
+	// branch comparison any more. A failure must not abandon the pass --
+	// reaping and retrying have nothing to do with git, and returning here
+	// would leave a dead runner's issue with no failure flag at all.
 	if deps.Fetch != nil {
 		if err := deps.Fetch(ctx); err != nil {
-			fetchOK = false
-			slog.Error("fetch primary checkout; skipping tend this delivery",
+			slog.Error("fetch primary checkout; carrying on with a possibly stale one",
 				"loop", cfg.Name, "issue", number, "err", err)
 		}
 	}
 
 	owner, repo := cfg.RepoOwner(), cfg.RepoName()
 
-	iss, eventPR, ok, err := subject(ctx, cfg, deps, owner, repo, number)
+	// The pull request number subject resolved is discarded here: this pass
+	// decides an ISSUE, and the only reader of that number was the tend half
+	// that moved to the project's tend dispatcher, which resolves it again from
+	// the same delivery. See TendIssue.
+	iss, _, ok, err := subject(ctx, cfg, deps, owner, repo, number)
 	if err != nil {
 		return sum, err
 	}
@@ -76,63 +78,11 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 		return sum, nil
 	}
 
-	snap := engine.Snapshot{Issues: []ghub.Issue{iss}, BehindBy: map[int]int{}, ReviewedAt: map[int]time.Time{}}
-	lastTend := map[int]time.Time{}
-	if cfg.TendPR && fetchOK && iss.HasLabel(cfg.Labels.Review) {
-		if pr, found := reviewPR(ctx, cfg, deps, owner, repo, iss, eventPR); found {
-			snap.PRs = []ghub.PullRequest{pr}
-			behind, err := deps.GH.BehindBy(ctx, owner, repo, pr.BaseRef, pr.HeadRef)
-			if err != nil {
-				// As in Tick: one unusable pull request must not abandon the
-				// pass. Anyone able to open a pull request could otherwise stop
-				// this loop answering deliveries for the issue it closes.
-				slog.Warn("compare failed; skipping this pull request",
-					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
-			} else {
-				snap.BehindBy[pr.Number] = behind
-				if err := deps.Store.PutPRLink(store.PRLink{
-					Loop: cfg.Name, Repo: cfg.Repo, Number: iss.Number,
-					PRNumber: pr.Number, HeadRef: pr.HeadRef, BaseRef: pr.BaseRef,
-				}); err != nil {
-					slog.Error("store pr link", "loop", cfg.Name, "issue", iss.Number, "err", err)
-				}
-			}
-
-			// The review trigger fails CLOSED: a failed read leaves the entry
-			// unset rather than abandoning the pass or treating "unknown" as
-			// "pending". This is the delivery fast path for the trigger --
-			// pull_request_review and pull_request_review_comment both land
-			// here -- so it, and Tick's full sweep as the safety net, are the
-			// only two places this read happens; see tendsweep.go and
-			// tendcheck.go for why it is deliberately absent from both.
-			//
-			// The last-tend read comes FIRST, and a failure skips the review
-			// read entirely. That ordering is the fail-closed guard, not a
-			// preference: an unset lastTend entry reads as the zero time, and
-			// any review activity at all is After(zero), so reading activity
-			// without a last-tend answer would mark the pull request
-			// review-pending on the strength of a store read that failed --
-			// dispatching an agent precisely because the loop could not tell
-			// whether one had already answered. It also spends no GitHub call
-			// on an answer that could not be used.
-			last, lastErr := deps.Store.LastTendAt(cfg.Name, cfg.Repo, pr.Number)
-			switch {
-			case lastErr != nil:
-				slog.Warn("read last tend time; judging this pull request on staleness alone",
-					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", lastErr)
-			default:
-				if !last.IsZero() {
-					lastTend[pr.Number] = last
-				}
-				if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
-					slog.Warn("read review activity; judging this pull request on staleness alone",
-						"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
-				} else if !activity.IsZero() {
-					snap.ReviewedAt[pr.Number] = activity
-				}
-			}
-		}
-	}
+	// No pull request, no comparison, no review activity. A loop does not tend,
+	// so a delivery reaching a loop is only ever about that loop's issue. The
+	// same delivery ALSO reaches the project's tend dispatcher, which runs
+	// loopcmd.TendIssue for it; see listener.Worker.dispatch.
+	snap := engine.Snapshot{Issues: []ghub.Issue{iss}}
 
 	// One row, not the loop's whole issue map. engine.Decide reads st.Issues
 	// only for the issues in the snapshot, so a wider read would be pure cost.
@@ -166,10 +116,20 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	// because the pass is; `loop status` reads the store, not this number.
 	sum.Live = len(live)
 
+	// Project-wide, unlike everything else this pass reads, and for the reason
+	// tendedIssues gives: a tend's rows are filed under the dispatcher's
+	// reserved name, so this loop's own scope can never show one. It is not
+	// narrowed to this issue -- the query is one indexed lookup either way, and
+	// engine.Decide reads only the issues in the snapshot.
+	tended, err := tendedIssues(cfg, deps)
+	if err != nil {
+		return sum, err
+	}
+
 	// Scoped to this issue's snapshot, so a webhook-driven tick spawns at most
 	// one `pi --list-models` rather than one per issue in the loop.
 	st := engine.State{
-		Issues: states, Running: live, LastTend: lastTend,
+		Issues: states, Running: live, Tended: tended,
 		Providers: resolveProviders(ctx, cfg, snap.Issues),
 	}
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
@@ -294,56 +254,6 @@ func subject(
 	slog.Info("resolved a pull request to the issue it closes",
 		"loop", cfg.Name, "pr", pr.Number, "issue", iss.Number)
 	return iss, pr.Number, true, nil
-}
-
-// reviewPR returns the pull request to consider tending for iss, fetched
-// singly.
-//
-// The pull request is identified either by the delivery itself (a
-// pull_request* event names it) or by the link a previous tick stored for this
-// issue. Neither is a guess that gets acted on unchecked: engine.LinkPR is
-// applied to the fetched pull request exactly as it is in a full tick, so the
-// closing reference and the TRUST decision are re-judged against what GitHub
-// says right now. Tending checks the head branch out and runs an agent inside
-// it, so a head that has since moved to a fork must stop being tended even
-// though the stored link still points at it.
-//
-// When neither source names one, this delivery does not tend. The cron sweep
-// still lists open pull requests and finds a new one; paying for that listing
-// on every delivery is what this change exists to stop.
-func reviewPR(
-	ctx context.Context,
-	cfg *config.Config,
-	deps Deps,
-	owner, repo string,
-	iss ghub.Issue,
-	eventPR int,
-) (ghub.PullRequest, bool) {
-	number := eventPR
-	if number == 0 {
-		links, err := deps.Store.PRLinks(cfg.Name, cfg.Repo)
-		if err != nil {
-			// Not fatal: the rest of the pass still decides this issue.
-			slog.Error("read pr links", "loop", cfg.Name, "issue", iss.Number, "err", err)
-			return ghub.PullRequest{}, false
-		}
-		number = links[iss.Number].PRNumber
-	}
-	if number <= 0 {
-		return ghub.PullRequest{}, false
-	}
-
-	pr, err := deps.GH.PullRequest(ctx, owner, repo, number)
-	if err != nil {
-		slog.Warn("cannot read the pull request for this issue; skipping tend",
-			"loop", cfg.Name, "issue", iss.Number, "pr", number, "err", err)
-		return ghub.PullRequest{}, false
-	}
-	linked, ok := engine.LinkPR(iss.Number, []ghub.PullRequest{pr})
-	if !ok {
-		return ghub.PullRequest{}, false
-	}
-	return linked, true
 }
 
 // warnBreakerNotEvaluated records the one behaviour a scoped pass cannot

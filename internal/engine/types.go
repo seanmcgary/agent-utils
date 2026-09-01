@@ -58,8 +58,29 @@ type State struct {
 	Issues map[int]store.IssueState
 	// Running holds every dispatch row still marked running whose process is
 	// confirmed alive. The caller performs the liveness check, so Decide stays
-	// pure.
+	// pure. It is scoped to THIS loop, which is why Tended exists beside it.
 	Running []store.Dispatch
+	// Tended holds every issue number the project's TEND DISPATCHER currently
+	// holds a live dispatch for. It is the RECIPROCAL of the project-wide guard
+	// in TendState: a tend rebases and force-pushes the branch a loop's agent
+	// wrote, so neither may start while the other is in it, and each has to be
+	// told about the other.
+	//
+	// It cannot come from Running. Running is loop-scoped, and a tend's rows are
+	// written under the dispatcher's own reserved name, so a loop reading only
+	// its own rows never sees one -- which is exactly how a loop came to start
+	// an agent on a branch a tend was force-pushing.
+	//
+	// Keyed by ISSUE, because that is what a loop decides. A tend row carries
+	// the issue it serves in Number and the pull request in PRNumber; the pull
+	// request half is TendState's business, not a loop's.
+	//
+	// A missing entry means "no live tend", which is also what a caller that
+	// leaves this nil says. That is safe only because the claim in
+	// store.CreateDispatch is the actual guarantee -- this map is what turns a
+	// refused claim into a clean skip with a reason, rather than the thing
+	// standing between two agents and one branch.
+	Tended map[int]bool
 	// Providers maps an issue number to the pi provider that would serve the
 	// model its next dispatch runs. The CALLER resolves it: resolution shells
 	// out to `pi --list-models`, and Decide performs no I/O.
@@ -85,14 +106,10 @@ type State struct {
 	// drop every dispatch, and re-arm the cooldown -- leaving --force a no-op
 	// in exactly the situation an operator reaches for it.
 	Force bool
-	// LastTend maps a PULL REQUEST number to the start time of its last
-	// FINISHED tend dispatch. Keyed by pull request, like Snapshot.ReviewedAt,
-	// because both are facts about the pull request, not the issue: an issue
-	// is worked by several loops in turn, but a tend dispatch and a review
-	// comment both land on one pull request regardless of which loop tends it.
-	// A pull request absent from this map has never had a finished tend
-	// dispatch, which is why any review activity on it counts as pending.
-	LastTend map[int]time.Time
+	// There is no LastTend here. It was the loop's half of the review-activity
+	// trigger, and the trigger moved wholesale to the tend dispatcher: a loop
+	// decides no tend, so nothing would read it. TendState.LastTend is where it
+	// lives now.
 }
 
 // Decision is one action the tick must perform.

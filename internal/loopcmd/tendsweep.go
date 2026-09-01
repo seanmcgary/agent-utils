@@ -33,7 +33,8 @@ import (
 // is logged, never dropped silently, and the next sweep takes the next batch.
 const maxTendPerSweep = 10
 
-// TendSweep rebases the stale pull requests of one loop, and does nothing else.
+// TendSweep rebases the stale pull requests of one project, and does nothing
+// else.
 //
 // base is the branch that moved. It exists so the pass can enforce the thing
 // that makes it safe rather than assert it: a merge into master says nothing
@@ -49,7 +50,7 @@ const maxTendPerSweep = 10
 // unrelated issue whose pull request was 16 commits behind. This pass acts on
 // many issues again, so it must not become that. Four things keep it apart:
 //
-//  1. Three things arm it, and all three name the same subject: the loop's
+//  1. Three things arm it, and all three name the same subject: the project's
 //     default branch moving. A pull request merged into it, a push to it, and
 //     the periodic tend check finding a pull request behind it. Opening an
 //     issue, moving a label and commenting arm no sweep, and neither does a
@@ -75,9 +76,10 @@ const maxTendPerSweep = 10
 // Keeping the read out of here also keeps this sweep's GitHub cost where it
 // is -- one BehindBy per review issue, not two.
 //
-// Decisions come from engine.Decide, the same function the full tick calls. A
-// scoped copy of the veto, live-dispatch and link rules would be a second
-// implementation free to drift; see tickIssue, which states the same rule.
+// Decisions come from engine.DecideTend, the same function the full tend tick
+// calls. A scoped copy of the live-dispatch, stopped and link rules would be a
+// second implementation free to drift; see tickIssue, which states the same
+// rule for the loops.
 //
 // # Where the lock is taken
 //
@@ -96,12 +98,6 @@ const maxTendPerSweep = 10
 // BehindBy is CompareCommits, a GitHub API call, so the comparisons do not
 // depend on Fetch having run and lose nothing by preceding it.
 func TendSweep(ctx context.Context, cfg *config.Config, deps Deps, base string) (Summary, error) {
-	// Checked before anything is read. The caller checks it too; TendSweep is
-	// exported, so a loop that does not tend must cost nothing whoever calls.
-	if !cfg.TendPR {
-		return Summary{}, nil
-	}
-
 	snap, links, err := tendSnapshot(ctx, cfg, deps, base)
 	if err != nil {
 		return Summary{}, err
@@ -139,7 +135,7 @@ func tendSnapshot(ctx context.Context, cfg *config.Config, deps Deps, base strin
 	var links []store.PRLink
 	snap := engine.Snapshot{Issues: issues, PRs: prs, BehindBy: map[int]int{}}
 	for _, iss := range issues {
-		if !iss.HasLabel(cfg.Labels.Review) {
+		if !iss.HasLabel(cfg.Tend.Label) {
 			continue
 		}
 		pr, ok := engine.LinkPR(iss.Number, prs)
@@ -204,94 +200,25 @@ func tendDispatch(
 		}
 	}
 
-	states, err := deps.Store.IssueStates(cfg.Name, cfg.Repo)
+	// No lastTend map, so no pull request is ever review-pending here. That is
+	// property 1 above, expressed in code rather than asserted: this sweep's
+	// subject is the default branch moving, and review activity is not that
+	// subject.
+	st, err := tendState(cfg, deps, nil, now, &sum)
 	if err != nil {
 		return sum, err
 	}
-	running, err := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
-	if err != nil {
-		return sum, err
-	}
 
-	// Retire dead TEND rows only.
-	//
-	// Every row is still READ: engine.Decide builds liveIssues from them, and a
-	// live start agent must keep suppressing a tend for its issue -- an agent
-	// working a branch and a tend agent force-pushing it are the same hazard as
-	// two agents. But only tend rows are RETIRED. tickIssue states why, where
-	// the scoped reaping lives: retiring the loop's rows on a delivery flags
-	// issues nobody touched for retry. A tend row cannot do that, because
-	// reapDead guards MarkNeedsRetry with `d.Kind != store.KindTend`, so
-	// retiring one writes no issue state at all.
-	//
-	// A dead row of another kind is therefore treated as live here. That is the
-	// conservative direction: the cost is a rebase this sweep declines to do,
-	// and the alternative cost is a second agent in a worktree that already
-	// holds one.
-	tendRows := make([]store.Dispatch, 0, len(running))
-	live := make([]store.Dispatch, 0, len(running))
-	for _, d := range running {
-		if d.Kind == store.KindTend {
-			tendRows = append(tendRows, d)
-			continue
-		}
-		live = append(live, d)
-	}
-	liveTend, err := reapDead(cfg, deps, tendRows, states, now, &sum)
-	if err != nil {
-		return sum, err
-	}
-	live = append(live, liveTend...)
-	sum.Live = len(live)
+	plan := engine.DecideTend(cfg, snap, st)
+	logTendSkips(cfg, plan)
 
-	// No Providers. The sweep only tends: it makes no retry decision, so it can
-	// never retire a cap, and resolving would spend a subprocess per model to
-	// produce a map nothing here reads.
-	st := engine.State{Issues: states, Running: live}
-	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
-		return sum, err
-	}
-
-	plan := engine.Decide(cfg, snap, st, now)
-	sum.BreakerTripped = plan.BreakerTripped
-
-	// A halted plan is the cooldown case, which leaves BreakerTripped false and
-	// so trips no warning below. Without this the operator gets an all-zeros
-	// summary and no reason -- the complaint that put a reason on the issue
-	// tick's own completion line.
-	if plan.Halted != "" {
-		slog.Info("tend sweep halted", "loop", cfg.Name, "reason", plan.Halted)
-	}
-
-	// clearUnreachableDeadlines is deliberately NOT called, for the reason
-	// tickIssue gives: this pass looked at review issues, so it holds no
-	// evidence about any other stamped row. Tick still runs it.
-
-	// A cooldown already set is OBEYED -- Decide halts on it -- but this pass
-	// never WRITES one. The breaker counts retry decisions within one call, and
-	// this pass discards every retry decision. A pass that will not act on that
-	// evidence must not stop the passes that would.
-	var tends []engine.Decision
-	if !plan.BreakerTripped {
-		for _, d := range plan.Decisions {
-			// The boundary that bounds the blast radius of whichever trigger
-			// armed this sweep -- a merge, a push, or the periodic check. It is the
-			// counterpart of tickIssue's per-issue check, and it is what keeps
-			// this from being the per-delivery reconcile that was removed. It
-			// must not depend on an invariant living in another package.
-			if d.Kind == engine.KindTend {
-				tends = append(tends, d)
-			}
-		}
-		// Issue order, so a capped sweep takes the low-numbered batch every
-		// time and the next sweep takes the next one. engine.Decide guarantees
-		// no ordering of Plan.Decisions, so the batch identity is this sort's
-		// to establish, not something to inherit.
-		sort.Slice(tends, func(i, j int) bool { return tends[i].Issue < tends[j].Issue })
-	} else {
-		slog.Warn("circuit breaker tripped; skipping all dispatch",
-			"loop", cfg.Name, "cooldown_until", plan.CooldownUntil)
-	}
+	// Issue order, so a capped sweep takes the low-numbered batch every time
+	// and the next sweep takes the next one. DecideTend already walks issues in
+	// order, so this pins the batch identity rather than establishing it -- and
+	// pinning it here is what keeps the cap below from depending on an ordering
+	// guarantee that lives in another package.
+	tends := plan.Decisions
+	sort.Slice(tends, func(i, j int) bool { return tends[i].Issue < tends[j].Issue })
 
 	var deferred []int
 	if len(tends) > maxTendPerSweep {
@@ -323,11 +250,12 @@ func tendDispatch(
 			"backoff", sum.Backoff, "deferred", deferred)
 	}
 
-	// Recorded like any other tick -- including on the breaker path, where Tick
-	// and tickIssue also record -- so the counter and the last-tick time keep
-	// meaning something in `project loop status`.
+	// Recorded like any other tick, so the counter and the last-tick time keep
+	// meaning something in `project loop status`. Never breaker-tripped: the
+	// breaker counts retry decisions within one call and this pass makes none,
+	// so a pass that will not act on that evidence must not report it either.
 	body, _ := json.Marshal(sum)
-	if _, err := deps.Store.RecordTick(cfg.Name, plan.BreakerTripped, string(body)); err != nil {
+	if _, err := deps.Store.RecordTick(cfg.Name, false, string(body)); err != nil {
 		return sum, err
 	}
 	slog.Info("tend sweep complete", "loop", cfg.Name, "base", base, "summary", string(body))

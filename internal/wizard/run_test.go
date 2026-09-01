@@ -35,7 +35,6 @@ func TestRunAcceptsEveryDefault(t *testing.T) {
 				"",       // 7.  labels.trigger
 				"",       // 8.  labels.in_flight
 				"",       // 9.  labels.blocked
-				"",       // 10. labels.review
 				"",       // 11. labels.terminal
 				"",       // 12. labels.veto
 				"",       // 13. agent.harness
@@ -110,7 +109,6 @@ func TestRunBypassPermissionsDeclineThenAcceptEditsStaysUnacknowledged(t *testin
 		"",                  // 7.  labels.trigger
 		"",                  // 8.  labels.in_flight
 		"",                  // 9.  labels.blocked
-		"",                  // 10. labels.review
 		"",                  // 11. labels.terminal
 		"",                  // 12. labels.veto
 		"",                  // 13. agent.harness
@@ -155,7 +153,6 @@ func TestRunBypassPermissionsDeclineReasksThenAccepts(t *testing.T) {
 		"",                  // 7.  labels.trigger
 		"",                  // 8.  labels.in_flight
 		"",                  // 9.  labels.blocked
-		"",                  // 10. labels.review
 		"",                  // 11. labels.terminal
 		"",                  // 12. labels.veto
 		"",                  // 13. agent.harness
@@ -202,7 +199,6 @@ func TestRunRetryBackoffFewerEntriesThanMaxReasks(t *testing.T) {
 		"",             // 7.  labels.trigger
 		"",             // 8.  labels.in_flight
 		"",             // 9.  labels.blocked
-		"",             // 10. labels.review
 		"",             // 11. labels.terminal
 		"",             // 12. labels.veto
 		"",             // 13. agent.harness
@@ -244,7 +240,6 @@ func TestRunRepoNotOwnerSlashNameReasks(t *testing.T) {
 		"",             // 7.  labels.trigger
 		"",             // 8.  labels.in_flight
 		"",             // 9.  labels.blocked
-		"",             // 10. labels.review
 		"",             // 11. labels.terminal
 		"",             // 12. labels.veto
 		"",             // 13. agent.harness
@@ -284,7 +279,6 @@ func TestRunInvalidAgentTimeoutReasks(t *testing.T) {
 		"",             // 7.  labels.trigger
 		"",             // 8.  labels.in_flight
 		"",             // 9.  labels.blocked
-		"",             // 10. labels.review
 		"",             // 11. labels.terminal
 		"",             // 12. labels.veto
 		"",             // 13. agent.harness
@@ -330,7 +324,6 @@ func TestRunVetoListIsSplitFromTemplateDefault(t *testing.T) {
 		"",         // 7.  labels.trigger
 		"",         // 8.  labels.in_flight
 		"",         // 9.  labels.blocked
-		"",         // 10. labels.review
 		"",         // 11. labels.terminal
 		"",         // 12. labels.veto (take the template default)
 		"",         // 13. agent.harness
@@ -384,7 +377,6 @@ func TestRunRequiredFieldWithEmptyDefaultReasks(t *testing.T) {
 		"",             // 7.  labels.trigger
 		"",             // 8.  labels.in_flight
 		"",             // 9.  labels.blocked
-		"",             // 10. labels.review
 		"",             // 11. labels.terminal
 		"",             // 12. labels.veto
 		"",             // 13. agent.harness
@@ -438,7 +430,6 @@ func TestRunInvalidNameReasks(t *testing.T) {
 		"",          // 7.  labels.trigger
 		"",          // 8.  labels.in_flight
 		"",          // 9.  labels.blocked
-		"",          // 10. labels.review
 		"",          // 11. labels.terminal
 		"",          // 12. labels.veto
 		"",          // 13. agent.harness
@@ -478,7 +469,6 @@ func TestRunNonPositiveAgentTimeoutReasks(t *testing.T) {
 		"",         // 7.  labels.trigger
 		"",         // 8.  labels.in_flight
 		"",         // 9.  labels.blocked
-		"",         // 10. labels.review
 		"",         // 11. labels.terminal
 		"",         // 12. labels.veto
 		"",         // 13. agent.harness
@@ -519,7 +509,6 @@ func TestRunNegativeRetryBreakerCooldownReasks(t *testing.T) {
 		"",         // 7.  labels.trigger
 		"",         // 8.  labels.in_flight
 		"",         // 9.  labels.blocked
-		"",         // 10. labels.review
 		"",         // 11. labels.terminal
 		"",         // 12. labels.veto
 		"",         // 13. agent.harness
@@ -573,7 +562,6 @@ func TestRunNegativeAgentMaxBudgetReasksAndZeroIsAccepted(t *testing.T) {
 				"",         // 7.  labels.trigger
 				"",         // 8.  labels.in_flight
 				"",         // 9.  labels.blocked
-				"",         // 10. labels.review
 				"",         // 11. labels.terminal
 				"",         // 12. labels.veto
 				"",         // 13. agent.harness
