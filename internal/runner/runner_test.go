@@ -679,7 +679,7 @@ func TestSuperviseFailsWhenClaudeAbandonsBackgroundWork(t *testing.T) {
 	// Follow the tick's own order: BeginDispatch writes the issue row before
 	// anything is spawned, and MarkSessionStarted updates that row rather than
 	// creating one.
-	if err := s.BeginDispatch("execution", "o/r", 68, "bg", false, time.Now()); err != nil {
+	if err := s.BeginDispatch("execution", "o/r", 68, "bg", "claude", "", false, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	id, _ := s.CreateDispatch(store.Dispatch{
@@ -736,7 +736,7 @@ func TestSuperviseTreatsASessionInUseRefusalAsProofTheSessionExists(t *testing.T
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	s := newStore(t)
-	if err := s.BeginDispatch("execution", "o/r", 73, "b3b1a9e5", false, time.Now()); err != nil {
+	if err := s.BeginDispatch("execution", "o/r", 73, "b3b1a9e5", "claude", "", false, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	id, _ := s.CreateDispatch(store.Dispatch{
@@ -792,7 +792,7 @@ func TestSuperviseKeepsASuccessfulRunThatMerelyMentionsSomethingInUse(t *testing
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	s := newStore(t)
-	if err := s.BeginDispatch("execution", "o/r", 80, "ok1", false, time.Now()); err != nil {
+	if err := s.BeginDispatch("execution", "o/r", 80, "ok1", "claude", "", false, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	id, _ := s.CreateDispatch(store.Dispatch{

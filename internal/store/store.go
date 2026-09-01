@@ -48,6 +48,20 @@ CREATE TABLE IF NOT EXISTS issues (
   -- silently creates a new session under that id, losing the conversation
   -- without saying so. Empty means "recorded before this column existed".
   session_harness TEXT NOT NULL DEFAULT '',
+  -- dispatch_harness and dispatch_provider record what the loop most recently
+  -- ATTEMPTED, which is not the question session_harness answers.
+  -- session_harness is the harness that CREATED the session, so it stays empty
+  -- when a dispatch dies before the harness emits a session identifier -- which
+  -- is exactly what a misconfigured harness does. The retirement rule in
+  -- engine.configRetired reads "did the configuration change", and reading it
+  -- from session_harness would answer yes on every tick and redispatch forever
+  -- with no human in the loop. BeginDispatch stamps these BEFORE the agent
+  -- runs, so one configuration change buys exactly one retirement.
+  --
+  -- Empty means "recorded before this column existed", which the engine reads
+  -- as unknown rather than as a change.
+  dispatch_harness  TEXT NOT NULL DEFAULT '',
+  dispatch_provider TEXT NOT NULL DEFAULT '',
   parked          INTEGER NOT NULL DEFAULT 0,
   -- retry_after is Unix seconds, and 0 means "no deadline". It is an INTEGER
   -- where every other timestamp in this schema is a TIMESTAMP
@@ -382,6 +396,8 @@ var addedColumns = []struct{ table, column, def string }{
 	{"dispatches", "model", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "harness", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "effort", "TEXT NOT NULL DEFAULT ''"},
+	{"issues", "dispatch_harness", "TEXT NOT NULL DEFAULT ''"},
+	{"issues", "dispatch_provider", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // backfillSessionHarness fills issues.session_harness for rows whose session was
@@ -525,7 +541,8 @@ func hasColumn(q querier, table, column string) (bool, error) {
 func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 	rows, err := s.db.Query(`
 		SELECT number, session_id, worktree_path, retry_count, last_retry_tick,
-		       needs_retry, session_started, session_harness, parked, retry_after,
+		       needs_retry, session_started, session_harness,
+		       dispatch_harness, dispatch_provider, parked, retry_after,
 		       stopped, stopped_reason, updated_at
 		FROM issues WHERE project_id = ? AND loop = ? AND repo = ?`,
 		s.projectID, loop, repo)
@@ -540,7 +557,8 @@ func (s *Store) IssueStates(loop, repo string) (map[int]IssueState, error) {
 		var retryAfter int64
 		if err := rows.Scan(&st.Number, &st.SessionID, &st.WorktreePath,
 			&st.RetryCount, &st.LastRetryTick, &st.NeedsRetry, &st.SessionStarted,
-			&st.SessionHarness, &st.Parked, &retryAfter, &st.Stopped, &st.StoppedReason,
+			&st.SessionHarness, &st.DispatchHarness, &st.DispatchProvider,
+			&st.Parked, &retryAfter, &st.Stopped, &st.StoppedReason,
 			&st.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan issue: %w", err)
 		}
@@ -569,6 +587,13 @@ func retryAfterTime(sec int64) time.Time {
 }
 
 // PutIssueState inserts or replaces one issue record.
+//
+// It reads dispatch_harness and dispatch_provider back but never writes them,
+// for the reason it never writes stopped: its one remaining caller is the park
+// path, a read-modify-write over state read before the dispatch that stamped
+// those columns. BeginDispatch is their only writer, and a stale value written
+// back here would report a configuration change that had already been acted
+// on -- which is a retirement the engine would grant again on the next tick.
 func (s *Store) PutIssueState(st IssueState) error {
 	if st.UpdatedAt.IsZero() {
 		st.UpdatedAt = time.Now().UTC()
@@ -780,7 +805,14 @@ func (s *Store) ClearStopped(loop, repo string, number int, now time.Time) (bool
 // (retry_count + 1) rather than incremented from a value read before the gap,
 // for the same reason. A human trigger begins a new episode, so it resets the
 // budget and drops any deadline left over from the previous one.
-func (s *Store) BeginDispatch(loop, repo string, number int, sessionID string, retry bool, now time.Time) error {
+// The harness and provider arguments are the configuration this dispatch is
+// about to run, stamped BEFORE the agent starts. engine.configRetired compares
+// them against what the NEXT dispatch would use to decide whether the issue's
+// accumulated failures still describe the configuration in play. Stamping them
+// here, rather than when a run reports its session, is what makes a retirement
+// terminate: a dispatch that dies before the harness says anything still
+// records what it tried.
+func (s *Store) BeginDispatch(loop, repo string, number int, sessionID, harness, provider string, retry bool, now time.Time) error {
 	// A retry deliberately leaves retry_after alone: MarkNeedsRetry is the only
 	// writer of a non-zero deadline, and a deadline stamped before the agent
 	// runs would be overwritten by the failure that follows, collapsing the
@@ -791,15 +823,18 @@ func (s *Store) BeginDispatch(loop, repo string, number int, sessionID string, r
 	}
 	_, err := s.db.Exec(`
 		INSERT INTO issues (project_id, loop, repo, number, session_id,
+		                    dispatch_harness, dispatch_provider,
 		                    needs_retry, parked, retry_count, updated_at)
-		VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
 		ON CONFLICT(project_id, loop, repo, number) DO UPDATE SET
-		  session_id  = excluded.session_id,
-		  needs_retry = 0,
-		  parked      = 0,
+		  session_id        = excluded.session_id,
+		  dispatch_harness  = excluded.dispatch_harness,
+		  dispatch_provider = excluded.dispatch_provider,
+		  needs_retry       = 0,
+		  parked            = 0,
 		  `+update+`,
-		  updated_at  = excluded.updated_at`,
-		s.projectID, loop, repo, number, sessionID, count, now.UTC())
+		  updated_at        = excluded.updated_at`,
+		s.projectID, loop, repo, number, sessionID, harness, provider, count, now.UTC())
 	if err != nil {
 		return fmt.Errorf("begin dispatch: %w", err)
 	}

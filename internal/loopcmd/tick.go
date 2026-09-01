@@ -552,7 +552,19 @@ func dispatch(
 	// costs a rebuild and buys nothing.
 	isRetry := d.Kind == engine.KindRetryStart || d.Kind == engine.KindRetryResume
 	if kind != store.KindTend {
-		if err := deps.Store.BeginDispatch(cfg.Name, cfg.Repo, d.Issue, sessionID, isRetry, now); err != nil {
+		// The stamps are the EFFECTIVE configuration, not the override alone.
+		// dispatches.model and dispatches.harness record only the label and are
+		// empty whenever the loop default was used -- an ambiguity the
+		// retirement rule cannot carry, because "empty" there would mean both
+		// "claude, by default" and "not recorded".
+		harness := runner.Effective(cfg, d.Overrides).Harness
+		if harness == "" {
+			harness = config.HarnessClaude
+		}
+		// The provider is resolved by the engine's caller and travels on the
+		// decision; it is wired in with engine.Decision.Provider.
+		if err := deps.Store.BeginDispatch(cfg.Name, cfg.Repo, d.Issue, sessionID,
+			harness, "", isRetry, now); err != nil {
 			return err
 		}
 	}
