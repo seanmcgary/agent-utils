@@ -1169,3 +1169,108 @@ func TestForcedTickDoesNotTripTheBreaker(t *testing.T) {
 		t.Errorf("decisions = %v, want both retries and the start", kinds(p))
 	}
 }
+
+// The incident this exists for: three pi dispatches failed on an OpenRouter
+// 402, the cap parked the issue, and the operator removed harness:pi to fall
+// back to the configured claude default. The re-applied trigger label must
+// dispatch, not meet the cap a second time.
+func TestHarnessChangeRetiresTheRetryCap(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {
+			SessionID:       "sess-1",
+			SessionStarted:  true,
+			SessionHarness:  config.HarnessPi,
+			DispatchHarness: config.HarnessPi,
+			NeedsRetry:      true,
+			RetryCount:      3,
+		},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+
+	if got := kinds(p); len(got) != 1 || got[0] != KindStart {
+		t.Fatalf("kinds = %v, want [%v]", got, KindStart)
+	}
+	if p.Decisions[0].SessionID != "" {
+		t.Errorf("SessionID = %q, want empty: a new harness must mint its own",
+			p.Decisions[0].SessionID)
+	}
+	if !strings.Contains(p.Decisions[0].Reason, "retiring") {
+		t.Errorf("Reason = %q, want it to say the history was retired", p.Decisions[0].Reason)
+	}
+}
+
+// The backoff window goes with the cap. A wait sized to let pi's provider
+// recover buys nothing once claude is the one running.
+func TestHarnessChangeSkipsTheBackoffWindow(t *testing.T) {
+	cfg := testConfig()
+	now := time.Now()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {
+			SessionStarted:  true,
+			DispatchHarness: config.HarnessPi,
+			NeedsRetry:      true,
+			RetryCount:      1,
+			RetryAfter:      now.Add(30 * time.Minute),
+		},
+	}}
+
+	p := Decide(cfg, snap, st, now)
+
+	if got := kinds(p); len(got) != 1 || got[0] != KindStart {
+		t.Fatalf("kinds = %v, want [%v]", got, KindStart)
+	}
+}
+
+// A retirement is a human reconfiguring the loop, not a platform fault, so it
+// must not push the circuit breaker toward its threshold and drop every other
+// issue's dispatch for the cooldown.
+func TestHarnessChangeDoesNotCountTowardTheBreaker(t *testing.T) {
+	cfg := testConfig()
+	cfg.Retry.Breaker.OrphanThreshold = 1
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {SessionStarted: true, DispatchHarness: config.HarnessPi, NeedsRetry: true, RetryCount: 3},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+
+	if p.BreakerTripped {
+		t.Error("BreakerTripped = true, want false for a retirement")
+	}
+}
+
+// Unknown is not a change. Rows written before dispatch_harness existed all
+// have an empty value, and retiring on that would wipe the retry budget of
+// every failing issue the moment this version is installed.
+func TestUnknownDispatchHarnessDoesNotRetire(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {SessionStarted: true, DispatchHarness: "", NeedsRetry: true, RetryCount: 3},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+
+	if got := kinds(p); len(got) != 1 || got[0] != KindParkRetryExhausted {
+		t.Fatalf("kinds = %v, want [%v]", got, KindParkRetryExhausted)
+	}
+}
+
+// The same harness failing again is the case the cap was written for.
+func TestSameHarnessStillParksAtTheCap(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	st := State{Issues: map[int]store.IssueState{
+		1: {SessionStarted: true, DispatchHarness: config.HarnessClaude, NeedsRetry: true, RetryCount: 3},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+
+	if got := kinds(p); len(got) != 1 || got[0] != KindParkRetryExhausted {
+		t.Fatalf("kinds = %v, want [%v]", got, KindParkRetryExhausted)
+	}
+}
