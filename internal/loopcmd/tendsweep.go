@@ -62,6 +62,19 @@ const maxTendPerSweep = 10
 //  3. It only considers pull requests targeting the branch that actually moved.
 //  4. It dispatches at most maxTendPerSweep of them.
 //
+// This is also why review activity is deliberately NOT read here, unlike
+// tickIssue and Tick. Property 1 states the sweep's subject: everything that
+// arms it names the loop's default branch moving. Review activity is not
+// that subject -- a merge to master must not dispatch agents at pull requests
+// that are current and merely carry comments -- so adding the read here would
+// break property 1 the same way a fifth trigger with no branch of its own
+// would. Review activity does not need this sweep anyway:
+// pull_request_review and pull_request_review_comment are both in
+// ghub.HookEvents, so a review already produces its own delivery that reaches
+// tickIssue directly, and Tick's cron sweep is that fast path's safety net.
+// Keeping the read out of here also keeps this sweep's GitHub cost where it
+// is -- one BehindBy per review issue, not two.
+//
 // Decisions come from engine.Decide, the same function the full tick calls. A
 // scoped copy of the veto, live-dispatch and link rules would be a second
 // implementation free to drift; see tickIssue, which states the same rule.
@@ -307,7 +320,7 @@ func tendDispatch(
 		// naming only the dispatches reads as "nothing happened".
 		slog.Warn("tend sweep hit its per-sweep cap; the rest wait for the next sweep",
 			"loop", cfg.Name, "dispatched", sum.Tended, "rebased", sum.Rebased,
-			"deferred", deferred)
+			"backoff", sum.Backoff, "deferred", deferred)
 	}
 
 	// Recorded like any other tick -- including on the breaker path, where Tick

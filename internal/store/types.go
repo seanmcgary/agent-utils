@@ -158,6 +158,16 @@ type Dispatch struct {
 	// sets a provider, it is derived from whichever model is in play. Empty
 	// means claude, or a resolution that failed.
 	Provider string
+	// ReviewPending carries engine.Decision.ReviewPending to the detached
+	// runner, which never sees the tick's Decision or Snapshot. It travels
+	// here rather than on pr_links because every PutPRLink call site runs
+	// BEFORE engine.Decide produces a ReviewPending value, and because
+	// PutPRLink's upsert rewrites every column -- so a tend sweep armed by any
+	// merge, which deliberately never sets this, would overwrite a set flag
+	// with a zero in the window between the decision and the runner reading
+	// the row. The dispatch row is written once, from the decision, by the
+	// code that made it, exactly like Model, Harness, and Effort above.
+	ReviewPending bool
 }
 
 // RunnerID is the dispatch identifier the runner process actually carries.
@@ -200,6 +210,30 @@ type PRLink struct {
 	// renders it, so it must survive into the detached runner, which never sees
 	// the tick's snapshot.
 	BehindBy int
+}
+
+// TendConflict is the backoff state for one pull request's repeated rebase
+// conflict. One row exists per pull request, never per fingerprint: a new
+// fingerprint replaces the row entirely, so it cannot inherit an old
+// conflict's count or deadline.
+type TendConflict struct {
+	ProjectID string
+	Loop      string
+	Repo      string
+	PRNumber  int
+	// Fingerprint is the SHA-256 (hex) of the head commit the rebase was
+	// attempted from and the sorted list of conflicted paths. A changed
+	// fingerprint means this is a different conflict, not a repeat.
+	Fingerprint string
+	// SeenCount counts agent DISPATCHES that met this fingerprint, never
+	// passes that merely observed it. A sweep is armed by every merge and
+	// every push, so a pass that only looks would inflate this count far
+	// faster than any human or agent action on the branch.
+	SeenCount   int
+	FirstSeenAt time.Time
+	LastSeenAt  time.Time
+	// RetryAfter is Unix-seconds-precision; the zero value means no deadline.
+	RetryAfter time.Time
 }
 
 // Tick is one recorded reconcile pass. The importer carries these across, so

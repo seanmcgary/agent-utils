@@ -19,6 +19,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
 	"github.com/seanmcgary/agent-utils/internal/migrate"
 	"github.com/seanmcgary/agent-utils/internal/registry"
+	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/version"
 	"github.com/urfave/cli/v3"
@@ -794,6 +795,16 @@ func logsCommand() *cli.Command {
 			if err != nil {
 				return err
 			}
+			// Re-resolve the harness from the DISPATCH once one is selected.
+			// opts.Harness above is only cfg.Agent.Harness, which is the
+			// harness the loop runs by default and not necessarily the one
+			// that wrote this file: a tend: section or a harness: label can
+			// send one dispatch to the other agent. The renderer picks the
+			// stream shape from this value (internal/loopcmd/logs.go), so a
+			// stale answer feeds a pi transcript to the claude renderer and
+			// prints nothing useful about a run that worked. This is the same
+			// resolution `sessions list` and `session describe` already do.
+			opts.Harness = runner.Effective(cfg, d.Kind, config.Overrides{Harness: d.Harness}).Harness
 			logPath := loopcmd.LogPathFor(cfg, d, stream)
 			if c.Bool("path") {
 				fmt.Println(logPath)

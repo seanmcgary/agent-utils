@@ -70,6 +70,11 @@ func (c *countingGH) BehindBy(context.Context, string, string, string, string) (
 	return 0, nil
 }
 
+func (c *countingGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
+	c.calls++
+	return time.Time{}, nil
+}
+
 func (c *countingGH) PostComment(context.Context, string, string, int, string) error {
 	c.calls++
 	return nil
@@ -284,6 +289,15 @@ func TestTendCheckDeletesARowWhosePullRequestIsClosed(t *testing.T) {
 	}
 	deps := tendCheckDeps(t, gh, map[string]int{"feat/merged": 4})
 	seedPRLink(t, deps, 7, 9, "feat/merged", "master")
+	// The conflict row follows the pull request out. If TendCheck deletes the
+	// pr_links row and leaves this one behind, the backoff on pull request 9
+	// would outlive the pull request itself.
+	if err := deps.Store.PutTendConflict(store.TendConflict{
+		Loop: tendCheckLoop, Repo: "o/r", PRNumber: 9, Fingerprint: "x",
+		SeenCount: 1, FirstSeenAt: time.Now(), LastSeenAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := TendCheck(context.Background(), tendCheckConfig(t), deps, true); err != nil {
 		t.Fatal(err)
@@ -294,6 +308,11 @@ func TestTendCheckDeletesARowWhosePullRequestIsClosed(t *testing.T) {
 	}
 	if _, ok := links[7]; ok {
 		t.Error("the row for a closed pull request was not deleted")
+	}
+	if _, ok, err := deps.Store.TendConflict(tendCheckLoop, "o/r", 9); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Error("the tend conflict row for a closed pull request was not deleted")
 	}
 }
 

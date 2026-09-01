@@ -43,10 +43,14 @@ func resolveProviders(ctx context.Context, cfg *config.Config, issues []ghub.Iss
 		if err != nil {
 			continue
 		}
-		if engine.EffectiveHarness(cfg, ov) != config.HarnessPi {
+		// store.KindStart: this resolves the provider for the issue's OWN
+		// dispatch, which is a start or a resume. A tend never reaches here --
+		// it carries no retry history to retire -- so the tend: section must
+		// not colour the answer.
+		if engine.EffectiveHarness(cfg, store.KindStart, ov) != config.HarnessPi {
 			continue
 		}
-		model := runner.Effective(cfg, ov).Model
+		model := runner.Effective(cfg, store.KindStart, ov).Model
 		if model == "" {
 			continue
 		}
@@ -172,7 +176,12 @@ type Summary struct {
 	// Rebased counts the pull requests git replayed with no agent. It is
 	// separate from Tended so a sweep's line says which of the two happened:
 	// how many rebases cost nothing, and how many needed an agent.
-	Rebased  int `json:"rebased"`
+	Rebased int `json:"rebased"`
+	// Backoff counts a KindTend decision that met a conflict already known to
+	// have defeated the agent, within its backoff window, and dispatched
+	// nothing. Separate from Rebased and Tended so an operator auditing the
+	// summary can tell a declined repeat from a completed one.
+	Backoff  int `json:"backoff"`
 	Promoted int `json:"promoted"`
 	Parked   int `json:"parked"`
 	// Stopped counts KindStop decisions applied this tick: an operator's
@@ -221,13 +230,39 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 		return sum, err
 	}
 
-	snap := engine.Snapshot{Issues: issues, BehindBy: map[int]int{}}
+	snap := engine.Snapshot{Issues: issues, BehindBy: map[int]int{}, ReviewedAt: map[int]time.Time{}}
+	lastTend := map[int]time.Time{}
 	if cfg.TendPR && fetchOK {
 		prs, err := deps.GH.ListOpenPullRequests(ctx, owner, repo)
 		if err != nil {
 			return sum, err
 		}
 		snap.PRs = prs
+
+		// One query for every pull request this tick might tend, not one per
+		// row: LastTendByPR groups by pull request so a pass deciding many
+		// issues issues one query.
+		//
+		// lastTendOK is what makes a failed read fail CLOSED, and it is
+		// load-bearing. An unset lastTend entry reads as the zero time, and
+		// any review activity at all is After(zero) -- so leaving the map
+		// empty and still reading review activity would mark EVERY
+		// review-labelled pull request in the repository as review-pending
+		// and answer one broken store read with a burst of agent dispatches.
+		// That is the opposite of what this whole change exists to do. So a
+		// failed read suppresses the review trigger for this tick entirely:
+		// the pull requests are judged on staleness alone, which is exactly
+		// the behaviour this loop had before the trigger existed. It also
+		// spends no GitHub call on an answer that could not be used.
+		lastTendOK := true
+		if m, err := deps.Store.LastTendByPR(cfg.Name, cfg.Repo); err != nil {
+			lastTendOK = false
+			slog.Warn("read last tend times; judging every pull request on staleness alone",
+				"loop", cfg.Name, "err", err)
+		} else {
+			lastTend = m
+		}
+
 		for _, iss := range issues {
 			if !iss.HasLabel(cfg.Labels.Review) {
 				continue
@@ -249,8 +284,31 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 			if err := deps.Store.PutPRLink(store.PRLink{
 				Loop: cfg.Name, Repo: cfg.Repo, Number: iss.Number,
 				PRNumber: pr.Number, HeadRef: pr.HeadRef, BaseRef: pr.BaseRef,
+				// The real count, not the zero this used to write. PutPRLink
+				// rewrites every column, so leaving it unset here overwrote
+				// whatever the tend sweep had recorded -- and RunAgent renders
+				// this value into the tend prompt, which tells the agent how
+				// far behind the branch is. A zero there tells it the opposite
+				// of why it was dispatched.
+				BehindBy: behind,
 			}); err != nil {
 				slog.Error("store pr link", "loop", cfg.Name, "issue", iss.Number, "err", err)
+			}
+
+			// The review trigger fails CLOSED: a failed read leaves the entry
+			// unset, so tendDecisions judges this pull request on staleness
+			// alone rather than treating "unknown" as "pending". Asked only
+			// for a candidate already accepted above -- labels.review and a
+			// LinkPR-trusted pull request -- so a pass with no candidates
+			// costs nothing. See tendsweep.go and tendcheck.go for why this
+			// read is deliberately absent from both of those passes.
+			if lastTendOK {
+				if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
+					slog.Warn("read review activity; judging this pull request on staleness alone",
+						"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
+				} else if !activity.IsZero() {
+					snap.ReviewedAt[pr.Number] = activity
+				}
 			}
 		}
 	}
@@ -274,6 +332,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	st := engine.State{
 		Issues: states, Running: live, CooldownUntil: time.Time{}, Force: deps.Force,
 		Providers: resolveProviders(ctx, cfg, snap.Issues),
+		LastTend:  lastTend,
 	}
 	sum.Live = len(live)
 	sum.Forced = deps.Force
@@ -305,12 +364,44 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 			"loop", cfg.Name, "cooldown_until", plan.CooldownUntil)
 	}
 
+	// The same per-pass ceiling TendSweep applies, and for the same reason:
+	// this is what ONE trigger may do to the remote and to the token budget.
+	// TendSweep bounded itself from the start; the full tick did not need to,
+	// because a tend decision required a pull request to be BEHIND its base and
+	// a cron sweep found at most a handful. The review-activity trigger removes
+	// that natural bound -- every review-labelled pull request carrying an
+	// unanswered trusted comment is now a candidate, and on the FIRST tick after
+	// this feature is installed every one of them qualifies at once, because no
+	// pull request has a finished tend row yet. Without a cap that upgrade
+	// dispatches an agent per open review pull request in one pass.
+	//
+	// Only TEND decisions are capped. A start, a resume, a retry, a park and a
+	// stop are all bounded by the labels a human applied, and dropping one would
+	// strand the issue rather than delay a rebase.
+	tends := 0
+	var deferred []int
 	for _, d := range plan.Decisions {
+		if d.Kind == engine.KindTend {
+			if tends >= maxTendPerSweep {
+				deferred = append(deferred, d.Issue)
+				continue
+			}
+			tends++
+		}
 		if err := act(ctx, cfg, deps, d, now, &sum); err != nil {
 			// One failed decision must not abandon the rest of the tick.
 			slog.Error("decision failed", "loop", cfg.Name, "kind", d.Kind,
 				"issue", d.Issue, "err", err)
 		}
+	}
+	if len(deferred) > 0 {
+		// Never silent, and the issues are NAMED rather than counted: a capped
+		// pass that said nothing would read as "every stale pull request was
+		// tended", which is the opposite of the truth. TendSweep's own cap
+		// warning states the same rule.
+		slog.Warn("tick hit the per-pass tend cap; the rest wait for the next tick",
+			"loop", cfg.Name, "tended", sum.Tended, "rebased", sum.Rebased,
+			"deferred", deferred)
 	}
 
 	// The backstop. A webhook delivery can be missed -- the daemon down, the
@@ -524,21 +615,52 @@ func act(
 		// conflicts. gitRebase reports whether it settled the decision --
 		// including the case where it settled it by declining to act, which is
 		// what a refused lease means.
-		switch outcome, err := gitRebase(ctx, cfg, deps, d); {
-		case err != nil:
+		outcome, pendingConflict, rebaseErr := gitRebase(ctx, cfg, deps, d, now)
+		switch {
+		case rebaseErr != nil:
 			// Logged, not returned: a git failure must not abandon the rest of
 			// the sweep, and the agent is the fallback this whole path is
 			// built around.
 			slog.Warn("automatic rebase failed; falling back to the tend agent",
-				"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
+				"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", rebaseErr)
 		case outcome == doneRebased:
+			// Count the rebase first, so the summary still reports it. Then
+			// fall through to the dispatch ONLY when review feedback is still
+			// unanswered: the rebase settled the staleness half of the
+			// decision, not the review half.
 			sum.Rebased++
-			return nil
+			if !d.ReviewPending {
+				return nil
+			}
 		case outcome == doneNoRebase:
-			// Settled by declining to act. No agent, and nothing counted.
+			// Settled by declining to act. No agent, and nothing counted. The
+			// branch this pass reasoned about is gone -- see gitRebase's doc
+			// comment -- so an agent sent at it now would work from a stale
+			// premise whatever the feedback says.
+			return nil
+		case outcome == doneBackedOff:
+			// gitRebase already declined to back off a ReviewPending decision
+			// -- that check is INSIDE the backoff, not here -- so a
+			// doneBackedOff reaching this point always has no feedback to
+			// answer. No special case belongs here: adding one back would
+			// double-dispatch the agent gitRebase already counted as backed
+			// off.
+			sum.Backoff++
 			return nil
 		}
-		return count(&sum.Tended, dispatch(ctx, cfg, deps, d, now, store.KindTend))
+		// The conflict sighting is committed only once the agent is really
+		// dispatched. dispatch can still fail after this point -- a worktree it
+		// cannot build, a spawn that will not start -- and no agent runs then,
+		// so counting it would let a repeating worktree or spawn failure walk a
+		// pull request to the 24h tier without the agent having seen the
+		// conflict once. That is the same failure the failed-abort path inside
+		// gitRebase refuses to cause, reached by a different route, so it gets
+		// the same answer: seen_count counts agent dispatches that HAPPENED.
+		err := dispatch(ctx, cfg, deps, d, now, store.KindTend)
+		if err == nil {
+			recordConflictDispatch(cfg, deps, d, pendingConflict)
+		}
+		return count(&sum.Tended, err)
 	case engine.KindResume:
 		return count(&sum.Resumed, dispatch(ctx, cfg, deps, d, now, store.KindResume))
 	case engine.KindRetryResume:
@@ -601,7 +723,7 @@ func dispatch(
 		// empty whenever the loop default was used -- an ambiguity the
 		// retirement rule cannot carry, because "empty" there would mean both
 		// "claude, by default" and "not recorded".
-		harness := runner.Effective(cfg, d.Overrides).Harness
+		harness := runner.Effective(cfg, kind, d.Overrides).Harness
 		if harness == "" {
 			harness = config.HarnessClaude
 		}
@@ -626,6 +748,9 @@ func dispatch(
 		// provider. It is the resolved value the engine compared, carried here
 		// so a park comment can name the account that actually failed.
 		Provider: d.Provider,
+		// ReviewPending travels here, not on pr_links: see
+		// store.Dispatch.ReviewPending for why.
+		ReviewPending: d.ReviewPending,
 	})
 	if err != nil {
 		return err
@@ -920,6 +1045,10 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 			// to make no push when the branch is current. Leaving it zero told
 			// every tend agent the opposite of why it was dispatched.
 			BehindBy: pr.BehindBy,
+			// From the DISPATCH row, not the pr_links row: the tick's
+			// Decision never reaches this detached process, and pr_links was
+			// rejected as a transport -- see store.Dispatch.ReviewPending.
+			ReviewPending: d.ReviewPending,
 		},
 		Labels: runner.PromptLabels{
 			Trigger:  cfg.Labels.Trigger,
@@ -947,6 +1076,11 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		runner.Invocation{
 			SessionID: d.SessionID, Prompt: prompt, Resume: resume,
 			Overrides: config.Overrides{Model: d.Model, Harness: d.Harness, Effort: d.Effort},
+			// Kind selects the tend: layer in runner.Effective. It comes from
+			// the dispatch row, the same source as Overrides above: this
+			// detached process never saw the tick's decision, only what tick.go
+			// wrote to the row before spawning it.
+			Kind: d.Kind,
 		},
 		workDir, d.LogPath)
 }

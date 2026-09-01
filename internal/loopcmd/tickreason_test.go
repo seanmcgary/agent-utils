@@ -158,7 +158,7 @@ func TestTickIssueLogsWhyItDecidedNothing(t *testing.T) {
 		},
 		{
 			name: "the pull request is current",
-			want: "the linked pull request is already up to date",
+			want: "the linked pull request is up to date with its base and carries no review activity since the last tend",
 			setup: func(t *testing.T, cfg *config.Config, gh *fakeGH, deps Deps) {
 				cfg.TendPR = true
 				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}

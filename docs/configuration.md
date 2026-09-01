@@ -167,6 +167,7 @@ absolute path** — it depends on no working directory and can never prompt.
 - [`labels`](#labels)
 - [Agent overrides from labels](#agent-overrides-from-labels)
 - [`agent`](#agent)
+- [`tend`](#tend)
 - [`tend_pr`](#tend_pr)
 - [`retry`](#retry)
 - [Prompts](#prompts)
@@ -197,6 +198,9 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.max_budget_usd` | number | no | `0`, meaning no limit |
 | `agent.background_tasks` | bool | no | `false` |
 | `agent.timeout` | duration | yes | — |
+| `tend.harness` | enum | no | falls back to `agent.harness` |
+| `tend.model` | string | no | falls back to `agent.model` |
+| `tend.effort` | enum | no | falls back to `agent.effort` |
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
 | `tend_pr` | bool | no | `false` |
 | `cleanup_closed_pr` | bool | no | `true` |
@@ -732,6 +736,90 @@ request population you trust.
 i_understand_bypass_permissions: true
 ```
 
+## `tend`
+
+Per-kind overrides for a tend dispatch: which harness runs it, on which model, at what effort.
+Optional; omit the whole section and every tend runs with `agent`'s settings, unchanged.
+
+It carries ONLY these three fields, on purpose. A tend agent's job — replay a rebase, or answer
+review feedback — is smaller than the job the trigger dispatch does, so a cheaper model is
+often enough for it; `tend:` exists to let that one choice diverge without repeating every other
+`agent` field (`permission_mode`, `worktree`, `max_budget_usd`, `timeout`,
+`background_tasks`) and inventing a second place to set them. Those keep coming from `agent:`
+for every dispatch, tend included.
+
+### `tend.harness` — optional
+
+| Value | Agent run |
+|---|---|
+| (empty) | Falls back to `agent.harness`. Default. |
+| `claude` | Runs `claude -p` for the tend dispatch, whatever `agent.harness` is. |
+| `pi` | Runs `pi -p --mode json` for the tend dispatch, whatever `agent.harness` is. |
+
+```yaml
+tend:
+  harness: claude
+```
+
+**Setting `tend.harness: pi` almost always means setting `tend.model` too.** The two fields fall
+back independently, so `tend.harness: pi` on its own leaves the tend running pi against
+`agent.model` — a claude alias like `opus`, which pi cannot resolve. Nothing rejects the pair at
+load time (the model is free text for both harnesses, exactly as `agent.model` is), so the
+mismatch surfaces as a failed dispatch. Give pi a `provider/id`:
+
+```yaml
+tend:
+  harness: pi
+  model: anthropic/claude-haiku-4-5
+```
+
+**Changing the harness starts a new session; it never resumes the issue's.** A session belongs
+to the harness that minted it, and pi does not refuse a session id it has never seen — it starts
+a fresh session under it and carries on, so resuming across harnesses would lose the earlier
+conversation silently rather than fail loudly. When the tend's effective harness (`tend.harness`,
+or `agent.harness` when that is empty) differs from the harness that started the issue's session
+— or the issue has no started session yet — the tend gets a fresh session instead of the issue's.
+A `harness:` label on the issue is resolved into this comparison too: it beats `tend.harness` the
+same way it beats `agent.harness` (see [Precedence](#precedence) below), so a tend running under
+a label override is compared against ITS effective harness, not the configured one.
+
+### `tend.model` — optional
+
+Passed straight through as `--model`, exactly like `agent.model`. Falls back to `agent.model`
+when empty.
+
+```yaml
+tend:
+  model: sonnet
+```
+
+### `tend.effort` — optional
+
+Passed as `--effort`, exactly like `agent.effort`. One of `low`, `medium`, `high`, `xhigh`,
+`max`. Falls back to `agent.effort` when empty. An invalid value fails the config load rather
+than the dispatch, the same as `agent.effort`.
+
+```yaml
+tend:
+  effort: low
+```
+
+### Precedence
+
+Every field a tend dispatch resolves passes through three layers, each replacing only what the
+layer before it set:
+
+1. **`agent:`** — the loop's default for every dispatch, tend included.
+2. **`tend:`** — overlaid only when the dispatch is a tend, and only its NON-EMPTY fields; a
+   `tend:` section that sets only `tend.model` leaves `tend.harness` and `tend.effort` falling
+   through to `agent.harness` and `agent.effort`, exactly as an absent `agent` field falls
+   through to claude's own default.
+3. **A label on the issue** (`harness:`, `model:`, `effort:`) — wins over both of the above.
+
+The label wins because `tend:` is a default for a whole CLASS of dispatch, while a label is an
+instruction about one issue — the same reasoning that already lets a label override `agent:`.
+See [Agent overrides from labels](#agent-overrides-from-labels).
+
 ## `cleanup_closed_pr`
 
 Whether a closed pull request's worktrees are removed. Default `true`.
@@ -850,7 +938,53 @@ branch itself to fold its fixes in, so a tend agent rebasing the same branch wou
 review's own force-push. A review loop hands the pull request back by applying the label the
 EXECUTION loop tends on, which is what puts tending back in one place.
 
-Version 1 rebases only. It does not reply to review feedback.
+**Two things trigger a tend, and either alone is enough.** The pull request is behind its base —
+the trigger this section led with — or review activity on it is newer than the last *finished*
+tend dispatch (a still-running tend is not counted twice: an issue with a live agent is never
+tended, per the safeguard above, so no second decision is produced while one runs). When both are
+true, the decision names both. A failed tend still counts as the last one: nothing here retries a
+crashed tend agent on its own, only the next qualifying trigger does.
+
+**Only a trusted reviewer's activity counts, and the loop's own comments never do.** A review or
+review comment counts only when its author's association with the repository is `OWNER`,
+`MEMBER`, or `COLLABORATOR` — the same bar a pull request itself must clear before tending
+trusts it at all. Activity written by the loop's own GitHub account is excluded outright,
+regardless of association: without that exclusion, a `tend_prompt` that has the agent post a
+reply would make its own comment newer than the dispatch that produced it, and every later pass
+would see pending review activity and dispatch again — an unattended loop billing itself to
+answer itself, forever.
+
+**The periodic tend check still triggers on staleness alone.** It reads local git refs, and
+nothing in a local checkout records who reviewed what, so it cannot cheaply ask "is there new
+review activity" the way it cheaply asks "is this behind." Review activity instead reaches a
+loop through its own GitHub webhook delivery: a `pull_request_review` or
+`pull_request_review_comment` delivery for a pull request tends its linked issue directly, the
+same way any delivery naming an issue already does. `agent-utils project loop tick`'s full
+reconcile catches it too, since it reads GitHub state rather than local refs.
+
+**Replying to review feedback needs a `tend_prompt` that branches on `{{.PR.ReviewPending}}`.**
+The shipped `tend_prompt` is a pure rebase instruction, and stays correct even for a
+review-triggered tend: a dispatch carrying `ReviewPending` still rebases first when it is also
+behind, and a template that never reads `{{.PR.ReviewPending}}` behaves exactly as before. To
+have the tend agent read and answer unresolved review threads, branch the prompt on that
+variable — see the commented-out example in `examples/execution.yaml`.
+
+**A rebase that keeps conflicting the same way backs off, rather than paying for another agent
+turn on it.** A conflict is fingerprinted by its conflicted paths together with the branch's
+HEAD commit — deliberately not the base: a tend sweep is armed by the base moving, so the base
+differs on every sweep by construction, and a fingerprint carrying it would suppress nothing.
+The wait after the 1st, 2nd, and 3rd-or-later agent dispatch that met one fingerprint is 1 hour,
+6 hours, and 24 hours; a pass that is still inside that window for the same fingerprint declines
+to dispatch the agent and writes nothing — a sweep can observe the same unresolved conflict many
+times an hour, and writing on every observation would push the wait forward faster than it ever
+elapses. A HEAD that moves, by an agent's push or a human's, is a different fingerprint, and the
+backoff starts over from the first sighting. One exception: a decision carrying `ReviewPending`
+is never backed off, because the backoff's evidence is a repeated rebase conflict and says
+nothing about whether a reviewer's comment has since been answered.
+
+The backoff needs `agent.worktree: per_issue`. The fingerprint is built from the conflicted
+paths, and those only exist in a worktree this program rebased itself, so a loop running
+`agent.worktree: none` hands the same conflict to the agent on every tick as before.
 
 ```yaml
 tend_pr: true
@@ -991,7 +1125,7 @@ rather than inside a detached process three hours later.
 |---|---|
 | `prompt` | An issue starts for the first time, or restarts because its previous attempt never created a session |
 | `resume_prompt` | An issue resumes an existing session |
-| `tend_prompt` | A stale pull request is rebased |
+| `tend_prompt` | A pull request is tended: it is behind its base, or it carries review activity newer than the last tend |
 
 `prompt` and `resume_prompt` are always required. `tend_prompt` is required only when
 `tend_pr` is true.
@@ -1026,6 +1160,7 @@ Available to all three prompts.
 | `{{.PR.HeadRef}}` | string | Tend dispatches only |
 | `{{.PR.BaseRef}}` | string | Tend dispatches only |
 | `{{.PR.BehindBy}}` | int | Commits the head lacks from the base |
+| `{{.PR.ReviewPending}}` | bool | Tend dispatches only; set when this tend was triggered, in whole or in part, by review activity newer than the last finished tend |
 | `{{.Labels.Trigger}}` | string | |
 | `{{.Labels.InFlight}}` | string | |
 | `{{.Labels.Blocked}}` | string | |
@@ -1046,6 +1181,8 @@ Beyond the required fields in the quick reference:
 | `repo` must contain exactly one `/`, both parts non-empty | `repo must be in owner/name form` |
 | `agent.worktree` ∈ {`per_issue`, `none`} | `agent.worktree must be …` |
 | `agent.effort` ∈ {`low`,`medium`,`high`,`xhigh`,`max`} or empty | `… is not a valid effort level` |
+| `tend.harness` ∈ {`claude`, `pi`} or empty | `tend.harness must be …` |
+| `tend.effort` ∈ {`low`,`medium`,`high`,`xhigh`,`max`} or empty | `… is not a valid effort level` |
 | `agent.permission_mode` is a real claude mode or empty | `… is not a valid claude permission mode` |
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
 | `agent.max_budget_usd` ≥ 0 (`0` means no cap) | `agent.max_budget_usd must not be negative` |

@@ -416,7 +416,10 @@ remains the reference for editing one by hand** — what each field means, what 
 what happens if you get it wrong. `examples/planning.yaml`, `examples/execution.yaml` and
 `examples/pr-review.yaml` are complete working files — the first two ported from the reference
 planning and execution orchestrators, the third a review loop that runs the strongest model over
-whatever the execution loop's produced, fixing what it finds rather than reporting it.
+whatever the execution loop's produced, fixing what it finds rather than reporting it. A tend
+dispatch — the automatic rebase-or-review-reply agent `tend_pr` arms — can run its own harness,
+model and effort instead of `agent`'s, cheaper by default since its job is smaller; see
+[`tend`](docs/configuration.md#tend) in the reference.
 
 A label on an issue can also override, for that issue alone, which model, harness, or effort
 level a dispatch uses: `model:<value>`, `harness:<value>`, `effort:<value>`. These are always
@@ -672,7 +675,10 @@ the check costs. The minimum is `1m`: each pass fetches and opens a database onc
 loop of every registered project, so a smaller value is a spin rather than a fast setting, and
 `config set` refuses one. Setting it to `0` disables the periodic check only — the merge
 trigger, the push trigger, and cron's full sweep all still reach the rebase path, so this does
-not turn tending off; `tend_pr: false` on the loop does that.
+not turn tending off; `tend_pr: false` on the loop does that. The periodic check still gates on
+staleness alone, whatever `tend_interval` is set to: review activity is not visible from a local
+checkout, so it reaches a loop only through its own `pull_request_review` or
+`pull_request_review_comment` webhook delivery, never through this timer.
 
 As it comes up, a foreground `listener start` prints the routing table it will use — every
 repository it will accept deliveries for, and the loops each one dispatches. This is the

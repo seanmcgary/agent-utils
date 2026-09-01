@@ -45,6 +45,16 @@ type TendCheckResult struct {
 //     function reports a count; it dispatches nothing and writes no issue
 //     state.
 //
+// No call to LatestReviewActivity belongs here either, for the same reason
+// property 2 exists: this function's whole contract is zero GitHub calls when
+// nothing is behind, and review activity is invisible to a local checkout --
+// there is no local ref that records who commented on a pull request. Adding
+// it here would either cost a request per candidate on every interval (paid
+// even when nothing is behind, breaking property 2) or require a second,
+// independent read of the same GitHub state tickIssue and Tick already cover.
+// It deletes a tend_conflicts row below, which is a store call, not a GitHub
+// call, and does not touch this contract.
+//
 // force runs the confirm step whether or not anything looks behind. The caller
 // sets it on the first pass after the daemon starts and every few hours after
 // that, because the gate can only skip the calls when it has rows to trust: a
@@ -168,6 +178,14 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 			slog.Error("could not delete a pr link whose pull request is closed",
 				"loop", cfg.Name, "issue", number, "pr", link.PRNumber, "err", err)
 			continue
+		}
+		// The conflict row follows the pull request out. It is a separate
+		// table and a separate call -- not part of the pr_links delete above
+		// -- so its own failure must not abandon the pr_links delete that
+		// already succeeded; log and continue exactly as that one does.
+		if err := deps.Store.DeleteTendConflict(cfg.Name, cfg.Repo, link.PRNumber); err != nil {
+			slog.Error("could not delete a tend conflict row whose pull request is closed",
+				"loop", cfg.Name, "issue", number, "pr", link.PRNumber, "err", err)
 		}
 		// Info, not Debug: nothing in this program logs at Debug, no handler is
 		// configured for it, and a row disappearing from the database is a state

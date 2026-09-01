@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
 func cfg() *config.Config {
@@ -155,6 +156,30 @@ func TestRenderPrompt(t *testing.T) {
 	}
 }
 
+// ReviewPending must reach the template so a tend_prompt can branch on
+// answering feedback versus a pure rebase. It comes from the dispatch row,
+// not from BehindBy's source; RenderPrompt only cares that PromptPR carries
+// it.
+func TestRenderPromptRendersReviewPending(t *testing.T) {
+	tmpl := "review pending: {{.PR.ReviewPending}}"
+
+	got, err := RenderPrompt(tmpl, PromptData{PR: PromptPR{Number: 20, ReviewPending: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "review pending: true" {
+		t.Errorf("got %q, want true", got)
+	}
+
+	got, err = RenderPrompt(tmpl, PromptData{PR: PromptPR{Number: 20, ReviewPending: false}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "review pending: false" {
+		t.Errorf("got %q, want false", got)
+	}
+}
+
 func TestRenderPromptRejectsUnknownField(t *testing.T) {
 	if _, err := RenderPrompt("{{.Nope}}", PromptData{}); err == nil {
 		t.Fatal("want an error for an unknown template field")
@@ -162,7 +187,7 @@ func TestRenderPromptRejectsUnknownField(t *testing.T) {
 }
 
 func TestEffectiveOverrideReplacesConfiguredValue(t *testing.T) {
-	s := Effective(cfg(), config.Overrides{Model: "claude-opus-5", Effort: "xhigh"})
+	s := Effective(cfg(), "", config.Overrides{Model: "claude-opus-5", Effort: "xhigh"})
 	if s.Model != "claude-opus-5" {
 		t.Errorf("Model = %q, want override", s.Model)
 	}
@@ -176,7 +201,7 @@ func TestEffectiveOverrideReplacesConfiguredValue(t *testing.T) {
 }
 
 func TestEffectiveUnsetOverrideKeepsConfiguredValue(t *testing.T) {
-	s := Effective(cfg(), config.Overrides{})
+	s := Effective(cfg(), "", config.Overrides{})
 	if s.Model != "opus" {
 		t.Errorf("Model = %q, want configured %q", s.Model, "opus")
 	}
@@ -187,7 +212,7 @@ func TestEffectiveUnsetOverrideKeepsConfiguredValue(t *testing.T) {
 
 func TestEffectiveNeverMutatesTheConfiguration(t *testing.T) {
 	c := cfg()
-	_ = Effective(c, config.Overrides{Model: "gpt-5", Harness: config.HarnessPi, Effort: "low"})
+	_ = Effective(c, "", config.Overrides{Model: "gpt-5", Harness: config.HarnessPi, Effort: "low"})
 	if c.Agent.Model != "opus" || c.Agent.Effort != "high" || c.Agent.Harness != "" {
 		t.Fatalf("Effective mutated cfg.Agent: %+v", c.Agent)
 	}
@@ -198,14 +223,14 @@ func TestEffectiveDropsAFlagShapedOverride(t *testing.T) {
 	// the tick wrote it, possibly under an older binary, and
 	// internal/store/legacy.go writes the dispatches table by a second path.
 	// Effective re-validates and drops anything that would not have parsed.
-	s := Effective(cfg(), config.Overrides{Model: "--dangerously-skip-permissions"})
+	s := Effective(cfg(), "", config.Overrides{Model: "--dangerously-skip-permissions"})
 	if s.Model != "opus" {
 		t.Errorf("Model = %q, want the configured value with the bad override dropped", s.Model)
 	}
 }
 
 func TestEffectiveDropsAnInvalidHarnessOverride(t *testing.T) {
-	s := Effective(cfg(), config.Overrides{Harness: "gpt"})
+	s := Effective(cfg(), "", config.Overrides{Harness: "gpt"})
 	if s.Harness != "" {
 		t.Errorf("Harness = %q, want the invalid override dropped", s.Harness)
 	}
@@ -221,7 +246,7 @@ func TestEffectiveDropsAnInvalidHarnessOverride(t *testing.T) {
 // and claudeEnv instead.
 func TestEffectiveUsesTheNormalisedHarnessValue(t *testing.T) {
 	c := &config.Config{Agent: config.Agent{Model: "opus"}}
-	s := Effective(c, config.Overrides{Harness: "PI"})
+	s := Effective(c, "", config.Overrides{Harness: "PI"})
 	if s.Harness != config.HarnessPi {
 		t.Errorf("Harness = %q, want the normalised lowercase %q", s.Harness, config.HarnessPi)
 	}
@@ -232,7 +257,7 @@ func TestEffectiveUsesTheNormalisedHarnessValue(t *testing.T) {
 // applied and PiBuildArgs simply emits neither flag.
 func TestEffectiveKeepsAPiOverrideOverTheClaudeOnlySettings(t *testing.T) {
 	c := cfg()
-	s := Effective(c, config.Overrides{Harness: config.HarnessPi})
+	s := Effective(c, "", config.Overrides{Harness: config.HarnessPi})
 	if s.Harness != config.HarnessPi {
 		t.Fatalf("Harness = %q, want %q: pi ignores what it does not implement",
 			s.Harness, config.HarnessPi)
@@ -263,5 +288,87 @@ func TestPiBuildArgsUsesTheEffectiveOverride(t *testing.T) {
 	}))
 	if !strings.Contains(j, "--model openai/gpt-5") {
 		t.Errorf("missing overridden model: %s", j)
+	}
+}
+
+// tendCfg is cfg() with a tend: section carrying only a model, the shape a
+// loop uses when it wants a cheaper model for tending and nothing else.
+func tendCfg() *config.Config {
+	c := cfg()
+	c.Tend = config.TendAgent{Model: "claude-haiku-4-5"}
+	return c
+}
+
+// KindTend prefers tend.model over agent.model.
+func TestEffectivePrefersTendModelForKindTend(t *testing.T) {
+	s := Effective(tendCfg(), store.KindTend, config.Overrides{})
+	if s.Model != "claude-haiku-4-5" {
+		t.Errorf("Model = %q, want tend.model", s.Model)
+	}
+}
+
+// An absent tend.model falls back to agent.model: the tend: overlay only
+// replaces the fields it sets, and this loop's tend: section sets only
+// tend.harness.
+func TestEffectiveFallsBackToAgentModelWhenTendModelIsEmpty(t *testing.T) {
+	c := cfg()
+	c.Tend = config.TendAgent{Harness: config.HarnessPi}
+	s := Effective(c, store.KindTend, config.Overrides{})
+	if s.Model != "opus" {
+		t.Errorf("Model = %q, want the configured agent.model %q", s.Model, "opus")
+	}
+	// The harness this loop DID set must still have been overlaid. Asserting
+	// only the fallback would pass just as well if the overlay never ran at
+	// all, which is the mutation this line exists to catch.
+	if s.Harness != config.HarnessPi {
+		t.Errorf("Harness = %q, want tend.harness %q", s.Harness, config.HarnessPi)
+	}
+}
+
+// The tend: overlay covers harness and effort, not only model. Each field is
+// asserted separately because each is its own branch in Effective: a suite
+// that checked only Model stayed green with the harness and effort branches
+// deleted, which would ship a claude binary and claude argv for a
+// "tend.harness: pi" tend and fail nowhere.
+func TestEffectiveOverlaysTendHarnessAndEffortForKindTend(t *testing.T) {
+	c := cfg()
+	c.Agent.Harness, c.Agent.Effort = config.HarnessClaude, "high"
+	c.Tend = config.TendAgent{Harness: config.HarnessPi, Effort: "low"}
+
+	s := Effective(c, store.KindTend, config.Overrides{})
+	if s.Harness != config.HarnessPi {
+		t.Errorf("Harness = %q, want tend.harness %q", s.Harness, config.HarnessPi)
+	}
+	if s.Effort != "low" {
+		t.Errorf("Effort = %q, want tend.effort %q", s.Effort, "low")
+	}
+
+	// The same config under a non-tend kind must read agent: for both.
+	s = Effective(c, store.KindStart, config.Overrides{})
+	if s.Harness != config.HarnessClaude {
+		t.Errorf("Harness = %q, want agent.harness %q for KindStart", s.Harness, config.HarnessClaude)
+	}
+	if s.Effort != "high" {
+		t.Errorf("Effort = %q, want agent.effort %q for KindStart", s.Effort, "high")
+	}
+}
+
+// KindStart ignores tend: entirely, even though the config carries one: a
+// start dispatch is not a tend, and reading cfg.Tend for it would leak a
+// tend-only setting into the trigger dispatch.
+func TestEffectiveIgnoresTendForKindStart(t *testing.T) {
+	s := Effective(tendCfg(), store.KindStart, config.Overrides{})
+	if s.Model != "opus" {
+		t.Errorf("Model = %q, want agent.model %q: KindStart must not read tend:", s.Model, "opus")
+	}
+}
+
+// A model: label beats both agent.model and tend.model for KindTend: the
+// label is an instruction about one issue, and it must win over the
+// class-wide tend: default the same way it already wins over agent:.
+func TestEffectiveLabelOverrideBeatsTendForKindTend(t *testing.T) {
+	s := Effective(tendCfg(), store.KindTend, config.Overrides{Model: "claude-opus-5"})
+	if s.Model != "claude-opus-5" {
+		t.Errorf("Model = %q, want the label override", s.Model)
 	}
 }

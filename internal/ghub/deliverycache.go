@@ -3,6 +3,7 @@ package ghub
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // DeliveryCache serves the repeated single-number reads of ONE webhook
@@ -53,6 +54,19 @@ type DeliveryCache struct {
 	mu     sync.Mutex
 	issues map[numberKey]issueAnswer
 	prs    map[numberKey]prAnswer
+	// reviewActivity memoises LatestReviewActivity per pull request, for the
+	// reason PullRequest is memoised below and BehindBy deliberately is not:
+	// several loops of several projects answer one delivery
+	// about the same pull request, the two REST reads behind this method
+	// return the same answer for all of them at the same instant, and this
+	// cache's lifetime is exactly one delivery -- so caching it can never
+	// serve a later delivery a stale answer.
+	reviewActivity map[numberKey]reviewAnswer
+}
+
+type reviewAnswer struct {
+	t   time.Time
+	err error
 }
 
 // numberKey identifies one number in one repository. The repository is part of
@@ -79,9 +93,10 @@ type prAnswer struct {
 // for why that lifetime is a correctness rule.
 func NewDeliveryCache(c Client) *DeliveryCache {
 	return &DeliveryCache{
-		c:      c,
-		issues: make(map[numberKey]issueAnswer),
-		prs:    make(map[numberKey]prAnswer),
+		c:              c,
+		issues:         make(map[numberKey]issueAnswer),
+		prs:            make(map[numberKey]prAnswer),
+		reviewActivity: make(map[numberKey]reviewAnswer),
 	}
 }
 
@@ -112,6 +127,28 @@ func (d *DeliveryCache) PullRequest(ctx context.Context, owner, repo string, num
 	pr, err := d.c.PullRequest(ctx, owner, repo, number)
 	d.prs[key] = prAnswer{pr: pr, err: err}
 	return pr, err
+}
+
+// LatestReviewActivity returns the delivery's answer for one pull request's
+// review activity, fetching it at most once.
+//
+// This IS memoised, unlike BehindBy just below. Several loops of several
+// projects can answer one delivery about the same pull request, the two REST
+// reads behind this method return the same answer for all of them at the
+// same instant, and this cache is dropped at the end of the one delivery it
+// was built for -- so caching cannot serve a later delivery a stale answer,
+// the failure DeliveryCache's own lifetime rule exists to prevent.
+func (d *DeliveryCache) LatestReviewActivity(ctx context.Context, owner, repo string, number int) (time.Time, error) {
+	key := numberKey{owner: owner, repo: repo, number: number}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if a, ok := d.reviewActivity[key]; ok {
+		return a.t, a.err
+	}
+	t, err := d.c.LatestReviewActivity(ctx, owner, repo, number)
+	d.reviewActivity[key] = reviewAnswer{t: t, err: err}
+	return t, err
 }
 
 // ListOpenIssues is not memoised: it belongs to a pass that reconciles a whole

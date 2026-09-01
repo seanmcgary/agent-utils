@@ -450,6 +450,9 @@ func (f *deliveryGH) listCalls() []string {
 func (f *deliveryGH) BehindBy(context.Context, string, string, string, string) (int, error) {
 	return 0, nil
 }
+func (f *deliveryGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
+	return time.Time{}, nil
+}
 func (f *deliveryGH) PostComment(context.Context, string, string, int, string) error { return nil }
 func (f *deliveryGH) EditLabels(context.Context, string, string, int, []string, []string) error {
 	return nil

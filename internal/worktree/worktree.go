@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -324,6 +325,44 @@ func (m *Manager) AbortRebase(ctx context.Context, path string) error {
 		return nil
 	}
 	return m.gitC(ctx, path, "rebase", "--abort")
+}
+
+// ConflictedPaths returns the paths a rebase left in conflict, sorted.
+//
+// The paths are read with "-z", not the newline-separated default, and split
+// on NUL rather than newline. "--name-only" C-quotes an unusual path only
+// while core.quotePath is true, so a repository that turned it off would
+// otherwise split one path containing a literal newline into two entries --
+// changing the shape of anything fingerprinted from this list. NUL is the one
+// byte a path cannot hold, which is also why the fingerprint that consumes
+// this list joins on it too.
+//
+// The result is sorted here, inside this function, not left to the caller.
+// The fingerprint built from this list is a hash, so an unstable order would
+// make one conflict look like a different conflict on the very next pass and
+// defeat the backoff it feeds completely.
+//
+// A clean worktree returns an empty slice and no error. A rebase can fail for
+// reasons that leave no conflicted path at all -- a dead context, a bad ref --
+// and the caller must be able to tell that apart from a real conflict.
+//
+// The returned paths are never passed back to git and never interpolated
+// into a command. Keep it that way: they come from a conflicted merge and can
+// contain anything a committer chose to name a file.
+func (m *Manager) ConflictedPaths(ctx context.Context, path string) ([]string, error) {
+	out, err := m.gitStdout(ctx, path, "diff", "-z", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, p := range strings.Split(out, "\x00") {
+		if p == "" {
+			continue
+		}
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	return paths, nil
 }
 
 // rebaseInProgress reports whether git has a rebase state directory for path.

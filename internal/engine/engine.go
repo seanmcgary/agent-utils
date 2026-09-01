@@ -4,6 +4,7 @@ package engine
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
@@ -91,7 +92,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// very issue it was told to stop.
 		//
 		// decided MUST be set here. tendDecisions skips only decided issues
-		// (engine.go:259), and a stopped issue awaiting review with a behind
+		// (see tendDecisions), and a stopped issue awaiting review with a behind
 		// pull request would otherwise get a tend agent force-pushing the
 		// branch of the session the operator just killed.
 		if state.Stopped {
@@ -208,7 +209,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			})
 			continue
 		}
-		if resumable(cfg, state, ov) {
+		if resumable(cfg, store.KindStart, state, ov) {
 			decisions = append(decisions, Decision{
 				Kind:      KindResume,
 				Issue:     iss.Number,
@@ -223,12 +224,15 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// A session belonging to ANOTHER harness carries no identifier into the
 		// start: the new harness must mint its own. Reusing the old id would
 		// hand claude an id it refuses and pi an id it would quietly reuse.
+		//
+		// store.KindStart, not store.KindTend: this is the trigger path, which
+		// only ever starts or resumes the issue's own session, never a tend's.
 		sessionID, reason := state.SessionID, "trigger label present and no started session exists"
 		if state.SessionStarted && state.SessionID != "" {
 			sessionID = ""
 			reason = fmt.Sprintf(
 				"starting a new session: the existing one was created by %s and this dispatch runs %s",
-				state.SessionHarness, EffectiveHarness(cfg, ov))
+				state.SessionHarness, EffectiveHarness(cfg, store.KindStart, ov))
 		}
 		decisions = append(decisions, Decision{
 			Kind:      KindStart,
@@ -275,7 +279,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	decisions = append(decisions, stops...)
 
 	if cfg.TendPR {
-		decisions = append(decisions, tendDecisions(cfg, issues, snap, st.Issues, liveTendPRs, decided, skips)...)
+		decisions = append(decisions, tendDecisions(cfg, issues, snap, st.Issues, st.LastTend, liveTendPRs, decided, skips)...)
 	}
 
 	return finish(Plan{Decisions: decisions, Skips: skips})
@@ -347,7 +351,12 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 	// reuse one ("Session ID <uuid> is already in use"), so passing the old id
 	// would make every retry fail in under a second and then park the issue with
 	// a comment blaming the platform.
-	if resumable(cfg, state, ov) {
+	// store.KindStart, because the only thing this kind selects is whether the
+	// tend: section applies, and a retry is never a tend. act maps
+	// KindRetryStart onto store.KindStart and KindRetryResume onto
+	// store.KindResume (see act's retry cases), so neither reaches
+	// store.KindTend and either would resolve the same harness here.
+	if resumable(cfg, store.KindStart, state, ov) {
 		return &Decision{
 			Kind:      KindRetryResume,
 			Issue:     number,
@@ -362,7 +371,7 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 	why := "the previous attempt never started one"
 	if state.SessionStarted && state.SessionID != "" {
 		why = fmt.Sprintf("the existing one was created by %s and this retry runs %s",
-			state.SessionHarness, EffectiveHarness(cfg, ov))
+			state.SessionHarness, EffectiveHarness(cfg, store.KindStart, ov))
 	}
 	return &Decision{
 		Kind:      KindRetryStart,
@@ -386,14 +395,34 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 // An UNKNOWN recorded harness (empty) is not a mismatch. Rows written before
 // the column existed all have one, and treating unknown as "different" would
 // restart every in-flight session the moment this version was installed.
-func resumable(cfg *config.Config, state store.IssueState, ov config.Overrides) bool {
+//
+// kind matters here for the same reason it matters to runner.Effective: a
+// loop whose tend.harness differs from its agent.harness must START the
+// tend's session, never resume the issue's. pi does not refuse an identifier
+// it has never seen -- it creates a fresh session under it and carries on --
+// so a resume across harnesses loses the conversation silently, the same
+// failure the doc comment above already describes for two DIFFERENT
+// harnesses generally. A tend inheriting the issue's session while running a
+// cheaper tend.harness is exactly that case, reached through the new
+// configuration layer instead of a harness: label.
+//
+// The unknown-harness carve-out above is NOT closed by kind, and that is a
+// deliberate limit rather than an oversight. A row written before
+// session_harness existed reports "", so a tend running a differing
+// tend.harness still resumes it. Closing it would mean guessing that an
+// unknown harness differs from this one, which restarts every in-flight
+// session on upgrade -- the failure the carve-out exists to prevent, and a
+// worse one than a single mis-resumed tend. MarkSessionStarted records the
+// resolved harness on every session from here on, so the exposure shrinks to
+// rows that predate that column and disappears as they age out.
+func resumable(cfg *config.Config, kind string, state store.IssueState, ov config.Overrides) bool {
 	if state.SessionID == "" || !state.SessionStarted {
 		return false
 	}
 	if state.SessionHarness == "" {
 		return true
 	}
-	return state.SessionHarness == EffectiveHarness(cfg, ov)
+	return state.SessionHarness == EffectiveHarness(cfg, kind, ov)
 }
 
 // configRetired reports whether the issue's accumulated retry failures still
@@ -424,7 +453,7 @@ func resumable(cfg *config.Config, state store.IssueState, ov config.Overrides) 
 // one vendor one way, and empty whenever resolution failed; either way the
 // provider comparison is skipped and the cap stands.
 func configRetired(cfg *config.Config, state store.IssueState, ov config.Overrides, provider string) string {
-	if h := EffectiveHarness(cfg, ov); state.DispatchHarness != "" && state.DispatchHarness != h {
+	if h := EffectiveHarness(cfg, store.KindStart, ov); state.DispatchHarness != "" && state.DispatchHarness != h {
 		return fmt.Sprintf(
 			"retiring the retry history: it belongs to %s and this dispatch runs %s",
 			state.DispatchHarness, h)
@@ -442,17 +471,29 @@ func configRetired(cfg *config.Config, state store.IssueState, ov config.Overrid
 	return ""
 }
 
-// EffectiveHarness is the harness a dispatch will actually run under: the
-// issue's override when it carries one, and the loop's configured harness
-// otherwise. ov is already parsed and validated by ParseOverrides, so its
-// Harness is either empty or a known harness name.
+// EffectiveHarness is the harness a dispatch will actually run under,
+// resolved in the same order runner.Effective resolves Settings.Harness: the
+// issue's label override when it carries one, then cfg.Tend.Harness when
+// kind is store.KindTend, then the loop's configured agent.harness, then the
+// claude default. ov is already parsed and validated by ParseOverrides, so
+// its Harness is either empty or a known harness name.
+//
+// kind is a store.Kind* value, and only store.KindTend changes the answer. It
+// has to be a parameter rather than an assumption because a loop may run a
+// cheaper harness for tending than for the issue's own work, and this
+// function is what resumable compares a stored session's harness against: a
+// tend resolved as though it were a start would be handed a session id the
+// harness it actually runs has never seen.
 //
 // Exported because loopcmd stamps the same value on the issue row through
 // BeginDispatch. Two copies of "which harness will actually run" is how the
 // stamp and the comparison drift apart.
-func EffectiveHarness(cfg *config.Config, ov config.Overrides) string {
+func EffectiveHarness(cfg *config.Config, kind string, ov config.Overrides) string {
 	if ov.Harness != "" {
 		return ov.Harness
+	}
+	if kind == store.KindTend && cfg.Tend.Harness != "" {
+		return cfg.Tend.Harness
 	}
 	if cfg.Agent.Harness != "" {
 		return cfg.Agent.Harness
@@ -491,11 +532,19 @@ func stoppedSkipReason(reason string) string {
 // that loop's tend_pr, and states came from that loop's rows, so the session a
 // tend inherits is necessarily the one belonging to the loop that owns the
 // pull request.
+// tendDecisions does NOT take engine.State: it takes states, the issue state
+// of one loop, plus lastTend beside it. Both are keyed data State also carries
+// as a whole, pulled out here as their own parameters because Decide's only
+// caller of this function already unpacked State into issues, snap, and
+// liveTendPRs before this point -- passing the whole struct through would
+// resurrect fields (Running, Force, CooldownUntil) this function has no use
+// for and no business reading.
 func tendDecisions(
 	cfg *config.Config,
 	issues []ghub.Issue,
 	snap Snapshot,
 	states map[int]store.IssueState,
+	lastTend map[int]time.Time,
 	liveTendPRs map[int]bool,
 	decided map[int]bool,
 	skips map[int]string,
@@ -524,9 +573,14 @@ func tendDecisions(
 			skips[iss.Number] = "a tend dispatch is already live for the linked pull request"
 			continue
 		}
-		if snap.BehindBy[pr.Number] <= 0 {
-			// A current pull request produces nothing. Silence is correct.
-			skips[iss.Number] = "the linked pull request is already up to date with its base"
+		behind := snap.BehindBy[pr.Number] > 0
+		reviewPending := snap.ReviewedAt[pr.Number].After(lastTend[pr.Number])
+		if !behind && !reviewPending {
+			// Silence is correct only when BOTH questions came back no. Naming
+			// both in the skip reason is what lets an operator reading "nothing
+			// happened" tell which one is false, rather than assuming staleness
+			// was the only thing ever checked.
+			skips[iss.Number] = "the linked pull request is up to date with its base and carries no review activity since the last tend"
 			continue
 		}
 		// A tend inherits the issue's session, so it must also inherit the
@@ -551,22 +605,42 @@ func tendDecisions(
 		// cannot be resumed, and "-r" against one fails identically every run.
 		// An empty identifier here tells dispatch to mint a fresh one, which is
 		// what a pull request whose issue has no started session still gets.
+		//
+		// store.KindTend, unlike the trigger and retry call sites above: this IS
+		// the tend dispatch, so resumable must weigh the session against
+		// cfg.Tend.Harness, not cfg.Agent.Harness. A loop whose tend.harness
+		// differs from agent.harness must start the tend's session fresh rather
+		// than resume the issue's, even though the issue's own session was
+		// started by the loop's default harness.
 		sessionID := ""
-		reason := fmt.Sprintf("%s is %d commits behind",
-			describeLink(iss.Number, pr), snap.BehindBy[pr.Number])
-		if s := states[iss.Number]; resumable(cfg, s, ov) {
+		// Both halves of the reason can hold at once -- a pull request can be
+		// behind AND carry unanswered review activity -- so both are named
+		// when true, keeping the existing "N commits behind" wording for the
+		// half that already had it.
+		var reasons []string
+		if behind {
+			reasons = append(reasons, fmt.Sprintf("%s is %d commits behind",
+				describeLink(iss.Number, pr), snap.BehindBy[pr.Number]))
+		}
+		if reviewPending {
+			reasons = append(reasons, fmt.Sprintf("%s carries review activity newer than the last tend",
+				describeLink(iss.Number, pr)))
+		}
+		reason := strings.Join(reasons, "; ")
+		if s := states[iss.Number]; resumable(cfg, store.KindTend, s, ov) {
 			sessionID = s.SessionID
 			reason += ", resuming the issue's session"
 		}
 		out = append(out, Decision{
-			Kind:      KindTend,
-			Issue:     iss.Number,
-			PR:        pr.Number,
-			HeadRef:   pr.HeadRef,
-			BaseRef:   pr.BaseRef,
-			SessionID: sessionID,
-			Reason:    reason,
-			Overrides: ov,
+			Kind:          KindTend,
+			Issue:         iss.Number,
+			PR:            pr.Number,
+			HeadRef:       pr.HeadRef,
+			BaseRef:       pr.BaseRef,
+			SessionID:     sessionID,
+			Reason:        reason,
+			Overrides:     ov,
+			ReviewPending: reviewPending,
 		})
 	}
 	return out

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
@@ -130,6 +131,11 @@ func (f *noCallGH) ListOpenPullRequests(context.Context, string, string) ([]ghub
 func (f *noCallGH) BehindBy(context.Context, string, string, string, string) (int, error) {
 	f.t.Fatal("BehindBy called; RunTick should have returned before Tick started")
 	return 0, nil
+}
+
+func (f *noCallGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
+	f.t.Fatal("LatestReviewActivity called; RunTick should have returned before Tick started")
+	return time.Time{}, nil
 }
 
 func (f *noCallGH) PostComment(context.Context, string, string, int, string) error {

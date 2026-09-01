@@ -28,6 +28,14 @@ agent:
   max_budget_usd: 50
   timeout: 4h
 
+# tend: lets a tend dispatch (the automatic rebase, and the review-reply below)
+# run a cheaper model than the build itself, since its job is smaller. Falls
+# back to agent's own harness/model/effort for any field left unset, and a
+# harness:/model:/effort: label on the issue still beats this. See
+# docs/configuration.md#tend.
+# tend:
+#   model: sonnet
+
 i_understand_bypass_permissions: true
 tend_pr: true
 
@@ -98,8 +106,9 @@ tend_prompt: |
   {{.Repo}}. It is {{.PR.BehindBy}} commits behind {{.PR.BaseRef}}.
 
   This is maintenance on a finished feature, NOT new feature work. Do not add
-  scope. Do not refactor beyond the rebase. NEVER merge or close the pull request.
-  Do not change any label unless you park.
+  scope. Do not refactor beyond the rebase and, when it applies below, the
+  review reply. NEVER merge or close the pull request. Do not change any label
+  unless you park.
 
   You run in an isolated git worktree checked out detached at
   origin/{{.PR.HeadRef}}. Its path is {{.Worktree}}, and it is NOT the worktree
@@ -121,9 +130,21 @@ tend_prompt: |
      you cannot get both sides' tests green -- run `git rebase --abort` and PARK
      with a comment listing the conflicted files. Never resolve by guessing.
 
+  {{if .PR.ReviewPending}}
+  4. This dispatch was also triggered by review activity newer than the last
+     tend. After the rebase (or the park) above, read the pull request's
+     unresolved review threads and comments. Answer each one: reply with your
+     reasoning, and push a fix when the reviewer is right. Leave a thread
+     unresolved when you disagree; say why in your reply rather than resolving
+     it yourself. Do not resolve a thread a human, not you, opened unless your
+     reply settles it and the reviewer's own tooling would mark it so.
+  {{end}}
+
   PARK means: post the comment, remove {{.Labels.Review}}, add
   {{.Labels.Blocked}}, and stop. End with: "To proceed: comment your decision and
   re-add the {{.Labels.Trigger}} label."
 
+  {{if not .PR.ReviewPending}}
   If the branch turns out to be current, post NO comment and make NO push.
   Silence is the correct output for a quiet pull request.
+  {{end}}

@@ -43,6 +43,14 @@ type Snapshot struct {
 	PRs    []ghub.PullRequest
 	// BehindBy maps a pull request number to how many commits it lacks.
 	BehindBy map[int]int
+	// ReviewedAt maps a PULL REQUEST number -- not an issue number -- to the
+	// time of its most recent trusted review activity. Review activity is a
+	// fact about a pull request, not the issue that links to it, and a pull
+	// request number is what LastTend below is keyed by too, so the two maps
+	// compare directly without a lookup through LinkPR. A pull request absent
+	// from this map has no known review activity, which a failed GitHub read
+	// also produces -- see the failure-direction comments in loopcmd.Tick and loopcmd.tickIssue.
+	ReviewedAt map[int]time.Time
 }
 
 // State is the stored view for one tick.
@@ -77,6 +85,14 @@ type State struct {
 	// drop every dispatch, and re-arm the cooldown -- leaving --force a no-op
 	// in exactly the situation an operator reaches for it.
 	Force bool
+	// LastTend maps a PULL REQUEST number to the start time of its last
+	// FINISHED tend dispatch. Keyed by pull request, like Snapshot.ReviewedAt,
+	// because both are facts about the pull request, not the issue: an issue
+	// is worked by several loops in turn, but a tend dispatch and a review
+	// comment both land on one pull request regardless of which loop tends it.
+	// A pull request absent from this map has never had a finished tend
+	// dispatch, which is why any review activity on it counts as pending.
+	LastTend map[int]time.Time
 }
 
 // Decision is one action the tick must perform.
@@ -104,6 +120,13 @@ type Decision struct {
 	// A KindTend decision carries none. A tend makes no retry decision, can
 	// never retire a cap, and does not reach BeginDispatch at all.
 	Provider string
+	// ReviewPending is set when this KindTend decision fired because review
+	// activity on the linked pull request is newer than its last finished
+	// tend dispatch, rather than (or in addition to) the pull request being
+	// behind its base. It travels to the detached runner on the dispatch row
+	// -- never on pr_links, see loopcmd.dispatch -- because the runner never
+	// sees this Decision or the tick's Snapshot.
+	ReviewPending bool
 }
 
 // Plan is the full output of one decision pass.

@@ -8,6 +8,7 @@ import (
 	"text/template"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
 // Invocation describes one claude run.
@@ -20,6 +21,12 @@ type Invocation struct {
 	// row. The detached runner never sees the tick's GitHub snapshot, so this
 	// is the only way an override reaches it.
 	Overrides config.Overrides
+	// Kind selects the configuration layer Effective applies: a store.Kind*
+	// value. An EMPTY value means "not a tend", which is the correct reading
+	// for a hand-built Invocation in a test -- every existing test constructs
+	// one without setting this field, and none of them means to exercise the
+	// tend: section.
+	Kind string
 }
 
 // Settings is the resolved agent configuration for one invocation, after an
@@ -30,12 +37,33 @@ type Settings struct {
 	Effort  string
 }
 
-// Effective returns the agent settings for one invocation. An override
-// replaces the configured value; an empty override keeps it.
+// Effective returns the agent settings for one invocation, resolved in three
+// layers: the loop's agent: defaults, then the tend: overlay when this
+// dispatch is a tend, then the per-issue label override. Each layer only
+// replaces what the one before it set; a layer with nothing to say leaves the
+// prior value alone.
 //
-// It returns a VALUE and never mutates cfg. Writing into cfg.Agent in place
-// would leave every later reader -- the retry policy, the log paths -- holding
-// a configuration that no longer matches the file it was loaded from.
+// The tend: overlay applies only when kind == store.KindTend, and only its
+// NON-EMPTY fields replace the agent: value -- a tend: section that sets only
+// tend.model must leave tend.harness and tend.effort falling through to
+// agent.harness and agent.effort, exactly as an absent field in Load leaves
+// them (config.go's comment beside Load's harness default says why). Every
+// other kind ignores cfg.Tend entirely: a start or resume dispatch has no
+// tend: section to consult, and reading it anyway would make cfg.Tend.Model
+// leak into a trigger dispatch the moment an operator set it.
+//
+// The label override wins over BOTH: tend: is a default for a whole CLASS of
+// dispatch, and a label is an instruction about one issue, which must be able
+// to override a class-wide default the same way it already overrides
+// agent:'s loop-wide one. This is why the override layer stays last and the
+// override re-validation below is unchanged -- it is still the last line of
+// defence before a value becomes an argv element, whichever layer supplied
+// the value it is now replacing.
+//
+// It returns a VALUE and never mutates cfg. Writing into cfg.Agent (or
+// cfg.Tend) in place would leave every later reader -- the retry policy, the
+// log paths -- holding a configuration that no longer matches the file it was
+// loaded from.
 //
 // Each override value is RE-VALIDATED through config.ParseOverrides, and a
 // value that fails is dropped rather than applied. This process did not parse
@@ -56,11 +84,23 @@ type Settings struct {
 // claude-only; when the effective harness is pi, PiBuildArgs and claudeEnv
 // never emit them, so the override IGNORES them rather than dropping a
 // guard the harness could have honoured.
-func Effective(cfg *config.Config, ov config.Overrides) Settings {
+func Effective(cfg *config.Config, kind string, ov config.Overrides) Settings {
 	s := Settings{
 		Harness: cfg.Agent.Harness,
 		Model:   cfg.Agent.Model,
 		Effort:  cfg.Agent.Effort,
+	}
+
+	if kind == store.KindTend {
+		if cfg.Tend.Harness != "" {
+			s.Harness = cfg.Tend.Harness
+		}
+		if cfg.Tend.Model != "" {
+			s.Model = cfg.Tend.Model
+		}
+		if cfg.Tend.Effort != "" {
+			s.Effort = cfg.Tend.Effort
+		}
 	}
 
 	var parsed config.Overrides
@@ -99,7 +139,7 @@ func Effective(cfg *config.Config, ov config.Overrides) Settings {
 // --print with --output-format stream-json is rejected unless --verbose is also
 // present, so --verbose is not optional here.
 func BuildArgs(cfg *config.Config, inv Invocation) []string {
-	s := Effective(cfg, inv.Overrides)
+	s := Effective(cfg, inv.Kind, inv.Overrides)
 
 	args := []string{
 		"-p",
@@ -139,7 +179,7 @@ func BuildArgs(cfg *config.Config, inv Invocation) []string {
 // pi has no cost-ceiling flag: the config layer accepts max_budget_usd but this
 // builder never emits it.
 func PiBuildArgs(cfg *config.Config, inv Invocation) []string {
-	s := Effective(cfg, inv.Overrides)
+	s := Effective(cfg, inv.Kind, inv.Overrides)
 
 	args := []string{
 		"-p",
@@ -166,6 +206,14 @@ type PromptPR struct {
 	HeadRef  string
 	BaseRef  string
 	BehindBy int
+	// ReviewPending is set when this tend dispatch was triggered, in whole or
+	// in part, by review activity newer than the last finished tend. It comes
+	// from the DISPATCH row (d.ReviewPending), not from BehindBy's source
+	// (the pr_links row): see engine.Decision.ReviewPending and
+	// loopcmd.dispatch for why the two travel differently. The shipped
+	// tend_prompt is a pure rebase instruction; a template that never
+	// branches on this field keeps behaving exactly as before.
+	ReviewPending bool
 }
 
 // PromptLabels is the label view a prompt template can read.

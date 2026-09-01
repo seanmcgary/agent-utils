@@ -416,3 +416,83 @@ func TestBackgroundTasksIsOffUnlessExplicitlyOn(t *testing.T) {
 		}
 	}
 }
+
+// A full tend: section loads and every field is read.
+func TestLoadAcceptsFullTendSection(t *testing.T) {
+	body := replaceOnce(validYAML, "tend_pr: true\n",
+		"tend:\n  harness: pi\n  model: anthropic/claude-haiku-4-5\n  effort: low\ntend_pr: true\n")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Tend.Harness != HarnessPi {
+		t.Errorf("Tend.Harness = %q, want %q", cfg.Tend.Harness, HarnessPi)
+	}
+	if cfg.Tend.Model != "anthropic/claude-haiku-4-5" {
+		t.Errorf("Tend.Model = %q, want the configured model", cfg.Tend.Model)
+	}
+	if cfg.Tend.Effort != "low" {
+		t.Errorf("Tend.Effort = %q, want %q", cfg.Tend.Effort, "low")
+	}
+}
+
+// A partial tend: section -- only one field set -- loads, and the fields left
+// out stay empty rather than inheriting agent's values at Load time. Effective
+// resolves the fallback later; Load must not do it here.
+func TestLoadAcceptsPartialTendSection(t *testing.T) {
+	body := replaceOnce(validYAML, "tend_pr: true\n",
+		"tend:\n  model: anthropic/claude-haiku-4-5\ntend_pr: true\n")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Tend.Model != "anthropic/claude-haiku-4-5" {
+		t.Errorf("Tend.Model = %q, want the configured model", cfg.Tend.Model)
+	}
+	if cfg.Tend.Harness != "" {
+		t.Errorf("Tend.Harness = %q, want empty: a partial section must not fill in the rest",
+			cfg.Tend.Harness)
+	}
+	if cfg.Tend.Effort != "" {
+		t.Errorf("Tend.Effort = %q, want empty: a partial section must not fill in the rest",
+			cfg.Tend.Effort)
+	}
+}
+
+func TestLoadRejectsBadTendHarness(t *testing.T) {
+	body := replaceOnce(validYAML, "tend_pr: true\n",
+		"tend:\n  harness: bogus\ntend_pr: true\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want error for a bad tend.harness, got nil")
+	}
+	if !strings.Contains(err.Error(), "tend.harness") {
+		t.Errorf("err = %v, want it to name tend.harness", err)
+	}
+}
+
+func TestLoadRejectsBadTendEffort(t *testing.T) {
+	body := replaceOnce(validYAML, "tend_pr: true\n",
+		"tend:\n  effort: turbo\ntend_pr: true\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want error for a bad tend.effort, got nil")
+	}
+	if !strings.Contains(err.Error(), "tend.effort") {
+		t.Errorf("err = %v, want it to name tend.effort", err)
+	}
+}
+
+// Load defaults agent.harness so it always resolves, but must NOT default
+// tend.harness: an absent value there means "fall back to agent.harness",
+// and defaulting it here would silently pin every tend dispatch to claude on
+// a harness: pi loop.
+func TestLoadLeavesTendHarnessEmpty(t *testing.T) {
+	cfg, err := Load(writeTemp(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Tend.Harness != "" {
+		t.Errorf("Tend.Harness = %q, want empty: Load must not default it", cfg.Tend.Harness)
+	}
+}
