@@ -15,6 +15,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 	_ "modernc.org/sqlite"
@@ -240,17 +241,19 @@ func rebaseConfig(t *testing.T) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	return &config.Config{
-		Name:            rebaseLoop,
-		Repo:            "o/r",
-		DefaultBranch:   "master",
-		TendPR:          true,
-		TendPrompt:      "rebase #{{.Issue.Number}}",
+		Name:          rebaseLoop,
+		Repo:          "o/r",
+		DefaultBranch: "master",
+		TendPrompt:    "rebase #{{.Issue.Number}}",
+		Tend: project.Tend{
+			Enabled: true, Loop: rebaseLoop, Label: "status:review",
+		},
 		CheckoutBaseDir: rebaseCheckout(t, dir),
 		WorktreeDir:     filepath.Join(dir, "wt"),
 		StateDir:        filepath.Join(dir, "state"),
 		Labels: config.Labels{
 			Trigger: "status:todo", InFlight: "status:doing",
-			Blocked: "status:blocked", Review: "status:review", Terminal: "status:done",
+			Blocked: "status:blocked", Terminal: "status:done",
 		},
 		Agent: config.Agent{
 			Model: "opus", Worktree: config.WorktreePerIssue,

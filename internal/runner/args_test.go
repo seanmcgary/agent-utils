@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -295,7 +296,7 @@ func TestPiBuildArgsUsesTheEffectiveOverride(t *testing.T) {
 // loop uses when it wants a cheaper model for tending and nothing else.
 func tendCfg() *config.Config {
 	c := cfg()
-	c.Tend = config.TendAgent{Model: "claude-haiku-4-5"}
+	c.Tend = project.Tend{Model: "claude-haiku-4-5"}
 	return c
 }
 
@@ -312,7 +313,7 @@ func TestEffectivePrefersTendModelForKindTend(t *testing.T) {
 // tend.harness.
 func TestEffectiveFallsBackToAgentModelWhenTendModelIsEmpty(t *testing.T) {
 	c := cfg()
-	c.Tend = config.TendAgent{Harness: config.HarnessPi}
+	c.Tend = project.Tend{Harness: config.HarnessPi}
 	s := Effective(c, store.KindTend, config.Overrides{})
 	if s.Model != "opus" {
 		t.Errorf("Model = %q, want the configured agent.model %q", s.Model, "opus")
@@ -333,7 +334,7 @@ func TestEffectiveFallsBackToAgentModelWhenTendModelIsEmpty(t *testing.T) {
 func TestEffectiveOverlaysTendHarnessAndEffortForKindTend(t *testing.T) {
 	c := cfg()
 	c.Agent.Harness, c.Agent.Effort = config.HarnessClaude, "high"
-	c.Tend = config.TendAgent{Harness: config.HarnessPi, Effort: "low"}
+	c.Tend = project.Tend{Harness: config.HarnessPi, Effort: "low"}
 
 	s := Effective(c, store.KindTend, config.Overrides{})
 	if s.Harness != config.HarnessPi {

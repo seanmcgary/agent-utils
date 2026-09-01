@@ -49,7 +49,7 @@ type Settings struct {
 // agent.harness and agent.effort, exactly as an absent field in Load leaves
 // them (config.go's comment beside Load's harness default says why). Every
 // other kind ignores cfg.Tend entirely: a start or resume dispatch has no
-// tend: section to consult, and reading it anyway would make cfg.Tend.Model
+// tend policy to consult, and reading it anyway would make cfg.Tend.Model
 // leak into a trigger dispatch the moment an operator set it.
 //
 // The label override wins over BOTH: tend: is a default for a whole CLASS of
@@ -221,7 +221,6 @@ type PromptLabels struct {
 	Trigger  string
 	InFlight string
 	Blocked  string
-	Review   string
 	Terminal string
 }
 

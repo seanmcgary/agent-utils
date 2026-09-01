@@ -14,6 +14,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -117,7 +118,7 @@ type harness struct {
 	// open, runTend and runCleanup, so they sit with the guarded fields rather
 	// than above the mutex with the write-once ones. defaultBranch and tendPR
 	// are the two config fields the open seam builds; both are needed to arm a
-	// sweep, which is gated on cfg.TendPR && d.IsMergeInto(cfg.DefaultBranch).
+	// sweep, which is gated on cfg.TendsPRs() && d.IsMergeInto(cfg.DefaultBranch).
 	// tendFn and cleanupFn decide what the RunTend and RunCleanup seams
 	// return; nil means success.
 	defaultBranch string                         // guarded by mu
@@ -293,7 +294,16 @@ func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (
 
 	cfg := &config.Config{
 		Name: loopFromPath(path), Repo: "o/r",
-		DefaultBranch: branch, TendPR: tend,
+		DefaultBranch: branch,
+	}
+	// Tending is the project's policy now, so a fixture turns it on by naming
+	// THIS loop in the policy rather than by setting a flag on the loop.
+	if tend {
+		cfg.Tend = project.Tend{
+			Enabled: true,
+			Loop:    cfg.Name,
+			Label:   "status:ready-for-review",
+		}
 	}
 	cfg.Retry.Max = max
 	for _, d := range backoff {
@@ -1670,7 +1680,7 @@ func TestPushArmsTheSweepAndRunsNoIssuePass(t *testing.T) {
 	h := newHarness(nil)
 	tgt := h.target("planning")
 	tgt.DefaultBranch = "master"
-	tgt.TendPR = true
+	tgt.Tends = true
 	h.targets = []Target{tgt}
 	h.defaultBranch = "master"
 	h.tendPR = true
@@ -1696,7 +1706,7 @@ func TestAMergeAndItsPushProduceOneSweep(t *testing.T) {
 	h := newHarness(nil)
 	tgt := h.target("planning")
 	tgt.DefaultBranch = "master"
-	tgt.TendPR = true
+	tgt.Tends = true
 	h.targets = []Target{tgt}
 	h.defaultBranch = "master"
 	h.tendPR = true
@@ -1715,7 +1725,7 @@ func TestPushToAnotherBranchOpensNothing(t *testing.T) {
 	h := newHarness(nil)
 	tgt := h.target("planning")
 	tgt.DefaultBranch = "master"
-	tgt.TendPR = true
+	tgt.Tends = true
 	h.targets = []Target{tgt}
 
 	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", PushedTo: "feat/x"})
@@ -1743,7 +1753,7 @@ func TestAPushsOpenFailureDoesNotCancelAnIssuesPendingRetry(t *testing.T) {
 
 	tgt := h.target("planning")
 	tgt.DefaultBranch = "master"
-	tgt.TendPR = true
+	tgt.Tends = true
 	h.targets = []Target{tgt}
 
 	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", PushedTo: "master"})
@@ -2453,12 +2463,12 @@ func tendCheckHarness(t *testing.T) *harness {
 // tendTarget is the harness's target for one loop, marked as tending.
 //
 // DefaultBranch and TendPR are set here as well as on the config the open seam
-// builds: the pass filters on Target.TendPR before it opens anything, and the
+// builds: the pass filters on Target.Tends before it opens anything, and the
 // harness's target helper leaves both fields zero.
 func (h *harness) tendTarget(loop string) Target {
 	t := h.target(loop)
 	t.DefaultBranch = "master"
-	t.TendPR = true
+	t.Tends = true
 	return t
 }
 
@@ -2823,7 +2833,7 @@ func TestAPushRunsNeitherTheEpicPassNorTheCleanupPass(t *testing.T) {
 	h := newHarness(nil)
 	tgt := h.target("planning")
 	tgt.DefaultBranch = "master"
-	tgt.TendPR = true
+	tgt.Tends = true
 	h.targets = []Target{tgt}
 	h.defaultBranch = "master"
 	h.tendPR = true

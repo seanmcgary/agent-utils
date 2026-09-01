@@ -504,7 +504,7 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 	kept := make([]Target, 0, len(targets))
 	for _, t := range targets {
 		// A push names no issue, so the only work it can start is the sweep.
-		tends := t.TendPR && d.IsPushTo(t.DefaultBranch)
+		tends := t.Tends && d.IsPushTo(t.DefaultBranch)
 		if d.Number == 0 && !tends {
 			continue
 		}
@@ -531,7 +531,7 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 	}
 
 	// Built from what SURVIVED the filter, and built after it. Naming every
-	// target watching the repository would claim a loop with tend_pr false
+	// target watching the repository would claim a loop that does not tend
 	// will sweep when it never will, and building the list first allocated it
 	// for every feature-branch push this daemon then dropped. An issue
 	// delivery keeps every target, so this is the same list it always was.
@@ -743,7 +743,7 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	// stays. It has to stay: a hook that nobody re-registers after this change
 	// still carries the old event list, and the merge path is what keeps
 	// working for it.
-	if cfg.TendPR && (d.IsMergeInto(cfg.DefaultBranch) || d.IsPushTo(cfg.DefaultBranch)) {
+	if cfg.TendsPRs() && (d.IsMergeInto(cfg.DefaultBranch) || d.IsPushTo(cfg.DefaultBranch)) {
 		w.armTend(ctx, t, cfg.DefaultBranch)
 	}
 
@@ -768,7 +768,7 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 
 	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
 	// for the operator's decision -- so it is gated on ClosedPR alone, not on
-	// cfg.TendPR or the merge check above.
+	// cfg.TendsPRs or the merge check above.
 	//
 	// d.Number > 0 for the reason the epic pass carries it: prNumber IS
 	// d.Number here, and a cleanup for pull request 0 would ask the worktree
@@ -1186,7 +1186,7 @@ func (w *Worker) tendCheckPass(ctx context.Context) {
 	w.pruneConfirms(routes.Targets)
 
 	for _, t := range routes.Targets {
-		if !t.TendPR {
+		if !t.Tends {
 			continue
 		}
 		// Checked between loops, not only at the top: the deadline above and a

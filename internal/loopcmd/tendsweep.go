@@ -98,7 +98,7 @@ const maxTendPerSweep = 10
 func TendSweep(ctx context.Context, cfg *config.Config, deps Deps, base string) (Summary, error) {
 	// Checked before anything is read. The caller checks it too; TendSweep is
 	// exported, so a loop that does not tend must cost nothing whoever calls.
-	if !cfg.TendPR {
+	if !cfg.TendsPRs() {
 		return Summary{}, nil
 	}
 
@@ -139,7 +139,7 @@ func tendSnapshot(ctx context.Context, cfg *config.Config, deps Deps, base strin
 	var links []store.PRLink
 	snap := engine.Snapshot{Issues: issues, PRs: prs, BehindBy: map[int]int{}}
 	for _, iss := range issues {
-		if !iss.HasLabel(cfg.Labels.Review) {
+		if !iss.HasLabel(cfg.Tend.Label) {
 			continue
 		}
 		pr, ok := engine.LinkPR(iss.Number, prs)

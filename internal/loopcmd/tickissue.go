@@ -78,7 +78,7 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 
 	snap := engine.Snapshot{Issues: []ghub.Issue{iss}, BehindBy: map[int]int{}, ReviewedAt: map[int]time.Time{}}
 	lastTend := map[int]time.Time{}
-	if cfg.TendPR && fetchOK && iss.HasLabel(cfg.Labels.Review) {
+	if cfg.TendsPRs() && fetchOK && iss.HasLabel(cfg.Tend.Label) {
 		if pr, found := reviewPR(ctx, cfg, deps, owner, repo, iss, eventPR); found {
 			snap.PRs = []ghub.PullRequest{pr}
 			behind, err := deps.GH.BehindBy(ctx, owner, repo, pr.BaseRef, pr.HeadRef)

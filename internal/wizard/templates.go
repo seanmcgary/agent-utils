@@ -26,12 +26,11 @@ var templateFS embed.FS
 // project reads the list as the chain it is building.
 var templateNames = []string{"planning", "execution", "pr-review", "exec-pr-review-findings"}
 
-// Template supplies the prompt bodies and the label and tend defaults that go
-// with them.
+// Template supplies the prompt bodies and the label defaults that go with
+// them.
 type Template struct {
 	Name         string
 	Labels       config.Labels
-	TendPR       bool
 	Prompt       string
 	ResumePrompt string
 	TendPrompt   string
@@ -78,7 +77,6 @@ func TemplateNamed(name string) (Template, bool) {
 	return Template{
 		Name:         name,
 		Labels:       cfg.Labels,
-		TendPR:       cfg.TendPR,
 		Prompt:       cfg.Prompt,
 		ResumePrompt: cfg.ResumePrompt,
 		TendPrompt:   cfg.TendPrompt,

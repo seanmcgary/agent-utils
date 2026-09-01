@@ -232,7 +232,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 
 	snap := engine.Snapshot{Issues: issues, BehindBy: map[int]int{}, ReviewedAt: map[int]time.Time{}}
 	lastTend := map[int]time.Time{}
-	if cfg.TendPR && fetchOK {
+	if cfg.TendsPRs() && fetchOK {
 		prs, err := deps.GH.ListOpenPullRequests(ctx, owner, repo)
 		if err != nil {
 			return sum, err
@@ -264,7 +264,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 		}
 
 		for _, iss := range issues {
-			if !iss.HasLabel(cfg.Labels.Review) {
+			if !iss.HasLabel(cfg.Tend.Label) {
 				continue
 			}
 			pr, ok := engine.LinkPR(iss.Number, prs)
@@ -1054,7 +1054,6 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 			Trigger:  cfg.Labels.Trigger,
 			InFlight: cfg.Labels.InFlight,
 			Blocked:  cfg.Labels.Blocked,
-			Review:   cfg.Labels.Review,
 			Terminal: cfg.Labels.Terminal,
 		},
 	})

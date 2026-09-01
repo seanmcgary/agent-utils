@@ -673,7 +673,6 @@ labels:
   trigger: trigger
   in_flight: in-flight
   blocked: blocked
-  review: review
 default_branch: master
 agent:
   model: opus

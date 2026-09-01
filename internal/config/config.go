@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/seanmcgary/agent-utils/internal/project"
 )
 
 // Config is one loop definition.
@@ -24,10 +27,24 @@ type Config struct {
 	// "master", so it is configuration rather than an assumption.
 	DefaultBranch string `yaml:"default_branch"`
 
-	Labels Labels    `yaml:"labels"`
-	Agent  Agent     `yaml:"agent"`
-	Tend   TendAgent `yaml:"tend"`
-	TendPR bool      `yaml:"tend_pr"`
+	Labels Labels `yaml:"labels"`
+	Agent  Agent  `yaml:"agent"`
+
+	// Tend is the PROJECT's pull-request maintenance policy, not this loop's.
+	// `yaml:"-"` is load-bearing: it is never read from a loop file, and the
+	// strict decoder rejects a `tend:` key here so an operator who writes one
+	// in the wrong file is told rather than ignored.
+	//
+	// Load injects it from the project descriptor beside this file, because
+	// every consumer needs the two together and threading a second value
+	// through Decide, Effective, the runner and the listener would have added a
+	// parameter to a dozen signatures whose only job was to arrive unchanged.
+	// A configuration loaded from outside a project -- a test fixture, a file
+	// passed by absolute path from elsewhere -- gets the zero value, which is
+	// tending OFF. That is the safe direction: the failure is a pull request
+	// that is not rebased, not one that is force-pushed by a policy nobody
+	// declared.
+	Tend project.Tend `yaml:"-"`
 
 	// CleanupClosedPR removes the worktrees of a closed pull request. It
 	// defaults to ON: nothing else removes a worktree, and one of a large
@@ -56,7 +73,6 @@ type Labels struct {
 	Trigger  string   `yaml:"trigger"`
 	InFlight string   `yaml:"in_flight"`
 	Blocked  string   `yaml:"blocked"`
-	Review   string   `yaml:"review"`
 	Terminal string   `yaml:"terminal"`
 	Veto     []string `yaml:"veto"`
 }
@@ -84,24 +100,6 @@ type Agent struct {
 	// bool cannot distinguish an absent field from an explicit false.
 	// claude-only: pi has no equivalent.
 	BackgroundTasks *bool `yaml:"background_tasks"`
-}
-
-// TendAgent holds the agent settings for a tend dispatch: which agent runs, on
-// which model, at which effort.
-//
-// It carries ONLY the three fields that say WHICH agent runs. The rejected
-// alternative was repeating every Agent field -- permission_mode, worktree,
-// max_budget_usd, timeout, background_tasks -- so a tend could diverge from
-// the trigger dispatch in those too. That gives an operator two places to set
-// one thing, and the concrete failure is an operator who sets a timeout in
-// one of them and gets the other's: a tend that quietly inherits the trigger
-// dispatch's stale worktree mode or an unset budget cap because they only
-// remembered to edit `agent:`. Every field this struct does NOT have is
-// deliberately shared with `agent:` for that reason.
-type TendAgent struct {
-	Harness string `yaml:"harness"`
-	Model   string `yaml:"model"`
-	Effort  string `yaml:"effort"`
 }
 
 // BackgroundTasksEnabled reports whether the claude child may background its
@@ -161,6 +159,20 @@ const (
 // agent instead of like a number that was too small.
 const DefaultAgentTimeout = 24 * time.Hour
 
+// TendsPRs reports whether THIS loop hosts the project's tend dispatches.
+//
+// Both halves have to hold: the project must have tending switched on with a
+// label to act on, and this loop must be the one the project names to host it.
+// See project.Tend.Loop for why a host has to be named at all -- in short,
+// every row a tend writes is keyed by loop, so two loops answering one policy
+// would each keep half the state and both force-push the same branch.
+func (c *Config) TendsPRs() bool {
+	if !c.Tend.Enabled || strings.TrimSpace(c.Tend.Label) == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(c.Tend.Loop), c.Name)
+}
+
 // CleanupClosedPREnabled reports whether a closed pull request's worktrees are
 // removed. Absent means enabled; see Config.CleanupClosedPR.
 func (c *Config) CleanupClosedPREnabled() bool {
@@ -197,14 +209,15 @@ func Load(path string) (*Config, error) {
 	if cfg.Agent.Harness == "" {
 		cfg.Agent.Harness = HarnessClaude
 	}
-	// cfg.Tend.Harness is deliberately NOT defaulted here. agent.harness must
-	// always resolve, because every dispatch needs an agent to run, but an
-	// empty tend.harness carries its own meaning: "use agent.harness for this
-	// tend too." Defaulting it to HarnessClaude here would silently pin every
-	// tend dispatch to claude on a loop configured with harness: pi, which is
-	// exactly the divergence a tend section that only sets a cheaper model was
-	// never meant to introduce. runner.Effective and engine.effectiveHarness
-	// both read the empty string as "fall through to agent.harness."
+	// The project descriptor's tend.harness is deliberately NOT defaulted, in
+	// project.Load or here. agent.harness must always resolve, because every
+	// dispatch needs an agent to run, but an empty tend.harness carries its own
+	// meaning: "use agent.harness for this tend too." Defaulting it to
+	// HarnessClaude would silently pin every tend dispatch to claude on a loop
+	// configured with harness: pi, which is exactly the divergence a tend policy
+	// that only sets a cheaper model was never meant to introduce.
+	// runner.Effective and engine.EffectiveHarness both read the empty string as
+	// "fall through to agent.harness."
 
 	// An omitted timeout means DefaultAgentTimeout, not an error.
 	//
@@ -229,7 +242,48 @@ func Load(path string) (*Config, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
+	if err := cfg.loadProjectTend(path); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+// loadProjectTend fills in Tend from the project descriptor that owns this
+// loop file.
+//
+// A loop configuration lives at <root>/.agent-utils/configs/<loop>.yaml and the
+// descriptor at <root>/.agent-utils/config.yaml, so the descriptor is two
+// directories up. Deriving it from the path rather than taking it as an
+// argument is what keeps Load's signature -- and every signature that carries a
+// *Config afterwards -- unchanged.
+//
+// A MISSING descriptor is not an error. Loading a loop file by absolute path
+// from outside a project is supported (`loop tick --config`), and so is a test
+// fixture in a temporary directory. Both get the zero policy, which is tending
+// off.
+//
+// A descriptor that exists but will not PARSE is an error, and deliberately so.
+// It is the same fail-closed reading EntryLoop applies to an unloadable loop
+// file: a descriptor whose tend block cannot be read might have said "enabled",
+// and continuing would run the loop with a policy nobody could see.
+func (c *Config) loadProjectTend(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		// A path this program just opened cannot fail to absolutise, so this
+		// is unreachable in practice. Returning rather than ignoring keeps the
+		// silent-no-tending case to the one documented above.
+		return fmt.Errorf("resolve %s: %w", path, err)
+	}
+	agentUtilsDir := filepath.Dir(filepath.Dir(abs))
+	pc, err := project.Load(agentUtilsDir)
+	if errors.Is(err, project.ErrNoConfig) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("invalid config %s: reading the project descriptor beside it: %w", path, err)
+	}
+	c.Tend = pc.Tend
+	return nil
 }
 
 func (c *Config) validate() error {
@@ -257,15 +311,26 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf("repo must be in owner/name form, got %q", c.Repo))
 	}
 
-	// labels.terminal is deliberately NOT required. The planning loop has a
-	// terminal label (the human's approval); the execution loop has none,
-	// because an issue leaves it when its pull request merges. Requiring it
-	// would force an operator to invent a value that changes no behavior.
+	// Every loop has the same three states of its own: queued, working, stuck.
+	// labels.terminal is the fourth and is optional only because a loop that
+	// nothing follows has nowhere to hand on to.
+	//
+	// There used to be a fifth, labels.review, meaning "the agent finished and
+	// its output is waiting for a human to read". It is gone, and its removal is
+	// the point rather than a tidy-up: it was the only label whose meaning
+	// depended on what came AFTER the loop, so it forced every loop to describe
+	// its neighbour. A loop now declares only its own states and ends the same
+	// way -- apply the terminal, stop -- and whether that terminal is read by a
+	// human or by the next loop is a fact about the label an operator chose, not
+	// something either loop knows.
+	//
+	// Two things had been keeping it alive, and both moved to the project
+	// descriptor, where a cross-loop concern belongs: tend eligibility is now
+	// tend.label, and the epic sweep's entry loop is now epic.loop.
 	roles := []struct{ field, value string }{
 		{"labels.trigger", c.Labels.Trigger},
 		{"labels.in_flight", c.Labels.InFlight},
 		{"labels.blocked", c.Labels.Blocked},
-		{"labels.review", c.Labels.Review},
 	}
 	for _, r := range roles {
 		if strings.TrimSpace(r.value) == "" {
@@ -395,10 +460,6 @@ func (c *Config) validate() error {
 	}
 	if c.Retry.Breaker.Cooldown.Std() <= 0 {
 		errs = append(errs, errors.New("retry.breaker.cooldown must be greater than zero"))
-	}
-
-	if c.TendPR && strings.TrimSpace(c.TendPrompt) == "" {
-		errs = append(errs, errors.New("tend_prompt is required when tend_pr is true"))
 	}
 
 	// Parse every template at load time. A typo such as {{.Issue.Titel}} would

@@ -21,12 +21,12 @@ type Target struct {
 	ConfigPath  string
 	LoopName    string
 	Repo        string
-	// DefaultBranch and TendPR are what let Deliver drop a push delivery
+	// DefaultBranch and Tends are what let Deliver drop a push delivery
 	// before it opens anything. Open reads the token, opens a SQLite handle
 	// and runs the migration check; a busy feature branch would pay all three
 	// on every push, once per loop, for a delivery no loop can act on.
 	DefaultBranch string
-	TendPR        bool
+	Tends         bool
 }
 
 // Ref returns the identity loopcmd.Open needs to run this target's tick. It
@@ -190,7 +190,7 @@ func Scan() (Routes, error) {
 				LoopName:      e.Name,
 				Repo:          e.Repo,
 				DefaultBranch: e.DefaultBranch,
-				TendPR:        e.TendPR,
+				Tends:         e.Tends,
 			})
 		}
 	}

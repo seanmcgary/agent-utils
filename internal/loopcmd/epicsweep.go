@@ -402,9 +402,9 @@ func isEntryLoop(cfg *config.Config, deps Deps) bool {
 			"loop", cfg.Name, "path", deps.ConfigPath)
 		return false
 	}
-	name, err := config.EntryLoop(dir, cfg.Repo)
+	name, err := config.EpicLoop(dir, cfg.Repo)
 	if err != nil {
-		slog.Warn("epic sweep skipped: cannot name the pipeline's entry loop",
+		slog.Warn("epic sweep skipped: the project names no usable epic.loop",
 			"loop", cfg.Name, "repo", cfg.Repo, "err", err)
 		return false
 	}

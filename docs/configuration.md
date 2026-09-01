@@ -170,8 +170,7 @@ absolute path** — it depends on no working directory and can never prompt.
 - [`labels`](#labels)
 - [Agent overrides from labels](#agent-overrides-from-labels)
 - [`agent`](#agent)
-- [`tend`](#tend)
-- [`tend_pr`](#tend_pr)
+- [Project settings: `tend` and `epic`](#project-settings-tend-and-epic)
 - [`retry`](#retry)
 - [Prompts](#prompts)
 - [Template variables](#template-variables)
@@ -190,7 +189,6 @@ absolute path** — it depends on no working directory and can never prompt.
 | `labels.trigger` | string | yes | — |
 | `labels.in_flight` | string | yes | — |
 | `labels.blocked` | string | yes | — |
-| `labels.review` | string | yes | — |
 | `labels.terminal` | string | no | empty |
 | `labels.veto` | list of string | no | empty |
 | `agent.harness` | enum | no | `claude` |
@@ -201,11 +199,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.max_budget_usd` | number | no | `0`, meaning no limit |
 | `agent.background_tasks` | bool | no | `false` |
 | `agent.timeout` | duration | no | `24h` |
-| `tend.harness` | enum | no | falls back to `agent.harness` |
-| `tend.model` | string | no | falls back to `agent.model` |
-| `tend.effort` | enum | no | falls back to `agent.effort` |
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
-| `tend_pr` | bool | no | `false` |
 | `cleanup_closed_pr` | bool | no | `true` |
 | `retry.max` | int | no | `0`, meaning never retry |
 | `retry.backoff` | list of duration | yes if `retry.max > 0` | empty |
@@ -214,7 +208,26 @@ absolute path** — it depends on no working directory and can never prompt.
 | `retry.breaker.cooldown` | duration | yes | — |
 | `prompt` | template | yes | — |
 | `resume_prompt` | template | yes | — |
-| `tend_prompt` | template | yes if `tend_pr` | — |
+| `tend_prompt` | template | no; needed only on the loop that hosts tending | — |
+| `labels.review` (removed) | — | — | — |
+| `tend_pr` (removed) | — | — | — |
+| `tend.*` (moved) | — | — | — |
+
+**The project descriptor**, `.agent-utils/config.yaml`, is a different file with a different
+shape — see [Two different `config.yaml` files](#two-different-configyaml-files). It holds the
+settings that belong to the project rather than to any one loop:
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `name` | string | yes | — |
+| `id` | UUID | yes | minted on `project init` |
+| `tend.enabled` | bool | no | `false` |
+| `tend.loop` | string | yes if `tend.enabled` | — |
+| `tend.label` | string | yes if `tend.enabled` | — |
+| `tend.harness` | enum | no | falls back to `agent.harness` |
+| `tend.model` | string | no | falls back to `agent.model` |
+| `tend.effort` | enum | no | falls back to `agent.effort` |
+| `epic.loop` | string | no; required to sweep epics | — |
 
 ## Identity and paths
 
@@ -376,6 +389,27 @@ default_branch: master
 Labels are the entire interface between you, the agent, and the loop. The loop reads them
 every tick and reconstructs its view from them, so it survives a restart with no memory.
 
+**A loop declares only its own states.** Four labels: queued (`trigger`), working (`in_flight`),
+stuck (`blocked`), and done (`terminal`). Nothing in a loop file names another loop, and nothing
+in it describes what happens after the issue leaves.
+
+**The chain is made of values, not of references.** Loops run in sequence because an operator
+chose one loop's `terminal` to be the next one's `trigger` — that is a fact about the strings, and
+neither loop asserts it or reads it back. The consequence worth holding on to: you can add,
+remove or reorder a loop by changing label values, and no other loop file has to be edited.
+
+Two questions genuinely span loops and so cannot be answered inside one: which pull requests to
+keep rebased, and which loop may promote an epic's unblocked children. Both live in the project
+descriptor — see [Project settings](#project-settings-tend-and-epic).
+
+There used to be a fifth label, `labels.review`, meaning "the agent finished and its output is
+waiting for a human to read". It is gone. It was the only label whose meaning depended on what
+came *after* the loop, so it made every loop describe its neighbour, and two mechanisms were
+quietly relying on it: tend eligibility (now `tend.label`) and the epic sweep's entry loop (now
+`epic.loop`). A loop that hands to a human now does it the same way as one that hands to a
+machine: it applies its terminal and stops. What makes a terminal a human gate is that no loop
+triggers on it.
+
 **The loop writes a label in two situations**, and never in any other. It applies `blocked` when
 an issue exhausts its retry budget — see `retry.max`. And it applies `trigger` to a sub-issue of
 an epic that a closing sibling unblocked — see [Epics](../README.md#epics), which also explains
@@ -422,71 +456,42 @@ To un-park, answer in a comment and re-apply `trigger`.
 blocked: status:needs-spec-input
 ```
 
-### `labels.review` — required
-
-The agent finished and its output is waiting for you to read. The **agent** applies it.
-
-If `tend_pr` is true, this label is also what makes an issue eligible for tending.
-
-**Those are two jobs, and in an automated chain they come apart.** A loop whose output goes
-straight to the next loop has no "waiting for you to read" state at all — but it may still be the
-loop that should tend. Naming the human's queue label here to obtain tending is the tempting fix
-and the wrong one: it summons the human at that loop's completion, before the rest of the pipeline
-has run. Give the loop a label that describes what it actually asserts, and let that label carry
-the tending.
-
-`examples/execution.yaml` is the worked case. It declares `review: status:pr-open`, applies it the
-moment the pull request opens, and never removes it — so the execution loop tends the branch
-continuously from then until the issue closes, through every downstream queue and park, while
-`status:ready-for-review` stays reserved for the end of the chain. Tending is paused for the
-windows where another agent is writing by `veto`, not by the absence of the label.
-
-```yaml
-review: status:plan-ready-for-review
-```
-
 ### `labels.terminal` — optional
 
-The issue has left this loop, and the label that says so is usually the next loop's `trigger`.
+The issue has left this loop. **Every loop ends by applying it**, as its agent's last action, and
+then stops. It is the only label a loop declares that says anything about what comes next — and
+even then it names a *state*, not a loop.
 
-**Who applies it depends on what the handoff is.** Where the terminal is a *human gate*, only you
-apply it and the prompt must forbid the agent from ever doing so — that is `examples/planning.yaml`,
-where the label is your approval of the spec and plan, and whose prompt says
-`You NEVER apply {{.Labels.Terminal}}, under any circumstance`. Where the terminal is a *machine
-handoff*, the loop's own agent applies it — that is `examples/execution.yaml` and
-`examples/pr-review.yaml`, which pass a branch down the chain without stopping for you.
+**Whether it is a human gate is not a property of the field.** It is whether any loop triggers on
+that state. In the reference chain, `planning`'s terminal (`status:ready-for-plan-review`) and the
+findings loop's terminal (`status:ready-for-review`) are gates, because nothing triggers on
+either; `execution`'s and `pr-review`'s terminals are handoffs, because the next loop's trigger is
+the same string. All four are applied by the agent, in the same way, and no loop file records
+which kind it is.
 
-**A machine handoff is only safe if the prompt makes it the agent's strictly final action**, after
-the last push, and says so in numbered steps. The terminal is the next loop's trigger, so applying
-it while the agent is still working starts a second agent on a branch the first is still writing
-to, and the two fight over the files and the labels alike. Note that this is a property of *when*
-the label is applied, not of *which field* it is: `labels.review` is applied mid-run by the same
-agents, and is safe there only because it is nobody's trigger.
+That symmetry is why planning's approval label is *not* its terminal. Planning ends at
+"planning is finished" and stops; you then apply `status:ready-for-execution`, which is
+execution's trigger and the one label planning's prompt forbids its agent from ever applying.
 
-It is optional because not every loop has one. It is nonetheless the field most likely to be
-wrongly omitted, because two of its three effects are invisible:
+**A terminal that another loop triggers on is only safe if the prompt makes applying it the
+agent's strictly final action**, after the last push, and says so in numbered steps. Otherwise the
+next agent starts on a branch the first is still writing to, and the two fight over the files and
+the labels alike. The reference `execution` and `pr-review` prompts both number their completion
+steps for exactly this reason.
 
-1. **Prompts name the gate** through `{{.Labels.Terminal}}`.
-2. **It is the pipeline graph.** `internal/config/entryloop.go` picks the front of the pipeline as
-   *the loop whose trigger is no OTHER loop's terminal or review label*, and only the loop at the
-   front runs the [epic sweep](../README.md#epics). A loop that omits its terminal therefore
-   leaves whatever it feeds looking like a **second entry loop** — the resolution goes ambiguous,
-   and the sweep is disabled for the whole project with nothing but a warning in the log. Every
-   loop that hands to another must declare the label it hands with, even when the field looks
-   decorative in isolation.
-3. **It does not, on its own, make the issue leave.** Nothing in the engine reads it for
-   selection. **To make an issue actually leave the loop, list the same label under `veto`** —
-   `examples/planning.yaml` lists `status:ready-for-execution` in both places for exactly this
-   reason.
+It is optional only because a loop may have nowhere to hand on to — but every reference loop has
+one, including the last, and a loop without one simply parks issues with no way out.
 
-Point 3 has a cost worth weighing before you apply it everywhere: `veto` is checked before *tend*
-decisions too, so vetoing the terminal also stops the loop rebasing a pull request parked in that
-state. `examples/execution.yaml` declares `terminal: status:ready-for-pr-review` and deliberately
-does **not** veto it, because a branch queued for review is exactly one that should keep being
-rebased while it waits.
+**It does not, on its own, make the issue leave.** Nothing in the engine reads it for selection.
+To make an issue actually leave the loop, **list the same label under `veto`** — otherwise a
+re-applied trigger can pull back work already handed downstream.
+
+Vetoing the terminal has one cost worth weighing: `veto` is checked before *tend* decisions too, so
+vetoing it also stops the loop rebasing a pull request parked in that state. That only matters for
+the loop the project names in `tend.loop`.
 
 ```yaml
-terminal: status:ready-for-execution
+terminal: status:ready-for-plan-review
 ```
 
 ### `labels.veto` — optional
@@ -804,90 +809,6 @@ request population you trust.
 i_understand_bypass_permissions: true
 ```
 
-## `tend`
-
-Per-kind overrides for a tend dispatch: which harness runs it, on which model, at what effort.
-Optional; omit the whole section and every tend runs with `agent`'s settings, unchanged.
-
-It carries ONLY these three fields, on purpose. A tend agent's job — replay a rebase, or answer
-review feedback — is smaller than the job the trigger dispatch does, so a cheaper model is
-often enough for it; `tend:` exists to let that one choice diverge without repeating every other
-`agent` field (`permission_mode`, `worktree`, `max_budget_usd`, `timeout`,
-`background_tasks`) and inventing a second place to set them. Those keep coming from `agent:`
-for every dispatch, tend included.
-
-### `tend.harness` — optional
-
-| Value | Agent run |
-|---|---|
-| (empty) | Falls back to `agent.harness`. Default. |
-| `claude` | Runs `claude -p` for the tend dispatch, whatever `agent.harness` is. |
-| `pi` | Runs `pi -p --mode json` for the tend dispatch, whatever `agent.harness` is. |
-
-```yaml
-tend:
-  harness: claude
-```
-
-**Setting `tend.harness: pi` almost always means setting `tend.model` too.** The two fields fall
-back independently, so `tend.harness: pi` on its own leaves the tend running pi against
-`agent.model` — a claude alias like `opus`, which pi cannot resolve. Nothing rejects the pair at
-load time (the model is free text for both harnesses, exactly as `agent.model` is), so the
-mismatch surfaces as a failed dispatch. Give pi a `provider/id`:
-
-```yaml
-tend:
-  harness: pi
-  model: anthropic/claude-haiku-4-5
-```
-
-**Changing the harness starts a new session; it never resumes the issue's.** A session belongs
-to the harness that minted it, and pi does not refuse a session id it has never seen — it starts
-a fresh session under it and carries on, so resuming across harnesses would lose the earlier
-conversation silently rather than fail loudly. When the tend's effective harness (`tend.harness`,
-or `agent.harness` when that is empty) differs from the harness that started the issue's session
-— or the issue has no started session yet — the tend gets a fresh session instead of the issue's.
-A `harness:` label on the issue is resolved into this comparison too: it beats `tend.harness` the
-same way it beats `agent.harness` (see [Precedence](#precedence) below), so a tend running under
-a label override is compared against ITS effective harness, not the configured one.
-
-### `tend.model` — optional
-
-Passed straight through as `--model`, exactly like `agent.model`. Falls back to `agent.model`
-when empty.
-
-```yaml
-tend:
-  model: sonnet
-```
-
-### `tend.effort` — optional
-
-Passed as `--effort`, exactly like `agent.effort`. One of `low`, `medium`, `high`, `xhigh`,
-`max`. Falls back to `agent.effort` when empty. An invalid value fails the config load rather
-than the dispatch, the same as `agent.effort`.
-
-```yaml
-tend:
-  effort: low
-```
-
-### Precedence
-
-Every field a tend dispatch resolves passes through three layers, each replacing only what the
-layer before it set:
-
-1. **`agent:`** — the loop's default for every dispatch, tend included.
-2. **`tend:`** — overlaid only when the dispatch is a tend, and only its NON-EMPTY fields; a
-   `tend:` section that sets only `tend.model` leaves `tend.harness` and `tend.effort` falling
-   through to `agent.harness` and `agent.effort`, exactly as an absent `agent` field falls
-   through to claude's own default.
-3. **A label on the issue** (`harness:`, `model:`, `effort:`) — wins over both of the above.
-
-The label wins because `tend:` is a default for a whole CLASS of dispatch, while a label is an
-instruction about one issue — the same reasoning that already lets a label override `agent:`.
-See [Agent overrides from labels](#agent-overrides-from-labels).
-
 ## `cleanup_closed_pr`
 
 Whether a closed pull request's worktrees are removed. Default `true`.
@@ -915,12 +836,119 @@ Two limits apply, and neither is configurable:
 cleanup_closed_pr: false   # keep the worktrees
 ```
 
-## `tend_pr`
+## Project settings: `tend` and `epic`
 
-Whether the loop rebases stale pull requests. Default `false`.
+**These live in `.agent-utils/config.yaml`, the PROJECT descriptor — not in a loop file.** A loop
+file that sets them fails to load. See
+[Two different `config.yaml` files](#two-different-configyaml-files).
 
-When true, for each issue carrying `labels.review`, on every tick and also when a tend sweep
-fires for the loop (see below):
+Both answer questions that span loops, and a question that spans loops cannot be answered inside
+one without making that loop describe its neighbours. Keeping them here is what lets a loop
+declare only its own labels.
+
+```yaml
+name: lawndominator
+id: 6f1c...        # minted by `project init`; never edit it
+
+tend:
+  enabled: true
+  loop:    exec-pr-review-findings
+  label:   status:ready-for-review
+  model:   sonnet
+
+epic:
+  loop: planning
+```
+
+### `tend`
+
+Whether the project keeps its open pull requests rebased, which ones, and which loop runs the
+dispatches. Off by default: tending force-pushes branches, and a policy that destructive is
+opt-in.
+
+It used to be a per-loop `tend_pr: bool` gated on that loop's `labels.review`. That worked only
+because the review label happened to mark the right issues, it meant an operator asking "does this
+repository keep its pull requests fresh" had to read every loop file to find out, and it had a
+misconfiguration with no error message: two loops in one project could both set `tend_pr`, and
+both would rebase the same branch.
+
+#### `tend.enabled` — optional, default `false`
+
+The switch. When false, nothing else in the block is read and no loop tends.
+
+#### `tend.label` — required when enabled
+
+The issue label that makes a pull request eligible. This is the explicit statement of what used to
+be implicit: *an issue in this state has a pull request worth keeping fresh*.
+
+Point it at the state where a pull request waits longest — in the reference chain that is
+`status:ready-for-review`, the human's merge queue. Every earlier wait is a machine that picks the
+issue up within a tick; only that one lasts long enough for the base branch to move underneath it.
+
+#### `tend.loop` — required when enabled
+
+Which loop's rows host the tend dispatches.
+
+Something has to say this, because `dispatches`, the live-dispatch guard, the per-pull-request
+last-tend time and the repeat-conflict fingerprints are all keyed by loop. Two loops answering one
+project-level policy would each keep half that state and both force-push, and nothing downstream
+would catch it: the live-dispatch guard only ever sees the loop it was called for.
+
+**Name the loop that last touches the branch.** Its worktree, its session and its `tend_prompt`
+are the ones that describe the work being maintained — and its terminal is usually the state
+`tend.label` names, which is the same thing said from the other side. The named loop needs a
+`tend_prompt`; no other loop does.
+
+#### `tend.harness`, `tend.model`, `tend.effort` — optional
+
+Which agent runs a tend, overriding the hosting loop's `agent:` section for tend dispatches only.
+Empty means "use that loop's `agent` setting for this too".
+
+These are the only three fields, on purpose. A tend agent's job — replay a rebase, or answer
+review feedback — is smaller than the job a trigger dispatch does, so a cheaper model is often
+enough for it; this exists to let that one choice diverge without repeating every other `agent`
+field (`permission_mode`, `worktree`, `max_budget_usd`, `timeout`, `background_tasks`) and
+inventing a second place to set them. Those keep coming from `agent:` for every dispatch, tend
+included.
+
+**Setting `tend.harness: pi` almost always means setting `tend.model` too.** The two fall back
+independently, so `tend.harness: pi` on its own leaves the tend running pi against `agent.model` —
+a claude alias like `opus`, which pi cannot resolve. Nothing rejects the pair at load time (the
+model is free text for both harnesses, exactly as `agent.model` is), so the mismatch surfaces as a
+failed dispatch. Give pi a `provider/id`:
+
+```yaml
+tend:
+  harness: pi
+  model: anthropic/claude-haiku-4-5
+```
+
+`tend.effort` is one of `low`, `medium`, `high`, `xhigh`, `max`; an invalid value fails the
+descriptor load rather than the dispatch. A `harness:`, `model:` or `effort:` label on the issue
+still beats all of these, the same way it beats `agent`'s.
+
+### `epic`
+
+`epic.loop` names the one loop allowed to promote an epic's unblocked sub-issues into its trigger
+label. Nothing else is configurable; see [Epics](../README.md#epics).
+
+Exactly one loop may do it: if every loop promoted into its own trigger, the execution loop would
+push a fresh issue straight to `status:ready-for-execution` and planning would be skipped —
+silently, and only for issues that happen to be swept.
+
+**This too used to be derived**, by asking which loop's trigger was no other loop's terminal or
+review label. Declaring it is the change: the derivation made the answer a property of every loop
+file at once, so renaming one label could move the front of the pipeline, or produce two
+candidates and disable promotion for the whole project with a single log line.
+
+A declaration that is missing, names a loop that does not exist, or names one watching another
+repository, is reported where the sweep would have run and promotes nothing. So is a project whose
+loop files will not all load — the broken one may be the loop that was named.
+
+### How tending works
+
+For each issue carrying `tend.label`, on every tick of the hosting loop and also when a tend sweep
+fires for it (see below):
 
 1. Find the open pull request whose body closes it (`Closes #N`, `Fixes #N`, `Resolves #N`).
 2. Ask how far behind its base it is (the local checkout for a sweep, the GitHub API for a
@@ -941,16 +969,26 @@ Three safeguards apply:
 - **An issue with a live agent is never tended**, so a rebase cannot force-push a branch its
   own build agent is committing to.
 - **Tending never changes a label.**
+- **A DRAFT pull request is never tended.** It is the author's working copy: nobody is blocked by
+  it being behind, no reviewer is waiting on a reply, and force-pushing a rebase under someone
+  still assembling the branch is the one thing tending must never do.
 - **A clean rebase has no session at all.** git replays the branch in this process, so there is
   no conversation to be fresh or stale, and no agent is dispatched. The rest of this bullet
   applies only to the tend agent a conflict escalates to.
-- **A tend agent resumes the issue's session** when the loop can — it carries the context of the
-  work it is rebasing. When the issue has no started session, or that session was minted by a
-  different harness than this tend will run, the tend gets a fresh session instead: a rebase is
-  idempotent and needs no memory of an earlier one.
+- **A tend agent gets its OWN session, always.** It never resumes the issue's, and never resumes
+  a previous tend's. It used to inherit the issue's, so a rebase agent carried the context of the
+  work it was rebasing; three things removed the reason. A clean rebase runs no agent now, so what
+  is left for one is a conflict or a review reply — both fully described by the branch, the
+  conflicted hunks and the pull request thread, none of them by the conversation that wrote the
+  code. Inheriting also BLOCKED the issue for as long as the tend ran, because two processes on
+  one session identifier is the same hazard as two agents in one branch. And the hosting loop is
+  not necessarily the loop that wrote the branch, so "the issue's session" no longer names one
+  obvious conversation to inherit. Continuity across repeat tends of a pull request is what
+  actually matters, and that lives in the database — the last-tend time and the conflict
+  fingerprints — rather than in a resumed conversation.
 
 **Three things arm a tend sweep.** A delivery for one issue still tends it directly — the
-issue carries `labels.review`, its linked pull request is behind its base, and the delivery
+issue carries `tend.label`, its linked pull request is behind its base, and the delivery
 named that issue — and beyond that:
 
 - **A merge into `default_branch`.** GitHub sends a `pull_request` delivery with `merged:
@@ -964,9 +1002,9 @@ named that issue — and beyond that:
   README next to `tend_interval`. It runs only while the listener runs, and each pass costs no
   GitHub call when nothing is behind.
 
-Whichever of these fires, every issue carrying `labels.review` whose linked pull request
-targets `default_branch` and is now behind gets a rebase attempt — git first, the agent only on
-conflict, exactly as above.
+Whichever of these fires, every issue carrying `tend.label` whose linked pull request targets
+`default_branch` and is now behind gets a rebase attempt — git first, the agent only on conflict,
+exactly as above.
 
 A pull request targeting any other branch is left alone. A merge into `master` says nothing
 about a branch based on `release/1.0`.
@@ -981,7 +1019,7 @@ applies to the agent-free rebases as well as the agent dispatches, since the poi
 how much force-pushing and how many agents one sweep can start. If more pull requests are
 behind than that, the rest are named in the log line and wait for the next sweep.
 
-**A closed pull request has its worktrees removed.** This is separate from `tend_pr` and is not
+**A closed pull request has its worktrees removed.** This is separate from tending and is not
 gated by it; `cleanup_closed_pr` turns it off. When GitHub reports a pull request closed — merged or not — the loop removes that
 pull request's `pr-<N>` worktree, and the `issue-<M>` worktree of the issue it closes, as soon
 as neither has a live dispatch. A worktree of a large repository is easily hundreds of
@@ -997,24 +1035,19 @@ reconcile: it is what retires a dead runner for an issue no delivery names, and 
 tend trigger at all on a machine that runs no listener daemon — the merge, push, and periodic
 triggers belong to the listener. Schedule it under cron regardless of whether the daemon runs.
 
-**Set this `false` for a planning loop.** `plan-feature` opens a design draft pull request
-whose body also says `Closes #N`, so a planning loop with tending on would force-push a draft
-you are in the middle of reading.
+**Never name a loop that writes to the branch.** `plan-feature` opens a design draft pull request
+whose body says `Closes #N`, so a planning loop that tended would force-push a draft you are in the
+middle of reading — and the drafts guard above only covers the draft case, not the general one. A
+review or remediation loop writes to the branch too: the reviewer commits its mechanical-gate
+fixes and the remediation loop force-pushes a whole round of them, either of which would race a
+tend rebase.
 
-**Set it `false` for a review loop and for a remediation loop too**, for a different reason: both
-write to the branch — the reviewer commits its mechanical-gate fixes, and the remediation loop
-force-pushes a whole round of them — so a tend agent rebasing the same branch would race their
-pushes. Tending stays in one place, on the execution loop.
-
-**What actually keeps the two apart is `veto`, not the label.** It is tempting to reason that a
-pull request waiting on review is untended because it has not reached the tending loop's
-`labels.review` yet. That is backwards: the execution agent applies `status:pr-open` when it opens
-the pull request and nothing in the chain ever removes it, so the execution loop tends that branch
-continuously from then on — through the review queue, the remediation queue, the human gate, and
-any park in between. `veto` is checked before tend decisions, so the execution loop must list
-`status:pr-reviewing` and `status:fixing-findings`: those two entries are the only thing that
-pauses its tend while another agent is rewriting the branch, and they resume it the moment that
-agent is done.
+**`tend.loop` is not what keeps them apart, though.** It says where the dispatches are recorded,
+not when they may run: the hosting loop tends every issue carrying `tend.label`, including ones
+another loop is working on. `veto` is what excludes those windows, and it is checked before tend
+decisions for exactly that reason. In the reference chain the hosting loop lists the states owned
+by the loops that write to branches, so its tend pauses while one of them is running and resumes
+the moment it is done.
 
 **Two things trigger a tend, and either alone is enough.** The pull request is behind its base —
 the trigger this section led with — or review activity on it is newer than the last *finished*
@@ -1041,11 +1074,11 @@ same way any delivery naming an issue already does. `agent-utils project loop ti
 reconcile catches it too, since it reads GitHub state rather than local refs.
 
 **Replying to review feedback needs a `tend_prompt` that branches on `{{.PR.ReviewPending}}`.**
-The shipped `tend_prompt` is a pure rebase instruction, and stays correct even for a
-review-triggered tend: a dispatch carrying `ReviewPending` still rebases first when it is also
-behind, and a template that never reads `{{.PR.ReviewPending}}` behaves exactly as before. To
-have the tend agent read and answer unresolved review threads, branch the prompt on that
-variable — see the commented-out example in `examples/execution.yaml`.
+A pure rebase instruction stays correct even for a review-triggered tend: a dispatch carrying
+`ReviewPending` still rebases first when it is also behind, and a template that never reads
+`{{.PR.ReviewPending}}` behaves exactly as before. To have the tend agent read and answer
+unresolved review threads, branch the prompt on that variable — see the `tend_prompt` in
+`examples/exec-pr-review-findings.yaml`, which is the reference chain's hosting loop.
 
 **A rebase that keeps conflicting the same way backs off, rather than paying for another agent
 turn on it.** A conflict is fingerprinted by its conflicted paths together with the branch's
@@ -1060,13 +1093,9 @@ backoff starts over from the first sighting. One exception: a decision carrying 
 is never backed off, because the backoff's evidence is a repeated rebase conflict and says
 nothing about whether a reviewer's comment has since been answered.
 
-The backoff needs `agent.worktree: per_issue`. The fingerprint is built from the conflicted
-paths, and those only exist in a worktree this program rebased itself, so a loop running
-`agent.worktree: none` hands the same conflict to the agent on every tick as before.
-
-```yaml
-tend_pr: true
-```
+The backoff needs `agent.worktree: per_issue` on the hosting loop. The fingerprint is built from
+the conflicted paths, and those only exist in a worktree this program rebased itself, so a loop
+running `agent.worktree: none` hands the same conflict to the agent on every tick as before.
 
 ## `retry`
 
@@ -1205,8 +1234,8 @@ rather than inside a detached process three hours later.
 | `resume_prompt` | An issue resumes an existing session |
 | `tend_prompt` | A pull request is tended: it is behind its base, or it carries review activity newer than the last tend |
 
-`prompt` and `resume_prompt` are always required. `tend_prompt` is required only when
-`tend_pr` is true.
+`prompt` and `resume_prompt` are always required. `tend_prompt` is optional, and is only ever
+rendered for the loop the project's `tend.loop` names.
 
 `resume_prompt` can be short. The agent is in the same conversation and already knows what it
 did; it needs to be told what changed, not told everything again.
@@ -1242,7 +1271,6 @@ Available to all three prompts.
 | `{{.Labels.Trigger}}` | string | |
 | `{{.Labels.InFlight}}` | string | |
 | `{{.Labels.Blocked}}` | string | |
-| `{{.Labels.Review}}` | string | |
 | `{{.Labels.Terminal}}` | string | Empty when `labels.terminal` is unset |
 
 Referring to a field that does not exist is a load-time error. Referring to one that exists
@@ -1259,8 +1287,6 @@ Beyond the required fields in the quick reference:
 | `repo` must contain exactly one `/`, both parts non-empty | `repo must be in owner/name form` |
 | `agent.worktree` ∈ {`per_issue`, `none`} | `agent.worktree must be …` |
 | `agent.effort` ∈ {`low`,`medium`,`high`,`xhigh`,`max`} or empty | `… is not a valid effort level` |
-| `tend.harness` ∈ {`claude`, `pi`} or empty | `tend.harness must be …` |
-| `tend.effort` ∈ {`low`,`medium`,`high`,`xhigh`,`max`} or empty | `… is not a valid effort level` |
 | `agent.permission_mode` is a real claude mode or empty | `… is not a valid claude permission mode` |
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
 | `agent.max_budget_usd` ≥ 0 (`0` means no cap) | `agent.max_budget_usd must not be negative` |
@@ -1271,11 +1297,21 @@ Beyond the required fields in the quick reference:
 | `retry.breaker.orphan_threshold` ≥ 1 | `must be at least 1` |
 | `retry.breaker.cooldown` > 0 | `must be greater than zero` |
 | `checkout_base_dir`/`worktree_dir` relative needs a project root | `… so there is no project root to resolve it against` |
-| `tend_prompt` non-empty when `tend_pr` | `tend_prompt is required when tend_pr is true` |
 | All three prompts parse as templates | `prompt: template: …` |
 | No unknown keys anywhere | `field … not found in type config.Config` |
 
 Every failure is reported at once, so one load tells you everything wrong with the file.
+
+The **project descriptor** is validated separately, and a failure there fails every loop in the
+project — the policy it carries might have said "enabled", and running a loop under a policy
+nobody can read is the outcome worth refusing:
+
+| Rule | Message |
+|---|---|
+| `tend.label` set when `tend.enabled` | `sets tend.enabled but no tend.label` |
+| `tend.loop` set when `tend.enabled` | `sets tend.enabled but no tend.loop` |
+| `tend.harness` ∈ {`claude`, `pi`} or empty | `tend.harness must be claude or pi` |
+| `tend.effort` ∈ {`low`,`medium`,`high`,`xhigh`,`max`} or empty | `tend.effort must be …` |
 
 To check every configuration in a project without touching GitHub:
 

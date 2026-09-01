@@ -21,7 +21,6 @@ labels:
   trigger: t
   in_flight: i
   blocked: b
-  review: r
   terminal: d
 agent:
   model: sonnet

@@ -62,7 +62,7 @@ agent-utils project init
 ```
 Created project "my-repo" (/Users/you/Code/my-repo/.agent-utils)
 Start from which template?
-  Supplies the label and tend_pr defaults below, and the three prompt bodies.
+  Supplies the label defaults below, and the prompt bodies.
   1) planning
   2) execution
 [planning]:
@@ -179,15 +179,18 @@ rebase still writes a `rebase` dispatch row — visible in `agent-utils project 
 like any other dispatch — and it is deliberately absent from `agent-utils project sessions
 list`, because a row with no session names nothing to list there.
 
-When a rebase does need the agent, it shares the session too. Rebasing a pull request is
-maintenance on work the session already did, so the rebase agent resumes that conversation
-rather than opening a throwaway one and reading the diff cold. It borrows the session without
-owning it: a tend never stamps the issue's session row, never spends its retry budget, and
-never marks it succeeded. The session belongs to the loop that carries `tend_pr: true` — the
-same loop's own row for that issue, so an issue that passed through `planning` before
-`execution` resumes the execution conversation, not the planning one. An issue whose session
-was never started still gets a fresh identifier, because `-r` against a session claude never
-created fails every time.
+When a rebase does need the agent, that agent gets its **own** session. It does not resume the
+issue's, and it never stamps the issue's session row, spends its retry budget, or marks it
+succeeded.
+
+It used to resume the issue's, on the reasoning that rebasing is maintenance on work that
+conversation already did. Three things retired that. A clean rebase runs no agent at all now, so
+what is left for one is a genuine conflict or a reply to review feedback — both described by the
+branch, the conflicted hunks and the pull request thread rather than by the conversation that
+wrote the code. Resuming also *blocked* the issue for as long as the tend ran, since two processes
+on one session identifier is the same hazard as two agents in one branch. And tending is a
+project-level policy with a declared host loop now, which is not necessarily the loop that wrote
+the branch, so "the issue's session" no longer names one obvious conversation to inherit.
 
 For the same reason, a tend runs the issue's `model:` and `harness:` labels rather than the
 loop's defaults: a session identifier only means something to the harness that minted it. When
@@ -416,32 +419,51 @@ remains the reference for editing one by hand** — what each field means, what 
 what happens if you get it wrong. `examples/` holds four complete working files that form one
 chain, each loop's `trigger` being the loop before its `terminal`:
 
-| Loop | Trigger | Hands on with | Does |
+| Loop | Trigger | Ends at | Does |
 |---|---|---|---|
-| `planning.yaml` | `status:ready-for-spec` | `status:ready-for-execution` — **human touch 1** | spec and plan, parked for your approval |
-| `execution.yaml` | `status:ready-for-execution` | `status:ready-for-pr-review` (its agent, last action) | builds the branch, opens the pull request |
-| `pr-review.yaml` | `status:ready-for-pr-review` | `status:ready-for-findings-exec` (its agent, last action) | runs the stronger model over the branch and posts a findings comment — it decides, it does not fix |
-| `exec-pr-review-findings.yaml` | `status:ready-for-findings-exec` | `status:ready-for-review` — **human touch 2** | applies that findings comment, one fresh subagent per file group, then hands the pull request to you to merge |
+| `planning.yaml` | `status:ready-for-spec` | `status:ready-for-plan-review` | spec and plan, parked for you to read |
+| `execution.yaml` | `status:ready-for-execution` | `status:ready-for-pr-review` | builds the branch, opens the pull request |
+| `pr-review.yaml` | `status:ready-for-pr-review` | `status:ready-for-findings-exec` | runs the stronger model over the branch and posts a findings comment — it decides, it does not fix |
+| `exec-pr-review-findings.yaml` | `status:ready-for-findings-exec` | `status:ready-for-review` | applies that findings comment, one fresh subagent per file group, then hands the pull request to you |
 
-**An issue takes exactly two human touches.** You approve the plan, and you merge. Everything
-between is machine handoff: each loop's agent applies the next loop's trigger as its own strictly
+**Every loop works the same way and knows nothing about its neighbours.** It declares four labels
+— queued, working, stuck, done — and ends by applying the last one and stopping. The chain exists
+only because you chose one loop's `terminal` to be the next one's `trigger`; that is a fact about
+the strings, not something either file asserts. Add, remove or reorder a stage by changing label
+values, and no other loop file needs editing.
+
+**An issue takes exactly two human touches**, and both are places where the chain simply stops:
+nothing triggers on `status:ready-for-plan-review`, so you read the plan and apply
+`status:ready-for-execution` yourself; nothing triggers on `status:ready-for-review`, so you read
+the pull request and merge. Between them each agent applies the next trigger as its own strictly
 final action, after its last push, so a second agent never starts on a branch the first is still
-writing to. `status:ready-for-review` means one thing — the pipeline is finished and it is your
-turn — and exactly one loop applies it.
+writing to.
 
-The first two are ported from the reference planning and execution orchestrators. The last two
-used to be one loop that reviewed and fixed in a single session; splitting them is what lets the
-review run a strong model on a small budget while the fixing runs a cheaper one in a fresh
-context per fix. Tending is keyed to a fifth label, `status:pr-open`, which the execution agent
-applies when it opens the pull request and nothing removes — so the branch keeps being rebased
-through every wait in the chain, including the one at your gate. `examples/pi.yaml` is the execution loop again under the `pi` harness, not a
+The first two loops are ported from the reference planning and execution orchestrators. The last
+two used to be one loop that reviewed and fixed in a single session; splitting them is what lets
+the review run a strong model on a small budget while the fixing runs a cheaper one in a fresh
+context per fix. `examples/pi.yaml` is the execution loop again under the `pi` harness, not a
 fifth stage. If you are running the older three-loop chain,
 [`docs/review-loop-split.md`](docs/review-loop-split.md) is the propagation and migration guide —
 what changes in each file, in what order, and where work already in flight lands.
 
-A tend dispatch — the automatic rebase-or-review-reply agent — can run its own harness, model and
-effort instead of `agent`'s, cheaper by default since its job is smaller; see
-[`tend`](docs/configuration.md#tend) in the reference.
+**Two settings are not in any loop file**, because they are questions no single loop can answer.
+They live in the project descriptor, `.agent-utils/config.yaml`:
+
+```yaml
+tend:
+  enabled: true
+  loop:    exec-pr-review-findings   # whose rows host the dispatches
+  label:   status:ready-for-review   # which pull requests to keep rebased
+  model:   sonnet                    # a tend's job is small; a cheap model does it
+epic:
+  loop: planning                     # the one loop that may promote epic siblings
+```
+
+Tending keeps a repository's open pull requests rebased and answers review activity on them, so it
+describes the repository rather than any loop's issue lifecycle; `tend.label` points at the state
+where a pull request waits longest, which is your merge queue. See
+[Project settings](docs/configuration.md#project-settings-tend-and-epic).
 
 A label on an issue can also override, for that issue alone, which model, harness, or effort
 level a dispatch uses: `model:<value>`, `harness:<value>`, `effort:<value>`. These are always
@@ -595,7 +617,7 @@ arms a tend sweep, which acts on pull requests the delivery never names.
 The third is a `push` delivery, which names no issue at all: its subject is a branch, and the
 only work it can start is that same sweep.
 
-Three things arm a **tend sweep** for a loop with `tend_pr: true`:
+Three things arm a **tend sweep** for the loop the project's `tend.loop` names:
 
 - **A merge into `default_branch`.** GitHub sends a `pull_request` delivery with `merged: true`
   on the close action, and that merge is what makes every other open pull request stale while
@@ -610,7 +632,8 @@ Three things arm a **tend sweep** for a loop with `tend_pr: true`:
   to leave running. See [`tend_interval`](#tend_interval) below for how often it fires.
 
 Whichever trigger fires, the sweep tries a plain git rebase before it dispatches anything —
-see [`tend_pr`](docs/configuration.md#tend_pr) for what that changes. It is capped either way.
+see [Project settings](docs/configuration.md#project-settings-tend-and-epic) for what that
+changes. It is capped either way.
 
 The fourth exception is on an `issues` delivery reporting a **close**: when the closed issue
 is a sub-issue of an epic, the delivery also sweeps that epic, promoting sibling sub-issues the
@@ -690,14 +713,14 @@ actually binds).
 
 `tend_interval` is the other machine-wide setting the listener reads, and it is also set with
 `agent-utils config set` — for example `agent-utils config set tend_interval 30m`. It controls
-how often the periodic tend check described above runs, for every loop with `tend_pr: true`
-of every registered project. The default, when it is unset, is `15m`; the check is cheap when
+how often the periodic tend check described above runs, for the tending loop of every registered
+project. The default, when it is unset, is `15m`; the check is cheap when
 nothing is behind, so this is tuned by how soon a stale branch should be noticed, not by what
 the check costs. The minimum is `1m`: each pass fetches and opens a database once per tending
 loop of every registered project, so a smaller value is a spin rather than a fast setting, and
 `config set` refuses one. Setting it to `0` disables the periodic check only — the merge
 trigger, the push trigger, and cron's full sweep all still reach the rebase path, so this does
-not turn tending off; `tend_pr: false` on the loop does that. The periodic check still gates on
+not turn tending off; `tend.enabled: false` in the project descriptor does that. The periodic check still gates on
 staleness alone, whatever `tend_interval` is set to: review activity is not visible from a local
 checkout, so it reaches a loop only through its own `pull_request_review` or
 `pull_request_review_comment` webhook delivery, never through this timer.
@@ -904,15 +927,27 @@ choose *which* issues are promoted: that was fixed when a maintainer put those i
 and declared the dependency. Point a loop only at a repository whose issue population you trust —
 see [Security](#security).
 
-**There is nothing to configure.** The `epic` label on the parent is the only switch. One loop per
-project does the promoting — the one at the front of the pipeline, which is the loop whose
-trigger label is no other loop's terminal or review label. Two projects watching the same
-repository each resolve their own entry loop and each sweep. In the reference chain that is
-`planning`, because every other loop's trigger is the terminal of the loop before it. **A loop
-that omits `labels.terminal` breaks this**, and breaks it silently: whatever it feeds then has a
-trigger that is nobody's terminal, so two loops look like the front, the resolution is ambiguous,
-and no loop sweeps. If that cannot be resolved to exactly one loop, the reason is logged and
-nothing else says so.
+**One line configures it.** The `epic` label on the parent is the switch on the issue side; on the
+configuration side the project descriptor names the one loop allowed to promote:
+
+```yaml
+epic:
+  loop: planning
+```
+
+Exactly one loop may do it, or the execution loop would push a fresh issue straight to
+`status:ready-for-execution` and planning would be skipped. Two projects watching the same
+repository each read their own descriptor and each sweep.
+
+**This used to be derived** — the loop whose trigger was no other loop's terminal or review label
+— and derivation is what the declaration replaces. It made the answer a property of every loop
+file at once: renaming one label could move the front of the pipeline, and a loop that omitted its
+terminal left whatever it fed looking like a second front, which disabled promotion for the whole
+project behind a single log line. A declaration cannot go ambiguous.
+
+A declaration that is missing, names a loop that does not exist, or names one watching another
+repository, promotes nothing and says why in the log. So does a project whose loop files will not
+all load — the broken one may be the loop that was named.
 
 Two things drive it: an `issues` delivery reporting a close, and `loop tick` under cron, which
 walks every open epic. The delivery is the fast path and cron is the backstop for a delivery that

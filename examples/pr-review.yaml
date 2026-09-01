@@ -25,28 +25,8 @@ labels:
   trigger:   status:ready-for-pr-review
   in_flight: status:pr-reviewing
   blocked:   status:needs-review-input
-  # review and terminal are the SAME label here, and this is the only loop in
-  # the chain where that is right. labels.review means "this loop finished and
-  # its output is waiting to be read"; labels.terminal means "the issue has left
-  # this loop". For a HUMAN handoff those are two states, because the human
-  # reads first and moves the issue second -- that is why planning keeps them
-  # apart and forbids its agent from ever applying its terminal. This handoff is
-  # to a MACHINE: the findings comment is posted and the next loop is queued in
-  # one action, so there is no interval between the two states for a second
-  # label to describe. Writing status:ready-for-review here instead would be a
-  # field the agent never applies, and it would make an issue queued for
-  # remediation indistinguishable from one already fixed and waiting on the
-  # human.
-  #
-  # Safe because tend_pr is false below. labels.review is one field doing two
-  # jobs, and the other job -- tend eligibility -- is switched off here.
-  #
-  # One consequence to expect rather than debug: `loop status` prints a
-  # handed-off issue as `veto`, never `in-review`. status.go checks veto before
-  # review, and this label is in both. That is the honest reading -- the issue
-  # HAS left this loop -- but it means this loop's in-review count is always
-  # zero.
-  review:    status:ready-for-findings-exec
+  # TERMINAL. Applied by this loop's agent as its strictly final action, and
+  # nothing else follows it. The remediation loop triggers on the same state.
   terminal:  status:ready-for-findings-exec
   veto:
     - "blocked:*"
@@ -108,29 +88,6 @@ agent:
 
 i_understand_bypass_permissions: true
 
-# Tending is an EXECUTION-loop duty, and this loop must never do it. It still
-# pushes -- the mechanical gates' fixes are commits -- so a tend agent rebasing
-# the same branch would race that push.
-#
-# Be exact about where tending actually lands, because the obvious reading is
-# wrong. A loop tends whatever ITS labels.review names, and for the execution
-# loop that is status:pr-open -- which the EXECUTION agent applies the moment it
-# opens the pull request, and which nothing in this chain ever removes. So the
-# branch is tended continuously from that moment on, including while it sits in
-# this loop's queue. It is not the case that a pull request waiting on review
-# goes untended.
-#
-# What stops the race is therefore not the absence of the label; it is the veto
-# list. The execution loop vetoes status:pr-reviewing and status:fixing-findings
-# exactly so its tend pauses while another agent is writing to the branch, and
-# resumes the moment that agent is done. Removing either veto reintroduces the
-# race silently, because veto is the only thing standing between a tend rebase
-# and this loop's force-push.
-#
-# Whichever end tends, it must not be vetoed: labels.veto is checked before
-# tend decisions too (internal/engine/engine.go), so vetoing a label would
-# silently disable tending on it as well as dispatching.
-tend_pr: false
 
 retry:
   max: 3
@@ -227,11 +184,10 @@ prompt: |
     4. @-mention @seanmcgary.
     5. Remove {{.Labels.InFlight}}.
     6. Add {{.Labels.Terminal}}. THIS IS YOUR LAST ACTION. Nothing follows it.
-  This loop's {{.Labels.Review}} and {{.Labels.Terminal}} are the same label, so
-  step 6 applies both roles at once and there is no second label to add. Add no
-  other status label; in particular status:ready-for-review means "the whole
-  pipeline is finished and it is the human's turn to merge", and only the
-  remediation loop after you applies it.
+  {{.Labels.Terminal}} is the ONLY label you add at the end. In particular do not
+  add status:ready-for-review: that means the whole pipeline is finished and it
+  is the human's turn to merge, and only the remediation loop after you applies
+  it.
 
   PARKING. Park only when you cannot proceed: a mechanical gate still red after
   your fixes, a rejected lease, or a pull request that cannot be resolved from
@@ -269,6 +225,3 @@ resume_prompt: |
   All other rules from your original instructions still apply, including that you
   fix nothing you find, that pushes use --force-with-lease, that
   {{.Labels.Terminal}} is your strictly last action, and that you never merge.
-
-tend_prompt: |
-  Tending is disabled for the pr-review loop. This template is never rendered.

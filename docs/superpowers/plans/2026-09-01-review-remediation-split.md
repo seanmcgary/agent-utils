@@ -211,7 +211,7 @@ a five-dimension review of a large branch is not hypothetical.
 | pr      | #26                                                          |
 | gate    | approved 2026-09-01 (design fixed by the operator's brief)   |
 | round   | 0                                                            |
-| decisions | 7 (see Decisions below)                                    |
+| decisions | 10 (see Decisions below)                                   |
 
 ### Decisions
 
@@ -263,6 +263,39 @@ a five-dimension review of a large branch is not hypothetical.
   a reader should see that "no ceiling" was decided, not forgotten. The timeout default is a real
   Go change in `Load()`, and `validate()` now rejects only a NEGATIVE duration, because YAML
   cannot distinguish an omitted field from an explicit zero.
+- **Policy change mid-run — loops are self-contained; `labels.review` is removed.** The operator
+  changed the design again while this was in flight. A loop now declares only its own four labels
+  (trigger, in_flight, blocked, terminal) and ends the same way: apply the terminal, stop. The
+  chain exists only because one loop's terminal is the next one's trigger — a fact about the
+  values, asserted by nothing.
+  `labels.review` was the one field whose meaning depended on what came AFTER the loop, so it is
+  gone. Two mechanisms were quietly keeping it alive and both moved to the project descriptor,
+  where a cross-loop concern belongs: tend eligibility became `tend.label`, and the epic sweep's
+  entry loop became `epic.loop`. This supersedes the `status:pr-open` rename entirely -- that
+  label existed only to give execution a tend key, and there is no longer anything to key.
+  Planning changed shape too: it now applies its own terminal (`status:ready-for-plan-review`) and
+  the human's approval label (`status:ready-for-execution`) is a separate label the prompt forbids
+  the agent from applying. What makes a terminal a gate is that no loop triggers on it, not the
+  field it is written in.
+- **`epic.loop` replaces `config.EntryLoop`'s derivation.** Did: rewrote it as
+  `config.EpicLoop`, reading `epic.loop` from the project descriptor, with `ErrNoEpicLoop` and
+  `ErrAmbiguousEpicLoop` (the latter now only for duplicate loop names). Why: the derivation WAS
+  the cross-loop dependency being removed. It also fails in a way a declaration cannot -- with
+  `labels.review` gone and planning's terminal no longer being execution's trigger,
+  `status:ready-for-execution` is nobody's terminal, so execution would resolve as a second entry
+  loop and the epic sweep would silently stop for the whole project. `isEntryLoop` in
+  `epicsweep.go` is the entire consumer set, so the blast radius was contained.
+  `TestExampleLoopsResolveToOneEntryLoop` tested the derived behaviour and is gone; two tests
+  replace it -- one that every example declares all four label roles, one that exactly one loop
+  ends at the human's merge queue.
+- **`tend.loop` was added to the brief's `tend:` shape.** Brief: `enabled`, `label`, `harness`,
+  `model`, `effort`. Did: added `loop`. Why: the store keys every tend row -- the dispatch, the
+  live-dispatch guard, the last-tend time, the conflict fingerprints -- by loop, and the brief said
+  to leave #25's store work alone. Without a named host, every loop in the project answers one
+  project-level policy and two of them force-push the same branch, which nothing downstream would
+  catch: `liveTendPRs` only ever sees the loop it was called for. The obvious derivation -- the
+  loop whose `labels.review` is the tend label -- died with `labels.review`, and every other
+  derivation reintroduces the coupling this change removed.
 - **Task 4b — new Go and a new test.** Brief: "Your work should be YAML/skills/docs only." Did:
   two lines in `internal/wizard/templates.go` and two tests in
   `internal/config/examples_test.go`. Why: `examples/*.yaml` is byte-pinned to

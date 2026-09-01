@@ -307,7 +307,7 @@ func TestTickIssueDoesNotWarnAboutTheBreakerWithoutARetry(t *testing.T) {
 // a listing of every open pull request in the repository.
 func TestTickIssueTendsFromASinglePullRequestFetch(t *testing.T) {
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	gh := &fakeGH{
 		issues: []ghub.Issue{
 			{Number: 51, Labels: []string{"review"}},
@@ -347,7 +347,7 @@ func TestTickIssueTendsFromASinglePullRequestFetch(t *testing.T) {
 // pull request.
 func TestTickIssueTendsThroughTheStoredPullRequestLink(t *testing.T) {
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{{
@@ -382,7 +382,7 @@ func TestTickIssueTendsThroughTheStoredPullRequestLink(t *testing.T) {
 // a pull request whose head has since moved to a fork must stop being tended.
 func TestTickIssueDoesNotTendAnUntrustedPullRequest(t *testing.T) {
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{{
@@ -549,9 +549,13 @@ func TestASharedFetchStillDecidesTrustForATend(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			planning := tickConfig(t)
-			planning.TendPR = true
+			planning.Tend.Enabled = true
 			execution := secondLoopConfig(t, "execution")
-			execution.TendPR = true
+			execution.Tend.Enabled = true
+			// Each loop's own project would name it as the tend host; these
+			// two are separate projects watching one repository, which is the
+			// case this test is about.
+			execution.Tend.Loop = execution.Name
 			gh := &fakeGH{
 				issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 				prs: []ghub.PullRequest{{

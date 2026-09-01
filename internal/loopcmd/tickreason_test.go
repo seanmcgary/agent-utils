@@ -130,7 +130,7 @@ func TestTickIssueLogsWhyItDecidedNothing(t *testing.T) {
 			name: "awaiting review with no pull request",
 			want: "no trusted pull request is linked",
 			setup: func(_ *testing.T, cfg *config.Config, gh *fakeGH, _ Deps) {
-				cfg.TendPR = true
+				cfg.Tend.Enabled = true
 				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
 			},
 		},
@@ -138,7 +138,7 @@ func TestTickIssueLogsWhyItDecidedNothing(t *testing.T) {
 			name: "a live tend",
 			want: "a tend dispatch is already live for the linked pull request",
 			setup: func(t *testing.T, cfg *config.Config, gh *fakeGH, deps Deps) {
-				cfg.TendPR = true
+				cfg.Tend.Enabled = true
 				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
 				gh.prs = []ghub.PullRequest{{
 					Number: 108, HeadRef: "feat/thing", BaseRef: "master",
@@ -160,7 +160,7 @@ func TestTickIssueLogsWhyItDecidedNothing(t *testing.T) {
 			name: "the pull request is current",
 			want: "the linked pull request is up to date with its base and carries no review activity since the last tend",
 			setup: func(t *testing.T, cfg *config.Config, gh *fakeGH, deps Deps) {
-				cfg.TendPR = true
+				cfg.Tend.Enabled = true
 				gh.issues = []ghub.Issue{{Number: issue, Labels: []string{"review"}}}
 				gh.prs = []ghub.PullRequest{{
 					Number: 108, HeadRef: "feat/thing", BaseRef: "master",

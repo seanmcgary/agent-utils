@@ -11,6 +11,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 )
@@ -92,11 +93,13 @@ func tendCheckConfig(t *testing.T) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	return &config.Config{
-		Name:            tendCheckLoop,
-		Repo:            "o/r",
-		DefaultBranch:   "master",
-		TendPR:          true,
-		TendPrompt:      "rebase #{{.Issue.Number}}",
+		Name:          tendCheckLoop,
+		Repo:          "o/r",
+		DefaultBranch: "master",
+		TendPrompt:    "rebase #{{.Issue.Number}}",
+		Tend: project.Tend{
+			Enabled: true, Loop: tendCheckLoop, Label: "status:review",
+		},
 		CheckoutBaseDir: dir,
 		WorktreeDir:     filepath.Join(dir, "wt"),
 		StateDir:        filepath.Join(dir, "state"),
@@ -104,7 +107,6 @@ func tendCheckConfig(t *testing.T) *config.Config {
 			Trigger:  "status:todo",
 			InFlight: "status:doing",
 			Blocked:  "status:blocked",
-			Review:   "status:review",
 			Terminal: "status:done",
 		},
 		Agent: config.Agent{
@@ -365,7 +367,7 @@ func TestTendCheckDoesNothingWhenTheLoopDoesNotTend(t *testing.T) {
 	deps := tendCheckDeps(t, gh, map[string]int{"feat/x": 3})
 	seedPRLink(t, deps, 7, 9, "feat/x", "master")
 	cfg := tendCheckConfig(t)
-	cfg.TendPR = false
+	cfg.Tend.Enabled = false
 
 	fetched := 0
 	deps.Fetch = func(context.Context) error {

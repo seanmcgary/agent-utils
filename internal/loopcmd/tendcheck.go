@@ -62,7 +62,7 @@ type TendCheckResult struct {
 // would stay wrong forever.
 func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (TendCheckResult, error) {
 	var out TendCheckResult
-	if !cfg.TendPR {
+	if !cfg.TendsPRs() {
 		return out, nil
 	}
 
@@ -200,7 +200,7 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 	// pass after the daemon starts -- would otherwise confirm nothing and report
 	// zero, which is the one case force exists to cover.
 	for _, iss := range issues {
-		if !iss.HasLabel(cfg.Labels.Review) {
+		if !iss.HasLabel(cfg.Tend.Label) {
 			continue
 		}
 		// LinkPR, not a lookup by a row's pr_number, and that is the point. It

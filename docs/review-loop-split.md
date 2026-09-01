@@ -23,19 +23,21 @@ document to still be current.
 | | Before | After |
 |---|---|---|
 | human touches | four: approve plan, hand the branch to review, and read the result | **two**: approve the plan, merge at the end |
-| `execution` | opens the PR, applies `status:ready-for-review`, stops; **you** apply `status:ready-for-pr-review` when you want it reviewed | opens the PR, applies `status:pr-open`, finishes, then applies `status:ready-for-pr-review` itself as its strictly last action |
+| `execution` | opens the PR, applies `status:ready-for-review`, stops; **you** apply `status:ready-for-pr-review` when you want it reviewed | opens the PR, finishes, then applies `status:ready-for-pr-review` itself as its strictly last action |
 | `pr-review` | reviews, then fixes what it finds, then applies `status:ready-for-review` | reviews, posts a findings comment, applies `status:ready-for-findings-exec`, stops |
 | remediation | inside the review session, in a context that grew to 321k tokens | a separate dispatch, one fresh subagent per **file** group |
 | findings | prose in a disposition table, re-located by whoever fixed them | anchored to `File:Line` with a prescribed fix, grouped by file |
 | handoff | none — one session did both | a comment ID in Pipeline State's `findings comment` field |
 | `status:ready-for-review` | applied by `execution` when it opened the PR, then again by `pr-review` — it meant both "a PR exists" and "your turn" | applied only by `exec-pr-review-findings`, at the very end. It means one thing: the pipeline is finished and it is your turn to merge |
-| tending | keyed to `status:ready-for-review`, which happened to be present from execution onward | keyed to `status:pr-open`, which says exactly that and is applied for exactly that reason |
+| tending | per-loop `tend_pr: true`, keyed to that loop's `labels.review` | a project-level `tend:` block naming the label and the hosting loop |
+| `labels.review` | required on every loop | **removed**. A loop declares only its own four labels and ends by applying its terminal |
+| epic sweep | derived the entry loop from the label graph | a project-level `epic.loop` declaration |
 
 The measurement behind it: over eight real sessions the reviewer fan-out cost $8.39 and the
 remediation that followed cost $90.86. A quarter of remediation's tool calls were re-reading code
 the reviewers had already read.
 
-## The four new labels
+## The three new labels
 
 Create these in **each** repository before touching any configuration file:
 
@@ -47,23 +49,28 @@ for r in koinos lawndominator projectwrangler snootsnap; do
     --description "A findings-execution agent is applying the review's findings"
   gh label create status:needs-findings-input --repo "mcgarylabs/$r-monorepo" \
     --description "Findings execution parked and needs a human answer"
-  gh label create status:pr-open --repo "mcgarylabs/$r-monorepo" \
-    --description "A pull request exists for this issue; keep it rebased"
 done
 ```
 
-Verify before continuing — three `findings` labels plus `status:pr-open` per repository:
+Plus one more, for planning's new terminal:
 
 ```bash
-gh label list --repo mcgarylabs/koinos-monorepo --limit 200 | grep -c findings     # want 3
-gh label list --repo mcgarylabs/koinos-monorepo --limit 200 | grep -c 'pr-open'    # want 1
+for r in koinos lawndominator projectwrangler snootsnap; do
+  gh label create status:ready-for-plan-review --repo "mcgarylabs/$r-monorepo" \
+    --description "Planning finished; read the plan and approve it"
+done
 ```
 
-**`status:pr-open` is the one that is easy to underestimate.** It is not cosmetic and it is not
-optional: it is the execution loop's `labels.review`, which is what makes an issue eligible for
-tending. If it does not exist when the swap lands, the execution agent's attempt to apply it fails
-and **nothing rebases any pull request in the project** — silently, because an untended pull
-request looks exactly like a fresh one until it is behind.
+Verify before continuing:
+
+```bash
+gh label list --repo mcgarylabs/koinos-monorepo --limit 200 | grep -c findings          # want 3
+gh label list --repo mcgarylabs/koinos-monorepo --limit 200 | grep -c plan-review       # want 1
+```
+
+Every other label in the new chain already exists — `status:ready-for-pr-review`,
+`status:ready-for-execution` and `status:ready-for-review` are all in use today, and their
+meanings do not change.
 
 **Do this first, and do not skip the verification.** A trigger label that does not exist in the
 repository produces no error anywhere: the tick lists every open issue, finds nothing carrying the
@@ -77,11 +84,65 @@ Every live `pr-review.yaml` is a machine-normalised copy of the old example: sam
 byte-for-byte, differing only in `repo`, `checkout_base_dir: .`, and `timeout: 8h0m0s`. So the
 propagation is: take the new example's bodies, keep the three local values.
 
+**Two removals apply to every loop file in every project**, and they are the reason this is not a
+label rename:
+
+- **`labels.review` is gone from the config format.** A file that still sets it fails to load.
+- **`tend_pr` is gone from the config format.** Same: a file that still sets it fails to load.
+
+Both moved to the project descriptor, `.agent-utils/config.yaml`, which is a different file — see
+step 0.
+
+### 0. The project descriptor — in all four projects
+
+New, and it comes first because two of the loop edits below depend on it. Add to
+`<project>/.agent-utils/config.yaml`, keeping the existing `name` and `id` lines untouched:
+
+```yaml
+tend:
+  enabled: true
+  loop:    exec-pr-review-findings
+  label:   status:ready-for-review
+  model:   sonnet
+
+epic:
+  loop: planning
+```
+
+**`tend:` replaces `tend_pr` on the loops.** Tending keeps a repository's open pull requests
+rebased; that describes the repository, not any one loop's issue lifecycle. The old per-loop flag
+was gated on that loop's `labels.review`, which worked only because the review label happened to
+mark the right issues — and it had a misconfiguration with no error message, since two loops in one
+project could both set `tend_pr` and both would rebase the same branch.
+
+`tend.loop` names which loop's rows host the dispatches, and it must be named: every row a tend
+writes — the dispatch, the live-dispatch guard, the last-tend time, the conflict fingerprints — is
+keyed by loop. **It moves from `execution` to `exec-pr-review-findings`**, the last loop to touch
+the branch, whose terminal is the state `tend.label` points at. That is also the state where a pull
+request waits longest: every earlier wait is a machine that picks the issue up within a tick, and
+only the human gate lasts long enough for the base branch to move.
+
+**`epic:` replaces a derivation, and fixes a bug that predates this work.** The epic sweep used to
+find its entry loop by asking which loop's trigger was no other loop's terminal or review label.
+Because the live `execution.yaml` declares no terminal, `pr-review`'s trigger is nobody's terminal,
+so `planning` and `pr-review` both resolve as entry loops — `ErrAmbiguousEntryLoop`, which means
+**the epic sweep is already disabled in all four projects today.** Its only symptom is a `WARN`.
+Declaring `epic.loop: planning` resolves it. Confirm afterwards that the warning has stopped:
+
+```
+epic sweep skipped: the project names no usable epic.loop     # new message
+epic sweep skipped: cannot name the pipeline's entry loop     # old message; must stop appearing
+```
+
+A descriptor that will not parse fails **every loop in the project**, deliberately: the policy it
+carries might have said "enabled", and running a loop under a policy nobody can read is the
+outcome worth refusing. Validate before going further (step 3 of the migration).
+
 ### 1. `pr-review.yaml` — in all four projects
 
 | Field | From | To |
 |---|---|---|
-| `labels.review` | `status:ready-for-review` | `status:ready-for-findings-exec` |
+| `labels.review` | `status:ready-for-review` | **delete the line** |
 | `labels.terminal` | absent | `status:ready-for-findings-exec` |
 | `labels.veto` | `blocked:*`, `status:ready-for-execution`, `status:executing` | add `status:ready-for-findings-exec` and `status:fixing-findings` |
 | `agent.effort` | `high` | `medium` |
@@ -89,17 +150,13 @@ propagation is: take the new example's bodies, keep the three local values.
 | `agent.timeout` | `8h0m0s` | `24h` (or delete the line) |
 | `prompt` | `reviewing-commits`, "YOU FIX WHAT YOU FIND" | `producing-review-findings`, "YOU DO NOT FIX WHAT YOU FIND" — copy the example's body verbatim |
 | `resume_prompt` | repeats "you fix what you find" | copy the example's body verbatim |
+| `tend_prompt` | a "never rendered" stub | delete it; only the hosting loop needs one |
 | header comment | says the loop "reviews and FIXES" | rewrite; it describes the old behaviour |
 
 `agent.model` stays `opus`. That is deliberate and it is the one setting the split makes *more*
 important: this loop's output is now a specification a cheaper model executes, so strength saved
 here is paid for twice downstream by an executor working out what a finding meant. Effort is the
 axis that drops, because the expensive part of the old loop was never the reviewing.
-
-`labels.review` and `labels.terminal` are the same value on purpose. For a machine handoff there
-is no interval between "output ready to read" and "left this loop", and writing
-`status:ready-for-review` here would make an issue queued for remediation look identical to one
-already fixed and waiting on you. It is safe only because `tend_pr` is false.
 
 ### 2. `exec-pr-review-findings.yaml` — new file, all four projects
 
@@ -110,9 +167,14 @@ summary somewhere: `config.Load` is strict and unconditionally requires `name`, 
 including `breaker.orphan_threshold` and `breaker.cooldown`, and — because
 `permission_mode: bypassPermissions` is set — `i_understand_bypass_permissions: true`.
 
-A file that will not load is not a local failure. `EntryLoop` refuses for the **whole
-repository** when any loop file fails to load, and the webhook router drops that loop from
-routing. Validate before going further (see step 3 of the migration).
+**Its `tend_prompt` is the one that actually runs**, since this is the loop `tend.loop` names. It
+is the rebase-and-review-reply template that used to live on `execution.yaml`, with one change: it
+tells the agent it is in a FRESH session and holds no memory of the branch. A tend no longer
+inherits the issue's session — see the migration notes below.
+
+A file that will not load is not a local failure. `EpicLoop` refuses for the **whole repository**
+when any loop file fails to load, and the webhook router drops that loop from routing. Validate
+before going further (see step 3 of the migration).
 
 ### 3. `execution.yaml` — in all four projects
 
@@ -121,11 +183,13 @@ routing. Validate before going further (see step 3 of the migration).
 
 | Field | From | To |
 |---|---|---|
-| `labels.review` | `status:ready-for-review` | `status:pr-open` |
+| `labels.review` | `status:ready-for-review` | **delete the line** |
 | `labels.terminal` | absent | `status:ready-for-pr-review` |
-| `labels.veto` | `blocked:*`, `status:pr-reviewing` | add `status:fixing-findings` |
+| `labels.veto` | `blocked:*`, `status:pr-reviewing` | add `status:ready-for-pr-review` and `status:fixing-findings` |
+| `tend_pr` | `true` | **delete the line**; the policy is the descriptor's now |
+| `tend_prompt` | the real rebase template | delete it; it moves to `exec-pr-review-findings.yaml` |
 | `agent.model` | `opus` | `sonnet` |
-| `prompt` | "ON COMPLETION. Open the pull request … add `{{.Labels.Review}}`" | a numbered six-step completion order ending with `{{.Labels.Terminal}}` as the strictly last action — copy the example's body verbatim |
+| `prompt` | "ON COMPLETION. Open the pull request … add `{{.Labels.Review}}`" | a numbered five-step completion order ending with `{{.Labels.Terminal}}` as the strictly last action — copy the example's body verbatim |
 | `resume_prompt` | silent on completion order | names the numbered order and the strictly-last terminal — copy verbatim |
 | header comment | says the human applies `status:ready-for-pr-review` by hand | rewrite; that is now the agent's job |
 
@@ -133,38 +197,13 @@ routing. Validate before going further (see step 3 of the migration).
 `max_budget_usd` is already `0` in all four `execution.yaml` files, so only the `pr-review.yaml`
 caps need clearing. `agent.timeout` is `8h0m0s` everywhere — see below.
 
-**Why `labels.review` moves off `status:ready-for-review`.** The field does two jobs — "the agent
-finished, go read it" and "this issue is eligible for tending" — and automating the chain pulls
-them apart. Execution no longer has a human-facing output state: its work goes straight to
-pr-review. But it is still the only loop that tends. Leaving `status:ready-for-review` here would
-summon you the moment execution finished, before the branch had been reviewed or fixed at all,
-which defeats the whole point of the change. `status:pr-open` keeps the tending and drops the
-claim on your attention, and it is honest about what the agent is actually asserting when it
-applies it: a pull request now exists.
-
-The consequence to hold on to is that **nothing removes `status:pr-open`**. It is on the issue
-from the moment the pull request opens until the issue closes, so tending covers every wait in the
-chain — the review queue, the remediation queue, your gate at the end, and any park in between.
-That is a wider tending window than the old configuration had, not a narrower one.
-
-**The `terminal` line fixes a bug that predates this work.** `EntryLoop` picks the front of the
-pipeline as *the loop whose trigger is no OTHER loop's terminal or review label*. With
-`execution.yaml` declaring no terminal, `pr-review`'s trigger is nobody's terminal, so `planning`
-and `pr-review` both resolve as entry loops, the resolution is ambiguous, and **the epic sweep is
-already disabled in all four projects** — its only symptom is a `WARN` reading
-`epic sweep skipped: cannot name the pipeline's entry loop`. Adding the line makes `pr-review`
-downstream of `execution` and leaves `planning` alone at the front. Confirm afterwards that the
-warning has stopped.
-
 **This supersedes the warning currently in your `execution.yaml`.** That comment says
 `status:ready-for-pr-review` "must NOT be" the execution loop's handoff, because the agent applies
 its label before its last phase and would start the review on a branch it is still writing to. The
-hazard is real and the comment was right about it. What has changed is the resolution: instead of
-avoiding the chain, the prompt now defines *when* the label is applied. `labels.review` stays
-early, because tending should start as soon as the pull request exists and that label is nobody's
-trigger. `labels.terminal` is applied only after the final push, as the numbered last step, and
-nothing follows it. Delete the old comment when you copy the new prompt in — leaving it beside a
-prompt that does the opposite is worse than either.
+hazard is real and the comment was right about it. What changed is the resolution: instead of
+avoiding the chain, the prompt now defines *when* the label is applied — after the final push, as a
+numbered last step, with nothing following it. Delete the old comment when you copy the new prompt
+in; leaving it beside a prompt that does the opposite is worse than either.
 
 **The prompt is the guard here, and there is no mechanical backstop for it.** If a project's
 `execution.yaml` gets the new `terminal` but keeps the old prompt, the agent never applies it and
@@ -172,12 +211,29 @@ issues simply stop at the end of execution — visible, recoverable, and the saf
 gets the new prompt but the agent applies the terminal early anyway, two agents land on one branch.
 That is why the prompt bodies are copied verbatim rather than summarised.
 
-`status:ready-for-pr-review` is declared as `terminal` but deliberately **not** added to
-`execution.yaml`'s `veto`. `veto` is checked before tend decisions too, so vetoing it would stop
-the execution loop rebasing a branch that is queued for review — which is exactly a branch that
-should keep being rebased while it waits.
+### 4. `planning.yaml` — in all four projects
 
-### 4. Cron
+| Field | From | To |
+|---|---|---|
+| `labels.review` | `status:plan-ready-for-review` | **delete the line** |
+| `labels.terminal` | `status:ready-for-execution` | `status:ready-for-plan-review` |
+| `labels.veto` | `blocked:*`, `status:ready-for-execution`, `status:executing`, `status:ready-for-review` | add `status:ready-for-plan-review` |
+| `tend_pr` | `false` | **delete the line** |
+| `tend_prompt` | a "never rendered" stub | delete it |
+| `prompt` | PARK-FOR-REVIEW applies `{{.Labels.Review}}`; "You NEVER apply `{{.Labels.Terminal}}`" | PARK-FOR-REVIEW applies `{{.Labels.Terminal}}` as its last action; "you NEVER apply `status:ready-for-execution`" — copy the example's body verbatim |
+| `resume_prompt` | ends "you never apply `{{.Labels.Terminal}}`" | copy the example's body verbatim |
+
+**The approval gate does not move; it stops being planning's terminal.** Before, planning ended by
+applying its review label and the human applied its terminal. Now planning ends by applying its own
+terminal — `status:ready-for-plan-review`, meaning "planning is finished" — and you apply
+`status:ready-for-execution`, which is execution's trigger and which the prompt forbids the agent
+from ever applying. You do exactly what you did before: read the plan comment, apply
+`status:ready-for-execution`. Only the label the agent leaves behind has changed name.
+
+`status:plan-ready-for-review` is retired by this. Leave the label in the repository; it costs
+nothing and it is what a rollback needs.
+
+### 5. Cron
 
 Cron entries are per loop, so the new loop needs its own line in each project's crontab or it
 never gets the sweep backstop. Mirror the existing lines:
@@ -222,24 +278,32 @@ you were trying to make cheaper by other means.
 
 1. **Create the four labels** in every repository, and verify (above).
 2. **Copy `exec-pr-review-findings.yaml`** into each project's `.agent-utils/configs/`.
-3. **Validate it loads**, per project, before going further:
+3. **Add the `tend:` and `epic:` blocks** to each project's `.agent-utils/config.yaml`.
+4. **Validate**, per project, before going further:
    `agent-utils project --name <p> loop status --name exec-pr-review-findings`
-   must print the loop rather than an error.
-4. **Add the cron line** for the new loop.
-5. **Swap `pr-review.yaml`.** Keep a `pr-review.yaml.bak`.
-6. **Last, swap `execution.yaml`.** Keep an `execution.yaml.bak`.
+   must print the loop rather than an error. A bad descriptor fails here too, and it fails every
+   loop in the project, so this one command covers steps 2 and 3 together.
+5. **Add the cron line** for the new loop.
+6. **Swap `pr-review.yaml`.** Keep a `pr-review.yaml.bak`.
+7. **Swap `execution.yaml`.** Keep an `execution.yaml.bak`.
+8. **Last, swap `planning.yaml`.** Keep a `planning.yaml.bak`.
 
 Every step is downstream-first, and that is the whole rule: **never create a producer of a label
-before its consumer exists.** Step 5 before step 2 strands a finished review at
-`status:ready-for-findings-exec` with no loop watching it. Step 6 before step 5 hands a branch to
+before its consumer exists.** Step 6 before step 2 strands a finished review at
+`status:ready-for-findings-exec` with no loop watching it. Step 7 before step 6 hands a branch to
 a `pr-review` that still fixes what it finds, which is not wrong but is not the pipeline you are
-migrating to. Nothing logs either case — a label no loop watches produces silence, not an error.
+migrating to. Step 8 before step 7 leaves plans parked at a terminal nothing consumes — harmless,
+but you will be relabelling by hand until you finish. Nothing logs any of it: a label no loop
+watches produces silence, not an error.
 
-Step 6 last has a second benefit worth taking deliberately: between step 5 and step 6 the new
-review and remediation loops are live but nothing feeds them automatically, so you can promote one
-issue by hand with `gh issue edit N --add-label status:ready-for-pr-review` and watch the whole new
-chain run end to end before the execution loop starts feeding it on its own. Do that once per
-project.
+Step 3 must come before steps 6–8 for a second reason: `tend_pr` and `labels.review` are removed
+from the loop format, so a swapped loop file no longer carries the tend policy at all. Between the
+swap and the descriptor edit, **nothing in that project tends**.
+
+Steps 6 and 7 have a benefit worth taking deliberately: after step 6 the new review and remediation
+loops are live but nothing feeds them automatically, so you can promote one issue by hand with
+`gh issue edit N --add-label status:ready-for-pr-review` and watch the whole new chain run end to
+end before the execution loop starts feeding it. Do that once per project.
 
 ### Where in-flight work lands
 
@@ -255,7 +319,9 @@ effect immediately and carries no state of its own. Every live state and what it
 | `status:ready-for-review` from the old flow | Nothing. The label means what it always did — the work is done and it is your turn — and no loop triggers on it. | **None. Do not relabel these.** |
 | `status:needs-review-input` or `status:needs-execution-input` | Idles. `blocked:*` does not match either and neither carries a trigger, so it waits for you to re-add the loop's trigger. | `loop reset` first — see below. |
 | Parked at the retry cap, or operator-stopped | Unaffected; none of their labels move. | None. |
-| **Any open pull request, in any of the above states** | It has no `status:pr-open` label, because that label did not exist when its execution agent ran. Execution's `labels.review` is now `status:pr-open`, so **none of these are tended any more.** They were tended before the swap and they silently stop being tended after it. | Backfill it once, per repository — see below. |
+| `status:speccing`, dispatch running | Untouched. The running agent keeps its **old** prompt, so it finishes by applying `status:plan-ready-for-review` and stops. | Read the plan and apply `status:ready-for-execution`, exactly as you always did. The label the agent left is the old one; nothing triggers on either, so nothing is stuck. |
+| `status:plan-ready-for-review` from the old flow | Nothing. No loop ever triggered on it and none does now. | Read and apply `status:ready-for-execution`. Relabelling to `status:ready-for-plan-review` is cosmetic. |
+| **Any open pull request, in any state** | Still tended, provided step 3 was done. The tending loop changes from `execution` to `exec-pr-review-findings` and the eligibility label stays `status:ready-for-review`, so the set of tended pull requests is unchanged. | None. |
 
 **The one real hazard is a resumed session.** Dispatch state is keyed by loop name and repository,
 not by labels, and `pr-review`'s `trigger` and `in_flight` names do not change in this migration —
@@ -270,22 +336,18 @@ its branch holds half-applied fixes. The two ways out:
   sitting at `status:needs-review-input` or `status:needs-execution-input` **before** you re-add
   its trigger.
 
-**The tending backfill is not optional, and it is easy to forget** because nothing reports it. Every
-pull request that already exists was opened before `status:pr-open` did, so after the swap the
-execution loop tends none of them. Backfill once per repository, right after step 6:
+**No label backfill is needed.** An earlier draft of this migration introduced a `status:pr-open`
+label to carry tend eligibility and required backfilling it onto every existing pull request; that
+is gone. Eligibility is `tend.label`, and it points at `status:ready-for-review` — the same label
+those pull requests already carry. Nothing to relabel.
 
-```bash
-gh issue list --repo mcgarylabs/koinos-monorepo --state open \
-  --json number,labels \
-  --jq '.[] | select([.labels[].name] | any(startswith("status:"))) | .number' \
-| while read -r n; do
-    gh issue edit "$n" --repo mcgarylabs/koinos-monorepo --add-label status:pr-open
-  done
-```
-
-That is deliberately wider than "issues with a pull request": adding the label to an issue that has
-no pull request is harmless, because tending also requires an open pull request that is behind. The
-opposite mistake — missing one — is a branch that quietly rots.
+**One tend behaviour changes, though, and it changes for in-flight work too.** A tend agent no
+longer resumes the issue's session; it gets its own, every time. Nothing needs doing about that,
+but expect the first tend after the swap on any given pull request to read the branch cold rather
+than remember writing it. That is the intended trade: a clean rebase runs no agent at all now, so
+what is left for one is a conflict or a review reply, both fully described by the branch and the
+pull request thread. Resuming also used to block the issue's own dispatches for as long as the tend
+ran.
 
 ### Verifying the swap took
 
@@ -293,10 +355,14 @@ Per repository, after the swap:
 
 - `gh issue list --label status:ready-for-findings-exec --json number,updatedAt` — entries should
   drain within one tick interval. Anything sitting there across two intervals means the new loop
-  is not running: check step 3 and step 4.
+  is not running: check steps 4 and 5.
 - `agent-utils project --name <p> loop status --name exec-pr-review-findings` — the tick count
   should rise.
-- The `epic sweep skipped: cannot name the pipeline's entry loop` warning should have stopped.
+- The `epic sweep skipped: cannot name the pipeline's entry loop` warning should have stopped, and
+  not been replaced by `epic sweep skipped: the project names no usable epic.loop`.
+- A pull request behind its base at `status:ready-for-review` should still get rebased. That is
+  the one behaviour that moved between loops, and the failure is silent: check the
+  `exec-pr-review-findings` logs for a tend, not the `execution` ones.
 
 ### If an issue stops moving in both loops
 
@@ -316,29 +382,40 @@ dispatched at all.
 
 ### Rollback
 
-Rolling back is not just restoring the file, because three labels would be left watched by
-nothing and nothing would say so.
+Rolling back is not just restoring the files, because labels would be left watched by nothing and
+nothing would say so.
 
 1. **Drain first.** For each of `status:ready-for-findings-exec`, `status:fixing-findings` and
    `status:needs-findings-input`: `gh issue list --label <l>` and relabel each issue back to
-   `status:ready-for-pr-review`.
+   `status:ready-for-pr-review`. Do the same for `status:ready-for-plan-review`, relabelling to
+   `status:plan-ready-for-review`.
 2. `agent-utils project --name <p> loop reset --name exec-pr-review-findings --issue N` for any
    issue that has a stored session with that loop.
-3. **Only then** restore `pr-review.yaml.bak` and delete `exec-pr-review-findings.yaml`. Removing
-   the file first makes the listener resolve the loop as gone and, after enough consecutive
-   observations, permanently clear its retry rows.
-4. Remove the cron line. Leave the three labels in the repository; they cost nothing and they are
-   what a second attempt needs.
+3. **Restore the loop files** — `planning.yaml.bak`, `execution.yaml.bak`, `pr-review.yaml.bak` —
+   and delete `exec-pr-review-findings.yaml`. Removing the loop file first makes the listener
+   resolve the loop as gone and, after enough consecutive observations, permanently clear its retry
+   rows.
+4. **Remove the `tend:` and `epic:` blocks** from the project descriptor, in the same edit. The
+   restored loop files carry `tend_pr` again, and a descriptor that still named
+   `exec-pr-review-findings` as its tend host would name a loop that no longer exists — which
+   disables tending rather than moving it.
+5. Remove the cron line. Leave every label in the repository; they cost nothing and they are what a
+   second attempt needs.
 
-## One invariant to keep
+**A rollback is only possible while the loop format still accepts `tend_pr` and `labels.review`.**
+Both are removed from the config format by the same release that introduces this migration, so
+rolling the *configuration* back also means running the older `agent-utils` binary. Keep the one
+you were on until the new chain has run a full feature end to end.
 
-Three loops now declare `review: status:ready-for-review`, and exactly one of them tends it.
-`exec-pr-review-findings` must keep `tend_pr: false`; giving it `true` would put two loops
-rebasing the same pull request.
+## Two invariants to keep
 
-And **`status:ready-for-review` must never enter the veto list of the loop that tends** — the
-execution loop. `veto` silently disables tending as well as dispatching, and because the execution
-agent applies that label when it opens the pull request and nothing ever removes it, that one
-entry would switch off tending for the entire pipeline downstream of execution. (`planning.yaml`
-vetoes it and that is fine: planning has `tend_pr: false`, so the field has only its dispatch
-job there.)
+**`status:ready-for-review` must never enter the veto list of the loop that tends** — the loop
+`tend.loop` names. `veto` is checked before tend decisions as well as dispatch decisions, so that
+one entry would switch tending off for the whole project, silently. Every other loop may veto it
+freely, and `planning.yaml` does.
+
+**Exactly one loop may end at `status:ready-for-review`.** It is the human's merge queue, and the
+whole two-touch design rests on nothing else putting an issue there. The temptation is a loop
+reaching for it to obtain something else — which is exactly what the old `labels.review` did for
+tend eligibility, and why an issue used to arrive in your queue the moment execution finished.
+Tending is `tend.label`'s job now, and it is set once, in the project descriptor.

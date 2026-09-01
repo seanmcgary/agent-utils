@@ -12,12 +12,12 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
-// sweepConfig is tickConfig with tending on. tickConfig leaves TendPR false,
+// sweepConfig is tickConfig with tending on. tickConfig leaves it off,
 // and TendSweep must produce nothing for a loop that does not tend.
 func sweepConfig(t *testing.T) *config.Config {
 	t.Helper()
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	cfg.TendPrompt = "rebase #{{.Issue.Number}}"
 	return cfg
 }
@@ -116,9 +116,9 @@ func TestTendSweepIgnoresAnUpToDatePullRequest(t *testing.T) {
 
 // A loop that does not tend produces nothing, whoever calls, and costs no API
 // call. The caller checks this too; TendSweep is exported, so it checks itself.
-func TestTendSweepDoesNothingWhenTendPRIsOff(t *testing.T) {
+func TestTendSweepDoesNothingWhenTendingIsOff(t *testing.T) {
 	cfg := sweepConfig(t)
-	cfg.TendPR = false
+	cfg.Tend.Enabled = false
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
 		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
@@ -367,7 +367,12 @@ func seedStartedSession(t *testing.T, deps Deps, cfg *config.Config, number int,
 
 // The whole point of the change: a rebase agent resumes the session that built
 // the branch instead of meeting it cold.
-func TestTendDispatchInheritsTheIssuesSession(t *testing.T) {
+// A tend runs in its OWN session, minted for the dispatch, even when the issue
+// has a perfectly good one. See the session comment in engine.tendDecisions:
+// the clean-rebase path is Go now, so the agent only meets conflicts and review
+// threads, and both are described by the branch rather than by the conversation
+// that wrote it. Inheriting also blocked the issue for as long as the tend ran.
+func TestTendDispatchDoesNotInheritTheIssuesSession(t *testing.T) {
 	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
@@ -386,8 +391,11 @@ func TestTendDispatchInheritsTheIssuesSession(t *testing.T) {
 	if len(running) != 1 {
 		t.Fatalf("running dispatches = %d, want 1", len(running))
 	}
-	if got := running[0].SessionID; got != "sess-1" {
-		t.Errorf("dispatch session = %q, want the issue's session %q", got, "sess-1")
+	if got := running[0].SessionID; got == "sess-1" {
+		t.Errorf("dispatch session = %q, want a fresh one: a tend does not inherit", got)
+	}
+	if running[0].SessionID == "" {
+		t.Error("dispatch session is empty: the tend must still get an identifier of its own")
 	}
 }
 

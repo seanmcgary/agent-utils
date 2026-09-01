@@ -18,7 +18,7 @@ import (
 // of dispatches, the opposite of the goal.
 func TestTickDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T) {
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -43,7 +43,7 @@ func TestTickDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T) {
 // LatestReviewActivity beside its own BehindBy call.
 func TestTickIssueDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T) {
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -69,7 +69,7 @@ func TestTickIssueDoesNotTendACurrentPullRequestWhenReviewReadFails(t *testing.T
 // current, and the dispatch row carries ReviewPending.
 func TestTickTendsACurrentPullRequestWithNewReviewActivity(t *testing.T) {
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -111,7 +111,7 @@ func TestTickTendsACurrentPullRequestWithNewReviewActivity(t *testing.T) {
 // closed costs nothing that was ever promised.
 func TestTickSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{
@@ -169,7 +169,7 @@ func dropDispatches(t *testing.T, dbPath string) {
 // read would manufacture a reason to dispatch an agent.
 func TestTickIssueSkipsTheReviewReadWhenTheLastTendReadFails(t *testing.T) {
 	cfg := tickConfig(t)
-	cfg.TendPR = true
+	cfg.Tend.Enabled = true
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{

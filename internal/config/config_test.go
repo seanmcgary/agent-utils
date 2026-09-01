@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/seanmcgary/agent-utils/internal/project"
 )
 
 const validYAML = `
@@ -18,7 +20,6 @@ labels:
   trigger: status:ready-for-spec
   in_flight: status:speccing
   blocked: status:needs-spec-input
-  review: status:plan-ready-for-review
   terminal: status:ready-for-execution
   veto:
     - blocked:design
@@ -31,7 +32,6 @@ agent:
   worktree: per_issue
   max_budget_usd: 25
   timeout: 3h
-tend_pr: true
 retry:
   max: 3
   backoff: [0s, 15m, 30m]
@@ -75,9 +75,6 @@ func TestLoadValid(t *testing.T) {
 	if got := cfg.Retry.Backoff[1].Std(); got != 15*time.Minute {
 		t.Errorf("Backoff[1] = %v, want 15m", got)
 	}
-	if !cfg.TendPR {
-		t.Error("TendPR = false, want true")
-	}
 	if len(cfg.Labels.Veto) != 1 || cfg.Labels.Veto[0] != "blocked:design" {
 		t.Errorf("Veto = %v", cfg.Labels.Veto)
 	}
@@ -101,7 +98,6 @@ default_branch: master
 labels:
   trigger: t
   in_flight: f
-  blocked: b
 agent: {model: opus, worktree: per_issue, timeout: 1h}
 retry: {max: 1, backoff: [0s], breaker: {orphan_threshold: 2, cooldown: 1m}}
 prompt: p
@@ -109,7 +105,7 @@ resume_prompt: rp
 `
 	_, err := Load(writeTemp(t, body))
 	if err == nil {
-		t.Fatal("want error for missing labels.review, got nil")
+		t.Fatal("want error for missing labels.blocked, got nil")
 	}
 }
 
@@ -237,11 +233,37 @@ func TestLoadRejectsBadWorktreeMode(t *testing.T) {
 	}
 }
 
-func TestTendPRRequiresTendPrompt(t *testing.T) {
+// tend_prompt is optional now. Whether a loop ever runs a tend is the project
+// descriptor's business -- tend.enabled, tend.label and tend.loop -- and none of
+// those are readable from a loop file, so a loop configuration cannot know
+// whether it needs the template. The dispatch path checks instead, which also
+// reports better: it names one pull request that was not tended rather than
+// refusing to load the loop at all.
+func TestLoadAcceptsMissingTendPrompt(t *testing.T) {
 	body := replaceOnce(validYAML, `tend_prompt: "rebase PR {{.PR.Number}}"`, "")
-	_, err := Load(writeTemp(t, body))
-	if err == nil {
-		t.Fatal("want error when tend_pr is true and tend_prompt is empty, got nil")
+	if _, err := Load(writeTemp(t, body)); err != nil {
+		t.Fatalf("tend_prompt must be optional: %v", err)
+	}
+}
+
+// A loop declares only its own states, and "waiting for a human to read" is not
+// one of them: it is a claim about what happens AFTER the loop. The field is
+// gone, so a file that still sets it must be rejected by the strict decoder
+// rather than silently ignored -- an operator upgrading needs to be told.
+func TestLoadRejectsTheRemovedReviewLabel(t *testing.T) {
+	body := replaceOnce(validYAML,
+		"  blocked: status:needs-spec-input\n",
+		"  blocked: status:needs-spec-input\n  review: status:plan-ready-for-review\n")
+	if _, err := Load(writeTemp(t, body)); err == nil {
+		t.Fatal("want error for the removed labels.review, got nil")
+	}
+}
+
+// Same for tend_pr, which moved to the project descriptor whole.
+func TestLoadRejectsTheRemovedTendPR(t *testing.T) {
+	body := replaceOnce(validYAML, "default_branch: master\n", "default_branch: master\ntend_pr: true\n")
+	if _, err := Load(writeTemp(t, body)); err == nil {
+		t.Fatal("want error for the removed tend_pr, got nil")
 	}
 }
 
@@ -316,7 +338,6 @@ labels:
   trigger: t
   in_flight: f
   blocked: b
-  review: r
 i_understand_bypass_permissions: false
 agent:
   harness: pi
@@ -456,82 +477,114 @@ func TestBackgroundTasksIsOffUnlessExplicitlyOn(t *testing.T) {
 	}
 }
 
-// A full tend: section loads and every field is read.
-func TestLoadAcceptsFullTendSection(t *testing.T) {
-	body := replaceOnce(validYAML, "tend_pr: true\n",
-		"tend:\n  harness: pi\n  model: anthropic/claude-haiku-4-5\n  effort: low\ntend_pr: true\n")
-	cfg, err := Load(writeTemp(t, body))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Tend.Harness != HarnessPi {
-		t.Errorf("Tend.Harness = %q, want %q", cfg.Tend.Harness, HarnessPi)
-	}
-	if cfg.Tend.Model != "anthropic/claude-haiku-4-5" {
-		t.Errorf("Tend.Model = %q, want the configured model", cfg.Tend.Model)
-	}
-	if cfg.Tend.Effort != "low" {
-		t.Errorf("Tend.Effort = %q, want %q", cfg.Tend.Effort, "low")
-	}
-}
-
-// A partial tend: section -- only one field set -- loads, and the fields left
-// out stay empty rather than inheriting agent's values at Load time. Effective
-// resolves the fallback later; Load must not do it here.
-func TestLoadAcceptsPartialTendSection(t *testing.T) {
-	body := replaceOnce(validYAML, "tend_pr: true\n",
-		"tend:\n  model: anthropic/claude-haiku-4-5\ntend_pr: true\n")
-	cfg, err := Load(writeTemp(t, body))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Tend.Model != "anthropic/claude-haiku-4-5" {
-		t.Errorf("Tend.Model = %q, want the configured model", cfg.Tend.Model)
-	}
-	if cfg.Tend.Harness != "" {
-		t.Errorf("Tend.Harness = %q, want empty: a partial section must not fill in the rest",
-			cfg.Tend.Harness)
-	}
-	if cfg.Tend.Effort != "" {
-		t.Errorf("Tend.Effort = %q, want empty: a partial section must not fill in the rest",
-			cfg.Tend.Effort)
-	}
-}
-
-func TestLoadRejectsBadTendHarness(t *testing.T) {
-	body := replaceOnce(validYAML, "tend_pr: true\n",
-		"tend:\n  harness: bogus\ntend_pr: true\n")
-	_, err := Load(writeTemp(t, body))
-	if err == nil {
-		t.Fatal("want error for a bad tend.harness, got nil")
-	}
-	if !strings.Contains(err.Error(), "tend.harness") {
-		t.Errorf("err = %v, want it to name tend.harness", err)
-	}
-}
-
-func TestLoadRejectsBadTendEffort(t *testing.T) {
-	body := replaceOnce(validYAML, "tend_pr: true\n",
-		"tend:\n  effort: turbo\ntend_pr: true\n")
-	_, err := Load(writeTemp(t, body))
-	if err == nil {
-		t.Fatal("want error for a bad tend.effort, got nil")
-	}
-	if !strings.Contains(err.Error(), "tend.effort") {
-		t.Errorf("err = %v, want it to name tend.effort", err)
-	}
-}
-
-// Load defaults agent.harness so it always resolves, but must NOT default
-// tend.harness: an absent value there means "fall back to agent.harness",
-// and defaulting it here would silently pin every tend dispatch to claude on
-// a harness: pi loop.
-func TestLoadLeavesTendHarnessEmpty(t *testing.T) {
+// A loop file outside a project loads with NO tend policy, which is tending
+// off.
+//
+// This is the safe direction and it is worth pinning: the alternative failure
+// is a pull request force-pushed by a policy nobody declared. `loop tick
+// --config <path>` and every test fixture take this path.
+func TestLoadWithoutAProjectLeavesTendOff(t *testing.T) {
 	cfg, err := Load(writeTemp(t, validYAML))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	if cfg.Tend.Enabled || cfg.Tend.Label != "" || cfg.Tend.Loop != "" {
+		t.Errorf("Tend = %+v, want the zero policy", cfg.Tend)
+	}
+	if cfg.TendsPRs() {
+		t.Error("TendsPRs = true with no project descriptor")
+	}
+}
+
+// A loop file INSIDE a project inherits the descriptor's policy, and TendsPRs
+// is true only for the loop the descriptor names.
+func TestLoadInheritsTheProjectTendPolicy(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), DirName)
+	if err := os.MkdirAll(ConfigsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := project.Save(dir, &project.Config{
+		Name: "p", ID: "00000000-0000-0000-0000-000000000001",
+		Tend: project.Tend{
+			Enabled: true,
+			Loop:    "planning",
+			Label:   "status:ready-for-review",
+			Model:   "sonnet",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(ConfigsDir(dir), "planning.yaml")
+	if err := os.WriteFile(path, []byte(validYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Tend.Label != "status:ready-for-review" || cfg.Tend.Model != "sonnet" {
+		t.Errorf("Tend = %+v, want the descriptor's policy", cfg.Tend)
+	}
+	if !cfg.TendsPRs() {
+		t.Error("TendsPRs = false for the loop the descriptor names")
+	}
+
+	// Load defaults agent.harness so it always resolves, but must NOT default
+	// tend.harness: an absent value there means "fall back to agent.harness",
+	// and defaulting it would silently pin every tend dispatch to claude on a
+	// harness: pi loop.
 	if cfg.Tend.Harness != "" {
-		t.Errorf("Tend.Harness = %q, want empty: Load must not default it", cfg.Tend.Harness)
+		t.Errorf("Tend.Harness = %q, want empty: nothing may default it", cfg.Tend.Harness)
+	}
+}
+
+// The same descriptor, read by a loop it does not name, does not tend. This is
+// what stops two loops in one project both force-pushing the same branch.
+func TestLoadDoesNotTendOnALoopTheProjectDoesNotName(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), DirName)
+	if err := os.MkdirAll(ConfigsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := project.Save(dir, &project.Config{
+		Name: "p", ID: "00000000-0000-0000-0000-000000000001",
+		Tend: project.Tend{Enabled: true, Loop: "execution", Label: "status:ready-for-review"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// validYAML is named "planning"; the descriptor names "execution".
+	path := filepath.Join(ConfigsDir(dir), "planning.yaml")
+	if err := os.WriteFile(path, []byte(validYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TendsPRs() {
+		t.Error("TendsPRs = true on a loop the descriptor does not name")
+	}
+}
+
+// A descriptor that exists but will not parse fails the loop load, rather than
+// silently leaving tending off. It might have said "enabled", and running the
+// loop with a policy nobody can read is the outcome worth refusing.
+func TestLoadRefusesABrokenProjectDescriptor(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), DirName)
+	if err := os.MkdirAll(ConfigsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	broken := "name: p\nid: x\ntend: [not a map"
+	if err := os.WriteFile(project.Path(dir), []byte(broken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(ConfigsDir(dir), "planning.yaml")
+	if err := os.WriteFile(path, []byte(validYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("want an error for an unreadable project descriptor, got nil")
 	}
 }

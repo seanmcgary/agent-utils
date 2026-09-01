@@ -14,77 +14,24 @@ labels:
   trigger:   status:ready-for-execution
   in_flight: status:executing
   blocked:   status:needs-execution-input
-  # status:pr-open is not "waiting for a human to read" -- nothing in this chain
-  # waits for a human until the very end -- and that is the point. labels.review
-  # does two jobs, and a fully automated chain pulls them apart:
+  # TERMINAL. Every loop ends the same way: apply this, stop. It is the only
+  # label a loop declares that says anything about what happens next, and even
+  # then it does not name the next loop -- it names a STATE. That pr-review
+  # happens to trigger on the same state is a fact about the labels an operator
+  # chose, not a dependency declared here or there.
   #
-  #   1. "the agent finished, go read it". This loop no longer has that state.
-  #      Its output goes straight to pr-review, and the human's turn comes only
-  #      after remediation, where exec-pr-review-findings applies
-  #      status:ready-for-review. That label now means one thing and one loop
-  #      applies it. Naming it here as well would summon the human at execution
-  #      time, before the branch has been reviewed or fixed -- which is exactly
-  #      the pipeline this configuration is trying not to be.
-  #
-  #   2. TEND ELIGIBILITY. This is the job that survives, and it is why the
-  #      field is not simply a placeholder. A loop tends whatever ITS
-  #      labels.review names, and this is the only loop that tends.
-  #
-  # So the label is chosen for job 2 and named for what it actually asserts: a
-  # pull request exists for this issue. The agent applies it the moment it opens
-  # the pull request, mid-run, and NOTHING ever removes it -- so tending covers
-  # the branch continuously from that moment until the issue closes, through the
-  # review queue, the remediation queue, the human gate at the end, and any park
-  # in between. The veto list below is what pauses it for the two windows where
-  # another agent is writing to the branch.
-  #
-  # Applying it mid-run is safe precisely BECAUSE it is not another loop's
-  # trigger. See the terminal below for the label where that distinction is the
-  # whole safety property.
-  review:    status:pr-open
-  # TERMINAL. status:ready-for-pr-review is pr-review's trigger, and THIS LOOP'S
-  # AGENT applies it, as its strictly final action. It is not a human gate.
-  #
-  # There are exactly two human touches on an issue in this pipeline: applying
-  # planning's terminal to approve a plan, and merging at the end. Everything
-  # between those is machine handoff, and this is the first of them.
-  #
-  # WHY IT IS SAFE TO CHAIN THIS FIELD WHEN labels.review IS NOT. The hazard is
-  # real: a label that is another loop's trigger starts a second agent, and if
-  # this agent is still writing to the branch, two agents end up on it, fighting
-  # over the files and the labels alike. The protection is not which field it is
-  # -- it is WHEN the field is applied. labels.review is applied mid-run, as soon
-  # as the pull request opens, because tending should start then. labels.terminal
-  # is applied only after the last push, as the last thing the agent does. The
-  # prompt below states that ordering explicitly and numbers the steps, because
-  # the ordering IS the safety property; the two labels are chained differently
-  # because their application contracts are different.
-  #
-  # It was omitted here until the review loop existed, on the reasoning that an
-  # issue leaves execution when its pull request merges. That reasoning is fine
-  # as prose and wrong as configuration, because labels.terminal is also the
-  # pipeline GRAPH. internal/config/entryloop.go picks the front of the pipeline
-  # as "the loop whose trigger is no OTHER loop's terminal or review label";
-  # with this field empty, pr-review's trigger is nobody's terminal, so pr-review
-  # resolves as a SECOND entry loop, the resolution is ambiguous, and the epic
-  # sweep is silently disabled for the whole project (internal/loopcmd/
-  # epicsweep.go logs a warning and promotes nothing). Declaring it is what
-  # makes the four-loop chain single-entry.
-  #
-  # Deliberately NOT repeated under veto, unlike planning's terminal. Vetoing a
-  # label also disables TENDING on it, and an issue queued for review is exactly
-  # a pull request that should keep being rebased while it waits.
+  # THE ORDER IS THE SAFETY PROPERTY. Because another loop does trigger on this
+  # state, applying it while this agent is still writing to the branch starts a
+  # second agent on that branch, and the two fight over the files and the labels
+  # alike. The prompt below numbers the completion steps for exactly that reason:
+  # the terminal is applied after the last push, and nothing follows it.
   terminal:  status:ready-for-pr-review
   veto:
     - "blocked:*"
-    # The states the REVIEW and REMEDIATION loops own. veto is checked before
-    # tend decisions too (internal/engine/engine.go), and these two entries are
-    # the ONLY thing standing between a tend rebase and another agent's push.
-    # status:pr-open is on the issue from the moment the pull request opens and
-    # is never removed, so without these the tend would fire straight through
-    # the review and remediation windows -- the reviewer commits its
-    # mechanical-gate fixes, and the remediation loop force-pushes a whole round
-    # of them. Removing either entry reintroduces that race silently.
+    # This loop's own terminal, so a re-applied trigger cannot pull back an
+    # issue already handed to the reviewer, plus the states the review and
+    # remediation loops own.
+    - status:ready-for-pr-review
     - status:pr-reviewing
     - status:fixing-findings
 
@@ -119,16 +66,20 @@ agent:
   # so a real long run looks like a flaky agent.
   timeout: 24h
 
-# tend: lets a tend dispatch (the automatic rebase, and the review-reply below)
-# run a cheaper model than the build itself, since its job is smaller. Falls
-# back to agent's own harness/model/effort for any field left unset, and a
-# harness:/model:/effort: label on the issue still beats this. See
-# docs/configuration.md#tend.
-# tend:
-#   model: sonnet
-
+# Tending is NOT configured here, and no loop configures it. It lives in the
+# PROJECT descriptor, .agent-utils/config.yaml, because it describes a
+# repository's open pull requests rather than this loop's issue lifecycle:
+#
+#   tend:
+#     enabled: true
+#     loop:    exec-pr-review-findings
+#     label:   status:ready-for-review
+#     model:   sonnet
+#
+# `loop` names which loop's rows host the dispatches, and it is the LAST loop in
+# the chain -- the one whose terminal the pull request is sitting at while it
+# waits for a human. See docs/configuration.md#tend.
 i_understand_bypass_permissions: true
-tend_pr: true
 
 retry:
   max: 3
@@ -180,23 +131,19 @@ prompt: |
   alike. Read the numbers as a sequence, not a checklist.
     1. Open the pull request, or promote plan-feature's draft, with
        "Closes #{{.Issue.Number}}" in the body. Assign @seanmcgary.
-    2. Add {{.Labels.Review}}. This says a pull request EXISTS. It does NOT say
-       you have finished, and it is not another loop's trigger, so it is safe to
-       apply here and it is deliberately applied early: it is what makes the
-       branch eligible for rebasing while it waits, from now until the issue
-       closes.
-    3. Finish the rest of build-feature -- including the pull request feedback
+    2. Finish the rest of build-feature -- including the pull request feedback
        loop. Keep the "## Pipeline State" block current at every phase
        transition.
-    4. Push everything: `git push -u origin <branch>`. Nothing you have not
+    3. Push everything: `git push -u origin <branch>`. Nothing you have not
        pushed exists.
-    5. Remove {{.Labels.InFlight}}.
-    6. Add {{.Labels.Terminal}}. THIS IS YOUR LAST ACTION. Nothing follows it --
+    4. Remove {{.Labels.InFlight}}.
+    5. Add {{.Labels.Terminal}}. THIS IS YOUR LAST ACTION. Nothing follows it --
        no push, no commit, no comment, no other label. If you find yourself with
        more work to do after this step, you applied it too early.
-  Do NOT add status:ready-for-review. That label means the whole pipeline is
-  finished and it is the human's turn to merge, and the loop at the END of the
-  chain applies it. Your work is followed by review and then remediation.
+  {{.Labels.Terminal}} is the ONLY label you add at the end. In particular do not
+  add status:ready-for-review: that means the whole pipeline is finished and it
+  is the human's turn to merge, and the loop at the END of the chain applies it.
+  Your work is followed by review and then remediation.
 
   NEVER MERGE. Merging is the human's decision, at every stage, without exception.
 
@@ -213,51 +160,3 @@ resume_prompt: |
   original instructions still apply, including push discipline, the numbered
   completion order, that {{.Labels.Terminal}} is your strictly last action, and
   never merging.
-
-tend_prompt: |
-  You are TENDING pull request #{{.PR.Number}} for issue #{{.Issue.Number}} in
-  {{.Repo}}. It is {{.PR.BehindBy}} commits behind {{.PR.BaseRef}}.
-
-  This is maintenance on a finished feature, NOT new feature work. Do not add
-  scope. Do not refactor beyond the rebase and, when it applies below, the
-  review reply. NEVER merge or close the pull request. Do not change any label
-  unless you park.
-
-  You run in an isolated git worktree checked out detached at
-  origin/{{.PR.HeadRef}}. Its path is {{.Worktree}}, and it is NOT the worktree
-  you built this branch in. You are resuming the session that did that work, so
-  your memory holds the old path: use the one named here and re-read any file
-  before you act on what you remember of it.
-
-  1. `git fetch origin`, then rebase onto origin/{{.PR.BaseRef}}.
-  2. If the rebase is clean, push with
-     `git push --force-with-lease origin HEAD:refs/heads/{{.PR.HeadRef}}`.
-     Use --force-with-lease, never plain --force. If the lease check REJECTS the
-     push, another run touched the branch: change nothing and stop.
-  3. If the rebase CONFLICTS, resolve it yourself when all three hold: you can
-     say what each side changes and why, the two sides touch different behavior
-     so keeping both is coherent, and both sides' tests over the conflicted
-     files pass after your resolution. Then push as step 2 describes and state
-     the resolution and its reasoning in your comment. Otherwise -- the sides
-     disagree about the SAME behavior, you cannot tell what a side was for, or
-     you cannot get both sides' tests green -- run `git rebase --abort` and PARK
-     with a comment listing the conflicted files. Never resolve by guessing.
-
-  {{if .PR.ReviewPending}}
-  4. This dispatch was also triggered by review activity newer than the last
-     tend. After the rebase (or the park) above, read the pull request's
-     unresolved review threads and comments. Answer each one: reply with your
-     reasoning, and push a fix when the reviewer is right. Leave a thread
-     unresolved when you disagree; say why in your reply rather than resolving
-     it yourself. Do not resolve a thread a human, not you, opened unless your
-     reply settles it and the reviewer's own tooling would mark it so.
-  {{end}}
-
-  PARK means: post the comment, remove {{.Labels.Review}}, add
-  {{.Labels.Blocked}}, and stop. End with: "To proceed: comment your decision and
-  re-add the {{.Labels.Trigger}} label."
-
-  {{if not .PR.ReviewPending}}
-  If the branch turns out to be current, post NO comment and make NO push.
-  Silence is the correct output for a quiet pull request.
-  {{end}}

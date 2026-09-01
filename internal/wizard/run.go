@@ -154,13 +154,6 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.Labels.Review, err = p.Ask(Question{
-		Key: "labels.review", Label: "Review label",
-		Help: "Applied when the loop parks for human review.", Default: tmpl.Labels.Review,
-	})
-	if err != nil {
-		return nil, err
-	}
 	cfg.Labels.Terminal, err = p.Ask(Question{
 		Key: "labels.terminal", Label: "Terminal label",
 		Help:     "Applied only by a human, to approve. Leave empty if this loop has no terminal label (the execution loop has none: an issue leaves it when its pull request merges).",
@@ -310,15 +303,11 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 		return nil, fmt.Errorf("agent.timeout: %w", err)
 	}
 
-	// 20. tend_pr, defaulted from the chosen template.
-	cfg.TendPR, err = p.Confirm(
-		"Tend open pull requests?",
-		"Rebase and push this loop's own pull request when its base branch moves ahead of it.",
-		tmpl.TendPR,
-	)
-	if err != nil {
-		return nil, err
-	}
+	// Tending is NOT asked here any more. It is a project-level policy in
+	// .agent-utils/config.yaml -- which pull requests to keep fresh, and which
+	// loop hosts the dispatches -- because it describes a repository's pull
+	// requests rather than one loop's issue lifecycle. Asking it per loop is how
+	// two loops used to end up rebasing one branch.
 
 	// 21. retry.max
 	maxAnswer, err := p.Ask(Question{

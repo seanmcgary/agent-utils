@@ -31,7 +31,6 @@ type yamlDoc struct {
 	DefaultBranch                string     `yaml:"default_branch"`
 	Labels                       yamlLabels `yaml:"labels"`
 	Agent                        yamlAgent  `yaml:"agent"`
-	TendPR                       bool       `yaml:"tend_pr"`
 	Retry                        yamlRetry  `yaml:"retry"`
 	AcknowledgeBypassPermissions bool       `yaml:"i_understand_bypass_permissions,omitempty"`
 	Prompt                       string     `yaml:"prompt"`
@@ -43,7 +42,6 @@ type yamlLabels struct {
 	Trigger  string   `yaml:"trigger"`
 	InFlight string   `yaml:"in_flight"`
 	Blocked  string   `yaml:"blocked"`
-	Review   string   `yaml:"review"`
 	Terminal string   `yaml:"terminal,omitempty"`
 	Veto     []string `yaml:"veto"`
 }
@@ -85,7 +83,6 @@ func toYAMLDoc(cfg *config.Config) yamlDoc {
 			Trigger:  cfg.Labels.Trigger,
 			InFlight: cfg.Labels.InFlight,
 			Blocked:  cfg.Labels.Blocked,
-			Review:   cfg.Labels.Review,
 			Terminal: cfg.Labels.Terminal,
 			Veto:     cfg.Labels.Veto,
 		},
@@ -98,7 +95,6 @@ func toYAMLDoc(cfg *config.Config) yamlDoc {
 			MaxBudgetUSD:   cfg.Agent.MaxBudgetUSD,
 			Timeout:        cfg.Agent.Timeout.String(),
 		},
-		TendPR: cfg.TendPR,
 		Retry: yamlRetry{
 			Max:     cfg.Retry.Max,
 			Backoff: backoff,

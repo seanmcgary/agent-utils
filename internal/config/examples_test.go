@@ -44,7 +44,6 @@ func TestExampleConfigsLoadAndRender(t *testing.T) {
 					Trigger:  cfg.Labels.Trigger,
 					InFlight: cfg.Labels.InFlight,
 					Blocked:  cfg.Labels.Blocked,
-					Review:   cfg.Labels.Review,
 					Terminal: cfg.Labels.Terminal,
 				},
 			}
@@ -65,89 +64,21 @@ func TestExampleConfigsLoadAndRender(t *testing.T) {
 	}
 }
 
-// The four reference loops must resolve to exactly ONE entry loop, and it must
-// be planning.
+// status:ready-for-review is the human's merge queue: exactly one loop may end
+// there, and no loop may trigger on it.
 //
-// This is not a test of EntryLoop -- entryloop_test.go covers the rule. It is a
-// test of the example FILES, and it exists because the failure it catches is
-// invisible. EntryLoop reads the chain out of labels.terminal and labels.review,
-// so a loop file that simply omits a terminal creates a second loop whose
-// trigger is nobody's terminal: two entries, ErrAmbiguousEntryLoop, and an epic
-// sweep that logs a warning and promotes nothing for the whole project. Every
-// individual file still loads and every loop still dispatches, so nothing else
-// in this package or in the wizard notices. Before the review/remediation split
-// this was already true of the shipped examples, undetected: pr-review's trigger
-// was no other loop's terminal because execution declared none.
+// The pipeline allows the human exactly two touches -- approving the plan, and
+// merging -- and every handoff between them is machine-to-machine. The way that
+// breaks is a loop reaching for the human's label to get something else: it used
+// to be tend eligibility, which was gated on a per-loop label and made the
+// execution loop declare status:ready-for-review purely to be tended. That
+// summoned the human at execution time, before the branch had been reviewed or
+// fixed at all.
 //
-// pi.yaml is copied in too. It shares execution's trigger and names the same
-// repo, which is exactly the shape most likely to reintroduce ambiguity.
-func TestExampleLoopsResolveToOneEntryLoop(t *testing.T) {
-	agentUtilsDir := t.TempDir()
-	configs := config.ConfigsDir(agentUtilsDir)
-	if err := os.MkdirAll(configs, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-
-	entries, err := os.ReadDir(filepath.Join("..", "..", "examples"))
-	if err != nil {
-		t.Fatalf("read examples: %v", err)
-	}
-	var repo string
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
-			continue
-		}
-		body, err := os.ReadFile(filepath.Join("..", "..", "examples", e.Name()))
-		if err != nil {
-			t.Fatalf("read %s: %v", e.Name(), err)
-		}
-		if err := os.WriteFile(filepath.Join(configs, e.Name()), body, 0o644); err != nil {
-			t.Fatalf("write %s: %v", e.Name(), err)
-		}
-		cfg, err := config.Load(filepath.Join(configs, e.Name()))
-		if err != nil {
-			t.Fatalf("load %s: %v", e.Name(), err)
-		}
-		// The examples all target one repository; assert it rather than
-		// assuming, so a future example pointed elsewhere fails loudly here
-		// instead of quietly narrowing what this test covers.
-		if repo == "" {
-			repo = cfg.Repo
-		} else if cfg.Repo != repo {
-			t.Fatalf("examples/%s names repo %q, want %q: this test assumes one repo",
-				e.Name(), cfg.Repo, repo)
-		}
-	}
-
-	got, err := config.EntryLoop(agentUtilsDir, repo)
-	if err != nil {
-		t.Fatalf("EntryLoop: %v", err)
-	}
-	if got != "planning" {
-		t.Errorf("EntryLoop = %q, want %q", got, "planning")
-	}
-}
-
-// status:ready-for-review must be declared by exactly ONE loop, and it must be
-// the loop at the END of the chain.
-//
-// The pipeline allows the human exactly two touches: applying planning's
-// terminal to approve a plan, and merging at the end. Every handoff between
-// those is machine-to-machine. labels.review is where that policy is easiest to
-// break, because the field does two jobs -- "the agent finished, go read it" and
-// "this issue is eligible for tending" -- and a loop that needs the second one
-// can quietly acquire the first by naming the human's label to get it.
-//
-// That is exactly what the execution loop used to do. It declared
-// review: status:ready-for-review and applied it mid-run, when it opened the
-// pull request, which under an automated chain summons the human before the
-// branch has been reviewed or fixed at all. It now declares status:pr-open --
-// same tending behaviour, no claim on the human's attention. A future edit that
-// points an earlier loop back at status:ready-for-review to get tending would
-// reintroduce the same defect, and nothing else in the suite would notice: every
-// file still loads, every loop still dispatches, and the entry-loop graph is
-// unchanged.
-func TestOnlyTheFinalLoopSummonsTheHuman(t *testing.T) {
+// Nothing else in the suite would catch a regression here. Every file would
+// still load, every loop would still dispatch, and the epic graph is a
+// declaration now, so it would not shift either.
+func TestOnlyTheFinalLoopEndsAtTheHumansQueue(t *testing.T) {
 	const humanQueue = "status:ready-for-review"
 	const finalLoop = "exec-pr-review-findings"
 
@@ -156,7 +87,7 @@ func TestOnlyTheFinalLoopSummonsTheHuman(t *testing.T) {
 		t.Fatalf("read examples: %v", err)
 	}
 
-	var declaring []string
+	var ending []string
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
 			continue
@@ -165,18 +96,55 @@ func TestOnlyTheFinalLoopSummonsTheHuman(t *testing.T) {
 		if err != nil {
 			t.Fatalf("load %s: %v", e.Name(), err)
 		}
-		if cfg.Labels.Review == humanQueue {
-			declaring = append(declaring, cfg.Name)
+		if cfg.Labels.Terminal == humanQueue {
+			ending = append(ending, cfg.Name)
 		}
-		// The same label as a TRIGGER would be worse still: a loop would run
-		// on the human's queue rather than merely filling it.
+		// Triggering on it would be worse than merely filling it: a loop would
+		// RUN on the queue the human is reading.
 		if cfg.Labels.Trigger == humanQueue {
 			t.Errorf("loop %q triggers on %s, which is the human's merge queue", cfg.Name, humanQueue)
 		}
 	}
 
-	if len(declaring) != 1 || declaring[0] != finalLoop {
-		t.Errorf("loops declaring review: %s = %v, want exactly [%s]", humanQueue, declaring, finalLoop)
+	if len(ending) != 1 || ending[0] != finalLoop {
+		t.Errorf("loops ending at %s = %v, want exactly [%s]", humanQueue, ending, finalLoop)
+	}
+}
+
+// Every loop declares the same four labels and nothing else. This is the shape
+// the design rests on: a loop describes its own states -- queued, working,
+// stuck, done -- and says nothing about its neighbours. The chain exists only
+// because an operator chose one loop's terminal to be another's trigger, which
+// is a fact about the values, not a field either loop sets.
+//
+// The terminal is what makes it uniform. Every loop now has one, including the
+// last: exec-pr-review-findings ends at the human's queue, which is a terminal
+// like any other and happens to have no loop triggering on it.
+func TestEveryExampleLoopDeclaresTheSameLabelRoles(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("..", "..", "examples"))
+	if err != nil {
+		t.Fatalf("read examples: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+			continue
+		}
+		t.Run(e.Name(), func(t *testing.T) {
+			cfg, err := config.Load(filepath.Join("..", "..", "examples", e.Name()))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			for _, l := range []struct{ role, value string }{
+				{"trigger", cfg.Labels.Trigger},
+				{"in_flight", cfg.Labels.InFlight},
+				{"blocked", cfg.Labels.Blocked},
+				{"terminal", cfg.Labels.Terminal},
+			} {
+				if l.value == "" {
+					t.Errorf("labels.%s is empty: every loop ends by applying its terminal, so every loop needs all four", l.role)
+				}
+			}
+		})
 	}
 }
 
@@ -194,25 +162,44 @@ func TestPiExampleIsPiHarness(t *testing.T) {
 	}
 }
 
-// The planning loop must never tend. plan-feature's design draft pull request
-// says "Closes #N", so tending would force-push a draft the human is reading.
-func TestPlanningExampleDoesNotTend(t *testing.T) {
-	cfg, err := config.Load(filepath.Join("..", "..", "examples", "planning.yaml"))
+// No example loop configures tending, because no loop file can any more. The
+// policy is the project descriptor's, and this test exists to catch a
+// reintroduction: examples/ has no descriptor beside it, so every example loads
+// with the zero policy and TendsPRs must be false for all of them.
+//
+// It matters most for planning. plan-feature's design draft pull request says
+// "Closes #N", so a planning loop that tended would force-push a draft the human
+// is reading.
+func TestNoExampleLoopTends(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("..", "..", "examples"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read examples: %v", err)
 	}
-	if cfg.TendPR {
-		t.Error("tend_pr must be false for the planning loop")
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+			continue
+		}
+		cfg, err := config.Load(filepath.Join("..", "..", "examples", e.Name()))
+		if err != nil {
+			t.Fatalf("load %s: %v", e.Name(), err)
+		}
+		if cfg.TendsPRs() {
+			t.Errorf("%s: TendsPRs = true, want false: tending is the project's policy, not a loop's", e.Name())
+		}
 	}
 }
 
-// No template may tell an agent to apply the terminal label. That gate is the
-// human's, and it is the one rule the whole pipeline depends on.
+// The planning agent must never apply the APPROVAL label.
 //
-// cfg.Prompt holds the template source, where the label is a
-// {{.Labels.Terminal}} placeholder rather than a literal value, so the check
-// runs against the rendered prompt an agent would actually receive.
-func TestNoTemplateApprovesItself(t *testing.T) {
+// Every loop now ends by applying its own terminal, planning included -- its
+// terminal means "planning is finished", not "the plan is approved". Approval is
+// a separate label the human applies after reading, and it is the one gate the
+// whole pipeline depends on, so the prompt has to forbid the agent from ever
+// applying it.
+//
+// cfg.Prompt holds the template source, so the check runs against the rendered
+// prompt an agent would actually receive.
+func TestPlanningNeverApprovesItself(t *testing.T) {
 	cfg, err := config.Load(filepath.Join("..", "..", "examples", "planning.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +215,6 @@ func TestNoTemplateApprovesItself(t *testing.T) {
 			Trigger:  cfg.Labels.Trigger,
 			InFlight: cfg.Labels.InFlight,
 			Blocked:  cfg.Labels.Blocked,
-			Review:   cfg.Labels.Review,
 			Terminal: cfg.Labels.Terminal,
 		},
 	}
@@ -237,8 +223,16 @@ func TestNoTemplateApprovesItself(t *testing.T) {
 		t.Fatalf("RenderPrompt: %v", err)
 	}
 
-	if !containsAll(rendered, "NEVER apply", cfg.Labels.Terminal) {
-		t.Error("the planning prompt must forbid applying the terminal label")
+	// The approval label is not planning's terminal and is not any label the
+	// loop declares, so it is named literally here, exactly as the prompt names
+	// it. That is the point of the test: a value no field carries is one a
+	// refactor can silently drop.
+	const approval = "status:ready-for-execution"
+	if !containsAll(rendered, "NEVER apply", approval) {
+		t.Errorf("the planning prompt must forbid applying %s", approval)
+	}
+	if cfg.Labels.Terminal == approval {
+		t.Errorf("planning's terminal must not BE the approval label: it is applied by the agent")
 	}
 }
 

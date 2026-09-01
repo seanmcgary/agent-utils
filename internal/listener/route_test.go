@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 )
 
@@ -49,7 +50,6 @@ func minimalConfig(name, repo string) string {
 		"  trigger: status:ready\n" +
 		"  in_flight: status:in-flight\n" +
 		"  blocked: status:blocked\n" +
-		"  review: status:review\n" +
 		"agent:\n" +
 		"  model: opus\n" +
 		"  worktree: per_issue\n" +
@@ -78,12 +78,32 @@ func setHome(t *testing.T) string {
 // case on purpose.
 func newProject(t *testing.T, home, name string) (id, dir string) {
 	t.Helper()
+	return newProjectTending(t, home, name, "")
+}
+
+// newProjectTending is newProject with the project's tend policy switched on
+// for the named loop. Pass "" for a project that does not tend.
+//
+// A descriptor is written either way, because config.Load reads one now: a
+// project without it loads its loops with the zero policy, which is what the
+// non-tending case is.
+func newProjectTending(t *testing.T, home, name, tendLoop string) (id, dir string) {
+	t.Helper()
 	root := filepath.Join(home, "projects", name)
 	dir = filepath.Join(root, config.DirName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	id = "id-" + name
+	pc := &project.Config{Name: name, ID: id}
+	if tendLoop != "" {
+		pc.Tend = project.Tend{
+			Enabled: true, Loop: tendLoop, Label: "status:ready-for-review",
+		}
+	}
+	if err := project.Save(dir, pc); err != nil {
+		t.Fatalf("project.Save: %v", err)
+	}
 	if err := registry.Register(dir, id, name); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -106,9 +126,9 @@ func writeLoop(t *testing.T, agentUtilsDir, fileName, body string) {
 func TestTargetsReturnsBothLoopsForASharedRepo(t *testing.T) {
 	home := setHome(t)
 	idA, dirA := newProject(t, home, "alpha")
-	idB, dirB := newProject(t, home, "beta")
+	idB, dirB := newProjectTending(t, home, "beta", "planning")
 	writeLoop(t, dirA, "planning.yaml", minimalConfig("planning", "acme/widgets"))
-	writeLoop(t, dirB, "planning.yaml", minimalConfig("planning", "acme/widgets")+"tend_pr: true\ntend_prompt: rebase\n")
+	writeLoop(t, dirB, "planning.yaml", minimalConfig("planning", "acme/widgets")+"tend_prompt: rebase\n")
 
 	targets, err := Targets("acme/widgets")
 	if err != nil {
@@ -120,17 +140,17 @@ func TestTargetsReturnsBothLoopsForASharedRepo(t *testing.T) {
 	seen := map[string]bool{}
 	for _, tg := range targets {
 		seen[tg.ProjectID] = true
-		// DefaultBranch and TendPR must survive the trip from config.Entry
+		// DefaultBranch and Tends must survive the trip from config.Entry
 		// into Target, or the push filter and the periodic tend pass have
 		// nothing to test without opening the config file themselves.
 		if tg.DefaultBranch != "master" {
 			t.Errorf("target %+v: DefaultBranch = %q, want master", tg, tg.DefaultBranch)
 		}
-		if tg.ProjectID == idA && tg.TendPR {
-			t.Errorf("target %+v: TendPR = true, want alpha's false", tg)
+		if tg.ProjectID == idA && tg.Tends {
+			t.Errorf("target %+v: Tends = true, want alpha's false", tg)
 		}
-		if tg.ProjectID == idB && !tg.TendPR {
-			t.Errorf("target %+v: TendPR = false, want beta's true", tg)
+		if tg.ProjectID == idB && !tg.Tends {
+			t.Errorf("target %+v: Tends = false, want beta's true", tg)
 		}
 	}
 	if !seen[idA] || !seen[idB] {
