@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 )
 
 // countingGH is a Client that answers from a fixture and counts what it was
@@ -14,13 +15,15 @@ type countingGH struct {
 	issues []Issue
 	prs    []PullRequest
 
-	fetchedIssues []int
-	fetchedPRs    []int
-	listedIssues  int
-	listedPRs     int
-	compares      int
-	comments      int
-	edits         int
+	fetchedIssues  []int
+	fetchedPRs     []int
+	listedIssues   int
+	listedPRs      int
+	compares       int
+	comments       int
+	edits          int
+	logins         int
+	reviewActivity int
 }
 
 // Issue answers ErrNotAnIssue for a number the fixture holds as a pull
@@ -63,6 +66,16 @@ func (f *countingGH) ListOpenPullRequests(context.Context, string, string) ([]Pu
 func (f *countingGH) BehindBy(context.Context, string, string, string, string) (int, error) {
 	f.compares++
 	return 16, nil
+}
+
+func (f *countingGH) AuthenticatedLogin(context.Context) (string, error) {
+	f.logins++
+	return "loop-bot", nil
+}
+
+func (f *countingGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
+	f.reviewActivity++
+	return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), nil
 }
 
 func (f *countingGH) PostComment(context.Context, string, string, int, string) error {
@@ -161,6 +174,49 @@ func TestDeliveryCacheFetchesAPullRequestOnceAndKeepsItsTrust(t *testing.T) {
 	}
 	if !first.Trusted || !second.Trusted || second.HeadRepo != "o/r" || second.Body != "Closes #51" {
 		t.Errorf("the memoised pull request differs from the fetched one: %+v then %+v", first, second)
+	}
+}
+
+// AuthenticatedLogin is memoised for the process, not just the delivery: the
+// token this cache wraps is a process-wide constant.
+func TestDeliveryCacheFetchesAuthenticatedLoginOnce(t *testing.T) {
+	gh := &countingGH{}
+	c := NewDeliveryCache(gh)
+
+	for range 3 {
+		login, err := c.AuthenticatedLogin(context.Background())
+		if err != nil {
+			t.Fatalf("AuthenticatedLogin: %v", err)
+		}
+		if login != "loop-bot" {
+			t.Errorf("AuthenticatedLogin = %q, want loop-bot", login)
+		}
+	}
+	if gh.logins != 1 {
+		t.Errorf("AuthenticatedLogin reached the client %d times, want 1", gh.logins)
+	}
+}
+
+// LatestReviewActivity IS memoised, unlike BehindBy: several loops of several
+// projects answer one delivery about the same pull request, and the answer is
+// the same instant for all of them.
+func TestDeliveryCacheFetchesReviewActivityOncePerPullRequest(t *testing.T) {
+	gh := &countingGH{}
+	c := NewDeliveryCache(gh)
+
+	for range 3 {
+		if _, err := c.LatestReviewActivity(context.Background(), "o", "r", 108); err != nil {
+			t.Fatalf("LatestReviewActivity: %v", err)
+		}
+	}
+	// A second pull request is a second fetch: the memo is keyed by number,
+	// the same as PullRequest and Issue above it.
+	if _, err := c.LatestReviewActivity(context.Background(), "o", "r", 60); err != nil {
+		t.Fatalf("LatestReviewActivity(60): %v", err)
+	}
+
+	if gh.reviewActivity != 2 {
+		t.Errorf("LatestReviewActivity reached the client %d times, want 2 (one per pull request)", gh.reviewActivity)
 	}
 }
 

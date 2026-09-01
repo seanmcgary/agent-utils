@@ -108,6 +108,12 @@ func (f *fakeGH) BehindBy(_ context.Context, _, _, _, head string) (int, error) 
 	}
 	return 0, nil
 }
+func (f *fakeGH) AuthenticatedLogin(context.Context) (string, error) {
+	return "loop-bot", nil
+}
+func (f *fakeGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
+	return time.Time{}, nil
+}
 func (f *fakeGH) PostComment(_ context.Context, _, _ string, _ int, body string) error {
 	f.comments = append(f.comments, body)
 	return nil

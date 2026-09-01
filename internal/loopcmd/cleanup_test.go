@@ -100,6 +100,40 @@ func TestCleanupClosedPRRemovesThePRWorktreeWhenThePullRequestClosesNoIssue(t *t
 	}
 }
 
+// For a cron-only machine, which never sees a review-comment delivery, this
+// is the only path that ever reaches a closed pull request's backoff row.
+// Without this delete, a pull request's repeat-conflict count would outlive
+// the pull request itself and haunt whatever number GitHub gives to the next
+// one.
+func TestCleanupClosedPRDeletesTheTendConflictRow(t *testing.T) {
+	cfg := cleanupConfig(t)
+	gh := &fakeGH{prs: []ghub.PullRequest{{
+		Number: 11, Body: "no closing reference here", HeadRef: "pr-branch",
+		BaseRef: "master", Trusted: true,
+	}}}
+	spawned := 0
+	deps := newDeps(t, cfg, gh, &spawned)
+
+	if err := deps.Store.PutTendConflict(store.TendConflict{
+		Loop: cfg.Name, Repo: cfg.Repo, PRNumber: 11, Fingerprint: "x",
+		SeenCount: 1, FirstSeenAt: time.Now(), LastSeenAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deps.WT.EnsurePR(11, "pr-branch"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CleanupClosedPR(context.Background(), cfg, deps, 11); err != nil {
+		t.Fatalf("CleanupClosedPR: %v", err)
+	}
+	if _, ok, err := deps.Store.TendConflict(cfg.Name, cfg.Repo, 11); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Error("the tend conflict row for a closed pull request was not deleted")
+	}
+}
+
 // A merged close removes both worktrees. CleanupClosedPR does not
 // distinguish merged from unmerged -- the operator's decision was "on any
 // close" -- but the merged case is the common one and gets its own test.

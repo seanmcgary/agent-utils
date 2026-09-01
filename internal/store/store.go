@@ -196,6 +196,33 @@ CREATE TABLE IF NOT EXISTS closures (
   PRIMARY KEY (project_id, repo, number)
 );
 
+-- One row per pull request currently backed off from repeated rebase
+-- conflicts.
+--
+-- The key is one row per PULL REQUEST, not one row per fingerprint. A new
+-- fingerprint REPLACES the row rather than adding one: the table cannot grow
+-- without a bound, and a changed conflict cannot inherit an old conflict's
+-- backoff -- the count and the deadline both belong to the conflict a rebase
+-- is meeting right now.
+--
+-- retry_after is Unix seconds with a literal DEFAULT 0 meaning "no deadline",
+-- matching issues.retry_after: no literal TIMESTAMP default reads back as the
+-- zero time. This is a NEW table, so it needs no addedColumns entry -- that
+-- mechanism exists to add a column to a database that already has the table
+-- without it, and no such database exists here.
+CREATE TABLE IF NOT EXISTS tend_conflicts (
+  project_id    TEXT NOT NULL DEFAULT '',
+  loop          TEXT NOT NULL,
+  repo          TEXT NOT NULL,
+  pr_number     INTEGER NOT NULL,
+  fingerprint   TEXT NOT NULL,
+  seen_count    INTEGER NOT NULL DEFAULT 0,
+  first_seen_at TIMESTAMP NOT NULL,
+  last_seen_at  TIMESTAMP NOT NULL,
+  retry_after   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_id, loop, repo, pr_number)
+);
+
 -- One row per legacy per-loop database this canonical file has imported.
 --
 -- The key is a triple, not a path. Two loops may share one state_dir, so one
@@ -1117,6 +1144,133 @@ func (s *Store) RunningDispatches(loop, repo string) ([]Dispatch, error) {
 	return scanDispatches(rows)
 }
 
+// LastTendAt returns the start time of the most recently FINISHED tend
+// dispatch for one pull request, and the zero time when it has never been
+// tended.
+//
+// Three choices here are deliberate, and each is load-bearing on its own:
+//
+//   - kind = 'tend' only. A kind = 'rebase' row records a rebase git performed
+//     with no conversation, so it read no review and answered no comment.
+//     Counting it would suppress the first tend after every automatic rebase,
+//     which is exactly the feedback the review-activity trigger exists to
+//     answer.
+//   - finished_at IS NOT NULL. dispatch writes the row before the agent starts
+//     (internal/loopcmd/tick.go:562), and engine.Decide's liveTendPRs already
+//     suppresses a second pass while one runs (engine.go:26-30,434). Counting a
+//     running row here would be a second, weaker copy of that guard.
+//   - A FAILED tend still counts. The alternative -- counting only a succeeded
+//     tend, so a crashed agent gets another turn at the same feedback -- was
+//     rejected: runner.finish deliberately writes no retry state for a tend
+//     (internal/runner/runner.go:353), so nothing would bound how many times a
+//     persistently failing tend is redispatched, and unbounded unattended spend
+//     is the failure this whole change exists to remove. The cost is that
+//     feedback which met a crashed agent waits for the next review comment; the
+//     dispatch row records the failure, and `project logs --list` shows it.
+//
+// A plain SELECT of started_at, not a SELECT of MAX(started_at). Both LastTendAt
+// and LastTendByPR use a MAX only inside a WHERE clause, as a text comparison
+// against the stored ISO-8601 value, and select the started_at COLUMN itself
+// as the output. modernc.org/sqlite carries a column's declared type
+// (TIMESTAMP) to the scan converter only for a bare column reference; an
+// aggregate expression's result column carries none, and Scan then either
+// fails outright (into time.Time or sql.NullTime) or -- worse -- silently
+// hands back the driver's own %v-formatted string ("2026-09-01 14:58:35 +0000
+// UTC") rather than the stored ISO-8601 text, which no further parsing here
+// recovers. Comparing MAX(started_at) against started_at in a WHERE clause
+// sidesteps the conversion entirely: SQLite compares the two as text, which
+// sorts and compares correctly because ISO-8601 timestamps do.
+//
+// LastTendAt returns the start time of the most recently FINISHED tend
+// dispatch for one pull request, and the zero time when it has never been
+// tended.
+//
+// Three choices here are deliberate, and each is load-bearing on its own:
+//
+//   - kind = 'tend' only. A kind = 'rebase' row records a rebase git performed
+//     with no conversation, so it read no review and answered no comment.
+//     Counting it would suppress the first tend after every automatic rebase,
+//     which is exactly the feedback the review-activity trigger exists to
+//     answer.
+//   - finished_at IS NOT NULL. dispatch writes the row before the agent starts
+//     (internal/loopcmd/tick.go:562), and engine.Decide's liveTendPRs already
+//     suppresses a second pass while one runs (engine.go:26-30,434). Counting a
+//     running row here would be a second, weaker copy of that guard.
+//   - A FAILED tend still counts. The alternative -- counting only a succeeded
+//     tend, so a crashed agent gets another turn at the same feedback -- was
+//     rejected: runner.finish deliberately writes no retry state for a tend
+//     (internal/runner/runner.go:353), so nothing would bound how many times a
+//     persistently failing tend is redispatched, and unbounded unattended spend
+//     is the failure this whole change exists to remove. The cost is that
+//     feedback which met a crashed agent waits for the next review comment; the
+//     dispatch row records the failure, and `project logs --list` shows it.
+//
+// A row that matches is returned like LastTick's ORDER BY ... LIMIT 1: no row
+// means the zero time via sql.ErrNoRows, compared with errors.Is.
+//
+// dispatches is indexed only on (project_id, loop, repo, status)
+// (store.go:199), and pr_number is not part of that index, so this scans.
+// That is accepted at current volumes; add an index when a loop's dispatch
+// history makes it matter.
+func (s *Store) LastTendAt(loop, repo string, prNumber int) (time.Time, error) {
+	var t time.Time
+	err := s.db.QueryRow(
+		`SELECT started_at FROM dispatches d
+		 WHERE project_id = ? AND loop = ? AND repo = ? AND pr_number = ?
+		   AND kind = ? AND finished_at IS NOT NULL
+		   AND started_at = (
+		     SELECT MAX(started_at) FROM dispatches
+		     WHERE project_id = d.project_id AND loop = d.loop AND repo = d.repo
+		       AND pr_number = d.pr_number AND kind = d.kind AND finished_at IS NOT NULL
+		   )`,
+		s.projectID, loop, repo, prNumber, KindTend).Scan(&t)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("last tend at: %w", err)
+	}
+	return t.UTC(), nil
+}
+
+// LastTendByPR returns the start time of the most recently finished tend
+// dispatch for every pull request this loop has tended, keyed by pull request
+// number.
+//
+// It exists so a pass deciding many issues issues one query instead of one
+// per pull request -- the same reasoning CostByIssue groups by number for. The
+// three choices documented on LastTendAt apply here identically. The
+// self-join replaces GROUP BY for the reason given above LastTendAt: a
+// GROUP BY pr_number, MAX(started_at) would select the aggregate as an output
+// column, and lose the declared type the same way.
+func (s *Store) LastTendByPR(loop, repo string) (map[int]time.Time, error) {
+	rows, err := s.db.Query(
+		`SELECT d.pr_number, d.started_at FROM dispatches d
+		 WHERE project_id = ? AND loop = ? AND repo = ?
+		   AND kind = ? AND finished_at IS NOT NULL
+		   AND started_at = (
+		     SELECT MAX(started_at) FROM dispatches
+		     WHERE project_id = d.project_id AND loop = d.loop AND repo = d.repo
+		       AND pr_number = d.pr_number AND kind = d.kind AND finished_at IS NOT NULL
+		   )`,
+		s.projectID, loop, repo, KindTend)
+	if err != nil {
+		return nil, fmt.Errorf("query last tend by pr: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[int]time.Time)
+	for rows.Next() {
+		var prNumber int
+		var t time.Time
+		if err := rows.Scan(&prNumber, &t); err != nil {
+			return nil, fmt.Errorf("scan last tend by pr: %w", err)
+		}
+		out[prNumber] = t.UTC()
+	}
+	return out, rows.Err()
+}
+
 // RecentDispatches returns the most recent dispatches for a loop, newest first.
 // A non-zero issue restricts the result to that issue.
 func (s *Store) RecentDispatches(loop, repo string, issue, limit int) ([]Dispatch, error) {
@@ -1261,6 +1415,81 @@ func (s *Store) DeletePRLink(loop, repo string, number int) error {
 		s.projectID, loop, repo, number)
 	if err != nil {
 		return fmt.Errorf("delete pr link: %w", err)
+	}
+	return nil
+}
+
+// TendConflict returns the backoff state for one pull request's rebase
+// conflict. The second result reports whether a row exists at all, because
+// the zero SeenCount of a never-seen pull request and the zero SeenCount of a
+// row that was somehow written with it must not be confused by a caller that
+// only checked the value.
+func (s *Store) TendConflict(loop, repo string, prNumber int) (TendConflict, bool, error) {
+	var c TendConflict
+	var firstSeen, lastSeen time.Time
+	var retryAfter int64
+	err := s.db.QueryRow(
+		`SELECT fingerprint, seen_count, first_seen_at, last_seen_at, retry_after
+		 FROM tend_conflicts
+		 WHERE project_id = ? AND loop = ? AND repo = ? AND pr_number = ?`,
+		s.projectID, loop, repo, prNumber).
+		Scan(&c.Fingerprint, &c.SeenCount, &firstSeen, &lastSeen, &retryAfter)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TendConflict{}, false, nil
+	}
+	if err != nil {
+		return TendConflict{}, false, fmt.Errorf("get tend conflict: %w", err)
+	}
+	c.ProjectID = s.projectID
+	c.Loop = loop
+	c.Repo = repo
+	c.PRNumber = prNumber
+	c.FirstSeenAt = firstSeen.UTC()
+	c.LastSeenAt = lastSeen.UTC()
+	c.RetryAfter = retryAfterTime(retryAfter)
+	return c, true, nil
+}
+
+// PutTendConflict inserts or replaces the backoff row for one pull request,
+// writing exactly the row it is given -- SeenCount and RetryAfter included.
+//
+// It does NOT compute either. The backoff schedule (conflictBackoff in
+// loopcmd) is a loopcmd constant the store cannot see, so a count advanced in
+// SQL could not derive the deadline that goes with it. Every caller holds the
+// loop lock -- act runs under it on all three passes that can reach a rebase
+// -- so the read-then-write this implies is not the racy pattern
+// BeginDispatch exists to avoid: nothing else can write this row between a
+// caller's TendConflict read and its PutTendConflict write.
+func (s *Store) PutTendConflict(c TendConflict) error {
+	_, err := s.db.Exec(`
+		INSERT INTO tend_conflicts (project_id, loop, repo, pr_number, fingerprint,
+		                            seen_count, first_seen_at, last_seen_at, retry_after)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id, loop, repo, pr_number) DO UPDATE SET
+		  fingerprint   = excluded.fingerprint,
+		  seen_count    = excluded.seen_count,
+		  first_seen_at = excluded.first_seen_at,
+		  last_seen_at  = excluded.last_seen_at,
+		  retry_after   = excluded.retry_after`,
+		s.projectID, c.Loop, c.Repo, c.PRNumber, c.Fingerprint, c.SeenCount,
+		c.FirstSeenAt.UTC(), c.LastSeenAt.UTC(), retryAfterSeconds(c.RetryAfter))
+	if err != nil {
+		return fmt.Errorf("put tend conflict: %w", err)
+	}
+	return nil
+}
+
+// DeleteTendConflict removes one pull request's backoff row, following the
+// pull request out wherever it stops being tendable: a clean rebase, a
+// pr_links delete in tendcheck, or the closed-pull-request cleanup. Deleting a
+// row that is not there is not an error, the same as DeletePRLink -- more than
+// one of those paths may reach the same row.
+func (s *Store) DeleteTendConflict(loop, repo string, prNumber int) error {
+	_, err := s.db.Exec(
+		`DELETE FROM tend_conflicts WHERE project_id = ? AND loop = ? AND repo = ? AND pr_number = ?`,
+		s.projectID, loop, repo, prNumber)
+	if err != nil {
+		return fmt.Errorf("delete tend conflict: %w", err)
 	}
 	return nil
 }

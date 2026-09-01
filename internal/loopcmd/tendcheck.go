@@ -169,6 +169,14 @@ func TendCheck(ctx context.Context, cfg *config.Config, deps Deps, force bool) (
 				"loop", cfg.Name, "issue", number, "pr", link.PRNumber, "err", err)
 			continue
 		}
+		// The conflict row follows the pull request out. It is a separate
+		// table and a separate call -- not part of the pr_links delete above
+		// -- so its own failure must not abandon the pr_links delete that
+		// already succeeded; log and continue exactly as that one does.
+		if err := deps.Store.DeleteTendConflict(cfg.Name, cfg.Repo, link.PRNumber); err != nil {
+			slog.Error("could not delete a tend conflict row whose pull request is closed",
+				"loop", cfg.Name, "issue", number, "pr", link.PRNumber, "err", err)
+		}
 		// Info, not Debug: nothing in this program logs at Debug, no handler is
 		// configured for it, and a row disappearing from the database is a state
 		// change an operator should be able to find afterwards.

@@ -396,6 +396,43 @@ func TestAbortRebaseLeavesACleanWorktree(t *testing.T) {
 	}
 }
 
+// A conflicted rebase reports the file it conflicted on, before the abort
+// clears it. The backoff this feeds needs it read in exactly that window.
+func TestConflictedPathsReportsAConflictedRebase(t *testing.T) {
+	m, _ := newTestManagerWithConflict(t)
+	path, err := m.EnsurePR(9, "feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Rebase(context.Background(), path, "master"); err == nil {
+		t.Fatal("this fixture must conflict")
+	}
+	got, err := m.ConflictedPaths(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "f.txt" {
+		t.Errorf("ConflictedPaths = %v, want [f.txt]", got)
+	}
+}
+
+// A clean worktree reports no conflicted paths and no error, so the caller
+// can tell "nothing to report" from "the read failed".
+func TestConflictedPathsOnACleanWorktree(t *testing.T) {
+	m, _ := newTestManagerWithRemote(t)
+	path, err := m.EnsurePR(9, "feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.ConflictedPaths(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ConflictedPaths on a clean worktree = %v, want empty", got)
+	}
+}
+
 // The caller aborts unconditionally after any Rebase failure, because it
 // cannot tell a conflict from a command that never ran. Nothing to abort must
 // therefore not be an error.

@@ -202,6 +202,30 @@ type PRLink struct {
 	BehindBy int
 }
 
+// TendConflict is the backoff state for one pull request's repeated rebase
+// conflict. One row exists per pull request, never per fingerprint: a new
+// fingerprint replaces the row entirely, so it cannot inherit an old
+// conflict's count or deadline.
+type TendConflict struct {
+	ProjectID string
+	Loop      string
+	Repo      string
+	PRNumber  int
+	// Fingerprint is the SHA-256 (hex) of the head commit the rebase was
+	// attempted from and the sorted list of conflicted paths. A changed
+	// fingerprint means this is a different conflict, not a repeat.
+	Fingerprint string
+	// SeenCount counts agent DISPATCHES that met this fingerprint, never
+	// passes that merely observed it. A sweep is armed by every merge and
+	// every push, so a pass that only looks would inflate this count far
+	// faster than any human or agent action on the branch.
+	SeenCount   int
+	FirstSeenAt time.Time
+	LastSeenAt  time.Time
+	// RetryAfter is Unix-seconds-precision; the zero value means no deadline.
+	RetryAfter time.Time
+}
+
 // Tick is one recorded reconcile pass. The importer carries these across, so
 // a migrated loop keeps its history and its tick counter.
 type Tick struct {

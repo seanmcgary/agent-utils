@@ -105,6 +105,16 @@ func CleanupClosedPR(ctx context.Context, cfg *config.Config, deps Deps, prNumbe
 		}
 	}
 
+	// The conflict row follows the pull request out, the same as the pr_links
+	// row TendCheck deletes -- and for a cron-only machine, which never sees a
+	// review-comment delivery, this is the ONLY path that reaches it. Logged
+	// and not returned: one unreadable row must not abandon the worktree
+	// removal below, which is the reason this whole pass runs.
+	if err := deps.Store.DeleteTendConflict(cfg.Name, cfg.Repo, prNumber); err != nil {
+		slog.Error("could not delete a tend conflict row whose pull request is closed",
+			"loop", cfg.Name, "pr", prNumber, "err", err)
+	}
+
 	// Both attempted, and both failures reported. Swallowing them left the
 	// caller logging a success whose only trace of the failure was an ERROR
 	// line with none of the loop or pull request context.
