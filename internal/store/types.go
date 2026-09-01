@@ -150,6 +150,14 @@ type Dispatch struct {
 	Model   string
 	Harness string
 	Effort  string
+	// Provider is the pi provider that served Model, resolved when the
+	// dispatch was decided. It is the same value stamped on the issue row, so
+	// a park comment naming it names what the engine actually compared.
+	//
+	// Unlike the three fields above it is EFFECTIVE, not an override: no label
+	// sets a provider, it is derived from whichever model is in play. Empty
+	// means claude, or a resolution that failed.
+	Provider string
 }
 
 // RunnerID is the dispatch identifier the runner process actually carries.

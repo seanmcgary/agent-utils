@@ -111,7 +111,13 @@ CREATE TABLE IF NOT EXISTS dispatches (
   -- dispatch. Empty means "no override", never "the empty model".
   model         TEXT NOT NULL DEFAULT '',
   harness       TEXT NOT NULL DEFAULT '',
-  effort        TEXT NOT NULL DEFAULT ''
+  effort        TEXT NOT NULL DEFAULT '',
+  -- provider is the pi provider serving this dispatch's model, resolved when
+  -- the dispatch was decided. Unlike the three columns above it is the
+  -- EFFECTIVE value rather than an override, because a provider has no label
+  -- to override: it is derived from whichever model ends up in play. Empty
+  -- means claude, or a resolution that failed.
+  provider      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS pr_links (
@@ -398,6 +404,7 @@ var addedColumns = []struct{ table, column, def string }{
 	{"dispatches", "effort", "TEXT NOT NULL DEFAULT ''"},
 	{"issues", "dispatch_harness", "TEXT NOT NULL DEFAULT ''"},
 	{"issues", "dispatch_provider", "TEXT NOT NULL DEFAULT ''"},
+	{"dispatches", "provider", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // backfillSessionHarness fills issues.session_harness for rows whose session was
@@ -963,11 +970,11 @@ func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO dispatches (project_id, loop, repo, number, kind, session_id,
 		                        status, started_at, log_path, pr_number, title,
-		                        model, harness, effort)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                        model, harness, effort, provider)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.projectID, d.Loop, d.Repo, d.Number, d.Kind, d.SessionID,
 		StatusRunning, time.Now().UTC(), d.LogPath, d.PRNumber, d.Title,
-		d.Model, d.Harness, d.Effort)
+		d.Model, d.Harness, d.Effort, d.Provider)
 	if err != nil {
 		return 0, fmt.Errorf("create dispatch: %w", err)
 	}
@@ -1063,7 +1070,7 @@ var ErrDispatchNotRunning = errors.New("dispatch is no longer running")
 const dispatchColumns = `id, project_id, loop, repo, number, kind, session_id, pid,
 	pid_start_at, status, started_at, finished_at, exit_code, cost_usd, duration_ms,
 	api_error, log_path, pr_number, title, legacy_source, legacy_id,
-	agent_pid, model, harness, effort`
+	agent_pid, model, harness, effort, provider`
 
 func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 	var d Dispatch
@@ -1072,7 +1079,7 @@ func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 		&d.SessionID, &d.PID, &pidStart, &d.Status, &d.StartedAt, &finished,
 		&d.ExitCode, &d.CostUSD, &d.DurationMS, &d.APIError, &d.LogPath,
 		&d.PRNumber, &d.Title, &d.LegacySource, &d.LegacyID,
-		&d.AgentPID, &d.Model, &d.Harness, &d.Effort)
+		&d.AgentPID, &d.Model, &d.Harness, &d.Effort, &d.Provider)
 	if err != nil {
 		return Dispatch{}, err
 	}

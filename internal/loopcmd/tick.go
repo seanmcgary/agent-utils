@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -620,6 +622,10 @@ func dispatch(
 		Model:   d.Overrides.Model,
 		Harness: d.Overrides.Harness,
 		Effort:  d.Overrides.Effort,
+		// Not an override, and so not read from d.Overrides: no label names a
+		// provider. It is the resolved value the engine compared, carried here
+		// so a park comment can name the account that actually failed.
+		Provider: d.Provider,
 	})
 	if err != nil {
 		return err
@@ -674,9 +680,99 @@ func dispatch(
 	return nil
 }
 
-const retryCapComment = `🔁 **Orphan retry cap reached (%d/%d)** — %d consecutive agent dispatches for this issue failed to complete. This usually indicates a sustained platform-side issue rather than a problem with the issue itself. Parking here rather than retrying indefinitely.
+const retryCapComment = `🔁 **Orphan retry cap reached (%d/%d)** — %d consecutive agent dispatches for this issue failed to complete.%s
 
-To proceed: re-add the ` + "`%s`" + ` label once the underlying issue has cleared, and this resumes normally.`
+To proceed: re-add the ` + "`%s`" + ` label once the underlying issue has cleared, and this resumes normally. Changing the harness, or the model to one on a different provider, clears the cap on its own.`
+
+// capFallback is the wording for a park with no recorded reason. It was once
+// the whole comment, and an operator reading it learned nothing actionable --
+// the 402 that caused the park was sitting in the dispatch row the entire
+// time. It is the fallback now, never the default.
+const capFallback = " This usually indicates a sustained platform-side issue rather than a problem with the issue itself. Parking here rather than retrying indefinitely."
+
+// urlPattern matches an absolute URL. Deliberately greedy to the next space: a
+// partially redacted URL is worse than none, because the surviving prefix
+// still identifies the resource.
+var urlPattern = regexp.MustCompile(`https?://\S+`)
+
+// capCause renders the sentence between the cap line and the instruction: what
+// actually went wrong, and what was running when it did.
+func capCause(d store.Dispatch) string {
+	reason := failureSentence(d.APIError)
+	if reason == "" {
+		return capFallback
+	}
+	where := ""
+	if parts := nonEmpty(d.Harness, d.Model, d.Provider); len(parts) > 0 {
+		where = " under " + strings.Join(parts, ", ")
+	}
+	return fmt.Sprintf(
+		"\n\nThe last failure reported:\n\n> %s\n\nThat ran%s. Parking here rather than retrying indefinitely.",
+		reason, where)
+}
+
+// nonEmpty drops the empty strings, so a claude dispatch -- which records no
+// provider -- does not render an empty slot in the parenthetical.
+func nonEmpty(vals ...string) []string {
+	var out []string
+	for _, v := range vals {
+		if s := strings.TrimSpace(v); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// failureSentence renders a dispatch's api_error for a PUBLIC GitHub comment,
+// or "" when nothing was recorded.
+//
+// api_error is often a bare status followed by the provider's JSON body --
+// `402: {"message":"...","code":402,...}`. The message field is the sentence a
+// human needs and the rest is envelope. Extracting it is best-effort: anything
+// that does not parse is redacted and truncated as it stands, which still
+// beats saying nothing.
+func failureSentence(apiError string) string {
+	s := strings.TrimSpace(apiError)
+	if s == "" {
+		return ""
+	}
+	if i := strings.Index(s, "{"); i >= 0 {
+		var body struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(s[i:]), &body); err == nil && body.Message != "" {
+			prefix := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s[:i]), ":"))
+			if prefix != "" {
+				return redactForComment(prefix + ": " + body.Message)
+			}
+			return redactForComment(body.Message)
+		}
+	}
+	return redactForComment(s)
+}
+
+// redactForComment strips what must not be published and caps the length.
+//
+// A provider is free to put anything in an error string, and OpenRouter's 402
+// puts a key-management URL in it:
+// https://openrouter.ai/workspaces/default/keys/<id>. That names the key and is
+// credential-adjacent, so every URL goes. The unredacted text stays on the
+// dispatch row and in the run log, where `agent-utils project logs` can still
+// reach it.
+func redactForComment(s string) string {
+	// A marker rather than nothing: providers put URLs mid-sentence ("To
+	// increase, visit <url> and adjust the limit"), and deleting one outright
+	// leaves a sentence that reads as though a word is missing.
+	s = urlPattern.ReplaceAllString(s, "[link redacted]")
+	s = strings.Join(strings.Fields(s), " ")
+	const max = 300
+	if r := []rune(s); len(r) > max {
+		// Cut on a rune boundary. Slicing the byte string would split a
+		// multi-byte rune and put mojibake in a GitHub comment.
+		s = strings.TrimSpace(string(r[:max])) + "…"
+	}
+	return s
+}
 
 // parkRetryExhausted is the ONE GitHub write this program performs. Every other
 // comment and label change belongs to the dispatched agent. The exception
@@ -708,8 +804,21 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 		return err
 	}
 
+	// Best-effort. The park is the point of this function, so a read that fails
+	// must not stop the comment or the label edits: the cause is omitted and
+	// the fallback wording stands.
+	var last store.Dispatch
+	if runs, err := deps.Store.RecentDispatches(cfg.Name, cfg.Repo, d.Issue, 5); err == nil {
+		for _, r := range runs {
+			if r.Status == store.StatusFailed {
+				last = r
+				break
+			}
+		}
+	}
+
 	body := fmt.Sprintf(retryCapComment,
-		cfg.Retry.Max, cfg.Retry.Max, cfg.Retry.Max, cfg.Labels.Trigger)
+		cfg.Retry.Max, cfg.Retry.Max, cfg.Retry.Max, capCause(last), cfg.Labels.Trigger)
 	if err := deps.GH.PostComment(ctx, owner, repo, d.Issue, body); err != nil {
 		return err
 	}
