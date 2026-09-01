@@ -78,13 +78,17 @@ i_understand_bypass_permissions: true
 # rewrites the branch (its subagents' fixes, folded and force-pushed), so a tend
 # agent rebasing the same branch would race its push.
 #
-# Note what this leaves, because it is the same trade pr-review.yaml documents,
-# moved one step along. A loop tends whatever ITS labels.review names. For the
-# execution loop that is status:ready-for-review, which under this chain is now
-# reached only after THIS loop finishes -- so a pull request waiting on review
-# or on findings execution is not tended by anyone, and one handed to the human
-# is. That is the correct end to tend: a pull request the human is about to
-# merge is the one that must not be stale.
+# Note where tending actually lands, because it is not where the label
+# transitions suggest. status:ready-for-review is this loop's labels.review AND
+# the execution loop's, but the EXECUTION agent already applied it when it
+# opened the pull request, and nothing removes it. So the branch is tended from
+# that point onward and this loop's final `add` is a re-assertion, not a first
+# application.
+#
+# Which means the veto list, not the label, is what keeps a tend agent off the
+# branch while this loop rewrites it: the execution loop vetoes
+# status:fixing-findings for exactly that window. That veto and this tend_pr are
+# the same guard seen from two sides, and both are required.
 tend_pr: false
 
 retry:
@@ -104,8 +108,10 @@ prompt: |
   YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
   {{.Labels.InFlight}}.
 
-  RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so {{.PR.Number}}
-  and {{.PR.HeadRef}} are EMPTY here and you must not use them. Read the
+  RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so the pull
+  request template fields are unset for this dispatch and you must not use them:
+  .PR.HeadRef renders empty and .PR.Number renders as 0, which is a valid-looking
+  issue number and will silently address the wrong thing. Read the
   "## Pipeline State" block in the issue's plan comment and take its `pr` field,
   then confirm it with `gh pr view <n> --json number,headRefName,baseRefName,state`.
   The pull request must be OPEN and must close this issue. If Pipeline State

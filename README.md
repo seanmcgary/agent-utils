@@ -414,14 +414,14 @@ logs.
 `agent-utils project loop new` writes a loop file for you, by asking; **[`docs/configuration.md`](docs/configuration.md)
 remains the reference for editing one by hand** — what each field means, what reads it, and
 what happens if you get it wrong. `examples/` holds four complete working files that form one
-chain, each loop's `trigger` being the loop before it's `terminal`:
+chain, each loop's `trigger` being the loop before its `terminal`:
 
 | Loop | Trigger | Hands on with | Does |
 |---|---|---|---|
 | `planning.yaml` | `status:ready-for-spec` | `status:ready-for-execution` (**you** apply it) | spec and plan, parked for your approval |
 | `execution.yaml` | `status:ready-for-execution` | `status:ready-for-pr-review` (**you** apply it) | builds the branch, opens the pull request |
 | `pr-review.yaml` | `status:ready-for-pr-review` | `status:ready-for-findings-exec` (its agent applies it) | runs the strongest model over the branch and posts a findings comment — it decides, it does not fix |
-| `exec-pr-review-findings.yaml` | `status:ready-for-findings-exec` | `status:ready-for-review` (its agent applies it) | applies that findings comment, one fresh subagent per file group, then hands the pull request to you |
+| `exec-pr-review-findings.yaml` | `status:ready-for-findings-exec` | `status:ready-for-review` (present since execution; its agent re-asserts it) | applies that findings comment, one fresh subagent per file group, then hands the pull request to you |
 
 The first two are ported from the reference planning and execution orchestrators. The last two
 used to be one loop that reviewed and fixed in a single session; splitting them is what lets the

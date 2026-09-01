@@ -9,7 +9,7 @@ together, in a stable order.
 
 `examples/planning.yaml`, `examples/execution.yaml`, `examples/pr-review.yaml` and
 `examples/exec-pr-review-findings.yaml` are complete working files, and together they are one
-chain: each loop's `trigger` is the loop before it's `terminal`. Read this reference for what each
+chain: each loop's `trigger` is the loop before its `terminal`. Read this reference for what each
 field means; read those for a shape to copy. `examples/pi.yaml` is the same loop as
 `execution.yaml` under the `pi` harness, not a fifth stage.
 
@@ -961,12 +961,16 @@ you are in the middle of reading.
 **Set it `false` for a review loop and for a remediation loop too**, for a different reason: both
 write to the branch — the reviewer commits its mechanical-gate fixes, and the remediation loop
 force-pushes a whole round of them — so a tend agent rebasing the same branch would race their
-pushes. Both hand the pull request on by applying a label the EXECUTION loop does not tend, and
-tending stays in one place: on `status:ready-for-review`, the human's own queue, which under the
-reference chain is reached only after remediation finishes. **The other half of that is the veto
-list**: `veto` is checked before tend decisions, so the execution loop must list
-`status:pr-reviewing` and `status:fixing-findings` — otherwise its tend rebases a branch another
-agent is rewriting.
+pushes. Tending stays in one place, on the execution loop.
+
+**What actually keeps the two apart is `veto`, not the label.** It is tempting to reason that a
+pull request waiting on review is untended because it has not reached `status:ready-for-review`
+yet. That is wrong: the execution agent applies `status:ready-for-review` when it opens the pull
+request, and nothing in the chain ever removes it, so the execution loop tends that branch
+continuously from then on — through the review queue and the remediation queue alike. `veto` is
+checked before tend decisions, so the execution loop must list `status:pr-reviewing` and
+`status:fixing-findings`: those two entries are the only thing that pauses its tend while another
+agent is rewriting the branch, and they resume it the moment that agent is done.
 
 **Two things trigger a tend, and either alone is enough.** The pull request is behind its base —
 the trigger this section led with — or review activity on it is newer than the last *finished*

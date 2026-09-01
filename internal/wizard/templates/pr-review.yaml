@@ -40,6 +40,12 @@ labels:
   #
   # Safe because tend_pr is false below. labels.review is one field doing two
   # jobs, and the other job -- tend eligibility -- is switched off here.
+  #
+  # One consequence to expect rather than debug: `loop status` prints a
+  # handed-off issue as `veto`, never `in-review`. status.go checks veto before
+  # review, and this label is in both. That is the honest reading -- the issue
+  # HAS left this loop -- but it means this loop's in-review count is always
+  # zero.
   review:    status:ready-for-findings-exec
   terminal:  status:ready-for-findings-exec
   veto:
@@ -92,13 +98,20 @@ i_understand_bypass_permissions: true
 # pushes -- the mechanical gates' fixes are commits -- so a tend agent rebasing
 # the same branch would race that push.
 #
-# Be clear about what that leaves, because it is a trade and not a free win.
-# A loop tends whatever ITS labels.review names, and for the execution loop
-# feeding this one that is status:ready-for-review, which under this chain is
-# now reached only after the REMEDIATION loop finishes. So a pull request
-# waiting on review, or waiting on its findings to be executed, is not tended by
-# anyone, and one already handed to the human is. That is the correct end to
-# tend: the pull request about to be merged is the one that must not be stale.
+# Be exact about where tending actually lands, because the obvious reading is
+# wrong. A loop tends whatever ITS labels.review names, and for the execution
+# loop that is status:ready-for-review -- which the EXECUTION agent applies when
+# it opens the pull request, and which nothing in this chain ever removes. So
+# the branch is tended continuously from that moment on, including while it sits
+# in this loop's queue. It is not the case that a pull request waiting on review
+# goes untended.
+#
+# What stops the race is therefore not the absence of the label; it is the veto
+# list. The execution loop vetoes status:pr-reviewing and status:fixing-findings
+# exactly so its tend pauses while another agent is writing to the branch, and
+# resumes the moment that agent is done. Removing either veto reintroduces the
+# race silently, because veto is the only thing standing between a tend rebase
+# and this loop's force-push.
 #
 # Whichever end tends, it must not be vetoed: labels.veto is checked before
 # tend decisions too (internal/engine/engine.go), so vetoing a label would
@@ -122,8 +135,10 @@ prompt: |
   YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
   {{.Labels.InFlight}}.
 
-  RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so {{.PR.Number}}
-  and {{.PR.HeadRef}} are EMPTY here and you must not use them. Read the
+  RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so the pull
+  request template fields are unset for this dispatch and you must not use them:
+  .PR.HeadRef renders empty and .PR.Number renders as 0, which is a valid-looking
+  issue number and will silently address the wrong thing. Read the
   "## Pipeline State" block in the issue's plan comment and take its `pr` field,
   then confirm it with `gh pr view <n> --json number,headRefName,baseRefName,state`.
   The pull request must be OPEN and must close this issue. If Pipeline State
@@ -185,10 +200,15 @@ prompt: |
   handoff, because {{.Labels.Terminal}} is another loop's trigger and applying
   it early puts a second agent on a branch you are still writing to.
     1. Push everything.
-    2. Post the findings artifact as a pull request comment and read back its
-       numeric comment ID.
+    2. Post the findings artifact with
+       `gh pr comment <n> --body-file <file>` and read back its numeric comment
+       ID. It must be a CONVERSATION comment, not a review comment: the next loop
+       fetches it from /issues/comments/<id>, which does not resolve a review
+       comment, so a `gh pr review` posting 404s there and strands the round.
     3. Write that ID into the "## Pipeline State" block's `findings comment`
-       field. The next loop fetches exactly that one comment by ID and never
+       field. If you split the artifact into parts, write the MANIFEST's ID --
+       never a part's. The next loop reads the manifest to learn the parts, so a
+       part ID there loses every group the manifest would have named. The next loop fetches exactly that one comment by ID and never
        searches, so an unwritten or stale ID strands the round.
     4. @-mention @seanmcgary.
     5. Remove {{.Labels.InFlight}}.
@@ -212,8 +232,13 @@ prompt: |
 resume_prompt: |
   Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
   in the SAME session you used before, so you already know which pull request you
-  were reviewing and what you had found. Remove {{.Labels.Trigger}} and add
-  {{.Labels.InFlight}} as your first action.
+  were reviewing and what you had found. As your first action remove
+  {{.Labels.Trigger}}, remove {{.Labels.Terminal}} IF IT IS STILL PRESENT, and
+  add {{.Labels.InFlight}}. The terminal removal matters: an issue carrying both
+  {{.Labels.Trigger}} and {{.Labels.Terminal}} is vetoed by this loop AND by the
+  remediation loop, which vetoes {{.Labels.Trigger}} for its own reasons. Neither
+  will touch it and nothing logs why. You are being re-dispatched for a NEW
+  round, so the previous round's handoff label is stale.
 
   Read the comments added since your last message. They answer the blocker you
   parked on, or they ask for another pass on a branch you already reviewed.

@@ -9,6 +9,10 @@ in flight when you change it.
 `~/Documents/Claude/Projects/{Koinos,LawnDominator,ProjectWrangler,SnootSnap}/code/*/.agent-utils/configs/`
 — are untouched by the change that added this file. Read the examples first, then apply.
 
+Every "From" value below was read from the live files on 2026-09-01. Nothing in this repository
+pins them, so `diff` each file against `examples/` before you edit it rather than trusting this
+document to still be current.
+
 ## What is different, in one table
 
 | | Before | After |
@@ -17,7 +21,7 @@ in flight when you change it.
 | remediation | inside the review session, in a context that grew to 321k tokens | a separate dispatch, one fresh subagent per **file** group |
 | findings | prose in a disposition table, re-located by whoever fixed them | anchored to `File:Line` with a prescribed fix, grouped by file |
 | handoff | none — one session did both | a comment ID in Pipeline State's `findings comment` field |
-| `status:ready-for-review` | applied by `pr-review` | applied by `exec-pr-review-findings` — same meaning, later in the chain |
+| `status:ready-for-review` | re-asserted by `pr-review` at the end | re-asserted by `exec-pr-review-findings` instead — in both chains it is FIRST applied by `execution`, and nothing ever removes it |
 
 The measurement behind it: over eight real sessions the reviewer fan-out cost $8.39 and the
 remediation that followed cost $90.86. A quarter of remediation's tool calls were re-reading code
@@ -41,7 +45,7 @@ done
 Verify before continuing — three per repository:
 
 ```bash
-gh label list --repo mcgarylabs/koinos-monorepo | grep -c findings   # want 3
+gh label list --repo mcgarylabs/koinos-monorepo --limit 200 | grep -c findings   # want 3
 ```
 
 **Do this first, and do not skip the verification.** A trigger label that does not exist in the
@@ -112,6 +116,14 @@ already disabled in all four projects** — its only symptom is a `WARN` reading
 downstream of `execution` and leaves `planning` alone at the front. Confirm afterwards that the
 warning has stopped.
 
+**This does not contradict the warning already in your `execution.yaml`.** That comment forbids
+pointing `labels.review` at `status:ready-for-pr-review`, and it is right: the agent applies
+`labels.review` before its last phase, so that would start the review on a branch the execution
+agent is still writing to. `labels.terminal` is a different field with different consequences —
+nothing in the engine reads it for selection, no agent applies it, and the execution prompt is not
+changed. It is read in exactly one place, `EntryLoop`. Keep the warning; it still applies to the
+line above it.
+
 `status:ready-for-pr-review` is declared as `terminal` but deliberately **not** added to
 `execution.yaml`'s `veto`. `veto` is checked before tend decisions too, so vetoing it would stop
 the execution loop rebasing a branch that is queued for review — which is exactly a branch that
@@ -181,6 +193,22 @@ Per repository, after the swap:
   should rise.
 - The `epic sweep skipped: cannot name the pipeline's entry loop` warning should have stopped.
 
+### If an issue stops moving in both loops
+
+An issue carrying **both** `status:ready-for-pr-review` and `status:ready-for-findings-exec` is
+vetoed by both loops: `pr-review` vetoes its own terminal so a stale trigger cannot pull back work
+already handed on, and `exec-pr-review-findings` vetoes `status:ready-for-pr-review` so it does not
+remediate under a reviewer. Each veto is right on its own and together they deadlock. The engine
+logs only `a veto label is present`, and
+`agent-utils project --name <p> loop status --name <loop>` prints `veto` for the issue under both
+loops — that pair is the signature.
+
+It is reachable by the ordinary operator action of re-adding `status:ready-for-pr-review` for
+another review round while the previous round's handoff label is still on the issue. Remove
+`status:ready-for-findings-exec` first, then add the trigger. The new `pr-review` resume prompt
+also clears the stale terminal itself on re-dispatch, so this only bites when the issue never gets
+dispatched at all.
+
 ### Rollback
 
 Rolling back is not just restoring the file, because three labels would be left watched by
@@ -201,6 +229,11 @@ nothing and nothing would say so.
 
 Three loops now declare `review: status:ready-for-review`, and exactly one of them tends it.
 `exec-pr-review-findings` must keep `tend_pr: false`; giving it `true` would put two loops
-rebasing the same pull request. And `status:ready-for-review` must never be added to any loop's
-`veto`, because `veto` silently disables tending as well as dispatching, and that label is the
-only thing keeping a pull request in your queue rebased.
+rebasing the same pull request.
+
+And **`status:ready-for-review` must never enter the veto list of the loop that tends** — the
+execution loop. `veto` silently disables tending as well as dispatching, and because the execution
+agent applies that label when it opens the pull request and nothing ever removes it, that one
+entry would switch off tending for the entire pipeline downstream of execution. (`planning.yaml`
+vetoes it and that is fine: planning has `tend_pr: false`, so the field has only its dispatch
+job there.)
