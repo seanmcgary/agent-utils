@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/proc"
@@ -588,9 +589,10 @@ func RenderSessions(p *Project, sessions []Session, all bool) string {
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "%-38s %-12s %-6s %-24s %-5s %-9s %-24s %-8s %-10s %s\n",
-		"SESSION", "LOOP", "ISSUE", "TITLE", "RUNS", "COST", "MODEL", "HARNESS",
-		"STATE", "LAST RUN")
+	fmt.Fprintf(&b, "%s %s %s %s %s %s %s %s %s %s\n",
+		fit("SESSION", 38), fit("LOOP", 12), fit("ISSUE", 6), fit("TITLE", 24),
+		fit("RUNS", 5), fit("COST", 9), fit("MODEL", 24), fit("HARNESS", 8),
+		fit("STATE", 10), "LAST RUN")
 	for _, s := range shown {
 		state := s.LastStatus
 		switch {
@@ -611,11 +613,11 @@ func RenderSessions(p *Project, sessions []Session, all bool) string {
 			// visible at all because --all asked for it.
 			state = "CLOSED"
 		}
-		fmt.Fprintf(&b, "%-38s %-12s %-6d %-24s %-5d $%-8.2f %-24s %-8s %-10s %s\n",
-			s.ID, truncate(s.Loop, 12), s.Issue, truncate(s.Title, 24),
-			s.Dispatches, s.Cost, truncate(orDash(s.Model), 24),
-			truncate(orDash(s.Harness), 8), state,
-			s.Last.Local().Format("2006-01-02 15:04"))
+		fmt.Fprintf(&b, "%s %s %-6d %s %-5d %s %s %s %s %s\n",
+			fit(s.ID, 38), fit(s.Loop, 12), s.Issue, fit(s.Title, 24),
+			s.Dispatches, fit(fmt.Sprintf("$%.2f", s.Cost), 9),
+			fit(orDash(s.Model), 24), fit(orDash(s.Harness), 8),
+			fit(state, 10), s.Last.Local().Format("2006-01-02 15:04"))
 	}
 
 	fmt.Fprint(&b, hiddenNote(hidden))
@@ -657,9 +659,22 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "%-16s %-38s %-12s %-6s %-24s %-5s %-9s %-24s %-8s %-10s %s\n",
-		"PROJECT", "SESSION", "LOOP", "ISSUE", "TITLE", "RUNS", "COST", "MODEL",
-		"HARNESS", "STATE", "LAST RUN")
+	// Project is padded but never truncated. The footer asks the operator to
+	// type this value back into --name, and registry.Find matches a name
+	// exactly, so an elided name is a selector that cannot resolve. That means
+	// the column has to be as wide as the widest name on this machine: a fixed
+	// width lets a longer name push every column after it out of line.
+	projWidth := len("PROJECT")
+	for _, s := range shown {
+		if n := utf8.RuneCountInString(s.Project); n > projWidth {
+			projWidth = n
+		}
+	}
+
+	fmt.Fprintf(&b, "%s %s %s %s %s %s %s %s %s %s %s\n",
+		fit("PROJECT", projWidth), fit("SESSION", 38), fit("LOOP", 12),
+		fit("ISSUE", 6), fit("TITLE", 24), fit("RUNS", 5), fit("COST", 9),
+		fit("MODEL", 24), fit("HARNESS", 8), fit("STATE", 10), "LAST RUN")
 	for _, s := range shown {
 		state := s.LastStatus
 		switch {
@@ -674,15 +689,11 @@ func RenderAllSessions(sessions []Session, f SessionFilter) string {
 		case s.Closed:
 			state = "CLOSED"
 		}
-		// Project is padded but never truncated. The footer asks the operator
-		// to type this value back into --name, and registry.Find matches a
-		// name exactly, so an elided name is a selector that cannot resolve.
-		// RenderProjects pads loop names the same way, for the same reason.
-		fmt.Fprintf(&b, "%-16s %-38s %-12s %-6d %-24s %-5d $%-8.2f %-24s %-8s %-10s %s\n",
-			s.Project, s.ID, truncate(s.Loop, 12), s.Issue,
-			truncate(s.Title, 24), s.Dispatches, s.Cost,
-			truncate(orDash(s.Model), 24), truncate(orDash(s.Harness), 8),
-			state, s.Last.Local().Format("2006-01-02 15:04"))
+		fmt.Fprintf(&b, "%s %s %s %-6d %s %-5d %s %s %s %s %s\n",
+			pad(s.Project, projWidth), fit(s.ID, 38), fit(s.Loop, 12), s.Issue,
+			fit(s.Title, 24), s.Dispatches, fit(fmt.Sprintf("$%.2f", s.Cost), 9),
+			fit(orDash(s.Model), 24), fit(orDash(s.Harness), 8), fit(state, 10),
+			s.Last.Local().Format("2006-01-02 15:04"))
 	}
 
 	// The long form, naming the project. The top-level logs command resolves
