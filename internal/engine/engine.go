@@ -184,8 +184,14 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		}
 
 		// A parked issue needs no separate guard here. parkRetryExhausted removes
-		// the trigger label, so the check below already skips it, and a human who
-		// re-applies that label deliberately un-parks the issue.
+		// the trigger label, so the check below already skips it.
+		//
+		// Re-applying that label reaches this branch only once needs_retry is
+		// clear, which the park itself does. While the flag is still set the
+		// failure path above owns the issue, and it un-parks only when the
+		// CONFIGURATION changed -- see configRetired. That asymmetry is
+		// deliberate: a configuration that failed its whole budget will fail
+		// the same way again, and a label edit on its own is not new evidence.
 		if !iss.HasLabel(cfg.Labels.Trigger) {
 			// Not final: tendDecisions may still act on this issue below, and
 			// it replaces this reason with its own when it does not.

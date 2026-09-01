@@ -869,8 +869,13 @@ How many times one issue may be retried before the loop gives up. `0` means neve
 the retries are exhausted, then removes `in_flight` and `trigger` and applies `blocked`.
 
 It removes `trigger` deliberately: leaving it would let the next tick resume the issue
-immediately and the park would stop nothing. Re-apply `trigger` yourself to resume, which
-also resets the retry budget.
+immediately and the park would stop nothing.
+
+The cap comment names the failure it parked on — the harness's own error, the harness, the
+model, and the pi provider — so the reason to change something is in the issue rather than in
+a run log. URLs are stripped from that error before it is posted: a provider is free to put
+anything in it, and OpenRouter's 402 embeds a key-management link. The unredacted text stays
+on the dispatch row and in the run log, reachable with `agent-utils project logs`.
 
 The counter also resets on any successful dispatch, so an issue that fails three times over
 its lifetime with successes in between is not parked on its next single failure.
@@ -878,6 +883,26 @@ its lifetime with successes in between is not parked on its next single failure.
 ```yaml
 max: 3
 ```
+
+#### Retiring a cap
+
+A retry cap is evidence about **one configuration**. An issue parked at `retry.max` un-parks
+by itself when the configuration those failures describe is no longer the one in play:
+
+- **Changing the harness** — the `harness:` label, or the loop's `agent.harness` — retires the
+  accumulated failures and skips whatever backoff was left. Three pi failures say nothing
+  about whether claude can build the issue.
+- **Changing the model to one served by a different pi provider** does the same. `openrouter`
+  and `openai-codex` are separate accounts with separate balances, so a credit failure on one
+  is no evidence about the other. The provider is resolved with `pi --list-models`; when it
+  cannot be resolved, the cap stands.
+- **Changing the model within one provider does not.** Swapping one OpenRouter model for
+  another while OpenRouter is out of credits changes nothing the failures were about.
+
+Re-applying `trigger` on its own does **not** clear a cap whose configuration has not changed.
+The comparison is against the harness and provider of the most recent *attempted* dispatch, so
+one change buys one retirement: if the new configuration also fails, it spends its own budget
+and parks on its own merits.
 
 ### `retry.backoff`
 
