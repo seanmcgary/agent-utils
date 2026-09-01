@@ -1081,6 +1081,82 @@ func TestTendIsSkippedWhenAnOverrideLabelIsInvalid(t *testing.T) {
 	}
 }
 
+// A tend.harness that differs from agent.harness must START the tend's
+// session, never resume the issue's -- the same session-continuity rule that
+// governs a harness: label, reached here through the new tend: configuration
+// layer instead.
+func TestTendWithDifferentTendHarnessStartsAFreshSession(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	cfg.Tend.Harness = config.HarnessPi
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s-claude", SessionStarted: true, SessionHarness: config.HarnessClaude},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	if id := p.Decisions[0].SessionID; id != "" {
+		t.Errorf("session id = %q, want empty: tend.harness differs from the session's harness", id)
+	}
+}
+
+// An empty tend.harness still inherits the issue's session: the tend:
+// overlay falls all the way back to agent.harness, which is what the started
+// session was recorded under.
+func TestTendWithEmptyTendHarnessStillInheritsTheSession(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s-claude", SessionStarted: true, SessionHarness: config.HarnessClaude},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	if id := p.Decisions[0].SessionID; id != "s-claude" {
+		t.Errorf("session id = %q, want the issue's session %q", id, "s-claude")
+	}
+}
+
+// A harness: label on the issue still beats tend.harness: the label is an
+// instruction about one issue, and it must win over the class-wide tend:
+// default the same way it wins over agent.harness.
+func TestTendHarnessLabelBeatsTendHarness(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agent.Harness = config.HarnessClaude
+	cfg.Tend.Harness = config.HarnessPi
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review, "harness:claude")},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 4},
+	}
+	st := State{Issues: map[int]store.IssueState{
+		1: {Number: 1, SessionID: "s-claude", SessionStarted: true, SessionHarness: config.HarnessClaude},
+	}}
+
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	if id := p.Decisions[0].SessionID; id != "s-claude" {
+		t.Errorf("session id = %q, want the issue's session %q: the harness:claude label "+
+			"beats tend.harness:pi", id, "s-claude")
+	}
+}
+
 // The retry path resumes too, and needs the same guard: a retry that resumes a
 // session the harness cannot see fails identically every attempt, straight to
 // the cap.

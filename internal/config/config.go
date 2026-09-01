@@ -23,9 +23,10 @@ type Config struct {
 	// "master", so it is configuration rather than an assumption.
 	DefaultBranch string `yaml:"default_branch"`
 
-	Labels Labels `yaml:"labels"`
-	Agent  Agent  `yaml:"agent"`
-	TendPR bool   `yaml:"tend_pr"`
+	Labels Labels    `yaml:"labels"`
+	Agent  Agent     `yaml:"agent"`
+	Tend   TendAgent `yaml:"tend"`
+	TendPR bool      `yaml:"tend_pr"`
 
 	// CleanupClosedPR removes the worktrees of a closed pull request. It
 	// defaults to ON: nothing else removes a worktree, and one of a large
@@ -82,6 +83,24 @@ type Agent struct {
 	// bool cannot distinguish an absent field from an explicit false.
 	// claude-only: pi has no equivalent.
 	BackgroundTasks *bool `yaml:"background_tasks"`
+}
+
+// TendAgent holds the agent settings for a tend dispatch: which agent runs, on
+// which model, at which effort.
+//
+// It carries ONLY the three fields that say WHICH agent runs. The rejected
+// alternative was repeating every Agent field -- permission_mode, worktree,
+// max_budget_usd, timeout, background_tasks -- so a tend could diverge from
+// the trigger dispatch in those too. That gives an operator two places to set
+// one thing, and the concrete failure is an operator who sets a timeout in
+// one of them and gets the other's: a tend that quietly inherits the trigger
+// dispatch's stale worktree mode or an unset budget cap because they only
+// remembered to edit `agent:`. Every field this struct does NOT have is
+// deliberately shared with `agent:` for that reason.
+type TendAgent struct {
+	Harness string `yaml:"harness"`
+	Model   string `yaml:"model"`
+	Effort  string `yaml:"effort"`
 }
 
 // BackgroundTasksEnabled reports whether the claude child may background its
@@ -165,6 +184,14 @@ func Load(path string) (*Config, error) {
 	if cfg.Agent.Harness == "" {
 		cfg.Agent.Harness = HarnessClaude
 	}
+	// cfg.Tend.Harness is deliberately NOT defaulted here. agent.harness must
+	// always resolve, because every dispatch needs an agent to run, but an
+	// empty tend.harness carries its own meaning: "use agent.harness for this
+	// tend too." Defaulting it to HarnessClaude here would silently pin every
+	// tend dispatch to claude on a loop configured with harness: pi, which is
+	// exactly the divergence a tend section that only sets a cheaper model was
+	// never meant to introduce. runner.Effective and engine.effectiveHarness
+	// both read the empty string as "fall through to agent.harness."
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
@@ -220,6 +247,17 @@ func (c *Config) validate() error {
 			HarnessClaude, HarnessPi, c.Agent.Harness))
 	}
 
+	// tend.harness is validated against the same enum as agent.harness,
+	// including the empty case: empty is "fall back to agent.harness," not "no
+	// opinion," so it is accepted here too and resolved later, never here.
+	switch c.Tend.Harness {
+	case "", HarnessClaude, HarnessPi:
+	default:
+		errs = append(errs, fmt.Errorf(
+			"tend.harness must be %q or %q, got %q",
+			HarnessClaude, HarnessPi, c.Tend.Harness))
+	}
+
 	// The claude-only settings -- agent.permission_mode,
 	// agent.background_tasks, agent.max_budget_usd -- are ACCEPTED whatever
 	// the harness is, and IGNORED by the harness that has no equivalent: pi
@@ -269,6 +307,16 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf(
 			"agent.effort %q is not a valid effort level", c.Agent.Effort))
 	}
+	switch c.Tend.Effort {
+	case "", "low", "medium", "high", "xhigh", "max":
+	default:
+		errs = append(errs, fmt.Errorf(
+			"tend.effort %q is not a valid effort level", c.Tend.Effort))
+	}
+	// tend.model is NOT required, unlike agent.model above: an empty value
+	// means "use agent.model," and requiring every tending loop to repeat a
+	// model it already set on agent: would defeat the point of a section
+	// whose only job is to let a FEW fields diverge.
 	// 0 is legitimate and documented: it means no cost ceiling, and
 	// internal/runner/args.go omits --max-budget-usd for it. A NEGATIVE value
 	// hits that same "> 0" gate, so it is silently identical to no cap -- an

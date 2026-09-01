@@ -25,12 +25,12 @@ at a fingerprint that already defeated it.
 
 | Field   | Value |
 |---------|-------|
-| stage   | 2 (plan review) |
+| stage   | 3 (implementation) |
 | class   | large (new config section, new table, new GitHub read, new gate before a dispatch) |
 | profile | backend |
 | branch  | feat/tend-cost-controls |
 | pr      | #25 |
-| gate    | pending |
+| gate    | approved 2026-09-01 |
 | round   | 0 |
 | decisions | 0 |
 

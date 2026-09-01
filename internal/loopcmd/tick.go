@@ -43,10 +43,14 @@ func resolveProviders(ctx context.Context, cfg *config.Config, issues []ghub.Iss
 		if err != nil {
 			continue
 		}
-		if engine.EffectiveHarness(cfg, ov) != config.HarnessPi {
+		// store.KindStart: this resolves the provider for the issue's OWN
+		// dispatch, which is a start or a resume. A tend never reaches here --
+		// it carries no retry history to retire -- so the tend: section must
+		// not colour the answer.
+		if engine.EffectiveHarness(cfg, store.KindStart, ov) != config.HarnessPi {
 			continue
 		}
-		model := runner.Effective(cfg, ov).Model
+		model := runner.Effective(cfg, store.KindStart, ov).Model
 		if model == "" {
 			continue
 		}
@@ -601,7 +605,7 @@ func dispatch(
 		// empty whenever the loop default was used -- an ambiguity the
 		// retirement rule cannot carry, because "empty" there would mean both
 		// "claude, by default" and "not recorded".
-		harness := runner.Effective(cfg, d.Overrides).Harness
+		harness := runner.Effective(cfg, kind, d.Overrides).Harness
 		if harness == "" {
 			harness = config.HarnessClaude
 		}
@@ -947,6 +951,11 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		runner.Invocation{
 			SessionID: d.SessionID, Prompt: prompt, Resume: resume,
 			Overrides: config.Overrides{Model: d.Model, Harness: d.Harness, Effort: d.Effort},
+			// Kind selects the tend: layer in runner.Effective. It comes from
+			// the dispatch row, the same source as Overrides above: this
+			// detached process never saw the tick's decision, only what tick.go
+			// wrote to the row before spawning it.
+			Kind: d.Kind,
 		},
 		workDir, d.LogPath)
 }
