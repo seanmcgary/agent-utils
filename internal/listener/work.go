@@ -225,6 +225,15 @@ type Worker struct {
 	// and nothing more; see RunIssue for the reconcile that was removed and
 	// must not come back.
 	RunTend func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, base string) (loopcmd.Summary, error)
+	// RunTendIssue decides tending for the ONE issue a delivery named, taking
+	// the tend dispatcher's lock itself. Production wires it to
+	// loopcmd.TendIssue.
+	//
+	// It is a separate seam from RunTend because the two answer different
+	// questions and must stay separable in a test: RunTend answers "the default
+	// branch moved" and reads no review activity at all, and this one answers
+	// "something happened to this issue" and is the fast path that does.
+	RunTendIssue func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, number int) (loopcmd.Summary, error)
 	// RunCleanup removes the worktree of a pull request that just closed, and
 	// the worktree of the issue it closes, once neither is in use. Production
 	// wires it to loopcmd.CleanupClosedPR. prNumber is the delivery's number:
@@ -354,6 +363,7 @@ func NewWorker(db *store.DB) *Worker {
 		Open:            loopcmd.Open,
 		RunIssue:        loopcmd.TickIssue,
 		RunTend:         loopcmd.TendSweep,
+		RunTendIssue:    loopcmd.TendIssue,
 		RunCleanup:      loopcmd.CleanupClosedPR,
 		RunEpic:         loopcmd.EpicSweep,
 		RunTendCheck:    loopcmd.TendCheck,
@@ -723,28 +733,27 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 		return
 	}
 
+	// The tend dispatcher answers a delivery with two things and nothing else:
+	// the sweep a moved default branch arms, and the scoped pass for the issue
+	// the delivery named. It has no epic sweep -- promotion is a loop's label
+	// write -- and no worktree cleanup of its own; see tendDeliver.
+	if t.IsTend() {
+		w.tendDeliver(ctx, t, d, cfg, deps)
+		return
+	}
+
 	// Gated on the window, not called outright. The leading delivery of a
 	// burst ticks here as it always has; the ones behind it are collapsed into
 	// the single trailing tick the window fires when it closes.
 	//
 	// Only the ISSUE pass is gated. The passes below decide different things
-	// and state their own timing: tending is already delayed by a timer of its
-	// own, and the epic sweep deliberately is not delayed at all.
+	// and state their own timing: the epic sweep deliberately is not delayed
+	// at all.
 	//
 	// d.Number > 0 keeps a push out of this pass entirely: a push names no
-	// issue, so the only work it can start is the sweep armed below.
+	// issue, and a loop has nothing else a push could start.
 	if d.Number > 0 && w.openIssueWindow(ctx, t, d.Number) {
 		w.issuePass(ctx, t, d, cfg, deps, key)
-	}
-
-	// Armed by a merge OR by a push. A merge into the default branch produces
-	// a push event too, so the two overlap; armTend collapses them onto one
-	// timer, which is why the overlap costs nothing and why the merge trigger
-	// stays. It has to stay: a hook that nobody re-registers after this change
-	// still carries the old event list, and the merge path is what keeps
-	// working for it.
-	if cfg.TendsPRs() && (d.IsMergeInto(cfg.DefaultBranch) || d.IsPushTo(cfg.DefaultBranch)) {
-		w.armTend(ctx, t, cfg.DefaultBranch)
 	}
 
 	// Runs after the issue's own pass, and independently of whether that pass
@@ -767,14 +776,85 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	}
 
 	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
-	// for the operator's decision -- so it is gated on ClosedPR alone, not on
-	// cfg.TendsPRs or the merge check above.
+	// for the operator's decision -- so it is gated on ClosedPR alone. The tend
+	// dispatcher runs its own, over its own worktrees; see tendDeliver.
 	//
 	// d.Number > 0 for the reason the epic pass carries it: prNumber IS
 	// d.Number here, and a cleanup for pull request 0 would ask the worktree
 	// manager to remove "pr-0".
 	if d.Number > 0 && d.ClosedPR {
 		w.cleanupPass(ctx, t, d, cfg, deps)
+	}
+}
+
+// tendDeliver answers one delivery for a project's TEND DISPATCHER.
+//
+// It is the tend half of tickOne, split out rather than woven through it,
+// because the two targets answer a delivery with different work and share only
+// the open. What a loop does here -- the issue window, the epic sweep, the retry
+// schedule -- a tend does not: it moves no label, promotes nothing, and is never
+// retried.
+//
+// The three things it does do are the three triggers tending has always had:
+//
+//  1. The SWEEP, armed by the default branch moving -- a merge into it or a push
+//     to it. A merge produces a push event too, so the two overlap; armTend
+//     collapses them onto one timer, which is why the overlap costs nothing and
+//     why the merge trigger stays. It has to stay: a hook nobody re-registers
+//     still carries the old event list, and the merge path keeps working for it.
+//     The third arm, the periodic check, reaches armTend from tendCheckOne.
+//  2. The scoped pass for the issue this delivery named, which is how REVIEW
+//     activity reaches tending within seconds rather than at the next cron run.
+//     It is deliberately not put on the sweep's timer: a review is about one
+//     pull request, and delaying it a minute to batch it with a merge train
+//     would batch it with work it has nothing to do with.
+//  3. Worktree cleanup when a pull request closes. The dispatcher has worktrees
+//     of its own -- <worktree_dir>/tend/pr-N, under its reserved name, distinct
+//     from every loop's issue-N -- and nothing else would ever remove them.
+func (w *Worker) tendDeliver(
+	ctx context.Context, t Target, d Delivery, cfg *config.Config, deps loopcmd.Deps,
+) {
+	if d.IsMergeInto(cfg.DefaultBranch) || d.IsPushTo(cfg.DefaultBranch) {
+		w.armTend(ctx, t, cfg.DefaultBranch)
+	}
+
+	// Shares the issue window with the loops for the same reason they do: a
+	// burst of deliveries about one issue must collapse into one pass. The
+	// window is keyed by (project, loop, issue), and the dispatcher's reserved
+	// name is a distinct loop there, so a tend pass and a loop tick for the
+	// same issue are never coalesced into one another.
+	if d.Number > 0 && w.openIssueWindow(ctx, t, d.Number) {
+		w.tendIssuePass(ctx, t, d, cfg, deps)
+	}
+
+	// d.Number > 0 for the reason the loop path carries it: prNumber IS
+	// d.Number here, and a cleanup for pull request 0 would ask the worktree
+	// manager to remove "pr-0".
+	if d.Number > 0 && d.ClosedPR {
+		w.cleanupPass(ctx, t, d, cfg, deps)
+	}
+}
+
+// tendIssuePass runs the scoped tend pass for one issue and decides what its
+// outcome means.
+//
+// Nothing, in both failure cases, and that is the same answer tendPass gives
+// for a sweep: this pass makes no retry decision of its own, so spending an
+// issue's retry budget on it would charge the issue for work it did not do.
+// A held lock re-arms nothing either -- the holder is a tend pass, which does
+// this pass's work as part of its own -- and a real failure is answered by the
+// next delivery, the next sweep, or the periodic check, whichever comes first.
+func (w *Worker) tendIssuePass(
+	ctx context.Context, t Target, d Delivery, cfg *config.Config, deps loopcmd.Deps,
+) {
+	if _, err := w.RunTendIssue(ctx, cfg, deps, d.Number); err != nil {
+		if errors.Is(err, lock.ErrHeld) {
+			slog.Info("another tend pass holds the dispatcher's lock; skipping this delivery",
+				"project", t.ProjectName, "issue", d.Number)
+			return
+		}
+		slog.Error("tend delivery failed", "project", t.ProjectName,
+			"issue", d.Number, "err", err)
 	}
 }
 
@@ -993,8 +1073,15 @@ func (w *Worker) issueBusy(t Target, number int) bool {
 // act is to change the labels this pass is about to read.
 //
 // It runs the issue pass ALONE. Going back through tickOne would re-enter the
-// window that fired it, and would re-run the tend, epic and cleanup passes
+// window that fired it, and would re-run the sweep, epic and cleanup passes
 // that belong to the delivery rather than to this issue.
+//
+// For a TEND target it runs the scoped tend pass instead, and that branch is
+// load-bearing rather than tidy: both targets share the window, keyed by
+// (project, loop, issue), so the dispatcher's trailing tick arrives here like
+// any other. Without the branch it would run a LOOP tick against the
+// dispatcher's configuration -- deciding issues against label roles that are
+// all the eligibility label, on a configuration with no retry policy.
 func (w *Worker) issueFresh(ctx context.Context, t Target, number int) {
 	acc, err := w.access()
 	if err != nil {
@@ -1013,6 +1100,10 @@ func (w *Worker) issueFresh(ctx context.Context, t Target, number int) {
 		slog.Error("cannot open loop", "loop", t.LoopName, "project", t.ProjectName,
 			"config", t.ConfigPath, "err", err)
 		w.schedule(ctx, t, number, kindOpen, openRetryMax, func(int) time.Duration { return w.OpenRetryDelay })
+		return
+	}
+	if t.IsTend() {
+		w.tendIssuePass(ctx, t, Delivery{Repo: t.Repo, Number: number}, cfg, deps)
 		return
 	}
 	key := loopKey{ProjectID: t.ProjectID, LoopName: t.LoopName}

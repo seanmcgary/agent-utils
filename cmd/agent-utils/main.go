@@ -18,6 +18,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
 	"github.com/seanmcgary/agent-utils/internal/migrate"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -161,6 +162,20 @@ func resolveLoopConfig(c *cli.Command, dir string) (string, error) {
 		return path, nil
 	}
 
+	// The tend dispatcher answers to a name like a loop, and deliberately so.
+	// It is not a loop and has no file, but it dispatches agents, writes
+	// dispatch rows, creates sessions and holds worktrees, and an operator has
+	// to be able to point every command that inspects those at it. Making it
+	// invisible to `--name` would have been the real cost of moving tending out
+	// of the loops.
+	//
+	// What comes back is the project descriptor's path, which loopcmd.Open
+	// recognises and turns into the tend configuration; see config.TendPath.
+	// Every command downstream -- tick, status, logs, reset -- then works on a
+	// *config.Config exactly as it does for a loop.
+	if strings.EqualFold(name, project.Reserved) {
+		return config.TendPath(dir), nil
+	}
 	if name != "" {
 		return config.Resolve(dir, name)
 	}
@@ -168,6 +183,17 @@ func resolveLoopConfig(c *cli.Command, dir string) (string, error) {
 	entries, err := config.List(dir)
 	if err != nil {
 		return "", err
+	}
+	// The tend dispatcher is NAMED in the ambiguity error, and it must be. A
+	// project that tends has a dispatcher an operator can tick, inspect and
+	// read logs from, and an error listing only the loop files would say it
+	// does not exist. It is deliberately not a candidate for the
+	// only-one-configuration shortcut below, and not offered in the
+	// interactive prompt either: both of those pick a default, and "the thing
+	// that force-pushes branches" must never be picked by default.
+	names := config.Names(entries)
+	if _, err := config.LoadTend(dir); err == nil {
+		names = append(names, project.Reserved)
 	}
 	if len(entries) == 1 {
 		return entries[0].Path, nil
@@ -184,7 +210,7 @@ func resolveLoopConfig(c *cli.Command, dir string) (string, error) {
 		}
 		// FullName already includes the root command name.
 		return "", fmt.Errorf("%w: %s\n\nName one, for example:\n  %s --name %s",
-			config.ErrAmbiguous, strings.Join(config.Names(entries), ", "),
+			config.ErrAmbiguous, strings.Join(names, ", "),
 			c.FullName(), example)
 	}
 	return promptForConfig(entries)
@@ -797,14 +823,14 @@ func logsCommand() *cli.Command {
 			}
 			// Re-resolve the harness from the DISPATCH once one is selected.
 			// opts.Harness above is only cfg.Agent.Harness, which is the
-			// harness the loop runs by default and not necessarily the one
-			// that wrote this file: a tend: section or a harness: label can
-			// send one dispatch to the other agent. The renderer picks the
+			// harness this configuration runs by default and not necessarily
+			// the one that wrote this file: a harness: label can send one
+			// dispatch to the other agent. The renderer picks the
 			// stream shape from this value (internal/loopcmd/logs.go), so a
 			// stale answer feeds a pi transcript to the claude renderer and
 			// prints nothing useful about a run that worked. This is the same
 			// resolution `sessions list` and `session describe` already do.
-			opts.Harness = runner.Effective(cfg, d.Kind, config.Overrides{Harness: d.Harness}).Harness
+			opts.Harness = runner.Effective(cfg, config.Overrides{Harness: d.Harness}).Harness
 			logPath := loopcmd.LogPathFor(cfg, d, stream)
 			if c.Bool("path") {
 				fmt.Println(logPath)
@@ -916,7 +942,18 @@ func loopCommand() *cli.Command {
 					// and never does, so no webhook delivery can force a tick.
 					deps.Force = c.Bool("force")
 
-					_, err = loopcmd.RunTick(ctx, cfg, deps)
+					// `--name tend` runs the tend dispatcher's own full pass,
+					// which is what makes tending schedulable from cron on a
+					// machine with no daemon -- the only trigger such a machine
+					// otherwise has. --force is accepted and does nothing here,
+					// because the gates it suspends (the breaker cooldown and
+					// the retry backoff windows) belong to a loop's retry
+					// policy and a tend has none.
+					run := loopcmd.RunTick
+					if config.IsTendPath(path) {
+						run = loopcmd.RunTendTick
+					}
+					_, err = run(ctx, cfg, deps)
 					if errors.Is(err, lock.ErrHeld) {
 						slog.Info("another tick is running; exiting", "loop", cfg.Name)
 						return nil
@@ -947,7 +984,15 @@ func loopCommand() *cli.Command {
 					}
 					defer cleanup()
 
-					out, err := loopcmd.Status(ctx, cfg, deps)
+					// The tend dispatcher gets its own report. Status renders a
+					// loop's issue states -- queued, in-flight, blocked -- and
+					// tending has none of them; what an operator needs there is
+					// the pull request queue it maintains. See TendStatus.
+					status := loopcmd.Status
+					if config.IsTendPath(path) {
+						status = loopcmd.TendStatus
+					}
+					out, err := status(ctx, cfg, deps)
 					if err != nil {
 						return err
 					}

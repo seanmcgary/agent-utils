@@ -11,7 +11,6 @@ import (
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
-	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 )
@@ -154,10 +153,6 @@ func tickConfig(t *testing.T) *config.Config {
 			Blocked:  "blocked",
 			Terminal: "terminal",
 		},
-		// The project's tend policy, as config.Load would have injected it.
-		// Enabled is false here: tickConfig is the base for tests that do not
-		// tend, and the ones that do turn it on.
-		Tend: project.Tend{Loop: "planning", Label: "review"},
 		Agent: config.Agent{
 			Model: "opus", Worktree: config.WorktreeNone, Timeout: config.Duration(time.Hour),
 		},

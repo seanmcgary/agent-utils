@@ -164,11 +164,11 @@ func conflictFingerprint(headSHA string, paths []string) string {
 //
 // # What stops a rebase that this function never sees
 //
-// A veto label, a stopped session, and a parked issue stop the rebase as well
-// as the agent. They are applied by engine.Decide, which is upstream of act:
-// tendDecisions drops a vetoed issue outright, and a stopped issue is marked
-// decided so no tend decision is produced for it. No such issue reaches this
-// function at all, so nothing here can rebase one.
+// A stopped session and a live agent stop the rebase as well as the agent.
+// They are applied by engine.DecideTend, which is upstream of act: a stopped
+// issue and one already holding an agent anywhere in the project are both
+// skipped there, so no such issue reaches this function at all and nothing
+// here can rebase one.
 //
 // That is worth naming because the design intent differs. The operator wanted
 // a clean replay to run regardless -- it spends no token and writes no label,
@@ -342,7 +342,7 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 // or the stored row -- dispatches the agent, because a gate that declines to
 // spend money must never be able to strand a pull request on state it could
 // not read. This is the opposite direction from the review trigger in
-// engine.tendDecisions, which fails CLOSED, because the two gates guard
+// engine.DecideTend, which fails CLOSED, because the two gates guard
 // opposite defaults: the review trigger decides whether to ACT at all, so an
 // unreadable input must not manufacture a reason to spend; this gate decides
 // whether to REFUSE an action already decided, so an unreadable input must

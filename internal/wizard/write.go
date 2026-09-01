@@ -35,7 +35,6 @@ type yamlDoc struct {
 	AcknowledgeBypassPermissions bool       `yaml:"i_understand_bypass_permissions,omitempty"`
 	Prompt                       string     `yaml:"prompt"`
 	ResumePrompt                 string     `yaml:"resume_prompt"`
-	TendPrompt                   string     `yaml:"tend_prompt,omitempty"`
 }
 
 type yamlLabels struct {
@@ -106,7 +105,6 @@ func toYAMLDoc(cfg *config.Config) yamlDoc {
 		AcknowledgeBypassPermissions: cfg.AcknowledgeBypassPermissions,
 		Prompt:                       cfg.Prompt,
 		ResumePrompt:                 cfg.ResumePrompt,
-		TendPrompt:                   cfg.TendPrompt,
 	}
 }
 

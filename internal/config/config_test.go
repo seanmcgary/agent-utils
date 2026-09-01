@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,7 +41,6 @@ retry:
     cooldown: 30m
 prompt: "plan issue {{.Issue.Number}}"
 resume_prompt: "resume issue {{.Issue.Number}}"
-tend_prompt: "rebase PR {{.PR.Number}}"
 `
 
 func writeTemp(t *testing.T, body string) string {
@@ -233,16 +233,34 @@ func TestLoadRejectsBadWorktreeMode(t *testing.T) {
 	}
 }
 
-// tend_prompt is optional now. Whether a loop ever runs a tend is the project
-// descriptor's business -- tend.enabled, tend.label and tend.loop -- and none of
-// those are readable from a loop file, so a loop configuration cannot know
-// whether it needs the template. The dispatch path checks instead, which also
-// reports better: it names one pull request that was not tended rather than
-// refusing to load the loop at all.
-func TestLoadAcceptsMissingTendPrompt(t *testing.T) {
-	body := replaceOnce(validYAML, `tend_prompt: "rebase PR {{.PR.Number}}"`, "")
-	if _, err := Load(writeTemp(t, body)); err != nil {
-		t.Fatalf("tend_prompt must be optional: %v", err)
+// tend_prompt is GONE from a loop file, not merely optional. A loop does not
+// tend, so the instructions for a tend belong to the project descriptor with
+// the rest of the policy. A file that still carries one must be told, not
+// silently ignored: an operator upgrading has to move it.
+func TestLoadRejectsTheRemovedTendPrompt(t *testing.T) {
+	body := replaceOnce(validYAML,
+		`resume_prompt: "resume issue {{.Issue.Number}}"`,
+		"resume_prompt: \"resume issue {{.Issue.Number}}\"\ntend_prompt: \"rebase PR {{.PR.Number}}\"")
+	if _, err := Load(writeTemp(t, body)); err == nil {
+		t.Fatal("want error for the removed tend_prompt, got nil")
+	}
+}
+
+// The tend dispatcher's name is reserved, and a loop that takes it must be
+// refused rather than allowed to share its rows. Both would key dispatches,
+// pr_links, tend_conflicts, the tick counter, the lock file and the worktree
+// tree by the same (project, loop) pair, and both would write them.
+func TestLoadRejectsTheReservedTendName(t *testing.T) {
+	body := replaceOnce(validYAML, "name: planning", "name: "+project.Reserved)
+	_, err := Load(writeTemp(t, body))
+	if err == nil {
+		t.Fatal("want error for a loop named after the tend dispatcher, got nil")
+	}
+	// The message must say WHY. "reserved" on its own reads as bureaucracy,
+	// and an operator who does not know what they would have collided with
+	// will rename the loop and wonder what they lost.
+	if !strings.Contains(err.Error(), "tend dispatcher") {
+		t.Errorf("error must name the tend dispatcher, got: %v", err)
 	}
 }
 
@@ -477,100 +495,151 @@ func TestBackgroundTasksIsOffUnlessExplicitlyOn(t *testing.T) {
 	}
 }
 
-// A loop file outside a project loads with NO tend policy, which is tending
-// off.
+// A loop file NEVER carries a tend policy, inside a project or outside one.
 //
-// This is the safe direction and it is worth pinning: the alternative failure
-// is a pull request force-pushed by a policy nobody declared. `loop tick
-// --config <path>` and every test fixture take this path.
-func TestLoadWithoutAProjectLeavesTendOff(t *testing.T) {
-	cfg, err := Load(writeTemp(t, validYAML))
+// Load stopped reading the project descriptor entirely when tending became its
+// own dispatcher: a loop that does not tend has no reason to know the policy
+// exists, and the zero value here is what every consumer of a loop
+// configuration now sees.
+func TestLoadNeverFillsInTheTendPolicy(t *testing.T) {
+	dir := tendProject(t, tendPolicy())
+
+	cfg, err := Load(filepath.Join(ConfigsDir(dir), "planning.yaml"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Tend.Enabled || cfg.Tend.Label != "" || cfg.Tend.Loop != "" {
-		t.Errorf("Tend = %+v, want the zero policy", cfg.Tend)
-	}
-	if cfg.TendsPRs() {
-		t.Error("TendsPRs = true with no project descriptor")
+	if cfg.Tend.Enabled || cfg.Tend.Label != "" || cfg.Tend.Prompt != "" {
+		t.Errorf("Tend = %+v, want the zero policy on a loop configuration", cfg.Tend)
 	}
 }
 
-// A loop file INSIDE a project inherits the descriptor's policy, and TendsPRs
-// is true only for the loop the descriptor names.
-func TestLoadInheritsTheProjectTendPolicy(t *testing.T) {
+// tendPolicy is a descriptor tend block that LoadTend accepts.
+func tendPolicy() project.Tend {
+	return project.Tend{
+		Enabled:        true,
+		Label:          "status:ready-for-review",
+		Model:          "sonnet",
+		PermissionMode: "acceptEdits",
+		Prompt:         "rebase PR {{.PR.Number}} for issue {{.Issue.Number}}",
+	}
+}
+
+// tendProject writes a descriptor and one loop file, and returns the
+// .agent-utils directory.
+func tendProject(t *testing.T, tend project.Tend) string {
+	t.Helper()
 	dir := filepath.Join(t.TempDir(), DirName)
 	if err := os.MkdirAll(ConfigsDir(dir), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := project.Save(dir, &project.Config{
-		Name: "p", ID: "00000000-0000-0000-0000-000000000001",
-		Tend: project.Tend{
-			Enabled: true,
-			Loop:    "planning",
-			Label:   "status:ready-for-review",
-			Model:   "sonnet",
-		},
+		Name: "p", ID: "00000000-0000-0000-0000-000000000001", Tend: tend,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(ConfigsDir(dir), "planning.yaml")
-	if err := os.WriteFile(path, []byte(validYAML), 0o644); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(ConfigsDir(dir), "planning.yaml"), []byte(validYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	return dir
+}
 
-	cfg, err := Load(path)
+// LoadTend synthesises the dispatcher: the policy's agent and prompt, the
+// loops' repository facts, and the reserved name.
+func TestLoadTendSynthesisesTheDispatcher(t *testing.T) {
+	dir := tendProject(t, tendPolicy())
+
+	cfg, err := LoadTend(dir)
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatalf("LoadTend: %v", err)
 	}
-	if cfg.Tend.Label != "status:ready-for-review" || cfg.Tend.Model != "sonnet" {
-		t.Errorf("Tend = %+v, want the descriptor's policy", cfg.Tend)
+	if cfg.Name != project.Reserved {
+		t.Errorf("Name = %q, want %q", cfg.Name, project.Reserved)
 	}
-	if !cfg.TendsPRs() {
-		t.Error("TendsPRs = false for the loop the descriptor names")
+	// The repository facts come from the loop, which is the only thing that
+	// knows them. A dispatcher that got these wrong would tend the wrong
+	// repository or rebase onto the wrong branch.
+	if cfg.Repo != "mcgarylabs/lawndominator-monorepo" || cfg.DefaultBranch != "master" {
+		t.Errorf("repo/branch = %q/%q, want the loop's", cfg.Repo, cfg.DefaultBranch)
 	}
-
-	// Load defaults agent.harness so it always resolves, but must NOT default
-	// tend.harness: an absent value there means "fall back to agent.harness",
-	// and defaulting it would silently pin every tend dispatch to claude on a
-	// harness: pi loop.
-	if cfg.Tend.Harness != "" {
-		t.Errorf("Tend.Harness = %q, want empty: nothing may default it", cfg.Tend.Harness)
+	// The agent comes from the policy, and NOTHING is inherited from the
+	// loop's agent: the loop runs opus at high effort and the tend must not.
+	if cfg.Agent.Model != "sonnet" || cfg.Agent.Harness != HarnessClaude {
+		t.Errorf("agent = %+v, want the tend policy's model on the default harness", cfg.Agent)
+	}
+	if cfg.Agent.Effort == "high" {
+		t.Error("effort was inherited from the loop's agent, which must never happen")
+	}
+	// A tend always gets its own worktree for the pull request it rebases.
+	if cfg.Agent.Worktree != WorktreePerIssue {
+		t.Errorf("Agent.Worktree = %q, want %q", cfg.Agent.Worktree, WorktreePerIssue)
+	}
+	// The prompt is the dispatcher's only prompt, so it lands where the runner
+	// already looks.
+	if !strings.Contains(cfg.Prompt, "rebase PR") {
+		t.Errorf("Prompt = %q, want the descriptor's tend.prompt", cfg.Prompt)
+	}
+	if cfg.Tend.Label != "status:ready-for-review" {
+		t.Errorf("Tend.Label = %q, want the descriptor's", cfg.Tend.Label)
 	}
 }
 
-// The same descriptor, read by a loop it does not name, does not tend. This is
-// what stops two loops in one project both force-pushing the same branch.
-func TestLoadDoesNotTendOnALoopTheProjectDoesNotName(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), DirName)
-	if err := os.MkdirAll(ConfigsDir(dir), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := project.Save(dir, &project.Config{
-		Name: "p", ID: "00000000-0000-0000-0000-000000000001",
-		Tend: project.Tend{Enabled: true, Loop: "execution", Label: "status:ready-for-review"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// validYAML is named "planning"; the descriptor names "execution".
-	path := filepath.Join(ConfigsDir(dir), "planning.yaml")
-	if err := os.WriteFile(path, []byte(validYAML), 0o644); err != nil {
-		t.Fatal(err)
-	}
+// Tending switched off is not an error, and the error it returns is
+// DISTINGUISHABLE. The listener skips such a project silently on every scan;
+// an operator who typed --name tend gets a sentence instead.
+func TestLoadTendReportsTendingOff(t *testing.T) {
+	tend := tendPolicy()
+	tend.Enabled = false
+	dir := tendProject(t, tend)
 
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.TendsPRs() {
-		t.Error("TendsPRs = true on a loop the descriptor does not name")
+	_, err := LoadTend(dir)
+	if !errors.Is(err, ErrNoTend) {
+		t.Fatalf("LoadTend err = %v, want ErrNoTend", err)
 	}
 }
 
-// A descriptor that exists but will not parse fails the loop load, rather than
-// silently leaving tending off. It might have said "enabled", and running the
-// loop with a policy nobody can read is the outcome worth refusing.
-func TestLoadRefusesABrokenProjectDescriptor(t *testing.T) {
+// A dispatcher with no permission mode would fail at its first `git push`, in
+// a detached process, a long way from the file that caused it. It is refused
+// here instead -- and NOT in project.Load, so an operator mid-edit can park a
+// policy without being stopped by a field only the dispatcher needs.
+func TestLoadTendRequiresAPermissionMode(t *testing.T) {
+	tend := tendPolicy()
+	tend.PermissionMode = ""
+	dir := tendProject(t, tend)
+
+	if _, err := LoadTend(dir); err == nil {
+		t.Fatal("want an error for a tend policy with no permission_mode, got nil")
+	}
+}
+
+// Loops that disagree about the repository leave the dispatcher unable to say
+// what it maintains. The error names BOTH loops: "the loops disagree" alone
+// leaves the operator to diff every file themselves.
+func TestLoadTendRejectsLoopsThatDisagreeAboutTheRepo(t *testing.T) {
+	dir := tendProject(t, tendPolicy())
+	other := replaceOnce(validYAML, "name: planning", "name: execution")
+	other = replaceOnce(other, "repo: mcgarylabs/lawndominator-monorepo", "repo: mcgarylabs/other")
+	if err := os.WriteFile(
+		filepath.Join(ConfigsDir(dir), "execution.yaml"), []byte(other), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadTend(dir)
+	if err == nil {
+		t.Fatal("want an error when the loops disagree about repo, got nil")
+	}
+	for _, want := range []string{"planning", "execution", "repo"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must name %q, got: %v", want, err)
+		}
+	}
+}
+
+// A descriptor that will not parse fails the DISPATCHER, rather than silently
+// leaving tending off. It might have said "enabled", and tending on a policy
+// nobody can read is the outcome worth refusing. A loop load is unaffected: a
+// loop no longer reads the descriptor at all.
+func TestLoadTendRefusesABrokenProjectDescriptor(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), DirName)
 	if err := os.MkdirAll(ConfigsDir(dir), 0o755); err != nil {
 		t.Fatal(err)
@@ -584,7 +653,58 @@ func TestLoadRefusesABrokenProjectDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Load(path); err == nil {
+	if _, err := Load(path); err != nil {
+		t.Fatalf("a loop load must not read the descriptor at all: %v", err)
+	}
+	if _, err := LoadTend(dir); err == nil {
 		t.Fatal("want an error for an unreadable project descriptor, got nil")
+	}
+}
+
+// The tend dispatcher is addressed by the PROJECT DESCRIPTOR's path, and
+// IsTendPath is the one seam that recognises it. loopcmd.Open, the detached
+// runner's --config, and the four operator commands all carry that path, so a
+// round trip that broke here would send `--name tend` into config.Load and
+// report a parse error about a file that is not a loop.
+func TestTendPathRoundTripsThroughIsTendPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), DirName)
+	if !IsTendPath(TendPath(dir)) {
+		t.Errorf("IsTendPath(%q) = false, want true", TendPath(dir))
+	}
+	// A loop file must never be mistaken for it: they live in configs/ and are
+	// named for their loops.
+	if IsTendPath(filepath.Join(ConfigsDir(dir), "planning.yaml")) {
+		t.Error("a loop file was recognised as the tend dispatcher's path")
+	}
+}
+
+// A loop file taking the reserved name is reported by DISCOVERY, not merely by
+// a direct Load: List is what the operator commands and the webhook router
+// walk, and an entry that silently did not appear would be harder to debug
+// than one that appears with its error.
+func TestListReportsALoopThatTakesTheReservedName(t *testing.T) {
+	t.Setenv("AGENT_UTILS_DIR", "")
+	dir := filepath.Join(t.TempDir(), DirName)
+	if err := os.MkdirAll(ConfigsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := replaceOnce(validYAML, "name: planning", "name: "+project.Reserved)
+	if err := os.WriteFile(
+		filepath.Join(ConfigsDir(dir), "tend.yaml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := List(dir)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].Err == nil {
+		t.Fatal("a loop named after the tend dispatcher must carry its load error")
+	}
+	if !strings.Contains(entries[0].Err.Error(), "tend dispatcher") {
+		t.Errorf("error must name the reason, got: %v", entries[0].Err)
 	}
 }

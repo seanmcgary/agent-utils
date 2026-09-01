@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -179,5 +180,128 @@ func TestEnsureNamedOnAnExistingProjectIgnoresBaseAndReportsNoRename(t *testing.
 	}
 	if again.Name != "original" {
 		t.Errorf("Name = %q, want the existing identity kept", again.Name)
+	}
+}
+
+// writeDescriptor saves a descriptor with the given tend policy and returns
+// its .agent-utils directory.
+func writeDescriptor(t *testing.T, tend Tend) string {
+	t.Helper()
+	dir := mkDir(t, t.TempDir(), "p")
+	c := &Config{Name: "p", ID: "00000000-0000-0000-0000-000000000001", Tend: tend}
+	if err := Save(dir, c); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	return dir
+}
+
+// goodTend is the smallest tend policy Load accepts.
+func goodTend() Tend {
+	return Tend{
+		Enabled:        true,
+		Label:          "status:ready-for-review",
+		Model:          "sonnet",
+		PermissionMode: "acceptEdits",
+		Prompt:         "rebase PR {{.PR.Number}}",
+	}
+}
+
+// Every field the dispatcher cannot run without is required when tending is
+// enabled, and each is reported by name. There is no loop behind the policy
+// any more, so there is nothing left for any of them to fall back on.
+func TestLoadRequiresTheFieldsATendCannotRunWithout(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*Tend)
+		want string
+	}{
+		{"label", func(x *Tend) { x.Label = "" }, "no tend.label"},
+		{"prompt", func(x *Tend) { x.Prompt = "" }, "no tend.prompt"},
+		{"model", func(x *Tend) { x.Model = "" }, "no tend.model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tend := goodTend()
+			tc.edit(&tend)
+			_, err := Load(writeDescriptor(t, tend))
+			if err == nil {
+				t.Fatalf("want an error for a policy with no tend.%s, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to name %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The same fields are NOT required while tending is switched off. That is how
+// an operator parks a policy without deleting it, and the descriptor is read by
+// every project command, so refusing here would break commands that have
+// nothing to do with tending.
+func TestLoadAcceptsAParkedTendPolicy(t *testing.T) {
+	tend := goodTend()
+	tend.Enabled = false
+	tend.Prompt, tend.Model, tend.Label = "", "", ""
+
+	if _, err := Load(writeDescriptor(t, tend)); err != nil {
+		t.Fatalf("a parked policy must load: %v", err)
+	}
+}
+
+// A tend prompt has no loop, so it has no loop labels. text/template renders a
+// zero struct field as the empty string rather than failing, so a prompt
+// carrying over the old host loop's "remove {{.Labels.Trigger}}" would silently
+// instruct the agent to act on a label named "". The reference is refused at
+// load time, where an operator reads it once.
+func TestLoadRejectsATendPromptThatReferencesLoopLabels(t *testing.T) {
+	tend := goodTend()
+	tend.Prompt = "park by removing {{.Labels.Terminal}} and adding {{.Labels.Blocked}}"
+
+	_, err := Load(writeDescriptor(t, tend))
+	if err == nil {
+		t.Fatal("want an error for a tend prompt naming .Labels, got nil")
+	}
+	// The message must offer the replacement. "rejected" alone leaves the
+	// operator with a prompt they cannot rewrite.
+	if !strings.Contains(err.Error(), "{{.Tend.Label}}") {
+		t.Errorf("error must name the replacement, got: %v", err)
+	}
+}
+
+// A tend prompt that will not parse fails the descriptor, not a detached runner
+// three hours later.
+func TestLoadRejectsAnUnparsableTendPrompt(t *testing.T) {
+	tend := goodTend()
+	tend.Prompt = "rebase {{.PR.Number"
+
+	if _, err := Load(writeDescriptor(t, tend)); err == nil {
+		t.Fatal("want an error for an unparsable tend prompt, got nil")
+	}
+}
+
+// bypassPermissions disables every permission prompt on pull request review
+// text written by third parties, so it needs the same acknowledgement a loop's
+// own permission mode does.
+func TestLoadRequiresTheBypassAcknowledgement(t *testing.T) {
+	tend := goodTend()
+	tend.PermissionMode = "bypassPermissions"
+
+	if _, err := Load(writeDescriptor(t, tend)); err == nil {
+		t.Fatal("want an error for unacknowledged bypassPermissions, got nil")
+	}
+
+	tend.AcknowledgeBypassPermissions = true
+	if _, err := Load(writeDescriptor(t, tend)); err != nil {
+		t.Fatalf("an acknowledged bypassPermissions must load: %v", err)
+	}
+}
+
+// An invalid permission mode is rejected by name rather than reaching a
+// dispatch claude would refuse.
+func TestLoadRejectsAnInvalidTendPermissionMode(t *testing.T) {
+	tend := goodTend()
+	tend.PermissionMode = "nonsense"
+
+	if _, err := Load(writeDescriptor(t, tend)); err == nil {
+		t.Fatal("want an error for an invalid tend.permission_mode, got nil")
 	}
 }

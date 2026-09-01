@@ -5,20 +5,25 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
-// sweepConfig is tickConfig with tending on. tickConfig leaves it off,
-// and TendSweep must produce nothing for a loop that does not tend.
+// sweepConfig is the TEND DISPATCHER: tickConfig's infrastructure, under the
+// reserved name, carrying the project's tend policy. That is the shape
+// config.LoadTend builds, and it is the only configuration the tend passes are
+// ever handed.
 func sweepConfig(t *testing.T) *config.Config {
 	t.Helper()
 	cfg := tickConfig(t)
-	cfg.Tend.Enabled = true
-	cfg.TendPrompt = "rebase #{{.Issue.Number}}"
+	cfg.Name = project.Reserved
+	cfg.Tend = project.Tend{
+		Enabled: true, Label: "review",
+		Model: "sonnet", Prompt: "rebase #{{.Issue.Number}}",
+	}
 	return cfg
 }
 
@@ -114,30 +119,11 @@ func TestTendSweepIgnoresAnUpToDatePullRequest(t *testing.T) {
 	}
 }
 
-// A loop that does not tend produces nothing, whoever calls, and costs no API
-// call. The caller checks this too; TendSweep is exported, so it checks itself.
-func TestTendSweepDoesNothingWhenTendingIsOff(t *testing.T) {
-	cfg := sweepConfig(t)
-	cfg.Tend.Enabled = false
-	gh := &fakeGH{
-		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
-		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
-		behind: map[int]int{11: 3},
-	}
-	spawned := 0
-	deps := newDeps(t, cfg, gh, &spawned)
-
-	sum, err := TendSweep(context.Background(), cfg, deps, "master")
-	if err != nil {
-		t.Fatalf("TendSweep: %v", err)
-	}
-	if sum.Tended != 0 || spawned != 0 {
-		t.Errorf("Tended = %d, spawned = %d, want 0 and 0", sum.Tended, spawned)
-	}
-	if gh.listedIssues != 0 {
-		t.Errorf("listedIssues = %d, want 0: a loop that does not tend must cost no API call", gh.listedIssues)
-	}
-}
+// There is no "tending is off" case here any more. TendSweep is only ever
+// handed the tend dispatcher's configuration, and config.LoadTend refuses to
+// build one for a project that has not switched tending on -- so the pass that
+// used to cost an issue listing before discovering it had nothing to do is
+// never reached at all.
 
 // One merge must not spawn an unbounded number of agents. Each dispatch is a
 // detached process with permission prompts disabled, in its own worktree.
@@ -188,15 +174,18 @@ func TestTendSweepRetiresDeadTendRowsOnly(t *testing.T) {
 	liveDispatch(t, cfg, deps, store.Dispatch{
 		Loop: cfg.Name, Repo: cfg.Repo, Number: 1, Kind: store.KindTend, PRNumber: 11, SessionID: "t1",
 	})
+	// A LOOP's row, under a loop's name. That is the shape the guard is about:
+	// the sweep reads every loop's running dispatches so it can see the agents
+	// it must not collide with, and it must retire none of them.
 	liveDispatch(t, cfg, deps, store.Dispatch{
-		Loop: cfg.Name, Repo: cfg.Repo, Number: 2, Kind: store.KindStart, SessionID: "s1",
+		Loop: "execution", Repo: cfg.Repo, Number: 2, Kind: store.KindStart, SessionID: "s1",
 	})
 
 	if _, err := TendSweep(context.Background(), cfg, deps, "master"); err != nil {
 		t.Fatalf("TendSweep: %v", err)
 	}
 
-	running, err := deps.Store.RunningDispatches(cfg.Name, cfg.Repo)
+	running, err := deps.Store.RunningDispatchesForRepo(cfg.Repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +204,7 @@ func TestTendSweepRetiresDeadTendRowsOnly(t *testing.T) {
 	if !sawStart {
 		t.Error("a dead start row was retired by a tend sweep; only tend rows may be")
 	}
-	st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, 2)
+	st, err := deps.Store.IssueState("execution", cfg.Repo, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,73 +274,13 @@ func TestTendSweepContinuesPastAFailedComparison(t *testing.T) {
 	}
 }
 
-// The breaker counts retry decisions, and this pass discards every one of
-// them. A pass that will not act on that evidence must not stop the passes
-// that would.
-func TestTendSweepWritesNoCooldown(t *testing.T) {
-	cfg := sweepConfig(t)
-	cfg.Retry.Breaker.OrphanThreshold = 1
-	gh := &fakeGH{
-		// The in-flight label is load-bearing. engine.Decide sends a
-		// NeedsRetry issue WITHOUT it down the KindClearRetry branch, which
-		// never reaches retryDecision and never counts toward eligibleRetries
-		// -- so the breaker would not trip and this test would assert "no
-		// cooldown" in a run where no cooldown was ever possible.
-		issues: []ghub.Issue{{Number: 1, Labels: []string{"review", "in-flight"}}},
-		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
-		behind: map[int]int{11: 3},
-	}
-	spawned := 0
-	deps := newDeps(t, cfg, gh, &spawned)
-	// One issue already needing a retry is enough to trip a threshold of 1.
-	if err := deps.Store.MarkNeedsRetry(cfg.Name, cfg.Repo, 1, deps.Now(), nil); err != nil {
-		t.Fatal(err)
-	}
-
-	sum, err := TendSweep(context.Background(), cfg, deps, "master")
-	if err != nil {
-		t.Fatalf("TendSweep: %v", err)
-	}
-	// Without this the test passes whenever the fixture stops tripping the
-	// breaker, which is exactly how it read as green while proving nothing.
-	if !sum.BreakerTripped {
-		t.Fatal("the fixture did not trip the breaker; this test would be vacuous")
-	}
-
-	until, err := deps.Store.CooldownUntil(cfg.Name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !until.IsZero() {
-		t.Errorf("CooldownUntil = %v, want zero: a tend sweep must not trip the breaker", until)
-	}
-}
-
-// The other half of the breaker contract: a cooldown this pass did not write
-// still stops it. engine.Decide halts on it, and the sweep must not dispatch
-// around that.
-func TestTendSweepObeysAnExistingCooldown(t *testing.T) {
-	cfg := sweepConfig(t)
-	gh := &fakeGH{
-		issues: []ghub.Issue{{Number: 1, Labels: []string{"review"}}},
-		prs:    []ghub.PullRequest{reviewPRFixture(1, 11, "master")},
-		behind: map[int]int{11: 3},
-	}
-	spawned := 0
-	deps := newDeps(t, cfg, gh, &spawned)
-	if err := deps.Store.SetCooldown(cfg.Name, deps.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-
-	sum, err := TendSweep(context.Background(), cfg, deps, "master")
-	if err != nil {
-		t.Fatalf("TendSweep: %v", err)
-	}
-	if sum.Tended != 0 || spawned != 0 {
-		t.Errorf("Tended = %d, spawned = %d, want 0 and 0 while the breaker is in cooldown",
-			sum.Tended, spawned)
-	}
-}
+// There are no breaker tests here any more, and their removal is the same
+// change as the rest: the circuit breaker counts RETRY decisions, the tend
+// dispatcher makes none, and DecideTend has no breaker to trip or obey. What
+// the two deleted tests pinned -- that a sweep neither writes a cooldown nor
+// dispatches around one -- is now true by construction rather than by
+// suppression, because there is no retry policy in the dispatcher's
+// configuration at all (see config.LoadTend).
 
 // seedStartedSession gives an issue the session state an execution agent would
 // have left behind: an identifier claude actually created.
@@ -368,7 +297,7 @@ func seedStartedSession(t *testing.T, deps Deps, cfg *config.Config, number int,
 // The whole point of the change: a rebase agent resumes the session that built
 // the branch instead of meeting it cold.
 // A tend runs in its OWN session, minted for the dispatch, even when the issue
-// has a perfectly good one. See the session comment in engine.tendDecisions:
+// has a perfectly good one. See the session comment in engine.DecideTend:
 // the clean-rebase path is Go now, so the agent only meets conflicts and review
 // threads, and both are described by the branch rather than by the conversation
 // that wrote it. Inheriting also blocked the issue for as long as the tend ran.
@@ -449,56 +378,5 @@ func TestTendDispatchMintsASessionWhenNoneStarted(t *testing.T) {
 	}
 	if running[0].SessionID == "" {
 		t.Error("a tend with no session to inherit must still carry an identifier")
-	}
-}
-
-// tendResumes is what the detached runner asks to choose "-r" over
-// --session-id. It runs in another process with only the dispatch row, so it
-// re-derives the answer rather than being told.
-func TestTendResumesOnlyAnInheritedStartedSession(t *testing.T) {
-	const id = "sess-1"
-	cases := []struct {
-		name  string
-		d     store.Dispatch
-		state store.IssueState
-		want  bool
-	}{
-		{
-			name:  "inherited and started",
-			d:     store.Dispatch{Kind: store.KindTend, SessionID: id},
-			state: store.IssueState{SessionID: id, SessionStarted: true},
-			want:  true,
-		},
-		{
-			name:  "inherited but never started",
-			d:     store.Dispatch{Kind: store.KindTend, SessionID: id},
-			state: store.IssueState{SessionID: id, SessionStarted: false},
-			want:  false,
-		},
-		{
-			name:  "tend minted its own",
-			d:     store.Dispatch{Kind: store.KindTend, SessionID: "throwaway"},
-			state: store.IssueState{SessionID: id, SessionStarted: true},
-			want:  false,
-		},
-		{
-			name:  "issue has no session at all",
-			d:     store.Dispatch{Kind: store.KindTend, SessionID: ""},
-			state: store.IssueState{},
-			want:  false,
-		},
-		{
-			name:  "not a tend",
-			d:     store.Dispatch{Kind: store.KindResume, SessionID: id},
-			state: store.IssueState{SessionID: id, SessionStarted: true},
-			want:  false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tendResumes(tc.d, tc.state); got != tc.want {
-				t.Errorf("tendResumes = %v, want %v", got, tc.want)
-			}
-		})
 	}
 }

@@ -255,14 +255,13 @@ func TestListSortsAndReportsBrokenFiles(t *testing.T) {
 	}
 }
 
-// List already loads each file in full. The two fields below are read off
-// that same load, so the push filter and the periodic tend pass never open a
-// database to learn which branch a loop tends.
+// List already loads each file in full, so the push filter reads the default
+// branch off that same load and never opens a database to learn it.
 //
-// Tends is false here because the fixture has no project descriptor, which is
-// also the only way a loop can end up not tending now -- the flag it used to
-// read no longer exists in a loop file.
-func TestListCarriesTheTendFacts(t *testing.T) {
+// There is no Tends beside it any more. Whether a project tends is not a
+// property of a loop, so it is read once from the project descriptor -- see
+// config.LoadTend and listener.Scan -- rather than resolved per file here.
+func TestListCarriesTheDefaultBranch(t *testing.T) {
 	t.Setenv("AGENT_UTILS_DIR", "")
 	dir := mkConfigs(t, t.TempDir(), map[string]string{"planning.yaml": validYAML})
 
@@ -275,9 +274,6 @@ func TestListCarriesTheTendFacts(t *testing.T) {
 	}
 	if entries[0].DefaultBranch != "master" {
 		t.Errorf("DefaultBranch = %q, want master", entries[0].DefaultBranch)
-	}
-	if entries[0].Tends {
-		t.Errorf("Tends = true, want false: no project descriptor enables tending")
 	}
 }
 

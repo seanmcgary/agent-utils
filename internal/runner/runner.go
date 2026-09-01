@@ -142,7 +142,7 @@ func Supervise(
 	// override on the row must select the pi binary and argument builder, and
 	// must keep claudeEnv (the print-mode background-task environment) out of
 	// a pi child, which reads none of it.
-	effective := Effective(cfg, inv.Kind, inv.Overrides)
+	effective := Effective(cfg, inv.Overrides)
 	bin := "claude"
 	build := func(inv Invocation) []string { return BuildArgs(cfg, inv) }
 	parse := ParseStream
@@ -362,7 +362,7 @@ func finish(cfg *config.Config, st *store.Store, d store.Dispatch, res store.Dis
 			// harness was used, and "" already means "unknown" to the engine.
 			// Recording the resolved name is what lets a later dispatch tell a
 			// session it may resume from one another harness minted.
-			harness := Effective(cfg, d.Kind, config.Overrides{Harness: d.Harness}).Harness
+			harness := Effective(cfg, config.Overrides{Harness: d.Harness}).Harness
 			if err := st.MarkSessionStarted(d.Loop, d.Repo, d.Number, harness); err != nil {
 				return fmt.Errorf("mark session started: %w", err)
 			}

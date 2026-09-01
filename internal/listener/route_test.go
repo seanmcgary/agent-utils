@@ -78,16 +78,15 @@ func setHome(t *testing.T) string {
 // case on purpose.
 func newProject(t *testing.T, home, name string) (id, dir string) {
 	t.Helper()
-	return newProjectTending(t, home, name, "")
+	return newProjectTending(t, home, name, false)
 }
 
-// newProjectTending is newProject with the project's tend policy switched on
-// for the named loop. Pass "" for a project that does not tend.
+// newProjectTending is newProject with the project's tend policy switched on.
 //
-// A descriptor is written either way, because config.Load reads one now: a
-// project without it loads its loops with the zero policy, which is what the
-// non-tending case is.
-func newProjectTending(t *testing.T, home, name, tendLoop string) (id, dir string) {
+// A descriptor is written either way. Whether a project tends is read from it
+// once per scan now -- there is no loop file that could say -- so a descriptor
+// with no tend block IS the non-tending case.
+func newProjectTending(t *testing.T, home, name string, tends bool) (id, dir string) {
 	t.Helper()
 	root := filepath.Join(home, "projects", name)
 	dir = filepath.Join(root, config.DirName)
@@ -96,9 +95,11 @@ func newProjectTending(t *testing.T, home, name, tendLoop string) (id, dir strin
 	}
 	id = "id-" + name
 	pc := &project.Config{Name: name, ID: id}
-	if tendLoop != "" {
+	if tends {
 		pc.Tend = project.Tend{
-			Enabled: true, Loop: tendLoop, Label: "status:ready-for-review",
+			Enabled: true, Label: "status:ready-for-review",
+			Model: "sonnet", PermissionMode: "acceptEdits",
+			Prompt: "rebase PR {{.PR.Number}}",
 		}
 	}
 	if err := project.Save(dir, pc); err != nil {
@@ -126,32 +127,45 @@ func writeLoop(t *testing.T, agentUtilsDir, fileName, body string) {
 func TestTargetsReturnsBothLoopsForASharedRepo(t *testing.T) {
 	home := setHome(t)
 	idA, dirA := newProject(t, home, "alpha")
-	idB, dirB := newProjectTending(t, home, "beta", "planning")
+	idB, dirB := newProjectTending(t, home, "beta", true)
 	writeLoop(t, dirA, "planning.yaml", minimalConfig("planning", "acme/widgets"))
-	writeLoop(t, dirB, "planning.yaml", minimalConfig("planning", "acme/widgets")+"tend_prompt: rebase\n")
+	writeLoop(t, dirB, "planning.yaml", minimalConfig("planning", "acme/widgets"))
 
 	targets, err := Targets("acme/widgets")
 	if err != nil {
 		t.Fatalf("Targets: %v", err)
 	}
-	if len(targets) != 2 {
-		t.Fatalf("len(targets) = %d, want 2: %+v", len(targets), targets)
+	// Three, not two: alpha's loop, beta's loop, and beta's TEND DISPATCHER,
+	// which is a target of its own rather than a flag on a loop.
+	if len(targets) != 3 {
+		t.Fatalf("len(targets) = %d, want 3: %+v", len(targets), targets)
 	}
 	seen := map[string]bool{}
+	tends := map[string]int{}
 	for _, tg := range targets {
 		seen[tg.ProjectID] = true
-		// DefaultBranch and Tends must survive the trip from config.Entry
-		// into Target, or the push filter and the periodic tend pass have
-		// nothing to test without opening the config file themselves.
+		if tg.IsTend() {
+			tends[tg.ProjectID]++
+			if tg.LoopName != project.Reserved {
+				t.Errorf("target %+v: a tend target must carry the reserved name", tg)
+			}
+			if tg.ConfigPath != config.TendPath(dirB) {
+				t.Errorf("target %+v: ConfigPath = %q, want the project descriptor",
+					tg, tg.ConfigPath)
+			}
+		}
+		// DefaultBranch must survive the trip into Target, or the push filter
+		// has nothing to test without opening the config file itself. The tend
+		// target carries it too, off the dispatcher config LoadTend built.
 		if tg.DefaultBranch != "master" {
 			t.Errorf("target %+v: DefaultBranch = %q, want master", tg, tg.DefaultBranch)
 		}
-		if tg.ProjectID == idA && tg.Tends {
-			t.Errorf("target %+v: Tends = true, want alpha's false", tg)
-		}
-		if tg.ProjectID == idB && !tg.Tends {
-			t.Errorf("target %+v: Tends = false, want beta's true", tg)
-		}
+	}
+	if tends[idA] != 0 {
+		t.Errorf("alpha does not tend, so it must contribute no tend target")
+	}
+	if tends[idB] != 1 {
+		t.Errorf("beta must contribute exactly one tend target, got %d", tends[idB])
 	}
 	if !seen[idA] || !seen[idB] {
 		t.Errorf("targets = %+v, want one loop from each of %s and %s", targets, idA, idB)

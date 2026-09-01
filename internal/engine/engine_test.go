@@ -7,7 +7,6 @@ import (
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
-	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -23,13 +22,6 @@ func testConfig() *config.Config {
 			Veto:     []string{"blocked:design"},
 		},
 		Agent: config.Agent{Model: "opus", Worktree: config.WorktreePerIssue},
-		// The project's policy, injected into the loop config by config.Load.
-		// Naming THIS loop is what makes TendsPRs true for it.
-		Tend: project.Tend{
-			Enabled: true,
-			Loop:    "planning",
-			Label:   "status:plan-ready-for-review",
-		},
 		Retry: config.Retry{
 			Max: 3,
 			// 0s, 15m, 30m. Wall-clock waits, one per retry.
@@ -221,27 +213,6 @@ func TestRetryStartCarriesNoSessionID(t *testing.T) {
 	}
 }
 
-// A live issue agent must suppress tending of its own branch. The agent flips
-// its own labels asynchronously, so an issue can still carry the review label
-// while its dispatch is live -- and a tend agent force-pushes the branch the
-// issue agent is committing to.
-func TestLiveIssueDispatchSuppressesTend(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy: map[int]int{20: 4},
-	}
-	st := State{
-		Issues:  map[int]store.IssueState{},
-		Running: []store.Dispatch{{Number: 1, Kind: store.KindStart, Status: store.StatusRunning}},
-	}
-	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none while the issue agent is live", kinds(p))
-	}
-}
-
 // This is the regression test for the strand bug: a deferred retry must still be
 // pending on the NEXT tick, because NeedsRetry is durable state rather than a
 // dispatch row the reconcile pass consumes.
@@ -420,67 +391,6 @@ func TestCooldownSuppressesEverything(t *testing.T) {
 	}
 }
 
-func TestTendsStalePullRequest(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy: map[int]int{20: 4},
-	}
-	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
-		t.Fatalf("decisions = %v, want one tend", kinds(p))
-	}
-	d := p.Decisions[0]
-	if d.PR != 20 || d.HeadRef != "feat/a" || d.BaseRef != "master" {
-		t.Errorf("decision = %+v", d)
-	}
-}
-
-func TestDoesNotTendCurrentPullRequest(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
-		BehindBy: map[int]int{20: 0},
-	}
-	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
-	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none for a current pull request", kinds(p))
-	}
-}
-
-func TestDoesNotTendWhenTendIsDisabled(t *testing.T) {
-	cfg := testConfig()
-	cfg.Tend.Enabled = false
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
-		BehindBy: map[int]int{20: 9},
-	}
-	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
-	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none when tend_pr is false", kinds(p))
-	}
-}
-
-func TestDoesNotTendWhileTendDispatchIsLive(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
-		BehindBy: map[int]int{20: 4},
-	}
-	st := State{
-		Issues:  map[int]store.IssueState{},
-		Running: []store.Dispatch{{Number: 1, PRNumber: 20, Kind: store.KindTend}},
-	}
-	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none while a tend dispatch is live", kinds(p))
-	}
-}
-
 func TestDecisionsAreOrderedByIssueNumber(t *testing.T) {
 	cfg := testConfig()
 	snap := Snapshot{Issues: []ghub.Issue{
@@ -497,83 +407,6 @@ func TestDecisionsAreOrderedByIssueNumber(t *testing.T) {
 		if d.Issue != want[i] {
 			t.Errorf("position %d = issue %d, want %d", i, d.Issue, want[i])
 		}
-	}
-}
-
-// A tend NEVER inherits the issue's session, even when there is a perfectly
-// good one to inherit. It used to, so that a rebase agent carried the context of
-// the work it was rebasing; three things removed the reason.
-//
-// A clean rebase no longer runs an agent at all, so what is left for one is a
-// conflict or a review reply -- both fully described by the branch, the hunks
-// and the thread. Inheriting BLOCKED the issue, because two processes on one
-// session identifier is the same hazard as two agents in one branch. And
-// tending is a project policy with a declared host loop now, which is not
-// necessarily the loop that wrote the branch, so "the issue's session" no longer
-// names one obvious conversation.
-func TestTendStartsItsOwnSessionEvenWhenTheIssueHasOne(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy: map[int]int{20: 4},
-	}
-	st := State{Issues: map[int]store.IssueState{
-		1: {SessionID: "sess-1", SessionStarted: true},
-	}}
-	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
-		t.Fatalf("decisions = %v, want one tend", kinds(p))
-	}
-	if got := p.Decisions[0].SessionID; got != "" {
-		t.Errorf("session = %q, want empty: an empty id is what tells dispatch to mint a fresh one", got)
-	}
-	// The reason must not advertise a resume that is not happening.
-	if strings.Contains(p.Decisions[0].Reason, "resuming") {
-		t.Errorf("reason = %q, must not claim to resume anything", p.Decisions[0].Reason)
-	}
-}
-
-// A DRAFT pull request is the author's working copy: nobody is blocked by it
-// being behind, and force-pushing a rebase under someone still assembling the
-// branch is the one thing tending must never do.
-func TestTendSkipsADraftPullRequest(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues: []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs: []ghub.PullRequest{{
-			Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master",
-			Trusted: true, Draft: true,
-		}},
-		BehindBy: map[int]int{20: 4},
-	}
-	p := Decide(cfg, snap, State{}, time.Now())
-	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none for a draft", kinds(p))
-	}
-	if got := p.Skips[1]; !strings.Contains(got, "draft") {
-		t.Errorf("skip reason = %q, want it to name the draft", got)
-	}
-}
-
-func TestTendStartsAFreshSessionWhenNoneWasStarted(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy: map[int]int{20: 4},
-	}
-	// The identifier exists but claude never created the session, so "-r" would
-	// fail every time. This is the same rule retryDecision applies.
-	st := State{Issues: map[int]store.IssueState{
-		1: {SessionID: "sess-1", SessionStarted: false},
-	}}
-	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
-		t.Fatalf("decisions = %v, want one tend", kinds(p))
-	}
-	if got := p.Decisions[0].SessionID; got != "" {
-		t.Errorf("session = %q, want empty so dispatch mints a fresh one", got)
 	}
 }
 
@@ -650,25 +483,6 @@ func TestStoppedIssueWithNoReasonDoesNotRenderALeadingSemicolon(t *testing.T) {
 	}
 	if !strings.Contains(reason, "sessions resume") {
 		t.Errorf("NoDecisionReason = %q, want it to still name the resume command", reason)
-	}
-}
-
-// tendDecisions skips only issues marked decided (engine.go:259). Without
-// the stopped branch setting decided, a tend agent would force-push the
-// branch of the session the operator just killed.
-func TestStoppedIssueAwaitingReviewProducesNoTend(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy: map[int]int{20: 4},
-	}
-	st := State{Issues: map[int]store.IssueState{
-		1: {Number: 1, Stopped: true, StoppedReason: "operator killed the session"},
-	}}
-	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none: a stopped issue must not be tended", kinds(p))
 	}
 }
 
@@ -1046,66 +860,6 @@ func TestAnUnknownSessionHarnessStillResumes(t *testing.T) {
 	}
 }
 
-// The issue's overrides still reach a tend, because a model: or harness: label
-// is the operator saying "run THIS issue's agents like so" and a tend is one of
-// them. Only the session inheritance went away, not the settings.
-//
-// The three tests this replaces all asked one question in different clothes --
-// does the tend resume, given this pairing of harnesses -- and the answer is now
-// "never", asserted once in TestTendStartsItsOwnSessionEvenWhenTheIssueHasOne.
-// Notably the lawndominator #183 case they were written for cannot happen at
-// all any more: a tend never carries an identifier another harness minted,
-// because it never carries one.
-func TestTendCarriesTheIssuesOverrides(t *testing.T) {
-	cfg := testConfig()
-	cfg.Agent.Harness = config.HarnessClaude
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label, "harness:pi", "model:sonnet")},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy: map[int]int{20: 4},
-	}
-	st := State{Issues: map[int]store.IssueState{
-		1: {Number: 1, SessionID: "s-pi", SessionStarted: true, SessionHarness: config.HarnessPi},
-	}}
-
-	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
-		t.Fatalf("decisions = %v, want one tend", kinds(p))
-	}
-	d := p.Decisions[0]
-	if d.Overrides.Harness != config.HarnessPi {
-		t.Errorf("harness override = %q, want pi", d.Overrides.Harness)
-	}
-	if d.Overrides.Model != "sonnet" {
-		t.Errorf("model override = %q, want sonnet", d.Overrides.Model)
-	}
-	if d.SessionID != "" {
-		t.Errorf("session id = %q, want empty: a tend never inherits", d.SessionID)
-	}
-}
-
-// An override the loop cannot parse must not dispatch a tend under the wrong
-// settings. It is skipped rather than stopped: a stale rebase is not the
-// issue's own work, and the trigger path already stops an issue whose labels
-// are invalid where that work would happen.
-func TestTendIsSkippedWhenAnOverrideLabelIsInvalid(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label, "harness:nope")},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy: map[int]int{20: 4},
-	}
-	st := State{Issues: map[int]store.IssueState{}}
-
-	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none", kinds(p))
-	}
-	if !strings.Contains(p.Skips[1], "harness") {
-		t.Errorf("skip = %q, want it to name the invalid override", p.Skips[1])
-	}
-}
-
 // The retry path resumes too, and needs the same guard: a retry that resumes a
 // session the harness cannot see fails identically every attempt, straight to
 // the cap.
@@ -1403,94 +1157,5 @@ func TestSameHarnessStillParksAtTheCap(t *testing.T) {
 
 	if got := kinds(p); len(got) != 1 || got[0] != KindParkRetryExhausted {
 		t.Fatalf("kinds = %v, want [%v]", got, KindParkRetryExhausted)
-	}
-}
-
-// A current pull request with review activity newer than the last tend must
-// still produce a KindTend decision, and ReviewPending must be true: this is
-// the whole point of the second trigger -- a pull request that needs no
-// rebase can still need an agent to answer feedback.
-func TestReviewActivityNewerThanLastTendProducesAReviewPendingTend(t *testing.T) {
-	cfg := testConfig()
-	now := time.Now()
-	snap := Snapshot{
-		Issues:     []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:        []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy:   map[int]int{20: 0},
-		ReviewedAt: map[int]time.Time{20: now},
-	}
-	st := State{
-		Issues:   map[int]store.IssueState{},
-		LastTend: map[int]time.Time{20: now.Add(-time.Hour)},
-	}
-	p := Decide(cfg, snap, st, now)
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
-		t.Fatalf("decisions = %v, want one tend", kinds(p))
-	}
-	if !p.Decisions[0].ReviewPending {
-		t.Error("ReviewPending = false, want true: review activity is newer than the last tend")
-	}
-}
-
-// The same pull request with the last tend NEWER than the review activity
-// must produce no decision, and the skip reason must name both halves of the
-// question.
-func TestReviewActivityOlderThanLastTendProducesNoDecision(t *testing.T) {
-	cfg := testConfig()
-	now := time.Now()
-	snap := Snapshot{
-		Issues:     []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:        []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
-		BehindBy:   map[int]int{20: 0},
-		ReviewedAt: map[int]time.Time{20: now.Add(-time.Hour)},
-	}
-	st := State{
-		Issues:   map[int]store.IssueState{},
-		LastTend: map[int]time.Time{20: now},
-	}
-	p := Decide(cfg, snap, st, now)
-	if len(p.Decisions) != 0 {
-		t.Fatalf("decisions = %v, want none: the last tend is newer than the review activity", kinds(p))
-	}
-	want := "the linked pull request is up to date with its base and carries no review activity since the last tend"
-	if got := p.NoDecisionReason(1); got != want {
-		t.Errorf("skip reason = %q, want %q", got, want)
-	}
-}
-
-// A behind pull request with no review activity still produces a decision,
-// and ReviewPending must be false: the staleness trigger alone must not be
-// mistaken for the review trigger.
-func TestBehindPullRequestWithNoReviewActivityIsNotReviewPending(t *testing.T) {
-	cfg := testConfig()
-	snap := Snapshot{
-		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy: map[int]int{20: 3},
-	}
-	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
-		t.Fatalf("decisions = %v, want one tend", kinds(p))
-	}
-	if p.Decisions[0].ReviewPending {
-		t.Error("ReviewPending = true, want false: no review activity was reported")
-	}
-}
-
-// A pull request with no prior tend and review activity is pending: LastTend
-// absent from the map reads as the zero time, and any review activity is
-// after that.
-func TestReviewActivityWithNoPriorTendIsPending(t *testing.T) {
-	cfg := testConfig()
-	now := time.Now()
-	snap := Snapshot{
-		Issues:     []ghub.Issue{issue(1, cfg.Tend.Label)},
-		PRs:        []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
-		BehindBy:   map[int]int{20: 0},
-		ReviewedAt: map[int]time.Time{20: now},
-	}
-	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, now)
-	if len(p.Decisions) != 1 || !p.Decisions[0].ReviewPending {
-		t.Fatalf("decisions = %v, want one review-pending tend", kinds(p))
 	}
 }

@@ -93,32 +93,37 @@ agent:
 
 i_understand_bypass_permissions: true
 
-# THIS LOOP HOSTS THE PROJECT'S TEND DISPATCHES, and the tend_prompt at the
-# bottom of this file is the one that actually runs. Nothing in this file says
-# so: the policy lives in the PROJECT descriptor, .agent-utils/config.yaml,
-# because it describes a repository's open pull requests rather than any loop's
-# issue lifecycle.
+# THIS LOOP DOES NOT TEND, and neither does any other. Tending is the PROJECT's
+# own dispatcher -- its own name, its own agent, its own session per dispatch,
+# its own worktrees -- and it is described entirely in the project descriptor,
+# .agent-utils/config.yaml, because it is about a repository's open pull
+# requests rather than any loop's issue lifecycle:
 #
 #   tend:
-#     enabled: true
-#     loop:    exec-pr-review-findings
-#     label:   status:ready-for-review
-#     model:   sonnet
-#
-# `loop` names this one for two reasons. It is the LAST loop to touch the
-# branch, so its worktree and its prompt describe the work being maintained; and
-# every row a tend writes -- the dispatch, the live-dispatch guard, the last-tend
-# time, the repeat-conflict fingerprints -- is keyed by loop, so a host has to be
-# named or two loops would each keep half that state and both force-push.
+#     enabled:         true
+#     label:           status:ready-for-review
+#     model:           sonnet
+#     permission_mode: bypassPermissions
+#     i_understand_bypass_permissions: true
+#     prompt: |
+#       ...
 #
 # `label` is this loop's terminal, which is the human's queue. Tending it is the
 # whole point: every earlier wait in the chain is a machine that picks the issue
 # up within a tick, and only this one lasts long enough for the base branch to
 # move.
 #
+# There is no `tend.loop`, and there is no `tend_prompt` in this file. There
+# used to be both, because the tend work ran inside this loop's ticks and its
+# rows had to be keyed by some loop's name. They are gone: the dispatcher keys
+# its rows by the reserved name "tend", which no loop may take, and it carries
+# its own prompt. `agent-utils project loop tick --name tend`,
+# `... loop status --name tend` and `... logs --name tend` all address it.
+#
 # The window in which this loop is REWRITING the branch is excluded by the
-# execution loop's veto of status:fixing-findings, not by anything here. A tend
-# and a findings run on one branch is the same hazard as two agents in it.
+# issue leaving status:ready-for-review while it works, and by the project-wide
+# live-dispatch guard the tend dispatcher applies. A tend and a findings run on
+# one branch is the same hazard as two agents in it.
 
 retry:
   max: 3
@@ -244,50 +249,3 @@ resume_prompt: |
   instructions still apply, including that you never re-review, that pushes use
   --force-with-lease, and that you never merge.
 
-tend_prompt: |
-  You are TENDING pull request #{{.PR.Number}} for issue #{{.Issue.Number}} in
-  {{.Repo}}. It is {{.PR.BehindBy}} commits behind {{.PR.BaseRef}}.
-
-  This is maintenance on a finished feature, NOT new feature work. Do not add
-  scope. Do not refactor beyond the rebase and, when it applies below, the
-  review reply. NEVER merge or close the pull request. Do not change any label
-  unless you park.
-
-  You run in an isolated git worktree checked out detached at
-  origin/{{.PR.HeadRef}}, at {{.Worktree}}. THIS IS A FRESH SESSION: you did not
-  write this branch and you hold no memory of it. Read what you need from the
-  branch, the diff and the pull request thread, and assume nothing about why a
-  line is the way it is.
-
-  1. `git fetch origin`, then rebase onto origin/{{.PR.BaseRef}}.
-  2. If the rebase is clean, push with
-     `git push --force-with-lease origin HEAD:refs/heads/{{.PR.HeadRef}}`.
-     Use --force-with-lease, never plain --force. If the lease check REJECTS the
-     push, another run touched the branch: change nothing and stop.
-  3. If the rebase CONFLICTS, resolve it yourself when all three hold: you can
-     say what each side changes and why, the two sides touch different behavior
-     so keeping both is coherent, and both sides' tests over the conflicted
-     files pass after your resolution. Then push as step 2 describes and state
-     the resolution and its reasoning in your comment. Otherwise -- the sides
-     disagree about the SAME behavior, you cannot tell what a side was for, or
-     you cannot get both sides' tests green -- run `git rebase --abort` and PARK
-     with a comment listing the conflicted files. Never resolve by guessing.
-
-  {{if .PR.ReviewPending}}
-  4. This dispatch was also triggered by review activity newer than the last
-     tend. After the rebase (or the park) above, read the pull request's
-     unresolved review threads and comments. Answer each one: reply with your
-     reasoning, and push a fix when the reviewer is right. Leave a thread
-     unresolved when you disagree; say why in your reply rather than resolving
-     it yourself. Do not resolve a thread a human, not you, opened unless your
-     reply settles it and the reviewer's own tooling would mark it so.
-  {{end}}
-
-  PARK means: post the comment, remove {{.Labels.Terminal}}, add
-  {{.Labels.Blocked}}, and stop. End with: "To proceed: comment your decision and
-  re-add the {{.Labels.Trigger}} label."
-
-  {{if not .PR.ReviewPending}}
-  If the branch turns out to be current, post NO comment and make NO push.
-  Silence is the correct output for a quiet pull request.
-  {{end}}

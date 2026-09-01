@@ -29,7 +29,7 @@ document to still be current.
 | findings | prose in a disposition table, re-located by whoever fixed them | anchored to `File:Line` with a prescribed fix, grouped by file |
 | handoff | none — one session did both | a comment ID in Pipeline State's `findings comment` field |
 | `status:ready-for-review` | applied by `execution` when it opened the PR, then again by `pr-review` — it meant both "a PR exists" and "your turn" | applied only by `exec-pr-review-findings`, at the very end. It means one thing: the pipeline is finished and it is your turn to merge |
-| tending | per-loop `tend_pr: true`, keyed to that loop's `labels.review` | a project-level `tend:` block naming the label and the hosting loop |
+| tending | per-loop `tend_pr: true`, keyed to that loop's `labels.review` | **its own dispatcher**, described entirely by a project-level `tend:` block — no loop file mentions it at all |
 | `labels.review` | required on every loop | **removed**. A loop declares only its own four labels and ends by applying its terminal |
 | epic sweep | derived the entry loop from the label graph | a project-level `epic.loop` declaration |
 
@@ -89,9 +89,16 @@ label rename:
 
 - **`labels.review` is gone from the config format.** A file that still sets it fails to load.
 - **`tend_pr` is gone from the config format.** Same: a file that still sets it fails to load.
+- **`tend_prompt` is gone from the config format.** Same again. A loop that does not tend — which
+  is now every loop — has no business carrying the instructions for a dispatch it never makes.
 
-Both moved to the project descriptor, `.agent-utils/config.yaml`, which is a different file — see
-step 0.
+All three moved to the project descriptor, `.agent-utils/config.yaml`, which is a different file —
+see step 0.
+
+**One name is now reserved.** A loop called `tend` fails to load, naming the reason: that is the
+tend dispatcher's own name, and every row this program writes is keyed by `(project, loop)`, so a
+loop sharing it would read and write the dispatcher's dispatches, pull request links, conflict
+rows, lock file and worktrees. None of the four projects has such a loop.
 
 ### 0. The project descriptor — in all four projects
 
@@ -101,26 +108,67 @@ New, and it comes first because two of the loop edits below depend on it. Add to
 ```yaml
 tend:
   enabled: true
-  loop:    exec-pr-review-findings
   label:   status:ready-for-review
   model:   sonnet
+  effort:  medium
+  permission_mode: bypassPermissions
+  i_understand_bypass_permissions: true
+  prompt: |
+    # the rebase-and-review-reply template that used to be execution.yaml's
+    # tend_prompt. Copy it from examples/project/config.yaml.
 
 epic:
   loop: planning
 ```
 
-**`tend:` replaces `tend_pr` on the loops.** Tending keeps a repository's open pull requests
-rebased; that describes the repository, not any one loop's issue lifecycle. The old per-loop flag
-was gated on that loop's `labels.review`, which worked only because the review label happened to
-mark the right issues — and it had a misconfiguration with no error message, since two loops in one
-project could both set `tend_pr` and both would rebase the same branch.
+**`tend:` replaces `tend_pr` on the loops, and it is now the WHOLE of tending.** Tending keeps a
+repository's open pull requests rebased and answers review activity on them; that describes the
+repository, not any one loop's issue lifecycle. The old per-loop flag was gated on that loop's
+`labels.review`, which worked only because the review label happened to mark the right issues —
+and it had a misconfiguration with no error message, since two loops in one project could both set
+`tend_pr` and both would rebase the same branch.
 
-`tend.loop` names which loop's rows host the dispatches, and it must be named: every row a tend
-writes — the dispatch, the live-dispatch guard, the last-tend time, the conflict fingerprints — is
-keyed by loop. **It moves from `execution` to `exec-pr-review-findings`**, the last loop to touch
-the branch, whose terminal is the state `tend.label` points at. That is also the state where a pull
-request waits longest: every earlier wait is a machine that picks the issue up within a tick, and
-only the human gate lasts long enough for the base branch to move.
+**There is no `tend.loop`.** An earlier draft of this change had one, naming which loop's rows
+hosted the dispatches, because the tend work still ran inside loop ticks and every row it wrote had
+to be keyed by some loop's name. That setting existed only because of the arrangement it was
+working around. Tending is its own **dispatcher** now: it keys its rows by the reserved name
+`tend`, runs its own agent, gets a fresh session per dispatch, and uses worktrees of its own at
+`<worktree_dir>/tend/pr-N`. No loop file says anything about it.
+
+**So the agent fields are the whole agent, not an overlay.** There is no loop `agent:` block behind
+them: `model` is REQUIRED when `enabled` is true, `permission_mode` is required by the dispatcher
+(a tend rebases and force-pushes, and claude denies every prompt in a detached run, so a tend with
+no mode fails at its first push), `harness` defaults to `claude`, and `effort` is optional. There
+is no `worktree` mode (a tend always gets its own worktree for the pull request), no
+`max_budget_usd` (a cap that lands mid-rebase leaves a half-resolved conflict) and no `timeout`
+(24h, the same default a loop gets by omitting it).
+
+**`tend.prompt` is the tend prompt**, moved out of the host loop's `tend_prompt`. It renders the
+same template context a loop prompt does with **one difference that has teeth**: a tend has no
+loop, so there are no loop labels. `{{.Labels.Trigger}}` and friends would render as empty strings,
+so a `tend.prompt` that mentions `.Labels` is **rejected at load time**. Name the labels literally,
+and use `{{.Tend.Label}}` for the eligibility label. The template in
+`examples/project/config.yaml` is the old one with exactly that edit applied.
+
+**`tend.label` is what makes a pull request eligible.** It stays `status:ready-for-review` — the
+final loop's terminal, and the state where a pull request waits longest: every earlier wait is a
+machine that picks the issue up within a tick, and only the human gate lasts long enough for the
+base branch to move.
+
+**Where the dispatcher shows up.** It answers to `tend` everywhere a loop name is accepted, which
+is deliberate — it dispatches agents and holds sessions, so it must not be invisible:
+
+```
+agent-utils project loop status --name tend    # the pull request queue it maintains
+agent-utils project loop tick   --name tend    # the full pass, for a cron entry
+agent-utils project logs        --name tend --list
+agent-utils project sessions list --name tend
+```
+
+`loop status --name tend` prints a different table from a loop's: the dispatcher moves no label and
+keeps no issue state, so what it reports is which pull request each eligible issue links to, how
+far behind it is, when it was last tended, and whether an agent is in it now. `sessions list` with
+no filter shows tend sessions alongside the loops', under the loop name `tend`.
 
 **`epic:` replaces a derivation, and fixes a bug that predates this work.** The epic sweep used to
 find its entry loop by asking which loop's trigger was no other loop's terminal or review label.
@@ -150,7 +198,7 @@ outcome worth refusing. Validate before going further (step 3 of the migration).
 | `agent.timeout` | `8h0m0s` | `24h` (or delete the line) |
 | `prompt` | `reviewing-commits`, "YOU FIX WHAT YOU FIND" | `producing-review-findings`, "YOU DO NOT FIX WHAT YOU FIND" — copy the example's body verbatim |
 | `resume_prompt` | repeats "you fix what you find" | copy the example's body verbatim |
-| `tend_prompt` | a "never rendered" stub | delete it; only the hosting loop needs one |
+| `tend_prompt` | a "never rendered" stub | delete it; the field no longer exists |
 | header comment | says the loop "reviews and FIXES" | rewrite; it describes the old behaviour |
 
 `agent.model` stays `opus`. That is deliberate and it is the one setting the split makes *more*
@@ -167,10 +215,11 @@ summary somewhere: `config.Load` is strict and unconditionally requires `name`, 
 including `breaker.orphan_threshold` and `breaker.cooldown`, and — because
 `permission_mode: bypassPermissions` is set — `i_understand_bypass_permissions: true`.
 
-**Its `tend_prompt` is the one that actually runs**, since this is the loop `tend.loop` names. It
-is the rebase-and-review-reply template that used to live on `execution.yaml`, with one change: it
-tells the agent it is in a FRESH session and holds no memory of the branch. A tend no longer
-inherits the issue's session — see the migration notes below.
+**It carries no `tend_prompt`, and neither does any other loop file.** The rebase-and-review-reply
+template that used to live on `execution.yaml` is now `tend.prompt` in the project descriptor
+(step 0), with two changes: it tells the agent it is in a FRESH session and holds no memory of the
+branch, and it names its labels literally instead of through `{{.Labels.*}}`, which a
+project-level prompt has no loop to fill in.
 
 A file that will not load is not a local failure. `EpicLoop` refuses for the **whole repository**
 when any loop file fails to load, and the webhook router drops that loop from routing. Validate
@@ -187,7 +236,7 @@ before going further (see step 3 of the migration).
 | `labels.terminal` | absent | `status:ready-for-pr-review` |
 | `labels.veto` | `blocked:*`, `status:pr-reviewing` | add `status:ready-for-pr-review` and `status:fixing-findings` |
 | `tend_pr` | `true` | **delete the line**; the policy is the descriptor's now |
-| `tend_prompt` | the real rebase template | delete it; it moves to `exec-pr-review-findings.yaml` |
+| `tend_prompt` | the real rebase template | delete it; it moves to `tend.prompt` in the project descriptor (step 0) |
 | `agent.model` | `opus` | `sonnet` |
 | `prompt` | "ON COMPLETION. Open the pull request … add `{{.Labels.Review}}`" | a numbered five-step completion order ending with `{{.Labels.Terminal}}` as the strictly last action — copy the example's body verbatim |
 | `resume_prompt` | silent on completion order | names the numbered order and the strictly-last terminal — copy verbatim |
@@ -219,7 +268,7 @@ That is why the prompt bodies are copied verbatim rather than summarised.
 | `labels.terminal` | `status:ready-for-execution` | `status:ready-for-plan-review` |
 | `labels.veto` | `blocked:*`, `status:ready-for-execution`, `status:executing`, `status:ready-for-review` | add `status:ready-for-plan-review` |
 | `tend_pr` | `false` | **delete the line** |
-| `tend_prompt` | a "never rendered" stub | delete it |
+| `tend_prompt` | a "never rendered" stub | delete it; the field no longer exists |
 | `prompt` | PARK-FOR-REVIEW applies `{{.Labels.Review}}`; "You NEVER apply `{{.Labels.Terminal}}`" | PARK-FOR-REVIEW applies `{{.Labels.Terminal}}` as its last action; "you NEVER apply `status:ready-for-execution`" — copy the example's body verbatim |
 | `resume_prompt` | ends "you never apply `{{.Labels.Terminal}}`" | copy the example's body verbatim |
 
@@ -296,9 +345,10 @@ migrating to. Step 8 before step 7 leaves plans parked at a terminal nothing con
 but you will be relabelling by hand until you finish. Nothing logs any of it: a label no loop
 watches produces silence, not an error.
 
-Step 3 must come before steps 6–8 for a second reason: `tend_pr` and `labels.review` are removed
-from the loop format, so a swapped loop file no longer carries the tend policy at all. Between the
-swap and the descriptor edit, **nothing in that project tends**.
+Step 3 must come before steps 6–8 for a second reason: `tend_pr`, `labels.review` and
+`tend_prompt` are all removed from the loop format, so a swapped loop file no longer carries the
+tend policy OR the tend prompt. Between the swap and the descriptor edit, **nothing in that project
+tends**.
 
 Steps 6 and 7 have a benefit worth taking deliberately: after step 6 the new review and remediation
 loops are live but nothing feeds them automatically, so you can promote one issue by hand with
@@ -321,7 +371,7 @@ effect immediately and carries no state of its own. Every live state and what it
 | Parked at the retry cap, or operator-stopped | Unaffected; none of their labels move. | None. |
 | `status:speccing`, dispatch running | Untouched. The running agent keeps its **old** prompt, so it finishes by applying `status:plan-ready-for-review` and stops. | Read the plan and apply `status:ready-for-execution`, exactly as you always did. The label the agent left is the old one; nothing triggers on either, so nothing is stuck. |
 | `status:plan-ready-for-review` from the old flow | Nothing. No loop ever triggered on it and none does now. | Read and apply `status:ready-for-execution`. Relabelling to `status:ready-for-plan-review` is cosmetic. |
-| **Any open pull request, in any state** | Still tended, provided step 3 was done. The tending loop changes from `execution` to `exec-pr-review-findings` and the eligibility label stays `status:ready-for-review`, so the set of tended pull requests is unchanged. | None. |
+| **Any open pull request, in any state** | Still tended, provided step 3 was done. Tending moves off `execution` and onto the project's own dispatcher; the eligibility label stays `status:ready-for-review`, so the set of tended pull requests is unchanged. Its dispatches, logs and sessions appear under the loop name `tend` rather than `execution`, and its worktrees move from `<worktree_dir>/execution/pr-N` to `<worktree_dir>/tend/pr-N` — the old ones are left on disk and can be deleted by hand. | None. |
 
 **The one real hazard is a resumed session.** Dispatch state is keyed by loop name and repository,
 not by labels, and `pr-review`'s `trigger` and `in_flight` names do not change in this migration —
@@ -396,9 +446,8 @@ nothing would say so.
    resolve the loop as gone and, after enough consecutive observations, permanently clear its retry
    rows.
 4. **Remove the `tend:` and `epic:` blocks** from the project descriptor, in the same edit. The
-   restored loop files carry `tend_pr` again, and a descriptor that still named
-   `exec-pr-review-findings` as its tend host would name a loop that no longer exists — which
-   disables tending rather than moving it.
+   restored loop files carry `tend_pr` and `tend_prompt` again, and a descriptor that still enabled
+   tending would run a second dispatcher against the same branches.
 5. Remove the cron line. Leave every label in the repository; they cost nothing and they are what a
    second attempt needs.
 
@@ -409,10 +458,13 @@ you were on until the new chain has run a full feature end to end.
 
 ## Two invariants to keep
 
-**`status:ready-for-review` must never enter the veto list of the loop that tends** — the loop
-`tend.loop` names. `veto` is checked before tend decisions as well as dispatch decisions, so that
-one entry would switch tending off for the whole project, silently. Every other loop may veto it
-freely, and `planning.yaml` does.
+**`status:ready-for-review` must never be anything but `tend.label`.** The loops' veto lists no
+longer affect tending at all: the dispatcher has no veto list, because the loops' lists name one
+another's states and a union of them would veto every status label the pipeline has, including the
+eligibility label itself. What gates a tend now is the eligibility label, the draft check, and two
+PROJECT-WIDE guards — an issue with a live dispatch in any loop, and an issue an operator stopped
+in any loop, are both skipped. Every loop may still veto `status:ready-for-review` for its own
+purposes, freely, and `planning.yaml` does.
 
 **Exactly one loop may end at `status:ready-for-review`.** It is the human's merge queue, and the
 whole two-touch design rests on nothing else putting an issue there. The temptation is a loop

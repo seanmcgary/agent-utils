@@ -43,7 +43,6 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	cfg := &config.Config{
 		Prompt:       tmpl.Prompt,
 		ResumePrompt: tmpl.ResumePrompt,
-		TendPrompt:   tmpl.TendPrompt,
 	}
 
 	// 1. name

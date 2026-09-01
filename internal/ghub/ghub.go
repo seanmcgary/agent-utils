@@ -314,7 +314,7 @@ const maxReviewPages = 10
 //
 //  1. Activity written by this loop's own authenticated login is skipped.
 //     The tend prompt tells the agent to comment (examples/execution.yaml
-//     tend_prompt), so a reply the loop itself wrote must never read as
+//     tend prompt), so a reply the agent itself wrote must never read as
 //     feedback awaiting an answer.
 //
 //     This filter is DEFENCE IN DEPTH, not the money-loop guard, and the

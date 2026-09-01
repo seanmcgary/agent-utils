@@ -118,13 +118,21 @@ type harness struct {
 	// open, runTend and runCleanup, so they sit with the guarded fields rather
 	// than above the mutex with the write-once ones. defaultBranch and tendPR
 	// are the two config fields the open seam builds; both are needed to arm a
-	// sweep, which is gated on cfg.TendsPRs() && d.IsMergeInto(cfg.DefaultBranch).
+	// sweep, which is gated on the target being the tend dispatcher and on
+	// d.IsMergeInto(cfg.DefaultBranch).
 	// tendFn and cleanupFn decide what the RunTend and RunCleanup seams
 	// return; nil means success.
 	defaultBranch string                         // guarded by mu
 	tendPR        bool                           // guarded by mu
 	tendFn        func(cfg *config.Config) error // guarded by mu
 	cleanupFn     func(cfg *config.Config) error // guarded by mu
+	// tendIssues records the issue of each scoped TEND pass, and tendIssueFn
+	// decides what that seam returns; nil means success. They are separate
+	// from tends/tendFn because the two passes answer different triggers -- a
+	// moved default branch, and a delivery about one issue -- and a test that
+	// could not tell them apart would pass with the wrong one running.
+	tendIssues  []int                          // guarded by mu
+	tendIssueFn func(cfg *config.Config) error // guarded by mu
 
 	tokenErr error
 	openErr  error
@@ -192,6 +200,7 @@ func newHarness(db *store.DB) *harness {
 	w.Open = h.open
 	w.RunIssue = h.runIssue
 	w.RunTend = h.runTend
+	w.RunTendIssue = h.runTendIssue
 	w.RunCleanup = h.runCleanup
 	w.ReapOrphans = h.reap
 	w.IssueBusy = h.issueBusy
@@ -229,6 +238,21 @@ func (h *harness) target(loop string) Target {
 	}
 }
 
+// tendDispatcherTarget is the fake Target for the project's TEND DISPATCHER.
+//
+// It is a target beside the loops, not a flag on one, which is the whole shape
+// of the change: Scan emits one per project that tends, it carries the reserved
+// name and the PROJECT DESCRIPTOR's path, and loopcmd.Open turns that path into
+// the tend configuration. A delivery fans out to it exactly as it does to a
+// loop, so a test that wants both passes lists both targets.
+func (h *harness) tendDispatcherTarget() Target {
+	t := h.target(project.Reserved)
+	t.ConfigPath = "/p/.agent-utils/config.yaml"
+	t.DefaultBranch = "master"
+	t.Tends = true
+	return t
+}
+
 func (h *harness) targetsSeam(repo string) ([]Target, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -254,6 +278,29 @@ func (h *harness) token() (string, error) {
 		return "", h.tokenErr
 	}
 	return "gh-token", nil
+}
+
+// runTendIssue is the RunTendIssue seam: the scoped tend pass a delivery about
+// one issue reaches. It records "<issue>" so a test can tell it apart from the
+// SWEEP a moved branch arms, which is what tendedLoops records.
+func (h *harness) runTendIssue(
+	_ context.Context, cfg *config.Config, _ loopcmd.Deps, number int,
+) (loopcmd.Summary, error) {
+	h.mu.Lock()
+	h.tendIssues = append(h.tendIssues, number)
+	fn := h.tendIssueFn
+	h.mu.Unlock()
+	if fn != nil {
+		return loopcmd.Summary{}, fn(cfg)
+	}
+	return loopcmd.Summary{}, nil
+}
+
+// tendedIssues reports the issues the scoped tend pass ran for, in order.
+func (h *harness) tendedIssues() []int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]int(nil), h.tendIssues...)
 }
 
 // reap is the ReapOrphans seam. It records the loop it was asked to reap and
@@ -292,17 +339,25 @@ func (h *harness) open(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (
 		return nil, loopcmd.Deps{}, nil, openErr
 	}
 
+	// The descriptor path IS the tend dispatcher, exactly as loopcmd.Open
+	// reads it: there is no loop file to name, so the name is the reserved one.
+	name := loopFromPath(path)
+	if config.IsTendPath(path) {
+		name = project.Reserved
+		tend = true
+	}
 	cfg := &config.Config{
-		Name: loopFromPath(path), Repo: "o/r",
+		Name: name, Repo: "o/r",
 		DefaultBranch: branch,
 	}
-	// Tending is the project's policy now, so a fixture turns it on by naming
-	// THIS loop in the policy rather than by setting a flag on the loop.
+	// Tending is the project's own dispatcher now, so a fixture turns it on by
+	// giving the opened configuration the policy -- which is what
+	// config.LoadTend does for the descriptor path a tend target carries.
 	if tend {
 		cfg.Tend = project.Tend{
 			Enabled: true,
-			Loop:    cfg.Name,
 			Label:   "status:ready-for-review",
+			Model:   "sonnet",
 		}
 	}
 	cfg.Retry.Max = max
@@ -1678,9 +1733,7 @@ func TestIsPushToRequiresAPushedBranch(t *testing.T) {
 // run. Only the sweep is armed.
 func TestPushArmsTheSweepAndRunsNoIssuePass(t *testing.T) {
 	h := newHarness(nil)
-	tgt := h.target("planning")
-	tgt.DefaultBranch = "master"
-	tgt.Tends = true
+	tgt := h.tendDispatcherTarget()
 	h.targets = []Target{tgt}
 	h.defaultBranch = "master"
 	h.tendPR = true
@@ -1694,8 +1747,99 @@ func TestPushArmsTheSweepAndRunsNoIssuePass(t *testing.T) {
 		t.Fatalf("armed %d timers, want 1", n)
 	}
 	h.timers.at(t, 0).f()
-	if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
-		t.Errorf("tends = %v, want [planning@master]", got)
+	if got := h.tendedLoops(); len(got) != 1 || got[0] != project.Reserved+"@master" {
+		t.Errorf("tends = %v, want [tend@master]", got)
+	}
+	// A push names no issue, so the dispatcher's SCOPED pass must not run
+	// either. The sweep is the only work a push can start.
+	if got := h.tendedIssues(); len(got) != 0 {
+		t.Errorf("scoped tend passes = %v, want none for a push", got)
+	}
+}
+
+// A delivery that NAMES an issue reaches the tend dispatcher's scoped pass, and
+// that is how review activity is answered within seconds: a
+// pull_request_review delivery lands here rather than waiting for the cron
+// sweep. It must not be put on the sweep's timer -- a review is about one pull
+// request, and delaying it to batch it with a merge train would batch it with
+// work it has nothing to do with.
+func TestADeliveryRunsTheScopedTendPassImmediately(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.tendDispatcherTarget()}
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
+
+	if got := h.tendedIssues(); len(got) != 1 || got[0] != 51 {
+		t.Errorf("scoped tend passes = %v, want [51]", got)
+	}
+	// No sweep: nothing said the default branch moved.
+	if n := h.timers.len(); n != 0 {
+		t.Errorf("armed %d timers, want 0: only a moved branch arms a sweep", n)
+	}
+	// And no LOOP pass: this target is the dispatcher, not a loop.
+	if got := h.ranLoops(); len(got) != 0 {
+		t.Errorf("issue passes = %v, want none: the tend dispatcher runs no loop tick", got)
+	}
+}
+
+// A failed scoped tend pass schedules NOTHING. The retry schedule spends an
+// ISSUE's retry budget on the loop that owns it, and a tend is not that
+// loop's work; the next delivery, the next sweep, or the periodic check
+// answers it instead.
+func TestAFailedScopedTendPassSchedulesNoRetry(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.tendDispatcherTarget()}
+	h.defaultBranch = "master"
+	h.tendPR = true
+	h.max = 3
+	h.backoff = []time.Duration{0, 0, 0}
+	h.tendIssueFn = func(*config.Config) error { return errBoom }
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
+
+	if n := h.timers.len(); n != 0 {
+		t.Errorf("armed %d timers, want 0: a failed tend pass must not enter the retry schedule", n)
+	}
+	if got := h.pendingLen(); got != 0 {
+		t.Errorf("pending retries = %d, want 0", got)
+	}
+}
+
+// A delivery WINDOW's trailing tick runs the tend dispatcher's own pass, not a
+// loop tick.
+//
+// Both targets share the window -- it is keyed by (project, loop, issue), and
+// the dispatcher's reserved name is a distinct key there -- so the trailing
+// tick arrives through the same seam a loop's does. Without the branch that
+// tells them apart it would run a LOOP tick against the dispatcher's
+// configuration, deciding issues against label roles that are all the
+// eligibility label, on a configuration with no retry policy. Nothing else
+// catches that: the leading tick is correct either way.
+func TestATrailingWindowTickRunsTheTendPassForATendTarget(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.tendDispatcherTarget()}
+	h.w.IssueDelay = 2 * time.Second
+	h.defaultBranch = "master"
+	h.tendPR = true
+
+	// Two deliveries about one issue: the first ticks and opens the window,
+	// the second rides it and makes the trailing tick fire.
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 51})
+
+	for i := 0; i < h.timers.len(); i++ {
+		if h.timers.at(t, i).d == h.w.IssueDelay {
+			h.timers.at(t, i).f()
+		}
+	}
+
+	if got := h.tendedIssues(); len(got) != 2 {
+		t.Errorf("scoped tend passes = %v, want two: the leading tick and the trailing one", got)
+	}
+	if got := h.ranLoops(); len(got) != 0 {
+		t.Errorf("issue passes = %v, want none: the tend dispatcher runs no loop tick", got)
 	}
 }
 
@@ -1704,9 +1848,7 @@ func TestPushArmsTheSweepAndRunsNoIssuePass(t *testing.T) {
 // two sweeps.
 func TestAMergeAndItsPushProduceOneSweep(t *testing.T) {
 	h := newHarness(nil)
-	tgt := h.target("planning")
-	tgt.DefaultBranch = "master"
-	tgt.Tends = true
+	tgt := h.tendDispatcherTarget()
 	h.targets = []Target{tgt}
 	h.defaultBranch = "master"
 	h.tendPR = true
@@ -1723,9 +1865,7 @@ func TestAMergeAndItsPushProduceOneSweep(t *testing.T) {
 // handle, no migration check. Open is the seam that proves it.
 func TestPushToAnotherBranchOpensNothing(t *testing.T) {
 	h := newHarness(nil)
-	tgt := h.target("planning")
-	tgt.DefaultBranch = "master"
-	tgt.Tends = true
+	tgt := h.tendDispatcherTarget()
 	h.targets = []Target{tgt}
 
 	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", PushedTo: "feat/x"})
@@ -1751,9 +1891,7 @@ func TestAPushsOpenFailureDoesNotCancelAnIssuesPendingRetry(t *testing.T) {
 		t.Fatalf("armed %d timers, want 1 for the issue's Open failure", n)
 	}
 
-	tgt := h.target("planning")
-	tgt.DefaultBranch = "master"
-	tgt.Tends = true
+	tgt := h.tendDispatcherTarget()
 	h.targets = []Target{tgt}
 
 	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", PushedTo: "master"})
@@ -1767,25 +1905,33 @@ func TestAPushsOpenFailureDoesNotCancelAnIssuesPendingRetry(t *testing.T) {
 	}
 }
 
-// The sweep is armed for exactly one case, and the issue pass always runs.
-func TestDeliverArmsATendSweepOnlyOnAMergeIntoTheLoopsDefaultBranch(t *testing.T) {
+// The sweep is armed for exactly one case, and the loop's issue pass always
+// runs.
+//
+// "the project does not tend" is now the ABSENCE of a tend target rather than
+// a flag on a loop: config.LoadTend refuses to build a dispatcher for a project
+// with tending switched off, so listener.Scan emits nothing for it.
+func TestDeliverArmsATendSweepOnlyOnAMergeIntoTheProjectsDefaultBranch(t *testing.T) {
 	cases := []struct {
 		name     string
 		delivery Delivery
-		tendPR   bool
+		tends    bool
 		wantArm  bool
 	}{
 		{"a merge into the default branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, true, true},
 		{"a merge into a feature branch", Delivery{Repo: "o/r", Number: 7, MergedInto: "feature"}, true, false},
 		{"not a merge", Delivery{Repo: "o/r", Number: 7}, true, false},
-		{"a merge, but the loop does not tend", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, false, false},
+		{"a merge, but the project does not tend", Delivery{Repo: "o/r", Number: 7, MergedInto: "master"}, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(nil)
 			h.targets = []Target{h.target("planning")}
+			if tc.tends {
+				h.targets = append(h.targets, h.tendDispatcherTarget())
+			}
 			h.defaultBranch = "master"
-			h.tendPR = tc.tendPR
+			h.tendPR = tc.tends
 
 			h.w.Deliver(context.Background(), tc.delivery)
 
@@ -1803,8 +1949,8 @@ func TestDeliverArmsATendSweepOnlyOnAMergeIntoTheLoopsDefaultBranch(t *testing.T
 			}
 			if want == 1 {
 				h.timers.at(t, 0).f()
-				if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
-					t.Errorf("tends = %v, want [planning@master]", got)
+				if got := h.tendedLoops(); len(got) != 1 || got[0] != project.Reserved+"@master" {
+					t.Errorf("tends = %v, want [tend@master]", got)
 				}
 			}
 		})
@@ -1816,7 +1962,7 @@ func TestDeliverArmsATendSweepOnlyOnAMergeIntoTheLoopsDefaultBranch(t *testing.T
 // suppresses anything, so an uncoalesced train multiplies.
 func TestDeliverCoalescesAMergeTrainIntoOneSweep(t *testing.T) {
 	h := newHarness(nil)
-	h.targets = []Target{h.target("planning")}
+	h.targets = []Target{h.target("planning"), h.tendDispatcherTarget()}
 	h.defaultBranch = "master"
 	h.tendPR = true
 
@@ -1841,7 +1987,7 @@ func TestDeliverCoalescesAMergeTrainIntoOneSweep(t *testing.T) {
 // armed: the base branch moved whatever happened to that one issue.
 func TestDeliverArmsATendSweepEvenWhenTheIssuePassFails(t *testing.T) {
 	h := newHarness(nil)
-	h.targets = []Target{h.target("planning")}
+	h.targets = []Target{h.target("planning"), h.tendDispatcherTarget()}
 	h.defaultBranch = "master"
 	h.tendPR = true
 	h.max = 1
@@ -1861,7 +2007,7 @@ func TestDeliverArmsATendSweepEvenWhenTheIssuePassFails(t *testing.T) {
 // would spend that issue's retry budget on something the issue did not do.
 func TestDeliverDoesNotRetryAFailedTendSweep(t *testing.T) {
 	h := newHarness(nil)
-	h.targets = []Target{h.target("planning")}
+	h.targets = []Target{h.target("planning"), h.tendDispatcherTarget()}
 	h.defaultBranch = "master"
 	h.tendPR = true
 	h.max = 3
@@ -1960,7 +2106,7 @@ func TestDeliverDoesNotRetryAFailedCleanup(t *testing.T) {
 // timers; nothing pinned that, and deleting the loop left the suite green.
 func TestStopAllStopsAnArmedTendSweep(t *testing.T) {
 	h := newHarness(nil)
-	h.targets = []Target{h.target("planning")}
+	h.targets = []Target{h.target("planning"), h.tendDispatcherTarget()}
 	h.defaultBranch = "master"
 	h.tendPR = true
 
@@ -1984,7 +2130,7 @@ func TestStopAllStopsAnArmedTendSweep(t *testing.T) {
 // exactly that case, and a daemon told to stop starts no new agent.
 func TestAnArmedTendSweepDoesNotRunAfterTheContextIsCancelled(t *testing.T) {
 	h := newHarness(nil)
-	h.targets = []Target{h.target("planning")}
+	h.targets = []Target{h.target("planning"), h.tendDispatcherTarget()}
 	h.defaultBranch = "master"
 	h.tendPR = true
 
@@ -2332,7 +2478,7 @@ func TestStopAllStopsArmedWindowsAndBusyRelooks(t *testing.T) {
 // The window gates the ISSUE pass alone.
 func TestAWindowedDeliveryStillRetriesAndTends(t *testing.T) {
 	h := newHarness(nil)
-	h.targets = []Target{h.target("planning")}
+	h.targets = []Target{h.target("planning"), h.tendDispatcherTarget()}
 	h.w.IssueDelay = 2 * time.Second
 	h.defaultBranch = "master"
 	h.tendPR = true
@@ -2349,7 +2495,13 @@ func TestAWindowedDeliveryStillRetriesAndTends(t *testing.T) {
 		waits[h.timers.at(t, i).d]++
 	}
 	want := map[time.Duration]int{
-		h.w.IssueDelay:   1, // the window
+		// TWO windows, one per target: the loop's issue pass and the tend
+		// dispatcher's scoped pass are both gated by the same coalescing
+		// window, keyed by (project, loop, issue), and the dispatcher's
+		// reserved name is a distinct key there. That separation is the point
+		// -- a burst about one issue must collapse for each of them, and
+		// neither may swallow the other's pass.
+		h.w.IssueDelay:   2,
 		5 * time.Minute:  1, // the retry, at the loop's own backoff
 		defaultTendDelay: 1, // the sweep
 	}
@@ -2365,8 +2517,8 @@ func TestAWindowedDeliveryStillRetriesAndTends(t *testing.T) {
 			h.timers.at(t, i).f()
 		}
 	}
-	if got := h.tendedLoops(); len(got) != 1 || got[0] != "planning@master" {
-		t.Errorf("tends = %v, want [planning@master]", got)
+	if got := h.tendedLoops(); len(got) != 1 || got[0] != project.Reserved+"@master" {
+		t.Errorf("tends = %v, want [tend@master]", got)
 	}
 }
 
@@ -2460,12 +2612,15 @@ func tendCheckHarness(t *testing.T) *harness {
 	return h
 }
 
-// tendTarget is the harness's target for one loop, marked as tending.
+// tendCheckTarget is a tend-dispatcher target under a made-up name, so a
+// single-project harness can stand in for several projects' dispatchers.
 //
-// DefaultBranch and TendPR are set here as well as on the config the open seam
-// builds: the pass filters on Target.Tends before it opens anything, and the
-// harness's target helper leaves both fields zero.
-func (h *harness) tendTarget(loop string) Target {
+// The periodic check walks the scan looking for Target.Tends, and each hit is
+// one project's dispatcher; the harness has one project, so the loop name is
+// what tells two fake dispatchers apart here. DefaultBranch is set here as
+// well as on the config the open seam builds: the pass filters on Target.Tends
+// before it opens anything, and the plain target helper leaves it zero.
+func (h *harness) tendCheckTarget(loop string) Target {
 	t := h.target(loop)
 	t.DefaultBranch = "master"
 	t.Tends = true
@@ -2480,7 +2635,7 @@ func (h *harness) tendTarget(loop string) Target {
 func (h *harness) scanTending(loops ...string) {
 	targets := make([]Target, 0, len(loops))
 	for _, loop := range loops {
-		targets = append(targets, h.tendTarget(loop))
+		targets = append(targets, h.tendCheckTarget(loop))
 	}
 	h.w.ScanTargets = func() (Routes, error) {
 		return Routes{Targets: targets}, nil
@@ -2831,9 +2986,7 @@ func TestTendTickerIsNilOnlyWhenTheIntervalIsZero(t *testing.T) {
 // reached them would sweep the epic of issue 0 and remove the worktree "pr-0".
 func TestAPushRunsNeitherTheEpicPassNorTheCleanupPass(t *testing.T) {
 	h := newHarness(nil)
-	tgt := h.target("planning")
-	tgt.DefaultBranch = "master"
-	tgt.Tends = true
+	tgt := h.tendDispatcherTarget()
 	h.targets = []Target{tgt}
 	h.defaultBranch = "master"
 	h.tendPR = true

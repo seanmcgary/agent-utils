@@ -10,6 +10,7 @@ import (
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 )
 
@@ -19,15 +20,31 @@ type Target struct {
 	ProjectName string
 	Dir         string // the project's .agent-utils directory
 	ConfigPath  string
-	LoopName    string
-	Repo        string
-	// DefaultBranch and Tends are what let Deliver drop a push delivery
-	// before it opens anything. Open reads the token, opens a SQLite handle
-	// and runs the migration check; a busy feature branch would pay all three
-	// on every push, once per loop, for a delivery no loop can act on.
+	// LoopName is the loop this target ticks -- or project.Reserved, which is
+	// not a loop at all but the project's TEND DISPATCHER. Scan emits one such
+	// target per project that enables tending, alongside its loops, so that
+	// everything downstream -- routing, arming, the periodic check, the retry
+	// scheduler's keys -- keeps working on the one shape it already knows. See
+	// tendTarget.
+	LoopName string
+	Repo     string
+	// DefaultBranch is what lets Deliver drop a push delivery before it opens
+	// anything. Open reads the token, opens a SQLite handle and runs the
+	// migration check; a busy feature branch would pay all three on every push,
+	// once per target, for a delivery nothing can act on.
 	DefaultBranch string
-	Tends         bool
+	// Tends marks the project's tend dispatcher. It is true for exactly one
+	// target per tending project and false for every loop -- a loop no longer
+	// tends at all, so this is an identity rather than a capability. The
+	// periodic tend check walks the scan looking for it.
+	Tends bool
 }
+
+// IsTend reports whether this target is a project's tend dispatcher rather than
+// one of its loops. It reads the same field Tends does, and exists so the
+// dispatch paths below say what they mean instead of testing a flag whose name
+// used to mean something else.
+func (t Target) IsTend() bool { return t.Tends }
 
 // Ref returns the identity loopcmd.Open needs to run this target's tick. It
 // carries only ID, Name, and Dir -- loopcmd.Open resolves everything else
@@ -190,7 +207,18 @@ func Scan() (Routes, error) {
 				LoopName:      e.Name,
 				Repo:          e.Repo,
 				DefaultBranch: e.DefaultBranch,
-				Tends:         e.Tends,
+			})
+		}
+
+		if t, skip, ok := tendTarget(p.ID, p.Name, p.AgentUtilsDir); ok {
+			routes.Targets = append(routes.Targets, t)
+		} else if skip != "" {
+			slog.Warn("skipping this project's tend dispatcher",
+				"project", p.Name, "dir", p.AgentUtilsDir, "err", skip)
+			routes.Skips = append(routes.Skips, Skip{
+				Project: p.Name, Dir: p.AgentUtilsDir,
+				File:   project.FileName,
+				Reason: "cannot build the tend dispatcher: " + skip,
 			})
 		}
 	}
@@ -205,6 +233,50 @@ func Scan() (Routes, error) {
 		return routes.Skips[i].File < routes.Skips[j].File
 	})
 	return routes, nil
+}
+
+// tendTarget builds the routing entry for one project's tend dispatcher, or
+// reports why it could not.
+//
+// Three outcomes, and the difference between the last two is the whole reason
+// this returns a string rather than an error:
+//
+//   - a target, for a project that enables tending and can build a dispatcher;
+//   - NOTHING, silently, for a project with no descriptor or with tending
+//     switched off. That is the normal state of most projects, on every scan,
+//     and a skip entry for it would fill `listener start`'s routing table with
+//     lines saying a project chose not to do something;
+//   - a skip reason, for a project that enables tending and cannot build one --
+//     no loop that loads, loops that disagree about the repository, a tend
+//     policy that fails validation. That is a misconfiguration an operator has
+//     to see, and it is permanent until they fix it.
+//
+// The dispatcher is loaded rather than assumed: Repo and DefaultBranch have to
+// be real for Deliver to route a push, and they come from the project's loops
+// agreeing on them. See config.LoadTend.
+func tendTarget(projectID, projectName, agentUtilsDir string) (Target, string, bool) {
+	cfg, err := config.LoadTend(agentUtilsDir)
+	switch {
+	case errors.Is(err, config.ErrNoTend), errors.Is(err, project.ErrNoConfig):
+		return Target{}, "", false
+	case errors.Is(err, config.ErrNoConfigs):
+		// A project with no configs/ directory at all. The loop walk above has
+		// already reported that, and repeating it as a tend failure would say
+		// the same thing twice about one project.
+		return Target{}, "", false
+	case err != nil:
+		return Target{}, err.Error(), false
+	}
+	return Target{
+		ProjectID:     projectID,
+		ProjectName:   projectName,
+		Dir:           agentUtilsDir,
+		ConfigPath:    config.TendPath(agentUtilsDir),
+		LoopName:      project.Reserved,
+		Repo:          cfg.Repo,
+		DefaultBranch: cfg.DefaultBranch,
+		Tends:         true,
+	}, "", true
 }
 
 // Targets returns every loop on this machine whose repo matches, case

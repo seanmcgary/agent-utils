@@ -128,7 +128,6 @@ func TestWriteRoundTripsEveryValue(t *testing.T) {
 	cfg.Agent.Harness = config.HarnessClaude
 	cfg.Agent.PermissionMode = "bypassPermissions"
 	cfg.AcknowledgeBypassPermissions = true
-	cfg.TendPrompt = "rebase #{{.Issue.Number}}"
 	cfg.Retry.Max = 3
 	cfg.Retry.Backoff = []config.Duration{
 		config.Duration(0),

@@ -86,9 +86,10 @@ func (c *countingGH) EditLabels(context.Context, string, string, int, []string, 
 	return nil
 }
 
-// tendCheckConfig is a loop that tends. It takes t so StateDir lands in a
-// temporary directory the test framework removes: the pass takes the loop lock,
-// and a lock file shared between tests would make them serialise on each other.
+// tendCheckConfig is the tend dispatcher. It takes t so StateDir lands in a
+// temporary directory the test framework removes: the pass takes the
+// dispatcher's lock, and a lock file shared between tests would make them
+// serialise on each other.
 func tendCheckConfig(t *testing.T) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
@@ -96,9 +97,9 @@ func tendCheckConfig(t *testing.T) *config.Config {
 		Name:          tendCheckLoop,
 		Repo:          "o/r",
 		DefaultBranch: "master",
-		TendPrompt:    "rebase #{{.Issue.Number}}",
 		Tend: project.Tend{
-			Enabled: true, Loop: tendCheckLoop, Label: "status:review",
+			Enabled: true, Label: "status:review",
+			Model: "sonnet", Prompt: "rebase #{{.Issue.Number}}",
 		},
 		CheckoutBaseDir: dir,
 		WorktreeDir:     filepath.Join(dir, "wt"),
@@ -358,35 +359,14 @@ func TestTendCheckIgnoresAnUntrustedPullRequest(t *testing.T) {
 	}
 }
 
-// A loop that does not tend must not fetch, must not compare, and must not call
-// GitHub -- not even when forced. The check is first in the function for the
-// reason TendSweep gives: TendCheck is exported, so a loop that does not tend
-// costs nothing whoever calls it.
-func TestTendCheckDoesNothingWhenTheLoopDoesNotTend(t *testing.T) {
-	gh := &countingGH{}
-	deps := tendCheckDeps(t, gh, map[string]int{"feat/x": 3})
-	seedPRLink(t, deps, 7, 9, "feat/x", "master")
-	cfg := tendCheckConfig(t)
-	cfg.Tend.Enabled = false
-
-	fetched := 0
-	deps.Fetch = func(context.Context) error {
-		fetched++
-		return nil
-	}
-	deps.Behind = func(context.Context, string, string) (int, bool, error) {
-		t.Error("a loop that does not tend compared a branch")
-		return 0, false, nil
-	}
-
-	got, err := TendCheck(context.Background(), cfg, deps, true)
-	if fetched != 0 {
-		t.Errorf("fetches = %d; a loop that does not tend must not touch git", fetched)
-	}
-	if err != nil || got.Confirmed || gh.calls != 0 {
-		t.Errorf("got %+v, err %v, calls %d; want a no-op", got, err, gh.calls)
-	}
-}
+// There is no "this loop does not tend" case any more, and its absence is the
+// point rather than a deletion. TendCheck is only ever handed the tend
+// dispatcher's own configuration, which exists only for a project that tends:
+// config.LoadTend returns ErrNoTend otherwise, and listener.Scan emits no
+// target. The gate moved from a per-loop field test on every interval to one
+// descriptor read per project, which is also where the API-call saving is --
+// every loop of every project used to be opened so that all but one could
+// discover it did not tend.
 
 // A hand-built Deps -- there are several in this program -- leaves Behind nil.
 // The pass runs on the daemon's Serve goroutine, where a panic takes every

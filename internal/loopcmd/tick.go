@@ -43,14 +43,10 @@ func resolveProviders(ctx context.Context, cfg *config.Config, issues []ghub.Iss
 		if err != nil {
 			continue
 		}
-		// store.KindStart: this resolves the provider for the issue's OWN
-		// dispatch, which is a start or a resume. A tend never reaches here --
-		// it carries no retry history to retire -- so the tend: section must
-		// not colour the answer.
-		if engine.EffectiveHarness(cfg, store.KindStart, ov) != config.HarnessPi {
+		if engine.EffectiveHarness(cfg, ov) != config.HarnessPi {
 			continue
 		}
-		model := runner.Effective(cfg, store.KindStart, ov).Model
+		model := runner.Effective(cfg, ov).Model
 		if model == "" {
 			continue
 		}
@@ -210,15 +206,18 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	var sum Summary
 	now := deps.Now()
 
-	// A failed fetch makes branch comparisons stale, so it suppresses TENDING.
-	// It must not abandon the tick: reaping dead runners, retrying, and parking
+	// Still fetched, and a failure no longer suppresses anything. The fetch
+	// existed for two readers: the branch comparisons a tend decided from, and
+	// the worktree a dispatch is created in. The comparisons left with tending,
+	// so all that is left is keeping the primary checkout current for the
+	// worktrees this tick may create -- and a stale checkout there costs a
+	// worktree branched from an older origin ref, not a wrong decision. It must
+	// not abandon the tick either: reaping dead runners, retrying and parking
 	// have nothing to do with git, and abandoning the pass would leave a dead
 	// runner's issue with no failure flag at all.
-	fetchOK := true
 	if deps.Fetch != nil {
 		if err := deps.Fetch(ctx); err != nil {
-			fetchOK = false
-			slog.Error("fetch primary checkout; skipping tend this tick",
+			slog.Error("fetch primary checkout; carrying on with a possibly stale one",
 				"loop", cfg.Name, "err", err)
 		}
 	}
@@ -230,88 +229,11 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 		return sum, err
 	}
 
-	snap := engine.Snapshot{Issues: issues, BehindBy: map[int]int{}, ReviewedAt: map[int]time.Time{}}
-	lastTend := map[int]time.Time{}
-	if cfg.TendsPRs() && fetchOK {
-		prs, err := deps.GH.ListOpenPullRequests(ctx, owner, repo)
-		if err != nil {
-			return sum, err
-		}
-		snap.PRs = prs
-
-		// One query for every pull request this tick might tend, not one per
-		// row: LastTendByPR groups by pull request so a pass deciding many
-		// issues issues one query.
-		//
-		// lastTendOK is what makes a failed read fail CLOSED, and it is
-		// load-bearing. An unset lastTend entry reads as the zero time, and
-		// any review activity at all is After(zero) -- so leaving the map
-		// empty and still reading review activity would mark EVERY
-		// review-labelled pull request in the repository as review-pending
-		// and answer one broken store read with a burst of agent dispatches.
-		// That is the opposite of what this whole change exists to do. So a
-		// failed read suppresses the review trigger for this tick entirely:
-		// the pull requests are judged on staleness alone, which is exactly
-		// the behaviour this loop had before the trigger existed. It also
-		// spends no GitHub call on an answer that could not be used.
-		lastTendOK := true
-		if m, err := deps.Store.LastTendByPR(cfg.Name, cfg.Repo); err != nil {
-			lastTendOK = false
-			slog.Warn("read last tend times; judging every pull request on staleness alone",
-				"loop", cfg.Name, "err", err)
-		} else {
-			lastTend = m
-		}
-
-		for _, iss := range issues {
-			if !iss.HasLabel(cfg.Tend.Label) {
-				continue
-			}
-			pr, ok := engine.LinkPR(iss.Number, prs)
-			if !ok {
-				continue
-			}
-			behind, err := deps.GH.BehindBy(ctx, owner, repo, pr.BaseRef, pr.HeadRef)
-			if err != nil {
-				// One unusable pull request must not abandon the whole tick. If
-				// this returned early, anyone able to open a pull request could
-				// stop the loop for every issue it watches.
-				slog.Warn("compare failed; skipping this pull request",
-					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
-				continue
-			}
-			snap.BehindBy[pr.Number] = behind
-			if err := deps.Store.PutPRLink(store.PRLink{
-				Loop: cfg.Name, Repo: cfg.Repo, Number: iss.Number,
-				PRNumber: pr.Number, HeadRef: pr.HeadRef, BaseRef: pr.BaseRef,
-				// The real count, not the zero this used to write. PutPRLink
-				// rewrites every column, so leaving it unset here overwrote
-				// whatever the tend sweep had recorded -- and RunAgent renders
-				// this value into the tend prompt, which tells the agent how
-				// far behind the branch is. A zero there tells it the opposite
-				// of why it was dispatched.
-				BehindBy: behind,
-			}); err != nil {
-				slog.Error("store pr link", "loop", cfg.Name, "issue", iss.Number, "err", err)
-			}
-
-			// The review trigger fails CLOSED: a failed read leaves the entry
-			// unset, so tendDecisions judges this pull request on staleness
-			// alone rather than treating "unknown" as "pending". Asked only
-			// for a candidate already accepted above -- labels.review and a
-			// LinkPR-trusted pull request -- so a pass with no candidates
-			// costs nothing. See tendsweep.go and tendcheck.go for why this
-			// read is deliberately absent from both of those passes.
-			if lastTendOK {
-				if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
-					slog.Warn("read review activity; judging this pull request on staleness alone",
-						"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
-				} else if !activity.IsZero() {
-					snap.ReviewedAt[pr.Number] = activity
-				}
-			}
-		}
-	}
+	// No pull requests, no comparisons, no review activity. A loop does not
+	// tend: the project's tend dispatcher owns all of that, and it runs its own
+	// pass over the same repository (see loopcmd.TendTick). What is left here is
+	// the loop's own issues, which is what a loop was always about.
+	snap := engine.Snapshot{Issues: issues}
 
 	states, err := deps.Store.IssueStates(cfg.Name, cfg.Repo)
 	if err != nil {
@@ -332,7 +254,6 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	st := engine.State{
 		Issues: states, Running: live, CooldownUntil: time.Time{}, Force: deps.Force,
 		Providers: resolveProviders(ctx, cfg, snap.Issues),
-		LastTend:  lastTend,
 	}
 	sum.Live = len(live)
 	sum.Forced = deps.Force
@@ -723,7 +644,7 @@ func dispatch(
 		// empty whenever the loop default was used -- an ambiguity the
 		// retirement rule cannot carry, because "empty" there would mean both
 		// "claude, by default" and "not recorded".
-		harness := runner.Effective(cfg, kind, d.Overrides).Harness
+		harness := runner.Effective(cfg, d.Overrides).Harness
 		if harness == "" {
 			harness = config.HarnessClaude
 		}
@@ -960,21 +881,6 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 	return nil
 }
 
-// tendResumes reports whether a tend dispatch borrowed the issue's session and
-// must therefore continue it rather than create it.
-//
-// It compares identifiers instead of trusting the kind, because a tend carries
-// its own throwaway session whenever the issue had no started one, and "-r"
-// against a session claude never created fails every time. This is the same
-// gate engine.tendDecisions applies when it decides what to offer; the two
-// agree by both reading SessionStarted.
-func tendResumes(d store.Dispatch, state store.IssueState) bool {
-	return d.Kind == store.KindTend &&
-		state.SessionStarted &&
-		state.SessionID != "" &&
-		state.SessionID == d.SessionID
-}
-
 // RunAgent executes one dispatch. The detached runner process calls it.
 func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int64) error {
 	d, err := deps.Store.GetDispatch(dispatchID)
@@ -992,28 +898,16 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		return err
 	}
 
+	// Two prompts, and a tend uses NEITHER branch: the tend dispatcher's
+	// configuration carries the project's tend.prompt in cfg.Prompt, because it
+	// is the only prompt that dispatcher has. So a KindTend dispatch takes the
+	// default here and starts a fresh session, which is exactly what it must do
+	// -- a tend never inherits and never resumes, so "-r" would target a session
+	// claude never created and fail in under a second, every time.
 	tmpl := cfg.Prompt
 	resume := false
-	switch d.Kind {
-	case store.KindResume:
+	if d.Kind == store.KindResume {
 		tmpl, resume = cfg.ResumePrompt, true
-	case store.KindTend:
-		tmpl = cfg.TendPrompt
-		// A tend that inherited the issue's session must RESUME it. Passing an
-		// existing identifier to --session-id is refused outright ("Session ID
-		// <uuid> is already in use"), so getting this wrong fails the dispatch
-		// in under a second rather than degrading quietly.
-		//
-		// The answer is re-derived from the store rather than carried on the
-		// row: this runs in a detached process that holds only the dispatch,
-		// and the alternative -- a second tend kind, or a resume column -- puts
-		// the fact in two places for reapDead, the liveness map, worktree
-		// selection and cleanup to disagree about.
-		st, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Number)
-		if err != nil {
-			return err
-		}
-		resume = tendResumes(d, st)
 	}
 
 	links, err := deps.Store.PRLinks(cfg.Name, cfg.Repo)
@@ -1050,12 +944,27 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 			// rejected as a transport -- see store.Dispatch.ReviewPending.
 			ReviewPending: d.ReviewPending,
 		},
-		Labels: runner.PromptLabels{
-			Trigger:  cfg.Labels.Trigger,
-			InFlight: cfg.Labels.InFlight,
-			Blocked:  cfg.Labels.Blocked,
-			Terminal: cfg.Labels.Terminal,
-		},
+		// A tend gets NO labels, and that is deliberate rather than an
+		// oversight: the tend dispatcher's configuration fills all four label
+		// roles with the eligibility label purely so the shared validator has
+		// something to check, and rendering those into a prompt would tell the
+		// agent that its trigger, in-flight, blocked and terminal labels are
+		// all the same string. project.Load refuses a tend prompt that
+		// references .Labels, so nothing can read what is withheld here.
+		Labels: func() runner.PromptLabels {
+			if d.Kind == store.KindTend {
+				return runner.PromptLabels{}
+			}
+			return runner.PromptLabels{
+				Trigger:  cfg.Labels.Trigger,
+				InFlight: cfg.Labels.InFlight,
+				Blocked:  cfg.Labels.Blocked,
+				Terminal: cfg.Labels.Terminal,
+			}
+		}(),
+		// The eligibility label, and only for a tend. A loop's prompt has its
+		// own four labels and no business reading a project-level one.
+		Tend: runner.PromptTend{Label: cfg.Tend.Label},
 	})
 	if err != nil {
 		// Route this through the same accounting as any other failed dispatch.
@@ -1075,11 +984,6 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		runner.Invocation{
 			SessionID: d.SessionID, Prompt: prompt, Resume: resume,
 			Overrides: config.Overrides{Model: d.Model, Harness: d.Harness, Effort: d.Effort},
-			// Kind selects the tend: layer in runner.Effective. It comes from
-			// the dispatch row, the same source as Overrides above: this
-			// detached process never saw the tick's decision, only what tick.go
-			// wrote to the row before spawning it.
-			Kind: d.Kind,
 		},
 		workDir, d.LogPath)
 }

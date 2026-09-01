@@ -79,7 +79,7 @@ func DescribeSession(p *Project, sessionID string) (SessionDetail, error) {
 	for _, d := range runs {
 		r := SessionRun{Dispatch: d}
 		if cfg != nil {
-			s := runner.Effective(cfg, d.Kind, config.Overrides{
+			s := runner.Effective(cfg, config.Overrides{
 				Model: d.Model, Harness: d.Harness,
 			})
 			r.Model, r.Harness = s.Model, s.Harness

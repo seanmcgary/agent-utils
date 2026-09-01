@@ -1152,6 +1152,68 @@ func (s *Store) RunningDispatches(loop, repo string) ([]Dispatch, error) {
 	return scanDispatches(rows)
 }
 
+// RunningDispatchesForRepo returns every running dispatch this project holds
+// against one repository, across ALL of its loops.
+//
+// It is the project-wide twin of RunningDispatches, and it exists for exactly
+// one caller: the tend dispatcher. Every other reader is a loop deciding its
+// own issues, and a loop must not see its neighbours' rows. Tending is the one
+// pass whose safety question spans loops -- "is any agent, anywhere in this
+// project, already working this issue's branch?" -- and it cannot be answered
+// from the reserved name's own rows, which hold only the project's tends.
+//
+// It is a new QUERY, not a new column: dispatches is already keyed
+// (project_id, loop, repo, status), so dropping `loop` from the WHERE clause is
+// the whole of the change. The index leads with project_id, so this is the same
+// lookup with one fewer equality on the end of the prefix.
+func (s *Store) RunningDispatchesForRepo(repo string) ([]Dispatch, error) {
+	rows, err := s.db.Query(
+		`SELECT `+dispatchColumns+` FROM dispatches
+		 WHERE project_id = ? AND repo = ? AND status = ?`,
+		s.projectID, repo, StatusRunning)
+	if err != nil {
+		return nil, fmt.Errorf("query running dispatches for repo: %w", err)
+	}
+	return scanDispatches(rows)
+}
+
+// StoppedIssuesForRepo returns every issue an operator has stopped in this
+// project's repository, in ANY loop, mapped to the reason.
+//
+// The tend dispatcher's counterpart to the per-loop Stopped flag Decide reads.
+// `sessions kill` stops an issue in the loop that was working it, and the
+// operator meant "run no more agents at this issue" -- a tend is one of that
+// issue's agents, and it would otherwise force-push the branch of the session
+// they just killed, because the tend dispatcher keeps no issue state of its own
+// and its own scope is always clean.
+//
+// An issue stopped in more than one loop yields whichever reason SQLite returns
+// last; the reasons are advisory text in a skip line, and reporting one of two
+// true reasons is not a failure worth a second query to order.
+func (s *Store) StoppedIssuesForRepo(repo string) (map[int]string, error) {
+	rows, err := s.db.Query(
+		`SELECT number, stopped_reason FROM issues
+		 WHERE project_id = ? AND repo = ? AND stopped = 1`,
+		s.projectID, repo)
+	if err != nil {
+		return nil, fmt.Errorf("query stopped issues for repo: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[int]string{}
+	for rows.Next() {
+		var (
+			number int
+			reason sql.NullString
+		)
+		if err := rows.Scan(&number, &reason); err != nil {
+			return nil, fmt.Errorf("scan stopped issue: %w", err)
+		}
+		out[number] = reason.String
+	}
+	return out, rows.Err()
+}
+
 // LastTendAt returns the FINISH time of the most recent finished tend dispatch
 // for one pull request, and the zero time when it has never been tended.
 //

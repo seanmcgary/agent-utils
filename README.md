@@ -617,7 +617,14 @@ arms a tend sweep, which acts on pull requests the delivery never names.
 The third is a `push` delivery, which names no issue at all: its subject is a branch, and the
 only work it can start is that same sweep.
 
-Three things arm a **tend sweep** for the loop the project's `tend.loop` names:
+**Tending is its own dispatcher, not a loop's job.** A project that enables it in
+`.agent-utils/config.yaml` gets one more delivery target beside its loops, under the reserved name
+`tend`: its own agent, its own session per dispatch, its own worktrees. A delivery naming an issue
+reaches it exactly as it reaches a loop, which is how a `pull_request_review` is answered within
+seconds. Inspect it like a loop — `project loop status --name tend`, `project loop tick --name
+tend`, `project logs --name tend`, `sessions list --name tend`.
+
+Three things arm a **tend sweep**, which acts on pull requests no delivery named:
 
 - **A merge into `default_branch`.** GitHub sends a `pull_request` delivery with `merged: true`
   on the close action, and that merge is what makes every other open pull request stale while
@@ -626,10 +633,11 @@ Three things arm a **tend sweep** for the loop the project's `tend.loop` names:
   request, so no merge event — makes every open pull request stale the same way a merge does,
   and the daemon now subscribes to `push` deliveries to catch it.
 - **A periodic check**, on a timer independent of any delivery. It runs only while the
-  listener runs — a machine with no daemon gets none of the three triggers above, and cron's
-  full sweep (below) is its only safety net. Each pass reads the refs the loop's own fetch
-  already updated; when nothing is behind it makes no GitHub call at all, so it costs nothing
-  to leave running. See [`tend_interval`](#tend_interval) below for how often it fires.
+  listener runs — a machine with no daemon gets none of the three triggers above, and
+  `project loop tick --name tend` under cron is its only safety net. Each pass reads the refs the
+  dispatcher's own fetch already updated; when nothing is behind it makes no GitHub call at all,
+  so it costs nothing to leave running. See [`tend_interval`](#tend_interval) below for how often
+  it fires.
 
 Whichever trigger fires, the sweep tries a plain git rebase before it dispatches anything —
 see [Project settings](docs/configuration.md#project-settings-tend-and-epic) for what that

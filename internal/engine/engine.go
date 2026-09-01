@@ -4,7 +4,6 @@ package engine
 import (
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
@@ -25,21 +24,20 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	}
 
 	liveIssues := make(map[int]bool, len(st.Running))
-	liveTendPRs := make(map[int]bool, len(st.Running))
 	for _, d := range st.Running {
 		if d.Kind == store.KindTend {
-			liveTendPRs[d.PRNumber] = true
-			// A tend that inherited the issue's session HOLDS that session for
-			// as long as it runs, so it blocks the issue as well as its pull
-			// request. Two claude processes resuming one session id is the same
-			// hazard as two agents in one branch.
+			// A loop no longer dispatches tends at all, so a KindTend row under
+			// a loop's name can only be one written before tending became its
+			// own dispatcher, still draining. It blocks this loop's issue only
+			// if it actually HOLDS the issue's session -- which is what the old
+			// inheriting tend did, and what makes two claude processes resuming
+			// one identifier the same hazard as two agents in one branch. A
+			// tend carrying its own session shares nothing and blocks nothing,
+			// so this costs nothing once the old rows have drained.
 			//
-			// A tend no longer inherits -- tendDecisions leaves SessionID empty
-			// and dispatch mints a fresh one -- so this can only match a row
-			// written before that change. It stays because those rows are still
-			// live during an upgrade, and it compares identifiers rather than
-			// testing the kind so it costs nothing once they have drained: a
-			// tend carrying its own session shares nothing and blocks nothing.
+			// The project's live tends are not tracked here. The dispatcher
+			// that needs them reads every loop's rows, not one loop's; see
+			// engine.TendLiveness.
 			if s := st.Issues[d.Number]; s.SessionID != "" && s.SessionID == d.SessionID {
 				liveIssues[d.Number] = true
 			}
@@ -62,8 +60,8 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	decided := make(map[int]bool)
 	// skips records why each examined issue got no decision. Entries are
 	// removed at the end for every issue that turned out to have one, so an
-	// issue skipped by the trigger check and then picked up by tendDecisions
-	// does not carry a reason contradicting its own decision.
+	// issue skipped by one stage and then picked up by a later one does not
+	// carry a reason contradicting its own decision.
 	skips := make(map[int]string)
 	eligibleRetries := 0
 
@@ -76,10 +74,6 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			// A live dispatch is the guard against double dispatch. Labels are
 			// not, because the agent owns them and may not have flipped yet.
 			//
-			// Mark the issue decided so tendDecisions skips it too. An agent
-			// working the branch and a tend agent force-pushing it are the same
-			// hazard as two dispatches, and the agent flips its own labels
-			// asynchronously, so the review label can still be present here.
 			decided[iss.Number] = true
 			skips[iss.Number] = "a dispatch is already live for this issue"
 			continue
@@ -94,10 +88,11 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// flag, and if the retry path won here the loop would redispatch the
 		// very issue it was told to stop.
 		//
-		// decided MUST be set here. tendDecisions skips only decided issues
-		// (see tendDecisions), and a stopped issue awaiting review with a behind
-		// pull request would otherwise get a tend agent force-pushing the
-		// branch of the session the operator just killed.
+		// The tend dispatcher applies the SAME rule from its own side, reading
+		// every loop's stopped issues project-wide (engine.TendState.Stopped),
+		// because a stopped issue with a behind pull request would otherwise
+		// get a tend agent force-pushing the branch of the session the operator
+		// just killed.
 		if state.Stopped {
 			decided[iss.Number] = true
 			skips[iss.Number] = stoppedSkipReason(state.StoppedReason)
@@ -197,8 +192,6 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// deliberate: a configuration that failed its whole budget will fail
 		// the same way again, and a label edit on its own is not new evidence.
 		if !iss.HasLabel(cfg.Labels.Trigger) {
-			// Not final: tendDecisions may still act on this issue below, and
-			// it replaces this reason with its own when it does not.
 			skips[iss.Number] = "no trigger label is present"
 			continue
 		}
@@ -212,7 +205,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			})
 			continue
 		}
-		if resumable(cfg, store.KindStart, state, ov) {
+		if resumable(cfg, state, ov) {
 			decisions = append(decisions, Decision{
 				Kind:      KindResume,
 				Issue:     iss.Number,
@@ -235,7 +228,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			sessionID = ""
 			reason = fmt.Sprintf(
 				"starting a new session: the existing one was created by %s and this dispatch runs %s",
-				state.SessionHarness, EffectiveHarness(cfg, store.KindStart, ov))
+				state.SessionHarness, EffectiveHarness(cfg, ov))
 		}
 		decisions = append(decisions, Decision{
 			Kind:      KindStart,
@@ -281,10 +274,9 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	decisions = append(decisions, parks...)
 	decisions = append(decisions, stops...)
 
-	if cfg.TendsPRs() {
-		decisions = append(decisions, tendDecisions(cfg, issues, snap, st.LastTend, liveTendPRs, decided, skips)...)
-	}
-
+	// No tend decisions. A loop does not tend: tending is the project's own
+	// dispatcher, and DecideTend is what makes its decisions, from
+	// project-wide state this per-loop pass does not hold.
 	return finish(Plan{Decisions: decisions, Skips: skips})
 }
 
@@ -354,12 +346,7 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 	// reuse one ("Session ID <uuid> is already in use"), so passing the old id
 	// would make every retry fail in under a second and then park the issue with
 	// a comment blaming the platform.
-	// store.KindStart, because the only thing this kind selects is whether the
-	// tend: section applies, and a retry is never a tend. act maps
-	// KindRetryStart onto store.KindStart and KindRetryResume onto
-	// store.KindResume (see act's retry cases), so neither reaches
-	// store.KindTend and either would resolve the same harness here.
-	if resumable(cfg, store.KindStart, state, ov) {
+	if resumable(cfg, state, ov) {
 		return &Decision{
 			Kind:      KindRetryResume,
 			Issue:     number,
@@ -374,7 +361,7 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 	why := "the previous attempt never started one"
 	if state.SessionStarted && state.SessionID != "" {
 		why = fmt.Sprintf("the existing one was created by %s and this retry runs %s",
-			state.SessionHarness, EffectiveHarness(cfg, store.KindStart, ov))
+			state.SessionHarness, EffectiveHarness(cfg, ov))
 	}
 	return &Decision{
 		Kind:      KindRetryStart,
@@ -418,14 +405,14 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 // worse one than a single mis-resumed tend. MarkSessionStarted records the
 // resolved harness on every session from here on, so the exposure shrinks to
 // rows that predate that column and disappears as they age out.
-func resumable(cfg *config.Config, kind string, state store.IssueState, ov config.Overrides) bool {
+func resumable(cfg *config.Config, state store.IssueState, ov config.Overrides) bool {
 	if state.SessionID == "" || !state.SessionStarted {
 		return false
 	}
 	if state.SessionHarness == "" {
 		return true
 	}
-	return state.SessionHarness == EffectiveHarness(cfg, kind, ov)
+	return state.SessionHarness == EffectiveHarness(cfg, ov)
 }
 
 // configRetired reports whether the issue's accumulated retry failures still
@@ -456,7 +443,7 @@ func resumable(cfg *config.Config, kind string, state store.IssueState, ov confi
 // one vendor one way, and empty whenever resolution failed; either way the
 // provider comparison is skipped and the cap stands.
 func configRetired(cfg *config.Config, state store.IssueState, ov config.Overrides, provider string) string {
-	if h := EffectiveHarness(cfg, store.KindStart, ov); state.DispatchHarness != "" && state.DispatchHarness != h {
+	if h := EffectiveHarness(cfg, ov); state.DispatchHarness != "" && state.DispatchHarness != h {
 		return fmt.Sprintf(
 			"retiring the retry history: it belongs to %s and this dispatch runs %s",
 			state.DispatchHarness, h)
@@ -476,27 +463,23 @@ func configRetired(cfg *config.Config, state store.IssueState, ov config.Overrid
 
 // EffectiveHarness is the harness a dispatch will actually run under,
 // resolved in the same order runner.Effective resolves Settings.Harness: the
-// issue's label override when it carries one, then cfg.Tend.Harness when
-// kind is store.KindTend, then the loop's configured agent.harness, then the
-// claude default. ov is already parsed and validated by ParseOverrides, so
-// its Harness is either empty or a known harness name.
+// issue's label override when it carries one, then the configuration's
+// agent.harness, then the claude default. ov is already parsed and validated
+// by ParseOverrides, so its Harness is either empty or a known harness name.
 //
-// kind is a store.Kind* value, and only store.KindTend changes the answer. It
-// has to be a parameter rather than an assumption because a loop may run a
-// cheaper harness for tending than for the issue's own work, and this
-// function is what resumable compares a stored session's harness against: a
-// tend resolved as though it were a start would be handed a session id the
-// harness it actually runs has never seen.
+// There is no dispatch KIND here any more. It used to take one, because a loop
+// hosted the project's tends and could run them on a different harness from its
+// own -- so "which harness will actually run" depended on whether this dispatch
+// was a tend. The tend dispatcher has its own configuration now, whose
+// agent.harness IS the tend harness, so the answer depends only on the
+// configuration and the label.
 //
 // Exported because loopcmd stamps the same value on the issue row through
 // BeginDispatch. Two copies of "which harness will actually run" is how the
 // stamp and the comparison drift apart.
-func EffectiveHarness(cfg *config.Config, kind string, ov config.Overrides) string {
+func EffectiveHarness(cfg *config.Config, ov config.Overrides) string {
 	if ov.Harness != "" {
 		return ov.Harness
-	}
-	if kind == store.KindTend && cfg.Tend.Harness != "" {
-		return cfg.Tend.Harness
 	}
 	if cfg.Agent.Harness != "" {
 		return cfg.Agent.Harness
@@ -514,152 +497,4 @@ func stoppedSkipReason(reason string) string {
 		return "clear it with `agent-utils sessions resume`"
 	}
 	return fmt.Sprintf("%s; clear it with `agent-utils sessions resume`", reason)
-}
-
-// tendDecisions selects stale pull requests for issues awaiting review.
-//
-// It refines skips for the issues it examines and declines to act on. An issue
-// awaiting review reached this point via the trigger check, whose reason ("no
-// trigger label") is true but useless for a review issue: what the operator
-// needs is that the pull request is current, or already being tended, or not
-// linked at all.
-//
-// A tend decision carries no resolved Provider. It makes no retry decision and
-// can never retire a cap, and loopcmd skips BeginDispatch entirely for a tend,
-// so there is nothing for the value to reach.
-//
-// tendDecisions does NOT take engine.State: it takes lastTend, which State
-// also carries, pulled out as its own parameter because Decide already
-// unpacked State into issues, snap and liveTendPRs before this point --
-// passing the whole struct through would resurrect fields (Running, Force,
-// CooldownUntil) this function has no use for and no business reading.
-//
-// It no longer takes the loop's issue state at all. That parameter existed only
-// to find the session a tend would inherit, and a tend now starts its own; see
-// the session comment in the body for why.
-func tendDecisions(
-	cfg *config.Config,
-	issues []ghub.Issue,
-	snap Snapshot,
-	lastTend map[int]time.Time,
-	liveTendPRs map[int]bool,
-	decided map[int]bool,
-	skips map[int]string,
-) []Decision {
-	var out []Decision
-	for _, iss := range issues {
-		if iss.HasAnyLabel(cfg.Labels.Veto) {
-			continue
-		}
-		if decided[iss.Number] {
-			// The issue already has a decision this tick. Two agents in one
-			// branch is worse than a late rebase.
-			continue
-		}
-		if !iss.HasLabel(cfg.Tend.Label) {
-			// Not in the tendable state at all: the trigger check already said
-			// why this one produced nothing, and tending has nothing to add.
-			continue
-		}
-		pr, ok := LinkPR(iss.Number, snap.PRs)
-		if !ok {
-			skips[iss.Number] = "the issue carries the tend label and no trusted pull request is linked"
-			continue
-		}
-		// A DRAFT is not ready to be maintained. It is the author's working
-		// copy: nobody is blocked by it being behind, no reviewer is waiting on
-		// a reply, and force-pushing a rebase under someone still assembling
-		// the branch is the one thing tending must never do. The snapshot's
-		// pull requests are already filtered to OPEN by ListOpenPullRequests,
-		// so open-and-not-draft is the whole readiness test.
-		if pr.Draft {
-			skips[iss.Number] = "the linked pull request is still a draft"
-			continue
-		}
-		if liveTendPRs[pr.Number] {
-			skips[iss.Number] = "a tend dispatch is already live for the linked pull request"
-			continue
-		}
-		behind := snap.BehindBy[pr.Number] > 0
-		reviewPending := snap.ReviewedAt[pr.Number].After(lastTend[pr.Number])
-		if !behind && !reviewPending {
-			// Silence is correct only when BOTH questions came back no. Naming
-			// both in the skip reason is what lets an operator reading "nothing
-			// happened" tell which one is false, rather than assuming staleness
-			// was the only thing ever checked.
-			skips[iss.Number] = "the linked pull request is up to date with its base and carries no review activity since the last tend"
-			continue
-		}
-		// The issue's overrides still apply to a tend: a model: or harness:
-		// label on an issue is the operator saying "run THIS issue's agents
-		// like so", and a tend is one of that issue's agents.
-		//
-		// An override the loop cannot parse skips the tend rather than stopping
-		// the issue. A stale rebase is not the issue's own work, and the
-		// trigger path already stops an issue whose labels are invalid where
-		// that work would happen.
-		ov, ovErr := config.ParseOverrides(iss.Labels)
-		if ovErr != nil {
-			skips[iss.Number] = ovErr.Error()
-			continue
-		}
-		// A TEND GETS ITS OWN SESSION. It does not inherit the issue's, and
-		// leaving sessionID empty is what tells dispatch to mint a fresh one.
-		//
-		// It used to inherit, so that a rebase agent carried the context of the
-		// work it was rebasing rather than meeting the branch cold. Three things
-		// removed the reason:
-		//
-		//  1. A clean rebase no longer runs an agent at all -- it is done in Go.
-		//     What is left for the agent is a genuine conflict, or a reply to
-		//     review activity. Both are fully described by the branch, the
-		//     conflict hunks and the pull request thread; neither needs the
-		//     conversation that originally wrote the code.
-		//  2. Inheriting BLOCKED the issue. Two processes resuming one session
-		//     identifier is the same hazard as two agents in one branch, so a
-		//     live tend had to hold the issue's session and stop it dispatching
-		//     -- a real cost paid for context that was rarely read.
-		//  3. Tending is now a project-level policy with a declared host loop.
-		//     The host is not necessarily the loop that wrote the branch, so
-		//     "the issue's session" no longer names one obvious conversation to
-		//     inherit; keeping inheritance would have meant inventing a rule for
-		//     which loop's session to take, which would be wrong as often as
-		//     right once several loops have touched an issue.
-		//
-		// A fresh session per tend also keeps maintenance work out of the
-		// authoring session's context, which otherwise grows on every rebase for
-		// the life of the pull request.
-		//
-		// Continuity across REPEAT tends of the same pull request is what
-		// actually matters -- it is what the repeat-conflict backoff reasons
-		// about -- and that lives in the store, keyed by pull request, not in a
-		// resumed conversation.
-		sessionID := ""
-		// Both halves of the reason can hold at once -- a pull request can be
-		// behind AND carry unanswered review activity -- so both are named
-		// when true, keeping the existing "N commits behind" wording for the
-		// half that already had it.
-		var reasons []string
-		if behind {
-			reasons = append(reasons, fmt.Sprintf("%s is %d commits behind",
-				describeLink(iss.Number, pr), snap.BehindBy[pr.Number]))
-		}
-		if reviewPending {
-			reasons = append(reasons, fmt.Sprintf("%s carries review activity newer than the last tend",
-				describeLink(iss.Number, pr)))
-		}
-		reason := strings.Join(reasons, "; ")
-		out = append(out, Decision{
-			Kind:          KindTend,
-			Issue:         iss.Number,
-			PR:            pr.Number,
-			HeadRef:       pr.HeadRef,
-			BaseRef:       pr.BaseRef,
-			SessionID:     sessionID,
-			Reason:        reason,
-			Overrides:     ov,
-			ReviewPending: reviewPending,
-		})
-	}
-	return out
 }

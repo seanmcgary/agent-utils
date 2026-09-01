@@ -1,12 +1,14 @@
 package loopcmd
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
@@ -124,6 +126,49 @@ func summariseLoop(entry config.Entry, projectID string, snap *snapshot) LoopSum
 	sum.Live = snap.live[byRepo]
 	sum.Orphans = snap.orphans[byRepo]
 	return sum
+}
+
+// summariseTend is summariseLoop for the project's tend dispatcher.
+//
+// It is a separate function rather than a synthetic config.Entry fed to
+// summariseLoop, because that function's first act is config.Load(entry.Path)
+// and the dispatcher's "path" is the project DESCRIPTOR, which config.Load
+// would rightly refuse. config.LoadTend is the loader here.
+//
+// The second result is false for a project that does not tend, which is a
+// choice rather than a fault and must produce no row at all. A policy that IS
+// enabled but cannot produce a dispatcher does produce one, carrying the error,
+// for the reason a broken loop file does: a configuration that silently does
+// not appear is harder to debug than one that appears with its error.
+func summariseTend(p *Project, snap *snapshot) (LoopSummary, bool) {
+	sum := LoopSummary{Name: project.Reserved}
+
+	cfg, err := config.LoadTend(p.Dir)
+	if errors.Is(err, config.ErrNoTend) {
+		return LoopSummary{}, false
+	}
+	if err != nil {
+		sum.Err = err
+		return sum, true
+	}
+	sum.Repo = cfg.Repo
+
+	stateDir, err := cfg.ResolveStateDir(config.TendPath(p.Dir))
+	if err != nil {
+		sum.Err = err
+		return sum, true
+	}
+	sum.StateDir = stateDir
+
+	k := store.LoopKey{ProjectID: p.Config.ID, Loop: cfg.Name}
+	st := snap.loops[k]
+	sum.Ticks = st.Ticks
+	sum.LastTick = st.LastTick
+	sum.Cost = st.CostByRepo[cfg.Repo]
+	byRepo := loopRepo{LoopKey: k, Repo: cfg.Repo}
+	sum.Live = snap.live[byRepo]
+	sum.Orphans = snap.orphans[byRepo]
+	return sum, true
 }
 
 // RenderProjects formats the project summaries for a terminal.

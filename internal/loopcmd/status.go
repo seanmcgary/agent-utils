@@ -112,13 +112,11 @@ func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) 
 			state = "queued"
 		case iss.HasLabel(cfg.Labels.Blocked):
 			state = "blocked"
-		case cfg.TendsPRs() && iss.HasLabel(cfg.Tend.Label):
-			// Not a state of the LOOP -- the issue has left it -- but this loop
-			// is the one that tends the pull request sitting there, so it is
-			// the one place an operator can see the queue it is maintaining.
-			// Only the host loop shows it; on any other loop the issue is gone
-			// and listing it would claim work this loop is not doing.
-			state = "tending"
+		// There is no "tending" row here any more. A loop does not tend, so an
+		// issue sitting at the project's tend label has left every loop's
+		// states and listing it here would claim work this loop is not doing.
+		// `agent-utils project loop status --name tend` is where that queue is
+		// reported now; see TendStatus.
 		default:
 			continue
 		}

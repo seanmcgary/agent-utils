@@ -235,8 +235,10 @@ func rebaseCheckout(t *testing.T, root string) string {
 	return checkout
 }
 
-// rebaseConfig is a loop that tends in a per-issue worktree, which is the only
-// mode the automatic rebase runs in.
+// rebaseConfig is the TEND DISPATCHER, in a per-issue worktree, which is the
+// only mode the automatic rebase runs in. Its name is the reserved one, its
+// prompt is the project's tend prompt, and it carries the policy directly --
+// which is what config.LoadTend produces.
 func rebaseConfig(t *testing.T) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
@@ -244,9 +246,9 @@ func rebaseConfig(t *testing.T) *config.Config {
 		Name:          rebaseLoop,
 		Repo:          "o/r",
 		DefaultBranch: "master",
-		TendPrompt:    "rebase #{{.Issue.Number}}",
 		Tend: project.Tend{
-			Enabled: true, Loop: rebaseLoop, Label: "status:review",
+			Enabled: true, Label: "status:review",
+			Model: "sonnet", Prompt: "rebase #{{.Issue.Number}}",
 		},
 		CheckoutBaseDir: rebaseCheckout(t, dir),
 		WorktreeDir:     filepath.Join(dir, "wt"),

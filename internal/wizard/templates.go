@@ -33,7 +33,6 @@ type Template struct {
 	Labels       config.Labels
 	Prompt       string
 	ResumePrompt string
-	TendPrompt   string
 }
 
 // Templates returns every embedded template, in the order the wizard offers
@@ -79,7 +78,6 @@ func TemplateNamed(name string) (Template, bool) {
 		Labels:       cfg.Labels,
 		Prompt:       cfg.Prompt,
 		ResumePrompt: cfg.ResumePrompt,
-		TendPrompt:   cfg.TendPrompt,
 	}, true
 }
 

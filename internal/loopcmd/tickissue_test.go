@@ -305,9 +305,8 @@ func TestTickIssueDoesNotWarnAboutTheBreakerWithoutARetry(t *testing.T) {
 
 // Tending from a delivery costs one pull request fetch and one comparison, not
 // a listing of every open pull request in the repository.
-func TestTickIssueTendsFromASinglePullRequestFetch(t *testing.T) {
-	cfg := tickConfig(t)
-	cfg.Tend.Enabled = true
+func TestTendIssueTendsFromASinglePullRequestFetch(t *testing.T) {
+	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{
 			{Number: 51, Labels: []string{"review"}},
@@ -325,9 +324,9 @@ func TestTickIssueTendsFromASinglePullRequestFetch(t *testing.T) {
 	deps := newDeps(t, cfg, gh, &spawned)
 
 	// The delivery names the pull request, as a pull_request event does.
-	sum, err := TickIssue(context.Background(), cfg, deps, 108)
+	sum, err := TendIssue(context.Background(), cfg, deps, 108)
 	if err != nil {
-		t.Fatalf("TickIssue: %v", err)
+		t.Fatalf("TendIssue: %v", err)
 	}
 	if sum.Tended != 1 {
 		t.Fatalf("Tended = %d, want 1", sum.Tended)
@@ -342,12 +341,11 @@ func TestTickIssueTendsFromASinglePullRequestFetch(t *testing.T) {
 }
 
 // An issues event on a review-labelled issue has no pull request number in it,
-// so the scoped tick uses the link a previous tick stored. This is what keeps
+// so the scoped pass uses the link a previous pass stored. This is what keeps
 // "the human commented on the issue" able to tend, without listing every open
 // pull request.
-func TestTickIssueTendsThroughTheStoredPullRequestLink(t *testing.T) {
-	cfg := tickConfig(t)
-	cfg.Tend.Enabled = true
+func TestTendIssueTendsThroughTheStoredPullRequestLink(t *testing.T) {
+	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{{
@@ -362,9 +360,9 @@ func TestTickIssueTendsThroughTheStoredPullRequestLink(t *testing.T) {
 		PRNumber: 108, HeadRef: "feat/51", BaseRef: "master",
 	})
 
-	sum, err := TickIssue(context.Background(), cfg, deps, 51)
+	sum, err := TendIssue(context.Background(), cfg, deps, 51)
 	if err != nil {
-		t.Fatalf("TickIssue: %v", err)
+		t.Fatalf("TendIssue: %v", err)
 	}
 	if sum.Tended != 1 {
 		t.Fatalf("Tended = %d, want 1", sum.Tended)
@@ -380,9 +378,8 @@ func TestTickIssueTendsThroughTheStoredPullRequestLink(t *testing.T) {
 // Trust is re-decided on the fetched pull request, not inherited from the
 // stored link. Tending checks the head branch out and runs an agent in it, so
 // a pull request whose head has since moved to a fork must stop being tended.
-func TestTickIssueDoesNotTendAnUntrustedPullRequest(t *testing.T) {
-	cfg := tickConfig(t)
-	cfg.Tend.Enabled = true
+func TestTendIssueDoesNotTendAnUntrustedPullRequest(t *testing.T) {
+	cfg := sweepConfig(t)
 	gh := &fakeGH{
 		issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 		prs: []ghub.PullRequest{{
@@ -394,9 +391,9 @@ func TestTickIssueDoesNotTendAnUntrustedPullRequest(t *testing.T) {
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
 
-	sum, err := TickIssue(context.Background(), cfg, deps, 108)
+	sum, err := TendIssue(context.Background(), cfg, deps, 108)
 	if err != nil {
-		t.Fatalf("TickIssue: %v", err)
+		t.Fatalf("TendIssue: %v", err)
 	}
 	if sum.Tended != 0 || spawned != 0 {
 		t.Fatalf("Tended = %d, spawned = %d, want 0 and 0 for an untrusted head", sum.Tended, spawned)
@@ -535,9 +532,13 @@ func TestOneDeliveryResolvesAPullRequestToItsIssueOnce(t *testing.T) {
 
 // Trust is still decided per the existing path when the fetch is shared.
 // Tending checks the head branch out and runs an agent inside it, so the
-// Trusted flag convertPR set at the API boundary is what every loop of the
-// delivery must read -- neither dropped by the sharing nor recomputed beside
-// it.
+// Trusted flag convertPR set at the API boundary is what every dispatcher of
+// the delivery must read -- neither dropped by the sharing nor recomputed
+// beside it.
+//
+// The two dispatchers here are two separate PROJECTS watching one repository,
+// which is why both carry the reserved name: within one project there is
+// exactly one.
 func TestASharedFetchStillDecidesTrustForATend(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -548,14 +549,7 @@ func TestASharedFetchStillDecidesTrustForATend(t *testing.T) {
 		{"fork head", false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			planning := tickConfig(t)
-			planning.Tend.Enabled = true
-			execution := secondLoopConfig(t, "execution")
-			execution.Tend.Enabled = true
-			// Each loop's own project would name it as the tend host; these
-			// two are separate projects watching one repository, which is the
-			// case this test is about.
-			execution.Tend.Loop = execution.Name
+			first, second := sweepConfig(t), sweepConfig(t)
 			gh := &fakeGH{
 				issues: []ghub.Issue{{Number: 51, Labels: []string{"review"}}},
 				prs: []ghub.PullRequest{{
@@ -567,11 +561,11 @@ func TestASharedFetchStillDecidesTrustForATend(t *testing.T) {
 			shared := ghub.NewDeliveryCache(gh)
 
 			spawned, tended := 0, 0
-			for _, cfg := range []*config.Config{planning, execution} {
+			for _, cfg := range []*config.Config{first, second} {
 				deps := newDeps(t, cfg, shared, &spawned)
-				sum, err := TickIssue(context.Background(), cfg, deps, 108)
+				sum, err := TendIssue(context.Background(), cfg, deps, 108)
 				if err != nil {
-					t.Fatalf("TickIssue(%s): %v", cfg.Name, err)
+					t.Fatalf("TendIssue: %v", err)
 				}
 				tended += sum.Tended
 			}

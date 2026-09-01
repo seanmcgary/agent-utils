@@ -3,9 +3,11 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/runner"
 )
 
@@ -51,7 +53,6 @@ func TestExampleConfigsLoadAndRender(t *testing.T) {
 			for label, tmpl := range map[string]string{
 				"prompt":        cfg.Prompt,
 				"resume_prompt": cfg.ResumePrompt,
-				"tend_prompt":   cfg.TendPrompt,
 			} {
 				if tmpl == "" {
 					continue
@@ -162,15 +163,19 @@ func TestPiExampleIsPiHarness(t *testing.T) {
 	}
 }
 
-// No example loop configures tending, because no loop file can any more. The
-// policy is the project descriptor's, and this test exists to catch a
-// reintroduction: examples/ has no descriptor beside it, so every example loads
-// with the zero policy and TendsPRs must be false for all of them.
+// No example loop mentions tending, because no loop file can any more.
+//
+// The policy AND the prompt are the project descriptor's, and this test exists
+// to catch a reintroduction of either. It reads the raw bytes rather than the
+// loaded configuration, because that is the only way to see the two things
+// worth catching: a `tend:` or `tend_prompt:` key would now be REJECTED by the
+// strict decoder, so a test that loaded the file would report a load failure
+// and say nothing about why.
 //
 // It matters most for planning. plan-feature's design draft pull request says
-// "Closes #N", so a planning loop that tended would force-push a draft the human
-// is reading.
-func TestNoExampleLoopTends(t *testing.T) {
+// "Closes #N", so a planning loop that tended would force-push a draft the
+// human is reading.
+func TestNoExampleLoopFileMentionsTending(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join("..", "..", "examples"))
 	if err != nil {
 		t.Fatalf("read examples: %v", err)
@@ -179,13 +184,51 @@ func TestNoExampleLoopTends(t *testing.T) {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
 			continue
 		}
-		cfg, err := config.Load(filepath.Join("..", "..", "examples", e.Name()))
+		raw, err := os.ReadFile(filepath.Join("..", "..", "examples", e.Name()))
 		if err != nil {
-			t.Fatalf("load %s: %v", e.Name(), err)
+			t.Fatalf("read %s: %v", e.Name(), err)
 		}
-		if cfg.TendsPRs() {
-			t.Errorf("%s: TendsPRs = true, want false: tending is the project's policy, not a loop's", e.Name())
+		for _, key := range []string{"\ntend:", "\ntend_prompt:", "\ntend_pr:"} {
+			if strings.Contains(string(raw), key) {
+				t.Errorf("%s declares %q: tending is the project's dispatcher, not a loop's",
+					e.Name(), strings.TrimPrefix(key, "\n"))
+			}
 		}
+	}
+}
+
+// The example project descriptor is the one place the tend policy lives, and
+// it must load. It is under examples/project/ rather than beside the loop files
+// because everything in examples/ is loaded AS a loop configuration by the
+// tests above, and this is not one.
+func TestExampleProjectDescriptorLoads(t *testing.T) {
+	dir := filepath.Join("..", "..", "examples", "project")
+	pc, err := project.Load(dir)
+	if err != nil {
+		t.Fatalf("project.Load: %v", err)
+	}
+	if !pc.Tend.Enabled {
+		t.Fatal("the example descriptor must demonstrate tending switched on")
+	}
+	// The prompt renders, with the context a TEND gets: no loop labels, and
+	// the eligibility label under .Tend. A prompt that only renders with
+	// .Labels populated is exactly what project.Load refuses, and this is the
+	// positive half of that check.
+	out, err := runner.RenderPrompt(pc.Tend.Prompt, runner.PromptData{
+		Repo:      "owner/repo",
+		SessionID: "sess",
+		Worktree:  "/tmp/wt",
+		Issue:     runner.PromptIssue{Number: 12, Title: "a title"},
+		PR: runner.PromptPR{
+			Number: 34, HeadRef: "feat/x", BaseRef: "master", BehindBy: 3,
+		},
+		Tend: runner.PromptTend{Label: pc.Tend.Label},
+	})
+	if err != nil {
+		t.Fatalf("render tend.prompt: %v", err)
+	}
+	if !strings.Contains(out, pc.Tend.Label) {
+		t.Errorf("rendered tend prompt does not name the eligibility label %q", pc.Tend.Label)
 	}
 }
 

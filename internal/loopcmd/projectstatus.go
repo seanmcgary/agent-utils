@@ -63,6 +63,20 @@ func Describe(p *Project) (*ProjectDetail, error) {
 	for _, e := range entries {
 		d.Loops = append(d.Loops, summariseLoop(e, p.Config.ID, snap))
 	}
+	// The TEND DISPATCHER is a row in this table too, and it has to be. It
+	// dispatches agents, holds sessions and spends money exactly as a loop
+	// does; a project status that listed only the loop files would report a
+	// project as idle while its tending ran. It is appended to Loops but NOT
+	// to Entries: Entries is the list of loop FILES, which is what the
+	// duplicate-name check and the webhook summary below reason about, and the
+	// dispatcher has no file.
+	//
+	// A project that does not tend, or whose policy cannot produce a
+	// dispatcher, contributes no row: summariseTend reports the failure in the
+	// row's Err, and the "not enabled" case is not a failure to report.
+	if l, ok := summariseTend(p, snap); ok {
+		d.Loops = append(d.Loops, l)
+	}
 	d.Webhooks, err = summariseWebhooks(db.Project(p.Config.ID), entries)
 	if err != nil {
 		return nil, err
