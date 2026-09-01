@@ -293,6 +293,40 @@ func TestEffectiveFallsBackToAgentModelWhenTendModelIsEmpty(t *testing.T) {
 	if s.Model != "opus" {
 		t.Errorf("Model = %q, want the configured agent.model %q", s.Model, "opus")
 	}
+	// The harness this loop DID set must still have been overlaid. Asserting
+	// only the fallback would pass just as well if the overlay never ran at
+	// all, which is the mutation this line exists to catch.
+	if s.Harness != config.HarnessPi {
+		t.Errorf("Harness = %q, want tend.harness %q", s.Harness, config.HarnessPi)
+	}
+}
+
+// The tend: overlay covers harness and effort, not only model. Each field is
+// asserted separately because each is its own branch in Effective: a suite
+// that checked only Model stayed green with the harness and effort branches
+// deleted, which would ship a claude binary and claude argv for a
+// "tend.harness: pi" tend and fail nowhere.
+func TestEffectiveOverlaysTendHarnessAndEffortForKindTend(t *testing.T) {
+	c := cfg()
+	c.Agent.Harness, c.Agent.Effort = config.HarnessClaude, "high"
+	c.Tend = config.TendAgent{Harness: config.HarnessPi, Effort: "low"}
+
+	s := Effective(c, store.KindTend, config.Overrides{})
+	if s.Harness != config.HarnessPi {
+		t.Errorf("Harness = %q, want tend.harness %q", s.Harness, config.HarnessPi)
+	}
+	if s.Effort != "low" {
+		t.Errorf("Effort = %q, want tend.effort %q", s.Effort, "low")
+	}
+
+	// The same config under a non-tend kind must read agent: for both.
+	s = Effective(c, store.KindStart, config.Overrides{})
+	if s.Harness != config.HarnessClaude {
+		t.Errorf("Harness = %q, want agent.harness %q for KindStart", s.Harness, config.HarnessClaude)
+	}
+	if s.Effort != "high" {
+		t.Errorf("Effort = %q, want agent.effort %q for KindStart", s.Effort, "high")
+	}
 }
 
 // KindStart ignores tend: entirely, even though the config carries one: a

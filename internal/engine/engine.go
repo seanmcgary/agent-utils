@@ -404,6 +404,16 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 // harnesses generally. A tend inheriting the issue's session while running a
 // cheaper tend.harness is exactly that case, reached through the new
 // configuration layer instead of a harness: label.
+//
+// The unknown-harness carve-out above is NOT closed by kind, and that is a
+// deliberate limit rather than an oversight. A row written before
+// session_harness existed reports "", so a tend running a differing
+// tend.harness still resumes it. Closing it would mean guessing that an
+// unknown harness differs from this one, which restarts every in-flight
+// session on upgrade -- the failure the carve-out exists to prevent, and a
+// worse one than a single mis-resumed tend. MarkSessionStarted records the
+// resolved harness on every session from here on, so the exposure shrinks to
+// rows that predate that column and disappears as they age out.
 func resumable(cfg *config.Config, kind string, state store.IssueState, ov config.Overrides) bool {
 	if state.SessionID == "" || !state.SessionStarted {
 		return false

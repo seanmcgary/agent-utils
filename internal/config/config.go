@@ -317,6 +317,7 @@ func (c *Config) validate() error {
 	// means "use agent.model," and requiring every tending loop to repeat a
 	// model it already set on agent: would defeat the point of a section
 	// whose only job is to let a FEW fields diverge.
+
 	// 0 is legitimate and documented: it means no cost ceiling, and
 	// internal/runner/args.go omits --max-budget-usd for it. A NEGATIVE value
 	// hits that same "> 0" gate, so it is silently identical to no cap -- an
