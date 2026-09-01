@@ -269,9 +269,13 @@ activity is pending. Its skip reason, when it produces neither, becomes "the lin
 is up to date with its base and carries no review activity since the last tend".
 
 `ReviewPending` also has to reach the DETACHED runner, which never sees the tick's snapshot. It
-travels the way `BehindBy` already does: a `review_pending` column on `pr_links`, written by the
-deciding pass and rendered into the prompt as `{{.PR.ReviewPending}}`. Without that the feature
-buys nothing. The shipped `tend_prompt` is a pure rebase instruction, so a `ReviewPending` dispatch
+travels on the DISPATCH row, the way `Model`, `Harness`, and `Effort` already do, and is rendered
+into the prompt as `{{.PR.ReviewPending}}`. A `pr_links` column was considered and rejected: every
+`PutPRLink` call site runs before `engine.Decide`, so none of them could set the flag, and
+`PutPRLink`'s upsert rewrites every column — so the tend sweep, which deliberately reads no review
+activity, would overwrite a set flag with a zero before the runner read it. The dispatch row is
+written once, from the decision, by the code that made it. Without this transport the feature buys
+nothing. The shipped `tend_prompt` is a pure rebase instruction, so a `ReviewPending` dispatch
 on a current pull request would render "It is 0 commits behind" and tell the agent to rebase and
 stop. The example and wizard prompts branch on the new variable; an operator's existing prompt
 keeps working unchanged and keeps rebasing only.
@@ -388,7 +392,9 @@ every other externally-influenced string on this path is bounded before it is lo
 **One exception: `ReviewPending` wins over the backoff.** The backoff's evidence is a repeated
 rebase conflict, and that says nothing about whether a reviewer's comment has been answered.
 Letting an unrelated conflict silence a reviewer for 24 hours is not a trade this change makes, so
-a `ReviewPending` decision dispatches the agent even when the rebase backed off.
+a review-pending decision is never backed off. The check belongs inside the backoff, not after it:
+that pass really does dispatch an agent at this fingerprint, so it must advance the count like any
+other, or a stuck conflict with a talkative reviewer would be bounded by nothing.
 
 **The gate fails OPEN.** An unreadable conflict row, or an unreadable conflicted-path list,
 dispatches the agent. A gate that declines to spend money must never be able to strand a pull

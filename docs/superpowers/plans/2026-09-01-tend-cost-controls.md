@@ -143,8 +143,8 @@ the current tree.
 - `loopcmd.Session.LastKind` — `internal/loopcmd/sessions.go:53`, set at `:539` from the newest
   dispatch of the session.
 - `ghub.DeliveryCache` (`internal/ghub/deliverycache.go`) is a PRODUCTION implementation of
-  `ghub.Client` that forwards every method by hand. `BehindBy` is passed through (`:134`);
-  `PullRequest` is memoised (`:126-136`). The daemon passes it to `loopcmd`
+  `ghub.Client` that forwards every method by hand. `BehindBy` is passed through (`:130-136`);
+  `PullRequest` is memoised (`:100-115`). The daemon passes it to `loopcmd`
   (`internal/listener/work.go:210,353`).
 - Test fixtures to reuse rather than reinvent: `initRepo`
   (`internal/worktree/worktree_test.go:39`) and `initRepoWithOrigin` (`:45`); `openTemp`
@@ -196,8 +196,10 @@ it will fail until Task 10 lands — that is expected; do not work around it.
 **review: no**
 
 - [ ] Change the signature to `Effective(cfg *config.Config, kind string, ov config.Overrides)
-  Settings`. `kind` is a `store.Kind*` value. `internal/runner` already imports `internal/store`
-  (`runner.go:22`), and `kind` is a plain string, so `args.go` needs no new import.
+  Settings`. `kind` is a `store.Kind*` value. Add `internal/store` to `args.go`'s OWN import
+  block. Go imports are per file, and `args.go` imports only `bytes`, `fmt`, `strconv`,
+  `text/template`, and `internal/config` today (`args.go:1-11`); the import at `runner.go:22`
+  does not reach it.
 
 - [ ] Build the base settings from `cfg.Agent`, then overlay each non-empty `cfg.Tend` field when
   `kind == store.KindTend`, then overlay the validated label overrides exactly as today. Do not
@@ -315,7 +317,7 @@ a `harness:` label on the issue still beats `tend.harness`.
 - [ ] Add both methods to `ghub.DeliveryCache` (`internal/ghub/deliverycache.go`). It is a
   PRODUCTION implementation, not a test fake, and the daemon build breaks without it
   (`internal/listener/work.go:210,353`). MEMOISE both, the way `PullRequest` is memoised at
-  `deliverycache.go:126-136` and unlike `BehindBy`'s pass-through at `:134`: several loops of
+  `deliverycache.go:100-115` and unlike `BehindBy`'s pass-through at `:130-136`: several loops of
   several projects answer one delivery, the answer is the same instant for all of them, and the
   cache's lifetime is one delivery. State that reasoning in the comment, as
   `deliverycache.go:14-48` requires.
@@ -382,9 +384,15 @@ failed but finished `tend` row IS returned; another project's row is invisible t
   keyed by PULL REQUEST number, not issue number, because review activity and a tend dispatch are
   both facts about a pull request.
 
+- [ ] Give `tendDecisions` the new map. It does NOT receive `engine.State`; it takes
+  `states map[int]store.IssueState` and its one caller (`engine.go:266`) passes `st.Issues`
+  (`engine.go:405-413`). Add a `lastTend map[int]time.Time` parameter beside `states` and pass
+  `st.LastTend` at the call site. Without this the new field on `State` is not reachable from the
+  function that reads it, and the package does not compile.
+
 - [ ] In `tendDecisions`, replace the `snap.BehindBy[pr.Number] <= 0` skip (`engine.go:438`) with a
   two-reason gate. Produce a decision when the pull request is behind, or when
-  `snap.ReviewedAt[pr.Number].After(st.LastTend[pr.Number])`. Set `ReviewPending` when the second
+  `snap.ReviewedAt[pr.Number].After(lastTend[pr.Number])`. Set `ReviewPending` when the second
   holds. Extend `Decision.Reason` so the log says which reason fired; keep the existing
   "N commits behind" wording for the first.
 
@@ -422,18 +430,28 @@ failed but finished `tend` row IS returned; another project's row is invisible t
   with the entry unset, matching how a failed `BehindBy` behaves there (`tickissue.go:83-87`); in
   `tick.go` do the same.
 
-- [ ] Carry `ReviewPending` to the detached runner, which never sees the tick's snapshot. Add
-  `review_pending INTEGER NOT NULL DEFAULT 0` to `pr_links` in `schemaTables`, add the
-  `{"pr_links", "review_pending", "INTEGER NOT NULL DEFAULT 0"}` entry to `addedColumns`
-  (`internal/store/store.go:365`), add `ReviewPending bool` to `store.PRLink`, and read and write
-  it in `PRLinks` and `PutPRLink`. This is the same transport `BehindBy` already uses, and the
-  same reason: `runner.RunAgent` renders the prompt from the `pr_links` row
-  (`internal/loopcmd/tick.go:753-762`).
+- [ ] Carry `ReviewPending` to the detached runner, which never sees the tick's snapshot, on the
+  DISPATCH row — not on `pr_links`. Add `review_pending INTEGER NOT NULL DEFAULT 0` to
+  `dispatches` in `schemaTables`, add `{"dispatches", "review_pending", "INTEGER NOT NULL DEFAULT
+  0"}` to `addedColumns` (`internal/store/store.go:365`), add `ReviewPending bool` to
+  `store.Dispatch`, and set it in `loopcmd.dispatch` from `d.ReviewPending` beside `Model`,
+  `Harness`, and `Effort` (`internal/loopcmd/tick.go:562-571`).
 
-- [ ] Add `ReviewPending bool` to `runner.PromptPR` and render it from the link row, so a
-  `tend_prompt` can branch on it. Without this the feature buys nothing: the shipped tend prompt is
-  a pure rebase instruction, and a `ReviewPending` dispatch on a current pull request would render
-  "It is 0 commits behind" and tell the agent to rebase and stop.
+  `pr_links` was considered and REJECTED for two concrete failures. First, no `PutPRLink` call
+  site could set it: all three run BEFORE `engine.Decide`, so no `Decision.ReviewPending` exists
+  yet at any of them (`tickissue.go:91`, `tick.go:206`, `tendsweep.go:189`). Second, `PutPRLink`
+  is an upsert whose `DO UPDATE SET` writes every column (`store.go:1168-1180`), and the tend
+  sweep deliberately does not read review activity — so a sweep armed by any merge would
+  overwrite a `1` with a `0` in the window between the decision and the detached runner reading
+  the row, and the agent would silently take the pure-rebase branch. The dispatch row has neither
+  problem: it is written once, from the decision, by the code that made the decision, which is
+  exactly how `Model`, `Harness`, and `Effort` already travel.
+
+- [ ] Add `ReviewPending bool` to `runner.PromptPR` and render it from the DISPATCH row
+  (`d.ReviewPending`) where `RunAgent` builds `PromptData` (`internal/loopcmd/tick.go:748-762`),
+  beside `BehindBy`, which comes from the link row. Without this the feature buys nothing: the
+  shipped tend prompt is a pure rebase instruction, and a `ReviewPending` dispatch on a current
+  pull request would render "It is 0 commits behind" and tell the agent to rebase and stop.
 
 - [ ] In `loopcmd.act`, make `doneRebased` fall through to the dispatch when `d.ReviewPending` is
   set. Count the rebase first, so the summary still reports it. Leave `doneNoRebase` returning
@@ -446,8 +464,9 @@ a `KindTend` decision with `ReviewPending` true; the same pull request with the 
 than the activity produces no decision and the new skip reason; a behind pull request with no
 review activity produces a decision with `ReviewPending` false; a failed review read leaves the
 decision on staleness alone and dispatches nothing for a current pull request; a clean rebase on a
-`ReviewPending` decision counts the rebase AND dispatches the agent; `PutPRLink`/`PRLinks`
-round-trip `ReviewPending`; a `tend_prompt` containing `{{.PR.ReviewPending}}` renders.
+`ReviewPending` decision counts the rebase AND dispatches the agent; `CreateDispatch` and the
+dispatch reads round-trip `ReviewPending`; a `tend_prompt` containing `{{.PR.ReviewPending}}`
+renders true for a review-pending dispatch and false otherwise.
 
 ## Task 7 — read the conflicted paths from git
 
@@ -560,8 +579,16 @@ deletes it on both cleanup paths.
 
   Clamp the index to the last entry.
 
-- [ ] Extend `RebaseGit` with `ConflictedPaths(ctx context.Context, path string) ([]string, error)`.
-  It is an interface so a test can drive this branch without a remote; keep that property.
+- [ ] Extend `RebaseGit` with `ConflictedPaths(ctx context.Context, path string) ([]string, error)`
+  — the same signature `worktree.Manager` gets in Task 7. It is an interface so a test can drive
+  this branch without a remote; keep that property.
+
+- [ ] Change `gitRebase`'s signature to take the clock:
+  `gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision, now
+  time.Time)`. `act` already holds a `now` (`internal/loopcmd/tick.go:452-457`) and passes it to
+  `dispatch` and `reapDead`; pass the same value here so one pass reads one clock. Do NOT reach
+  for `deps.Now()` inside `gitRebase` — a test that pins the tick's clock would then see two
+  different times in one pass.
 
 - [ ] In `gitRebase`, on the conflict branch, in this exact order:
 
@@ -577,12 +604,20 @@ deletes it on both cleanup paths.
   3. Compute the fingerprint. Read the stored row with `deps.Store.TendConflict`. If that read
      failed, log and fall through to `notDone` — a gate that declines to spend money must fail OPEN
      on unreadable state, or an unreadable row would strand the pull request.
-  4. If a row exists, its fingerprint matches, and `now` is before its `retry_after`: return
-     `doneBackedOff` WITHOUT writing anything. Do not advance `seen_count` and do not move
-     `retry_after`. A sweep is armed by every merge and every push, so a write here would push the
-     deadline forward more often than it arrives and the agent would never be dispatched again;
-     `seen_count` is a count of agent dispatches that failed at this conflict, not of passes that
-     saw it.
+  4. If a row exists, its fingerprint matches, `now` is before its `retry_after`, AND the
+     decision does NOT carry `ReviewPending`: return `doneBackedOff` WITHOUT writing anything. Do
+     not advance `seen_count` and do not move `retry_after`. A sweep is armed by every merge and
+     every push, so a write here would push the deadline forward more often than it arrives and
+     the agent would never be dispatched again; `seen_count` is a count of agent dispatches that
+     failed at this conflict, not of passes that saw it.
+
+     `d.ReviewPending` is checked HERE rather than in `act` so the count stays honest. The backoff
+     is evidence about a repeated rebase conflict and says nothing about whether a reviewer's
+     comment has been answered, so a review-pending decision must still reach the agent — and
+     because it does, that pass IS an agent dispatch at this fingerprint and must advance the
+     count like any other. Letting `act` override the outcome instead would dispatch the agent
+     without ever advancing `seen_count`, so a stuck conflict with a talkative reviewer would be
+     bounded by nothing.
   5. Otherwise the agent is about to be dispatched. Compute the new count — `1` when no row exists
      or the fingerprint changed, else `seen_count + 1` — and write the row with
      `retry_after = now + conflictBackoff[min(count, len)-1]`. A failed write is logged, not
@@ -604,11 +639,10 @@ deletes it on both cleanup paths.
   not return it: the rebase HAPPENED, and reporting it as undone would send an agent at an
   already-current branch.
 
-- [ ] Handle `doneBackedOff` in `loopcmd.act`. It dispatches no agent, EXCEPT when
-  `d.ReviewPending` is set, in which case it falls through to the dispatch exactly as `doneRebased`
-  does. The backoff's evidence is a repeated rebase conflict; that says nothing about whether a
-  reviewer's comment has been answered, and letting an unrelated conflict silence a reviewer for
-  24 hours is not a trade this change is making. Say that in the comment.
+- [ ] Handle `doneBackedOff` in `loopcmd.act`: return with no agent and no dispatch count, like
+  `doneNoRebase`. No `ReviewPending` special case belongs here — `gitRebase` already declined to
+  back off such a decision, so a `doneBackedOff` reaching `act` is always one with no feedback to
+  answer. Say that, so a later reader does not add the case back and double-dispatch.
 
 - [ ] Add `Backoff int \`json:"backoff"\`` to `loopcmd.Summary` (`tick.go:124`) — every field there
   carries an explicit snake_case tag because `Summary` is marshalled into `ticks.summary_json` —
@@ -622,8 +656,8 @@ fingerprint within the window returns `doneBackedOff`, dispatches nothing, and l
 `seen_count` and `retry_after` UNCHANGED; the same fingerprint after `retry_after` dispatches and
 writes `seen_count = 2` with a six-hour deadline; a moved head produces a new fingerprint and
 writes `seen_count = 1`; a clean rebase deletes the row; a rebase failure with no conflicted paths
-dispatches; an unreadable conflict row dispatches; a `ReviewPending` decision dispatches even when
-backed off.
+dispatches; an unreadable conflict row dispatches; a `ReviewPending` decision inside the backoff
+window dispatches AND advances `seen_count`.
 
 ## Task 10 — documentation
 
