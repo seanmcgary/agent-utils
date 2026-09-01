@@ -1456,3 +1456,92 @@ func TestSameHarnessStillParksAtTheCap(t *testing.T) {
 		t.Fatalf("kinds = %v, want [%v]", got, KindParkRetryExhausted)
 	}
 }
+
+// A current pull request with review activity newer than the last tend must
+// still produce a KindTend decision, and ReviewPending must be true: this is
+// the whole point of the second trigger -- a pull request that needs no
+// rebase can still need an agent to answer feedback.
+func TestReviewActivityNewerThanLastTendProducesAReviewPendingTend(t *testing.T) {
+	cfg := testConfig()
+	now := time.Now()
+	snap := Snapshot{
+		Issues:     []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:        []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy:   map[int]int{20: 0},
+		ReviewedAt: map[int]time.Time{20: now},
+	}
+	st := State{
+		Issues:   map[int]store.IssueState{},
+		LastTend: map[int]time.Time{20: now.Add(-time.Hour)},
+	}
+	p := Decide(cfg, snap, st, now)
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	if !p.Decisions[0].ReviewPending {
+		t.Error("ReviewPending = false, want true: review activity is newer than the last tend")
+	}
+}
+
+// The same pull request with the last tend NEWER than the review activity
+// must produce no decision, and the skip reason must name both halves of the
+// question.
+func TestReviewActivityOlderThanLastTendProducesNoDecision(t *testing.T) {
+	cfg := testConfig()
+	now := time.Now()
+	snap := Snapshot{
+		Issues:     []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:        []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
+		BehindBy:   map[int]int{20: 0},
+		ReviewedAt: map[int]time.Time{20: now.Add(-time.Hour)},
+	}
+	st := State{
+		Issues:   map[int]store.IssueState{},
+		LastTend: map[int]time.Time{20: now},
+	}
+	p := Decide(cfg, snap, st, now)
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none: the last tend is newer than the review activity", kinds(p))
+	}
+	want := "the linked pull request is up to date with its base and carries no review activity since the last tend"
+	if got := p.NoDecisionReason(1); got != want {
+		t.Errorf("skip reason = %q, want %q", got, want)
+	}
+}
+
+// A behind pull request with no review activity still produces a decision,
+// and ReviewPending must be false: the staleness trigger alone must not be
+// mistaken for the review trigger.
+func TestBehindPullRequestWithNoReviewActivityIsNotReviewPending(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{
+		Issues:   []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy: map[int]int{20: 3},
+	}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindTend {
+		t.Fatalf("decisions = %v, want one tend", kinds(p))
+	}
+	if p.Decisions[0].ReviewPending {
+		t.Error("ReviewPending = true, want false: no review activity was reported")
+	}
+}
+
+// A pull request with no prior tend and review activity is pending: LastTend
+// absent from the map reads as the zero time, and any review activity is
+// after that.
+func TestReviewActivityWithNoPriorTendIsPending(t *testing.T) {
+	cfg := testConfig()
+	now := time.Now()
+	snap := Snapshot{
+		Issues:     []ghub.Issue{issue(1, cfg.Labels.Review)},
+		PRs:        []ghub.PullRequest{{Number: 20, Body: "Closes #1", HeadRef: "feat/a", BaseRef: "master", Trusted: true}},
+		BehindBy:   map[int]int{20: 0},
+		ReviewedAt: map[int]time.Time{20: now},
+	}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, now)
+	if len(p.Decisions) != 1 || !p.Decisions[0].ReviewPending {
+		t.Fatalf("decisions = %v, want one review-pending tend", kinds(p))
+	}
+}

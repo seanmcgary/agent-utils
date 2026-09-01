@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
@@ -75,7 +76,8 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 		return sum, nil
 	}
 
-	snap := engine.Snapshot{Issues: []ghub.Issue{iss}, BehindBy: map[int]int{}}
+	snap := engine.Snapshot{Issues: []ghub.Issue{iss}, BehindBy: map[int]int{}, ReviewedAt: map[int]time.Time{}}
+	lastTend := map[int]time.Time{}
 	if cfg.TendPR && fetchOK && iss.HasLabel(cfg.Labels.Review) {
 		if pr, found := reviewPR(ctx, cfg, deps, owner, repo, iss, eventPR); found {
 			snap.PRs = []ghub.PullRequest{pr}
@@ -94,6 +96,26 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 				}); err != nil {
 					slog.Error("store pr link", "loop", cfg.Name, "issue", iss.Number, "err", err)
 				}
+			}
+
+			// The review trigger fails CLOSED: a failed read leaves the entry
+			// unset rather than abandoning the pass or treating "unknown" as
+			// "pending". This is the delivery fast path for the trigger --
+			// pull_request_review and pull_request_review_comment both land
+			// here -- so it, and Tick's full sweep as the safety net, are the
+			// only two places this read happens; see tendsweep.go and
+			// tendcheck.go for why it is deliberately absent from both.
+			if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
+				slog.Warn("read review activity; judging this pull request on staleness alone",
+					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
+			} else if !activity.IsZero() {
+				snap.ReviewedAt[pr.Number] = activity
+			}
+			if last, err := deps.Store.LastTendAt(cfg.Name, cfg.Repo, pr.Number); err != nil {
+				slog.Warn("read last tend time; judging this pull request on staleness alone",
+					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
+			} else if !last.IsZero() {
+				lastTend[pr.Number] = last
 			}
 		}
 	}
@@ -133,7 +155,7 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	// Scoped to this issue's snapshot, so a webhook-driven tick spawns at most
 	// one `pi --list-models` rather than one per issue in the loop.
 	st := engine.State{
-		Issues: states, Running: live,
+		Issues: states, Running: live, LastTend: lastTend,
 		Providers: resolveProviders(ctx, cfg, snap.Issues),
 	}
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {

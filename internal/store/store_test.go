@@ -497,6 +497,41 @@ func TestCreateDispatchOverridesAndAgentPID(t *testing.T) {
 	}
 }
 
+// ReviewPending travels on the dispatch row, not on pr_links -- see
+// store.Dispatch.ReviewPending -- so CreateDispatch and every read that
+// shares dispatchColumns must round-trip it like Model, Harness, and Effort.
+func TestCreateDispatchRoundTripsReviewPending(t *testing.T) {
+	s := openTemp(t)
+	id, err := s.CreateDispatch(Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 3, Kind: KindTend,
+		PRNumber: 20, ReviewPending: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateDispatch: %v", err)
+	}
+	got, err := s.GetDispatch(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ReviewPending {
+		t.Error("ReviewPending = false, want true")
+	}
+
+	id2, err := s.CreateDispatch(Dispatch{
+		Loop: "execution", Repo: "o/r", Number: 4, Kind: KindTend, PRNumber: 21,
+	})
+	if err != nil {
+		t.Fatalf("CreateDispatch: %v", err)
+	}
+	got2, err := s.GetDispatch(id2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2.ReviewPending {
+		t.Error("ReviewPending = true, want false: the field was never set")
+	}
+}
+
 // A database created by an older build gains all six new columns, and a
 // stopped issue's stopped/stopped_reason survive the key rebuild that
 // happens along the way. A string check that only greps for "stopped" in the

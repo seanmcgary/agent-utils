@@ -4,6 +4,7 @@ package engine
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
@@ -278,7 +279,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	decisions = append(decisions, stops...)
 
 	if cfg.TendPR {
-		decisions = append(decisions, tendDecisions(cfg, issues, snap, st.Issues, liveTendPRs, decided, skips)...)
+		decisions = append(decisions, tendDecisions(cfg, issues, snap, st.Issues, st.LastTend, liveTendPRs, decided, skips)...)
 	}
 
 	return finish(Plan{Decisions: decisions, Skips: skips})
@@ -531,11 +532,19 @@ func stoppedSkipReason(reason string) string {
 // that loop's tend_pr, and states came from that loop's rows, so the session a
 // tend inherits is necessarily the one belonging to the loop that owns the
 // pull request.
+// tendDecisions does NOT take engine.State: it takes states, the issue state
+// of one loop, plus lastTend beside it. Both are keyed data State also carries
+// as a whole, pulled out here as their own parameters because Decide's only
+// caller of this function already unpacked State into issues, snap, and
+// liveTendPRs before this point -- passing the whole struct through would
+// resurrect fields (Running, Force, CooldownUntil) this function has no use
+// for and no business reading.
 func tendDecisions(
 	cfg *config.Config,
 	issues []ghub.Issue,
 	snap Snapshot,
 	states map[int]store.IssueState,
+	lastTend map[int]time.Time,
 	liveTendPRs map[int]bool,
 	decided map[int]bool,
 	skips map[int]string,
@@ -564,9 +573,14 @@ func tendDecisions(
 			skips[iss.Number] = "a tend dispatch is already live for the linked pull request"
 			continue
 		}
-		if snap.BehindBy[pr.Number] <= 0 {
-			// A current pull request produces nothing. Silence is correct.
-			skips[iss.Number] = "the linked pull request is already up to date with its base"
+		behind := snap.BehindBy[pr.Number] > 0
+		reviewPending := snap.ReviewedAt[pr.Number].After(lastTend[pr.Number])
+		if !behind && !reviewPending {
+			// Silence is correct only when BOTH questions came back no. Naming
+			// both in the skip reason is what lets an operator reading "nothing
+			// happened" tell which one is false, rather than assuming staleness
+			// was the only thing ever checked.
+			skips[iss.Number] = "the linked pull request is up to date with its base and carries no review activity since the last tend"
 			continue
 		}
 		// A tend inherits the issue's session, so it must also inherit the
@@ -599,21 +613,34 @@ func tendDecisions(
 		// than resume the issue's, even though the issue's own session was
 		// started by the loop's default harness.
 		sessionID := ""
-		reason := fmt.Sprintf("%s is %d commits behind",
-			describeLink(iss.Number, pr), snap.BehindBy[pr.Number])
+		// Both halves of the reason can hold at once -- a pull request can be
+		// behind AND carry unanswered review activity -- so both are named
+		// when true, keeping the existing "N commits behind" wording for the
+		// half that already had it.
+		var reasons []string
+		if behind {
+			reasons = append(reasons, fmt.Sprintf("%s is %d commits behind",
+				describeLink(iss.Number, pr), snap.BehindBy[pr.Number]))
+		}
+		if reviewPending {
+			reasons = append(reasons, fmt.Sprintf("%s carries review activity newer than the last tend",
+				describeLink(iss.Number, pr)))
+		}
+		reason := strings.Join(reasons, "; ")
 		if s := states[iss.Number]; resumable(cfg, store.KindTend, s, ov) {
 			sessionID = s.SessionID
 			reason += ", resuming the issue's session"
 		}
 		out = append(out, Decision{
-			Kind:      KindTend,
-			Issue:     iss.Number,
-			PR:        pr.Number,
-			HeadRef:   pr.HeadRef,
-			BaseRef:   pr.BaseRef,
-			SessionID: sessionID,
-			Reason:    reason,
-			Overrides: ov,
+			Kind:          KindTend,
+			Issue:         iss.Number,
+			PR:            pr.Number,
+			HeadRef:       pr.HeadRef,
+			BaseRef:       pr.BaseRef,
+			SessionID:     sessionID,
+			Reason:        reason,
+			Overrides:     ov,
+			ReviewPending: reviewPending,
 		})
 	}
 	return out

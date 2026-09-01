@@ -2,6 +2,7 @@ package loopcmd
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
+	_ "modernc.org/sqlite"
 )
 
 // rebaseLoop is the loop every fixture below belongs to. It is a constant
@@ -28,12 +30,24 @@ const rebaseLoop = "execution"
 // to fail against.
 type fakeGit struct {
 	// dirty, rebaseErr and pushErr choose the branch under test.
-	dirty      bool
-	rebaseErr  error
-	pushErr    error
-	abortErr   error
-	ensureErr  error
-	headSHAErr error
+	dirty           bool
+	rebaseErr       error
+	pushErr         error
+	abortErr        error
+	ensureErr       error
+	headSHAErr      error
+	headSHAOverride string
+
+	// conflictedPaths and conflictedPathsErr choose the backoff gate's
+	// answer. An empty slice with no error is the default, matching what a
+	// worktree with no readable conflict looks like: the backoff gate falls
+	// through and the ordinary conflict path (abort, dispatch) runs.
+	conflictedPaths    []string
+	conflictedPathsErr error
+	// conflictedPathsCalls counts how many times ConflictedPaths was read, so
+	// a test can assert it ran on the detached cleanup context and only once
+	// per conflict.
+	conflictedPathsCalls int
 
 	// abortNeedsLiveCtx makes the abort fail on a dead context and succeed on
 	// a live one, which is how the real thing behaves: the worktree helpers
@@ -89,9 +103,16 @@ func (g *fakeGit) DirtyCtx(context.Context, string) (bool, error) {
 
 // HeadSHA answers a different id before and after the refresh, so a lease read
 // too early is visible in the pushed value rather than passing silently.
+//
+// headSHAOverride lets a test simulate a HEAD that moved between two act
+// calls -- an agent, or a human, pushing a fix -- without a second real
+// checkout: the fingerprint backoff must treat it as a new conflict.
 func (g *fakeGit) HeadSHA(context.Context, string) (string, error) {
 	if g.headSHAErr != nil {
 		return "", g.headSHAErr
+	}
+	if g.headSHAOverride != "" {
+		return g.headSHAOverride, nil
 	}
 	if g.ensured {
 		return "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nil
@@ -135,6 +156,14 @@ func (g *fakeGit) PushWithLease(_ context.Context, _, _, lease string) error {
 		return fmt.Errorf("refusing to push with lease %q, which is not a full object id", lease)
 	}
 	return g.pushErr
+}
+
+func (g *fakeGit) ConflictedPaths(context.Context, string) ([]string, error) {
+	g.conflictedPathsCalls++
+	if g.conflictedPathsErr != nil {
+		return nil, g.conflictedPathsErr
+	}
+	return g.conflictedPaths, nil
 }
 
 // fakeLeaseSHA is worktree.leaseSHA, which is unexported. A full lowercase
@@ -502,7 +531,7 @@ func TestGitRebaseCleansUpOnAContextTheCallerAlreadyCancelled(t *testing.T) {
 
 	// gitRebase directly: act's agent fallback would need a live context of
 	// its own, and the property under test is entirely inside gitRebase.
-	outcome, err := gitRebase(ctx, cfg, deps, tendDecision())
+	outcome, err := gitRebase(ctx, cfg, deps, tendDecision(), time.Now())
 	if err != nil {
 		t.Fatalf("gitRebase: %v", err)
 	}
@@ -529,7 +558,7 @@ func TestGitRebaseWorktreeRefreshFailureFallsBackToTheAgent(t *testing.T) {
 	deps, git := rebaseDeps(t, cfg)
 	git.ensureErr = errors.New("fetch origin feat/x: exit status 128")
 
-	outcome, err := gitRebase(context.Background(), cfg, deps, tendDecision())
+	outcome, err := gitRebase(context.Background(), cfg, deps, tendDecision(), time.Now())
 	if err == nil {
 		t.Fatal("err = nil; a failed worktree refresh must be reported")
 	}
@@ -556,7 +585,7 @@ func TestGitRebaseUnreadableHeadNeverPushes(t *testing.T) {
 	deps, git := rebaseDeps(t, cfg)
 	git.headSHAErr = errors.New(`rev-parse HEAD returned "", which is not an object id`)
 
-	outcome, err := gitRebase(context.Background(), cfg, deps, tendDecision())
+	outcome, err := gitRebase(context.Background(), cfg, deps, tendDecision(), time.Now())
 	if err == nil {
 		t.Fatal("err = nil; an unreadable head must be reported")
 	}
@@ -568,5 +597,345 @@ func TestGitRebaseUnreadableHeadNeverPushes(t *testing.T) {
 	}
 	if git.pushes != 0 {
 		t.Errorf("pushes = %d, want 0: nothing may be force-pushed without a lease", git.pushes)
+	}
+}
+
+// --- Task 9: the repeat-conflict backoff ---
+
+// A first conflict at a fingerprint dispatches the agent and writes a row
+// with seen_count = 1 and a one-hour deadline.
+func TestConflictBackoffFirstSightingDispatchesAndWritesOneHour(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	now := time.Now()
+	var sum Summary
+
+	if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Tended != 1 {
+		t.Fatalf("Tended = %d, want 1: a conflict never seen before must dispatch", sum.Tended)
+	}
+	if sum.Backoff != 0 {
+		t.Errorf("Backoff = %d, want 0", sum.Backoff)
+	}
+
+	row, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("TendConflict reported no row after a first-sighting dispatch")
+	}
+	if row.SeenCount != 1 {
+		t.Errorf("SeenCount = %d, want 1", row.SeenCount)
+	}
+	if want := now.Add(time.Hour); row.RetryAfter.Sub(want).Abs() > time.Second {
+		t.Errorf("RetryAfter = %v, want close to %v", row.RetryAfter, want)
+	}
+}
+
+// The same fingerprint within the backoff window returns doneBackedOff,
+// dispatches nothing, and leaves seen_count and retry_after UNCHANGED: a
+// backed-off pass must not advance the count or move the deadline, or the
+// agent would never be dispatched again.
+func TestConflictBackoffWithinWindowDispatchesNothingAndWritesNothing(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	now := time.Now()
+
+	var sum1 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum1); err != nil {
+		t.Fatal(err)
+	}
+	before, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12)
+	if err != nil || !ok {
+		t.Fatalf("TendConflict after first dispatch: ok=%v err=%v", ok, err)
+	}
+
+	var sum2 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now.Add(time.Minute), &sum2); err != nil {
+		t.Fatal(err)
+	}
+	if sum2.Tended != 0 {
+		t.Errorf("Tended = %d, want 0: the backoff window has not elapsed", sum2.Tended)
+	}
+	if sum2.Backoff != 1 {
+		t.Errorf("Backoff = %d, want 1", sum2.Backoff)
+	}
+
+	after, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12)
+	if err != nil || !ok {
+		t.Fatalf("TendConflict after backed-off pass: ok=%v err=%v", ok, err)
+	}
+	if after.SeenCount != before.SeenCount {
+		t.Errorf("SeenCount changed from %d to %d; a backed-off pass must write nothing",
+			before.SeenCount, after.SeenCount)
+	}
+	if !after.RetryAfter.Equal(before.RetryAfter) {
+		t.Errorf("RetryAfter changed from %v to %v; a backed-off pass must write nothing",
+			before.RetryAfter, after.RetryAfter)
+	}
+}
+
+// The same fingerprint AFTER retry_after has passed dispatches again and
+// writes seen_count = 2 with a six-hour deadline.
+func TestConflictBackoffAfterDeadlineDispatchesAgainAndAdvancesToSixHours(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	now := time.Now()
+
+	var sum1 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum1); err != nil {
+		t.Fatal(err)
+	}
+
+	later := now.Add(2 * time.Hour)
+	var sum2 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), later, &sum2); err != nil {
+		t.Fatal(err)
+	}
+	if sum2.Tended != 1 {
+		t.Fatalf("Tended = %d, want 1: the deadline has passed", sum2.Tended)
+	}
+
+	row, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12)
+	if err != nil || !ok {
+		t.Fatalf("TendConflict: ok=%v err=%v", ok, err)
+	}
+	if row.SeenCount != 2 {
+		t.Errorf("SeenCount = %d, want 2", row.SeenCount)
+	}
+	if want := later.Add(6 * time.Hour); row.RetryAfter.Sub(want).Abs() > time.Second {
+		t.Errorf("RetryAfter = %v, want close to %v", row.RetryAfter, want)
+	}
+}
+
+// A moved HEAD produces a new fingerprint and writes seen_count = 1, even
+// though a row already exists: an agent or a human changed the branch, so the
+// conflict this pass meets is not the one already tried.
+func TestConflictBackoffMovedHeadStartsANewFingerprint(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	now := time.Now()
+
+	var sum1 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Still inside the backoff window, but the head has moved.
+	git.headSHAOverride = "cccccccccccccccccccccccccccccccccccccccc"
+	var sum2 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now.Add(time.Minute), &sum2); err != nil {
+		t.Fatal(err)
+	}
+	if sum2.Tended != 1 {
+		t.Fatalf("Tended = %d, want 1: a moved head is a new conflict", sum2.Tended)
+	}
+
+	row, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12)
+	if err != nil || !ok {
+		t.Fatalf("TendConflict: ok=%v err=%v", ok, err)
+	}
+	if row.SeenCount != 1 {
+		t.Errorf("SeenCount = %d, want 1: a new fingerprint resets the count", row.SeenCount)
+	}
+}
+
+// A clean rebase deletes the conflict row: a branch that replayed cleanly has
+// no conflict left to remember.
+func TestConflictBackoffCleanRebaseDeletesTheRow(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	now := time.Now()
+
+	var sum1 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum1); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12); err != nil || !ok {
+		t.Fatalf("TendConflict after the first conflict: ok=%v err=%v", ok, err)
+	}
+
+	git.rebaseErr = nil
+	var sum2 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now.Add(time.Minute), &sum2); err != nil {
+		t.Fatal(err)
+	}
+	if sum2.Rebased != 1 {
+		t.Fatalf("Rebased = %d, want 1", sum2.Rebased)
+	}
+	if _, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12); err != nil || ok {
+		t.Fatalf("TendConflict after a clean rebase: ok=%v err=%v, want no row", ok, err)
+	}
+}
+
+// A rebase failure that leaves no conflicted path is not a conflict this gate
+// understands. Refusing to dispatch on it would be a silent stall, so it
+// dispatches like an ordinary conflict.
+func TestConflictBackoffNoConflictedPathsDispatches(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	// git.conflictedPaths left nil: the default, matching a worktree with no
+	// readable conflicted paths.
+	var sum Summary
+
+	if err := act(context.Background(), cfg, deps, tendDecision(), time.Now(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Tended != 1 {
+		t.Errorf("Tended = %d, want 1: no conflicted paths must not be treated as a backoff", sum.Tended)
+	}
+}
+
+// An unreadable conflict row must dispatch the agent: the gate fails OPEN, so
+// state it could not read never strands a pull request.
+func TestConflictBackoffUnreadableRowDispatches(t *testing.T) {
+	cfg := rebaseConfig(t)
+	dbPath := filepath.Join(t.TempDir(), "s.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	git := &fakeGit{
+		rebaseErr:       errors.New("CONFLICT (content): Merge conflict in a.go"),
+		conflictedPaths: []string{"a.go"},
+	}
+	deps := Deps{
+		Store:      db.Project(testProject),
+		ProjectID:  testProject,
+		GH:         &countingGH{},
+		WT:         worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch),
+		SelfPath:   "/bin/true",
+		ConfigPath: "/tmp/loop.yaml",
+		Now:        time.Now,
+		Spawn: func(string, int64, string, string, string) (int, error) {
+			return 4242, nil
+		},
+		IsAlive: func(int, int64) bool { return true },
+		Git:     git,
+	}
+
+	// Break the read this gate depends on without touching anything else the
+	// pass writes: dropping the table makes TendConflict's SELECT fail while
+	// dispatches, pr_links, and every other table stay intact.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec("DROP TABLE tend_conflicts"); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var sum Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), time.Now(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Tended != 1 {
+		t.Errorf("Tended = %d, want 1: an unreadable row must fail open", sum.Tended)
+	}
+}
+
+// A ReviewPending decision is never backed off, even inside the window, and
+// because it therefore reaches the agent, it still advances seen_count like
+// any other dispatch: the check belongs INSIDE the backoff, not as an
+// override in act.
+func TestConflictBackoffReviewPendingDispatchesAndAdvancesCount(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	now := time.Now()
+
+	var sum1 Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum1); err != nil {
+		t.Fatal(err)
+	}
+
+	d := tendDecision()
+	d.ReviewPending = true
+	var sum2 Summary
+	if err := act(context.Background(), cfg, deps, d, now.Add(time.Minute), &sum2); err != nil {
+		t.Fatal(err)
+	}
+	if sum2.Tended != 1 {
+		t.Fatalf("Tended = %d, want 1: a review-pending decision must never be backed off", sum2.Tended)
+	}
+	if sum2.Backoff != 0 {
+		t.Errorf("Backoff = %d, want 0", sum2.Backoff)
+	}
+
+	row, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12)
+	if err != nil || !ok {
+		t.Fatalf("TendConflict: ok=%v err=%v", ok, err)
+	}
+	if row.SeenCount != 2 {
+		t.Errorf("SeenCount = %d, want 2: a review-pending dispatch still counts as a sighting", row.SeenCount)
+	}
+}
+
+// --- Task 6: review activity falls through a clean rebase ---
+
+// A clean rebase on a ReviewPending decision must count the rebase AND fall
+// through to dispatch the agent: the rebase settles only the staleness half
+// of the decision, and the feedback is still unanswered.
+func TestCleanRebaseOnAReviewPendingDecisionCountsAndDispatches(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	d := tendDecision()
+	d.ReviewPending = true
+	var sum Summary
+
+	if err := act(context.Background(), cfg, deps, d, time.Now(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Rebased != 1 {
+		t.Errorf("Rebased = %d, want 1: the clean replay still happened", sum.Rebased)
+	}
+	if sum.Tended != 1 {
+		t.Errorf("Tended = %d, want 1: unanswered review feedback must still reach the agent", sum.Tended)
+	}
+	if git.pushes != 1 {
+		t.Errorf("pushes = %d, want 1", git.pushes)
+	}
+
+	running, err := deps.Store.RunningDispatches(rebaseLoop, "o/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(running) != 1 || !running[0].ReviewPending {
+		t.Fatalf("running dispatch = %+v, want one row with ReviewPending set", running)
+	}
+}
+
+// Without ReviewPending, a clean rebase settles the decision outright: no
+// agent runs, matching the behaviour before this trigger existed.
+func TestCleanRebaseWithoutReviewPendingDispatchesNoAgent(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, _ := rebaseDeps(t, cfg)
+	var sum Summary
+
+	if err := act(context.Background(), cfg, deps, tendDecision(), time.Now(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Rebased != 1 || sum.Tended != 0 {
+		t.Errorf("Rebased = %d, Tended = %d, want 1 and 0", sum.Rebased, sum.Tended)
 	}
 }

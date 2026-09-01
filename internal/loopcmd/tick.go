@@ -176,7 +176,12 @@ type Summary struct {
 	// Rebased counts the pull requests git replayed with no agent. It is
 	// separate from Tended so a sweep's line says which of the two happened:
 	// how many rebases cost nothing, and how many needed an agent.
-	Rebased  int `json:"rebased"`
+	Rebased int `json:"rebased"`
+	// Backoff counts a KindTend decision that met a conflict already known to
+	// have defeated the agent, within its backoff window, and dispatched
+	// nothing. Separate from Rebased and Tended so an operator auditing the
+	// summary can tell a declined repeat from a completed one.
+	Backoff  int `json:"backoff"`
 	Promoted int `json:"promoted"`
 	Parked   int `json:"parked"`
 	// Stopped counts KindStop decisions applied this tick: an operator's
@@ -225,13 +230,28 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 		return sum, err
 	}
 
-	snap := engine.Snapshot{Issues: issues, BehindBy: map[int]int{}}
+	snap := engine.Snapshot{Issues: issues, BehindBy: map[int]int{}, ReviewedAt: map[int]time.Time{}}
+	lastTend := map[int]time.Time{}
 	if cfg.TendPR && fetchOK {
 		prs, err := deps.GH.ListOpenPullRequests(ctx, owner, repo)
 		if err != nil {
 			return sum, err
 		}
 		snap.PRs = prs
+
+		// One query for every pull request this tick might tend, not one per
+		// row: LastTendByPR groups by pull request so a pass deciding many
+		// issues issues one query. A failed read is logged and leaves
+		// lastTend empty rather than abandoning the tick -- see the
+		// per-pull-request failure handling below, which is where the
+		// consequence of an unset entry actually lands.
+		if m, err := deps.Store.LastTendByPR(cfg.Name, cfg.Repo); err != nil {
+			slog.Warn("read last tend times; judging every pull request on staleness alone",
+				"loop", cfg.Name, "err", err)
+		} else {
+			lastTend = m
+		}
+
 		for _, iss := range issues {
 			if !iss.HasLabel(cfg.Labels.Review) {
 				continue
@@ -256,6 +276,20 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 			}); err != nil {
 				slog.Error("store pr link", "loop", cfg.Name, "issue", iss.Number, "err", err)
 			}
+
+			// The review trigger fails CLOSED: a failed read leaves the entry
+			// unset, so tendDecisions judges this pull request on staleness
+			// alone rather than treating "unknown" as "pending". Asked only
+			// for a candidate already accepted above -- labels.review and a
+			// LinkPR-trusted pull request -- so a pass with no candidates
+			// costs nothing. See tendsweep.go and tendcheck.go for why this
+			// read is deliberately absent from both of those passes.
+			if activity, err := deps.GH.LatestReviewActivity(ctx, owner, repo, pr.Number); err != nil {
+				slog.Warn("read review activity; judging this pull request on staleness alone",
+					"loop", cfg.Name, "issue", iss.Number, "pr", pr.Number, "err", err)
+			} else if !activity.IsZero() {
+				snap.ReviewedAt[pr.Number] = activity
+			}
 		}
 	}
 
@@ -278,6 +312,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	st := engine.State{
 		Issues: states, Running: live, CooldownUntil: time.Time{}, Force: deps.Force,
 		Providers: resolveProviders(ctx, cfg, snap.Issues),
+		LastTend:  lastTend,
 	}
 	sum.Live = len(live)
 	sum.Forced = deps.Force
@@ -528,7 +563,7 @@ func act(
 		// conflicts. gitRebase reports whether it settled the decision --
 		// including the case where it settled it by declining to act, which is
 		// what a refused lease means.
-		switch outcome, err := gitRebase(ctx, cfg, deps, d); {
+		switch outcome, err := gitRebase(ctx, cfg, deps, d, now); {
 		case err != nil:
 			// Logged, not returned: a git failure must not abandon the rest of
 			// the sweep, and the agent is the fallback this whole path is
@@ -536,10 +571,28 @@ func act(
 			slog.Warn("automatic rebase failed; falling back to the tend agent",
 				"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
 		case outcome == doneRebased:
+			// Count the rebase first, so the summary still reports it. Then
+			// fall through to the dispatch ONLY when review feedback is still
+			// unanswered: the rebase settled the staleness half of the
+			// decision, not the review half.
 			sum.Rebased++
-			return nil
+			if !d.ReviewPending {
+				return nil
+			}
 		case outcome == doneNoRebase:
-			// Settled by declining to act. No agent, and nothing counted.
+			// Settled by declining to act. No agent, and nothing counted. The
+			// branch this pass reasoned about is gone -- see gitRebase's doc
+			// comment -- so an agent sent at it now would work from a stale
+			// premise whatever the feedback says.
+			return nil
+		case outcome == doneBackedOff:
+			// gitRebase already declined to back off a ReviewPending decision
+			// -- that check is INSIDE the backoff, not here -- so a
+			// doneBackedOff reaching this point always has no feedback to
+			// answer. No special case belongs here: adding one back would
+			// double-dispatch the agent gitRebase already counted as backed
+			// off.
+			sum.Backoff++
 			return nil
 		}
 		return count(&sum.Tended, dispatch(ctx, cfg, deps, d, now, store.KindTend))
@@ -630,6 +683,9 @@ func dispatch(
 		// provider. It is the resolved value the engine compared, carried here
 		// so a park comment can name the account that actually failed.
 		Provider: d.Provider,
+		// ReviewPending travels here, not on pr_links: see
+		// store.Dispatch.ReviewPending for why.
+		ReviewPending: d.ReviewPending,
 	})
 	if err != nil {
 		return err
@@ -924,6 +980,10 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 			// to make no push when the branch is current. Leaving it zero told
 			// every tend agent the opposite of why it was dispatched.
 			BehindBy: pr.BehindBy,
+			// From the DISPATCH row, not the pr_links row: the tick's
+			// Decision never reaches this detached process, and pr_links was
+			// rejected as a transport -- see store.Dispatch.ReviewPending.
+			ReviewPending: d.ReviewPending,
 		},
 		Labels: runner.PromptLabels{
 			Trigger:  cfg.Labels.Trigger,

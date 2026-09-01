@@ -156,6 +156,30 @@ func TestRenderPrompt(t *testing.T) {
 	}
 }
 
+// ReviewPending must reach the template so a tend_prompt can branch on
+// answering feedback versus a pure rebase. It comes from the dispatch row,
+// not from BehindBy's source; RenderPrompt only cares that PromptPR carries
+// it.
+func TestRenderPromptRendersReviewPending(t *testing.T) {
+	tmpl := "review pending: {{.PR.ReviewPending}}"
+
+	got, err := RenderPrompt(tmpl, PromptData{PR: PromptPR{Number: 20, ReviewPending: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "review pending: true" {
+		t.Errorf("got %q, want true", got)
+	}
+
+	got, err = RenderPrompt(tmpl, PromptData{PR: PromptPR{Number: 20, ReviewPending: false}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "review pending: false" {
+		t.Errorf("got %q, want false", got)
+	}
+}
+
 func TestRenderPromptRejectsUnknownField(t *testing.T) {
 	if _, err := RenderPrompt("{{.Nope}}", PromptData{}); err == nil {
 		t.Fatal("want an error for an unknown template field")

@@ -55,6 +55,14 @@ type fakeGH struct {
 	// own dispatch work ran, which is a different, uninteresting failure.
 	listIssuesErr      error
 	failListIssuesFrom int
+
+	// reviewActivity and reviewActivityErr choose LatestReviewActivity's
+	// answer per pull request number. A nil/zero entry answers the zero
+	// time, matching "no review activity", and reviewActivityErr lets a test
+	// prove the review trigger's failure direction: a failed read must leave
+	// the pull request judged on staleness alone, never treated as pending.
+	reviewActivity    map[int]time.Time
+	reviewActivityErr map[int]error
 }
 
 func (f *fakeGH) ListOpenIssues(context.Context, string, string) ([]ghub.Issue, error) {
@@ -111,8 +119,11 @@ func (f *fakeGH) BehindBy(_ context.Context, _, _, _, head string) (int, error) 
 func (f *fakeGH) AuthenticatedLogin(context.Context) (string, error) {
 	return "loop-bot", nil
 }
-func (f *fakeGH) LatestReviewActivity(context.Context, string, string, int) (time.Time, error) {
-	return time.Time{}, nil
+func (f *fakeGH) LatestReviewActivity(_ context.Context, _, _ string, number int) (time.Time, error) {
+	if err := f.reviewActivityErr[number]; err != nil {
+		return time.Time{}, err
+	}
+	return f.reviewActivity[number], nil
 }
 func (f *fakeGH) PostComment(_ context.Context, _, _ string, _ int, body string) error {
 	f.comments = append(f.comments, body)

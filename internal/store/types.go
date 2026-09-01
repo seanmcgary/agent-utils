@@ -158,6 +158,16 @@ type Dispatch struct {
 	// sets a provider, it is derived from whichever model is in play. Empty
 	// means claude, or a resolution that failed.
 	Provider string
+	// ReviewPending carries engine.Decision.ReviewPending to the detached
+	// runner, which never sees the tick's Decision or Snapshot. It travels
+	// here rather than on pr_links because every PutPRLink call site runs
+	// BEFORE engine.Decide produces a ReviewPending value, and because
+	// PutPRLink's upsert rewrites every column -- so a tend sweep armed by any
+	// merge, which deliberately never sets this, would overwrite a set flag
+	// with a zero in the window between the decision and the runner reading
+	// the row. The dispatch row is written once, from the decision, by the
+	// code that made it, exactly like Model, Harness, and Effort above.
+	ReviewPending bool
 }
 
 // RunnerID is the dispatch identifier the runner process actually carries.

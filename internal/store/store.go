@@ -117,7 +117,14 @@ CREATE TABLE IF NOT EXISTS dispatches (
   -- EFFECTIVE value rather than an override, because a provider has no label
   -- to override: it is derived from whichever model ends up in play. Empty
   -- means claude, or a resolution that failed.
-  provider      TEXT NOT NULL DEFAULT ''
+  provider      TEXT NOT NULL DEFAULT '',
+  -- review_pending carries engine.Decision.ReviewPending to the detached
+  -- runner, which never sees the tick's Decision. It lives here, not on
+  -- pr_links, because every PutPRLink call site runs before engine.Decide
+  -- produces this value, and PutPRLink's upsert rewrites every column -- so a
+  -- tend sweep, which deliberately never sets this, would overwrite a set
+  -- flag with 0 before the runner read the row. See store.Dispatch.
+  review_pending INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS pr_links (
@@ -432,6 +439,7 @@ var addedColumns = []struct{ table, column, def string }{
 	{"issues", "dispatch_harness", "TEXT NOT NULL DEFAULT ''"},
 	{"issues", "dispatch_provider", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "provider", "TEXT NOT NULL DEFAULT ''"},
+	{"dispatches", "review_pending", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // backfillSessionHarness fills issues.session_harness for rows whose session was
@@ -997,11 +1005,11 @@ func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO dispatches (project_id, loop, repo, number, kind, session_id,
 		                        status, started_at, log_path, pr_number, title,
-		                        model, harness, effort, provider)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                        model, harness, effort, provider, review_pending)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.projectID, d.Loop, d.Repo, d.Number, d.Kind, d.SessionID,
 		StatusRunning, time.Now().UTC(), d.LogPath, d.PRNumber, d.Title,
-		d.Model, d.Harness, d.Effort, d.Provider)
+		d.Model, d.Harness, d.Effort, d.Provider, d.ReviewPending)
 	if err != nil {
 		return 0, fmt.Errorf("create dispatch: %w", err)
 	}
@@ -1097,7 +1105,7 @@ var ErrDispatchNotRunning = errors.New("dispatch is no longer running")
 const dispatchColumns = `id, project_id, loop, repo, number, kind, session_id, pid,
 	pid_start_at, status, started_at, finished_at, exit_code, cost_usd, duration_ms,
 	api_error, log_path, pr_number, title, legacy_source, legacy_id,
-	agent_pid, model, harness, effort, provider`
+	agent_pid, model, harness, effort, provider, review_pending`
 
 func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 	var d Dispatch
@@ -1106,7 +1114,7 @@ func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 		&d.SessionID, &d.PID, &pidStart, &d.Status, &d.StartedAt, &finished,
 		&d.ExitCode, &d.CostUSD, &d.DurationMS, &d.APIError, &d.LogPath,
 		&d.PRNumber, &d.Title, &d.LegacySource, &d.LegacyID,
-		&d.AgentPID, &d.Model, &d.Harness, &d.Effort, &d.Provider)
+		&d.AgentPID, &d.Model, &d.Harness, &d.Effort, &d.Provider, &d.ReviewPending)
 	if err != nil {
 		return Dispatch{}, err
 	}

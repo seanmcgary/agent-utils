@@ -206,6 +206,14 @@ type PromptPR struct {
 	HeadRef  string
 	BaseRef  string
 	BehindBy int
+	// ReviewPending is set when this tend dispatch was triggered, in whole or
+	// in part, by review activity newer than the last finished tend. It comes
+	// from the DISPATCH row (d.ReviewPending), not from BehindBy's source
+	// (the pr_links row): see engine.Decision.ReviewPending and
+	// loopcmd.dispatch for why the two travel differently. The shipped
+	// tend_prompt is a pure rebase instruction; a template that never
+	// branches on this field keeps behaving exactly as before.
+	ReviewPending bool
 }
 
 // PromptLabels is the label view a prompt template can read.
