@@ -7,8 +7,11 @@ The parser is **strict**: an unknown key is an error, not a warning. A misspelle
 the load rather than being silently ignored. Every validation error for a file is reported
 together, in a stable order.
 
-`examples/planning.yaml`, `examples/execution.yaml` and `examples/pr-review.yaml` are complete
-working files. Read this reference for what each field means; read those for a shape to copy.
+`examples/planning.yaml`, `examples/execution.yaml`, `examples/pr-review.yaml` and
+`examples/exec-pr-review-findings.yaml` are complete working files, and together they are one
+chain: each loop's `trigger` is the loop before it's `terminal`. Read this reference for what each
+field means; read those for a shape to copy. `examples/pi.yaml` is the same loop as
+`execution.yaml` under the `pi` harness, not a fifth stage.
 
 ## Where configuration files live
 
@@ -431,16 +434,38 @@ review: status:plan-ready-for-review
 
 ### `labels.terminal` — optional
 
-The issue has left this loop. **You** apply it; no agent ever does.
+The issue has left this loop, and the label that says so is usually the next loop's `trigger`.
 
-It is optional because not every loop has one. The planning loop does — your approval of the
-spec and plan. The execution loop does not: an issue leaves it when its pull request merges.
-Requiring the field would force you to invent a value that changes nothing.
+**Who applies it depends on what the handoff is.** Where the terminal is a *human gate*, only you
+apply it and the prompt must forbid the agent from ever doing so — that is planning, where the
+label is your approval of the spec and plan, and `examples/planning.yaml`'s prompt says
+`You NEVER apply {{.Labels.Terminal}}, under any circumstance`. Where the terminal is a *machine
+handoff*, the loop's own agent applies it, **as its strictly last action** — that is
+`examples/pr-review.yaml`, which hands a reviewed branch to the remediation loop. Order matters
+there: a downstream trigger applied before the upstream agent's final phase starts a second agent
+on a branch the first is still writing to.
 
-`labels.terminal` changes no engine behaviour. It exists so prompts can name the gate via
-`{{.Labels.Terminal}}`. **To make an issue actually leave the loop, list the same label under
-`veto`.** The planning example lists `status:ready-for-execution` in both places for exactly
-this reason.
+It is optional because not every loop has one. It is nonetheless the field most likely to be
+wrongly omitted, because two of its three effects are invisible:
+
+1. **Prompts name the gate** through `{{.Labels.Terminal}}`.
+2. **It is the pipeline graph.** `internal/config/entryloop.go` picks the front of the pipeline as
+   *the loop whose trigger is no OTHER loop's terminal or review label*, and only the loop at the
+   front runs the [epic sweep](../README.md#epics). A loop that omits its terminal therefore
+   leaves whatever it feeds looking like a **second entry loop** — the resolution goes ambiguous,
+   and the sweep is disabled for the whole project with nothing but a warning in the log. Every
+   loop that hands to another must declare the label it hands with, even when the field looks
+   decorative in isolation.
+3. **It does not, on its own, make the issue leave.** Nothing in the engine reads it for
+   selection. **To make an issue actually leave the loop, list the same label under `veto`** —
+   `examples/planning.yaml` lists `status:ready-for-execution` in both places for exactly this
+   reason.
+
+Point 3 has a cost worth weighing before you apply it everywhere: `veto` is checked before *tend*
+decisions too, so vetoing the terminal also stops the loop rebasing a pull request parked in that
+state. `examples/execution.yaml` declares `terminal: status:ready-for-pr-review` and deliberately
+does **not** veto it, because a branch queued for review is exactly one that should keep being
+rebased while it waits.
 
 ```yaml
 terminal: status:ready-for-execution
@@ -933,10 +958,15 @@ triggers belong to the listener. Schedule it under cron regardless of whether th
 whose body also says `Closes #N`, so a planning loop with tending on would force-push a draft
 you are in the middle of reading.
 
-**Set it `false` for a review loop too**, for a different reason: `reviewing-commits` rebases the
-branch itself to fold its fixes in, so a tend agent rebasing the same branch would race the
-review's own force-push. A review loop hands the pull request back by applying the label the
-EXECUTION loop tends on, which is what puts tending back in one place.
+**Set it `false` for a review loop and for a remediation loop too**, for a different reason: both
+write to the branch — the reviewer commits its mechanical-gate fixes, and the remediation loop
+force-pushes a whole round of them — so a tend agent rebasing the same branch would race their
+pushes. Both hand the pull request on by applying a label the EXECUTION loop does not tend, and
+tending stays in one place: on `status:ready-for-review`, the human's own queue, which under the
+reference chain is reached only after remediation finishes. **The other half of that is the veto
+list**: `veto` is checked before tend decisions, so the execution loop must list
+`status:pr-reviewing` and `status:fixing-findings` — otherwise its tend rebases a branch another
+agent is rewriting.
 
 **Two things trigger a tend, and either alone is enough.** The pull request is behind its base —
 the trigger this section led with — or review activity on it is newer than the last *finished*

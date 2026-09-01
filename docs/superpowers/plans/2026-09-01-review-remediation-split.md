@@ -8,13 +8,26 @@
 that fixes what the review found — so remediation runs in a fresh context at a cheaper tier
 instead of inside the reviewing session.
 
-**Architecture:** Configuration and documentation only. No Go changes. `pr-review` becomes
-review-only and declares `labels.terminal: status:ready-for-findings-exec`, which is the new
-`exec-pr-review-findings` loop's trigger. `internal/config/entryloop.go` already derives the
-pipeline graph from exactly that relation, so declaring the terminal is what makes the third loop
-a documented member of the chain rather than an orphan that would break entry-loop resolution.
+**Architecture:** Configuration, documentation, and the small amount of Go that pins them.
+`pr-review` becomes review-only and declares `labels.terminal: status:ready-for-findings-exec`,
+which is the new `exec-pr-review-findings` loop's trigger. `internal/config/entryloop.go` derives
+the pipeline graph from exactly that relation.
 
-**Tech Stack:** YAML loop files under `examples/`, Markdown under `docs/` and `README.md`.
+Two consequences the first draft of this plan got wrong, both found by the plan review:
+
+- **`examples/` is not free-standing.** `internal/wizard/templates/*.yaml` are byte-identical
+  copies enforced by `TestExamplesMatchTheEmbeddedTemplates`, so every example edit is two edits,
+  and adding a fourth loop is also a `go:embed` line and a `templateNames` entry.
+- **The terminal edge does more than document the chain.** `examples/execution.yaml` declared no
+  terminal, so `pr-review`'s trigger was no other loop's terminal and `planning` and `pr-review`
+  BOTH resolved as entry loops — ambiguous, which disables the epic sweep for the whole project
+  with nothing but a log warning. That was already true before this change. Declaring
+  `terminal: status:ready-for-pr-review` on the execution loop is what actually makes the chain
+  single-entry, and a new test pins it.
+
+**Tech Stack:** YAML loop files under `examples/` and `internal/wizard/templates/`, two small Go
+edits in `internal/wizard/templates.go`, tests in `internal/config/examples_test.go`, Markdown
+under `docs/` and `README.md`.
 
 **Spec:** none. The design was fixed by the operator before this plan; the measurements below are
 his, and the plan implements the agreed shape rather than re-deriving it.
@@ -114,10 +127,13 @@ a five-dimension review of a large branch is not hypothetical.
 - [ ] Add the terminal-label instruction as the strictly final action, with the reason.
 - [ ] Add the findings-artifact instruction: post one comment, record its ID in Pipeline State's
       `findings comment` field, name the format contract.
-- [ ] Lower `max_budget_usd` from 50 to 5. Measured review phase is ~$1.05/session.
-- [ ] **Keep `model: opus`, `effort: high`.** The existing comment's rationale — the reviewer must
-      be stronger than whatever wrote the code — gets stronger, not weaker, once the reviewer's
-      output is a specification a cheaper executor consumes.
+- [ ] Lower `max_budget_usd` from 50 to 10. Measured review phase is ~$1.05/session.
+- [ ] **Keep `model: opus`; drop `effort: high` → `medium`.** The existing comment's rationale —
+      the reviewer must be stronger than whatever wrote the code — gets stronger, not weaker,
+      once the reviewer's output is a specification a cheaper executor consumes, so the MODEL
+      does not move. Effort does: the expensive part of the old loop was the remediation, and
+      reading a diff against a rubric is bounded work. The comment claiming this loop runs "the
+      strongest model at the highest effort, always" is now wrong and must be reworded.
 - [ ] Update `resume_prompt` to match: it currently repeats "you fix what you find".
 
 `review: yes` — this file is the contract the other two hang off.
@@ -140,11 +156,14 @@ a five-dimension review of a large branch is not hypothetical.
 ### Task 3 — retune `examples/execution.yaml`
 
 - [ ] `model: opus` → `sonnet`; `effort: high` → `medium`.
-- [ ] Add `status:fixing-findings` to `veto`, so tend does not rebase a branch while fixes are
-      landing — the same reason `status:pr-reviewing` is already there.
-- [ ] Comment the veto entry with that reason.
+- [ ] Add `status:pr-reviewing` AND `status:fixing-findings` to `veto`, so tend does not rebase a
+      branch while another agent is rewriting it. The brief said `status:pr-reviewing` was already
+      there; it is not — only the four LIVE `execution.yaml` files have it, and the example has
+      only `blocked:*`. So the hazard exists unguarded in the example as shipped.
+- [ ] Add `terminal: status:ready-for-pr-review`, and comment why it must NOT also go in `veto`.
+- [ ] Comment every veto entry with its reason.
 
-`review: no` — gated by `git diff` and by Task 5's doc consistency check.
+`review: yes` — the terminal edge changes entry-loop resolution for the whole project.
 
 ### Task 4 — the propagation and migration document
 
@@ -158,6 +177,18 @@ a five-dimension review of a large branch is not hypothetical.
       say what to do with an issue mid-`status:pr-reviewing` when the configs are swapped.
 
 `review: yes` — a wrong migration strands live work.
+
+### Task 4b — the wizard copies and the tests that pin them
+
+- [ ] Copy every edited example verbatim over `internal/wizard/templates/<name>.yaml`.
+- [ ] Add `templates/exec-pr-review-findings.yaml` to the `go:embed` directive and
+      `"exec-pr-review-findings"` to `templateNames` in `internal/wizard/templates.go`.
+- [ ] Extend `internal/config/examples_test.go`'s render list to every file in `examples/`, not a
+      subset — `pr-review.yaml` was never covered there.
+- [ ] Add a test asserting the example set resolves to exactly ONE entry loop, and that it is
+      `planning`. Verify it FAILS without the terminal from Task 3.
+
+`review: yes` — this is the task that makes the rest verifiable.
 
 ### Task 5 — docs
 
@@ -180,7 +211,7 @@ a five-dimension review of a large branch is not hypothetical.
 | pr      | #26                                                          |
 | gate    | approved 2026-09-01 (design fixed by the operator's brief)   |
 | round   | 0                                                            |
-| decisions | 1 (see Decisions below)                                    |
+| decisions | 5 (see Decisions below)                                    |
 
 ### Decisions
 
@@ -189,3 +220,28 @@ a five-dimension review of a large branch is not hypothetical.
   `plan comment`, spaced and unquoted; an underscored field would be the only one of its kind in
   a table a human reads. The name is prose in a Markdown table, not a parsed key — nothing in Go
   reads it.
+- **Task 1 — `agent.effort`.** Brief: keep `high`. Did: `medium`. Why: the operator corrected the
+  brief mid-run. `model: opus` is unchanged; only the effort axis moved. The config comment
+  claiming this loop runs "the strongest model at the highest effort, always" was reworded rather
+  than deleted, because the model half of it is still the loop's whole point.
+- **Task 1 — `labels.review`.** Brief: silent on it. Did: set it equal to `labels.terminal`
+  (`status:ready-for-findings-exec`). Why: the plan review pointed out that the alternative is a
+  field the agent never applies, and that leaving it at `status:ready-for-review` makes an issue
+  *queued for remediation* indistinguishable from one *already fixed and waiting on the human* —
+  to the execution loop's tend and to `agent-utils status` alike. Safe only because `tend_pr` is
+  false here, which the config comment says.
+- **Task 3 — the terminal on the execution loop.** Brief: silent on it; the brief's scope was
+  pr-review, the new loop, and execution's model settings. Did: added
+  `terminal: status:ready-for-pr-review`. Why: this is scope the brief did not ask for, and it is
+  here because the plan review found the shipped example set already resolves to TWO entry loops,
+  which disables the epic sweep for the whole project behind nothing but a log warning. The new
+  loop does not cause that and does not fix it; the missing terminal on `execution` is the cause.
+  Leaving it would have shipped a four-loop chain whose graph does not resolve, in the same change
+  that documents the graph.
+- **Task 4b — new Go and a new test.** Brief: "Your work should be YAML/skills/docs only." Did:
+  two lines in `internal/wizard/templates.go` and two tests in
+  `internal/config/examples_test.go`. Why: `examples/*.yaml` is byte-pinned to
+  `internal/wizard/templates/*.yaml` by an existing test, so a YAML-only change does not exist for
+  three of these files; and the entry-loop breakage above is invisible without a test that asserts
+  it. Neither edit touches `internal/config`'s non-test source, so there is no collision with the
+  open `tend:` pull request.

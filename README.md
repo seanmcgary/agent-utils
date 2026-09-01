@@ -413,12 +413,26 @@ logs.
 
 `agent-utils project loop new` writes a loop file for you, by asking; **[`docs/configuration.md`](docs/configuration.md)
 remains the reference for editing one by hand** — what each field means, what reads it, and
-what happens if you get it wrong. `examples/planning.yaml`, `examples/execution.yaml` and
-`examples/pr-review.yaml` are complete working files — the first two ported from the reference
-planning and execution orchestrators, the third a review loop that runs the strongest model over
-whatever the execution loop's produced, fixing what it finds rather than reporting it. A tend
-dispatch — the automatic rebase-or-review-reply agent `tend_pr` arms — can run its own harness,
-model and effort instead of `agent`'s, cheaper by default since its job is smaller; see
+what happens if you get it wrong. `examples/` holds four complete working files that form one
+chain, each loop's `trigger` being the loop before it's `terminal`:
+
+| Loop | Trigger | Hands on with | Does |
+|---|---|---|---|
+| `planning.yaml` | `status:ready-for-spec` | `status:ready-for-execution` (**you** apply it) | spec and plan, parked for your approval |
+| `execution.yaml` | `status:ready-for-execution` | `status:ready-for-pr-review` (**you** apply it) | builds the branch, opens the pull request |
+| `pr-review.yaml` | `status:ready-for-pr-review` | `status:ready-for-findings-exec` (its agent applies it) | runs the strongest model over the branch and posts a findings comment — it decides, it does not fix |
+| `exec-pr-review-findings.yaml` | `status:ready-for-findings-exec` | `status:ready-for-review` (its agent applies it) | applies that findings comment, one fresh subagent per file group, then hands the pull request to you |
+
+The first two are ported from the reference planning and execution orchestrators. The last two
+used to be one loop that reviewed and fixed in a single session; splitting them is what lets the
+review run a strong model on a small budget while the fixing runs a cheaper one in a fresh
+context per fix. `examples/pi.yaml` is the execution loop again under the `pi` harness, not a
+fifth stage. If you are running the older three-loop chain,
+[`docs/review-loop-split.md`](docs/review-loop-split.md) is the propagation and migration guide —
+what changes in each file, in what order, and where work already in flight lands.
+
+A tend dispatch — the automatic rebase-or-review-reply agent — can run its own harness, model and
+effort instead of `agent`'s, cheaper by default since its job is smaller; see
 [`tend`](docs/configuration.md#tend) in the reference.
 
 A label on an issue can also override, for that issue alone, which model, harness, or effort
@@ -885,9 +899,12 @@ see [Security](#security).
 **There is nothing to configure.** The `epic` label on the parent is the only switch. One loop per
 project does the promoting — the one at the front of the pipeline, which is the loop whose
 trigger label is no other loop's terminal or review label. Two projects watching the same
-repository each resolve their own entry loop and each sweep. In the reference pair that is
-`planning`, because `planning`'s terminal label is `execution`'s trigger. If that cannot be
-resolved to exactly one loop, no loop sweeps and the reason is logged.
+repository each resolve their own entry loop and each sweep. In the reference chain that is
+`planning`, because every other loop's trigger is the terminal of the loop before it. **A loop
+that omits `labels.terminal` breaks this**, and breaks it silently: whatever it feeds then has a
+trigger that is nobody's terminal, so two loops look like the front, the resolution is ambiguous,
+and no loop sweeps. If that cannot be resolved to exactly one loop, the reason is logged and
+nothing else says so.
 
 Two things drive it: an `issues` delivery reporting a close, and `loop tick` under cron, which
 walks every open epic. The delivery is the fast path and cron is the backstop for a delivery that

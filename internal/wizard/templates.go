@@ -13,14 +13,18 @@ import (
 // examples/*.yaml at run time would fail for every real user; go:embed bakes
 // the content into the binary at build time instead.
 //
-//go:embed templates/planning.yaml templates/execution.yaml templates/pr-review.yaml
+//go:embed templates/planning.yaml templates/execution.yaml templates/pr-review.yaml templates/exec-pr-review-findings.yaml
 var templateFS embed.FS
 
 // templateNames lists the embedded templates, in the order Templates and the
 // wizard's own template question offer them. It is kept in sync with the
 // file list embedded into templateFS above by templates_test.go, which loads
 // every one of them through config.Load.
-var templateNames = []string{"planning", "execution", "pr-review"}
+//
+// The order is the pipeline's own order, and it is the only useful one: each
+// loop's trigger is the previous loop's terminal, so an operator scaffolding a
+// project reads the list as the chain it is building.
+var templateNames = []string{"planning", "execution", "pr-review", "exec-pr-review-findings"}
 
 // Template supplies the prompt bodies and the label and tend defaults that go
 // with them.

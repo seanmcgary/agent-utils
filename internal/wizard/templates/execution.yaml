@@ -14,15 +14,50 @@ labels:
   trigger:   status:ready-for-execution
   in_flight: status:executing
   blocked:   status:needs-execution-input
+  # Note what labels.review is doing here, because this loop is the only one
+  # that tends. The agent applies it BEFORE its last phase, which is why it must
+  # never be pointed at another loop's trigger: that would start the next agent
+  # on a branch this one is still writing to, and two agents on one branch fight
+  # over the labels as well as the files. Handing a branch to pr-review is the
+  # human's call, and the terminal below is how the human makes it.
   review:    status:ready-for-review
-  # The execution loop has no terminal label. An issue leaves it when its pull
-  # request merges, so the field is omitted rather than invented.
+  # TERMINAL. status:ready-for-pr-review is pr-review's trigger, and YOU apply
+  # it, by hand, to a branch you want reviewed. This loop's agent never does,
+  # for the reason stated just above.
+  #
+  # It was omitted here until the review loop existed, on the reasoning that an
+  # issue leaves execution when its pull request merges. That reasoning is fine
+  # as prose and wrong as configuration, because labels.terminal is also the
+  # pipeline GRAPH. internal/config/entryloop.go picks the front of the pipeline
+  # as "the loop whose trigger is no OTHER loop's terminal or review label";
+  # with this field empty, pr-review's trigger is nobody's terminal, so pr-review
+  # resolves as a SECOND entry loop, the resolution is ambiguous, and the epic
+  # sweep is silently disabled for the whole project (internal/loopcmd/
+  # epicsweep.go logs a warning and promotes nothing). Declaring it is what
+  # makes the four-loop chain single-entry.
+  #
+  # Deliberately NOT repeated under veto, unlike planning's terminal. Vetoing a
+  # label also disables TENDING on it, and an issue queued for review is exactly
+  # a pull request that should keep being rebased while it waits.
+  terminal:  status:ready-for-pr-review
   veto:
     - "blocked:*"
+    # The states the REVIEW and REMEDIATION loops own. veto is checked before
+    # tend decisions too (internal/engine/engine.go), so these entries are what
+    # stop a tend agent rebasing a branch while another agent is rewriting it:
+    # the reviewer commits its mechanical-gate fixes, and the remediation loop
+    # force-pushes a whole round of them. Both would race this loop's rebase.
+    - status:pr-reviewing
+    - status:fixing-findings
 
 agent:
-  model: opus
-  effort: high
+  # Sonnet at medium effort. Execution consumes a plan that a senior model
+  # already wrote and a human already approved, so its work is specified rather
+  # than derived -- the same reason the remediation loop runs sonnet against a
+  # prescriptive findings artifact. When the executor struggles, the fix is a
+  # better plan, not a more expensive executor.
+  model: sonnet
+  effort: medium
   permission_mode: bypassPermissions
   worktree: per_issue
   max_budget_usd: 50

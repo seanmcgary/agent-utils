@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -12,7 +13,18 @@ import (
 // a template must fail here, not at three in the morning inside a detached
 // process whose output nobody is reading.
 func TestExampleConfigsLoadAndRender(t *testing.T) {
-	for _, name := range []string{"planning.yaml", "execution.yaml", "pi.yaml"} {
+	// Every file in examples/, not a subset. pr-review.yaml and
+	// exec-pr-review-findings.yaml are also embedded as wizard templates and so
+	// are loaded a second time there, but that test is about the wizard's copy;
+	// a reader of this list should not have to know which examples happen to be
+	// covered somewhere else.
+	for _, name := range []string{
+		"planning.yaml",
+		"execution.yaml",
+		"pr-review.yaml",
+		"exec-pr-review-findings.yaml",
+		"pi.yaml",
+	} {
 		t.Run(name, func(t *testing.T) {
 			cfg, err := config.Load(filepath.Join("..", "..", "examples", name))
 			if err != nil {
@@ -50,6 +62,69 @@ func TestExampleConfigsLoadAndRender(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The four reference loops must resolve to exactly ONE entry loop, and it must
+// be planning.
+//
+// This is not a test of EntryLoop -- entryloop_test.go covers the rule. It is a
+// test of the example FILES, and it exists because the failure it catches is
+// invisible. EntryLoop reads the chain out of labels.terminal and labels.review,
+// so a loop file that simply omits a terminal creates a second loop whose
+// trigger is nobody's terminal: two entries, ErrAmbiguousEntryLoop, and an epic
+// sweep that logs a warning and promotes nothing for the whole project. Every
+// individual file still loads and every loop still dispatches, so nothing else
+// in this package or in the wizard notices. Before the review/remediation split
+// this was already true of the shipped examples, undetected: pr-review's trigger
+// was no other loop's terminal because execution declared none.
+//
+// pi.yaml is copied in too. It shares execution's trigger and names the same
+// repo, which is exactly the shape most likely to reintroduce ambiguity.
+func TestExampleLoopsResolveToOneEntryLoop(t *testing.T) {
+	agentUtilsDir := t.TempDir()
+	configs := config.ConfigsDir(agentUtilsDir)
+	if err := os.MkdirAll(configs, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	entries, err := os.ReadDir(filepath.Join("..", "..", "examples"))
+	if err != nil {
+		t.Fatalf("read examples: %v", err)
+	}
+	var repo string
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("..", "..", "examples", e.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(configs, e.Name()), body, 0o644); err != nil {
+			t.Fatalf("write %s: %v", e.Name(), err)
+		}
+		cfg, err := config.Load(filepath.Join(configs, e.Name()))
+		if err != nil {
+			t.Fatalf("load %s: %v", e.Name(), err)
+		}
+		// The examples all target one repository; assert it rather than
+		// assuming, so a future example pointed elsewhere fails loudly here
+		// instead of quietly narrowing what this test covers.
+		if repo == "" {
+			repo = cfg.Repo
+		} else if cfg.Repo != repo {
+			t.Fatalf("examples/%s names repo %q, want %q: this test assumes one repo",
+				e.Name(), cfg.Repo, repo)
+		}
+	}
+
+	got, err := config.EntryLoop(agentUtilsDir, repo)
+	if err != nil {
+		t.Fatalf("EntryLoop: %v", err)
+	}
+	if got != "planning" {
+		t.Errorf("EntryLoop = %q, want %q", got, "planning")
 	}
 }
 
