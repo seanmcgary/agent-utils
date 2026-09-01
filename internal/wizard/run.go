@@ -284,7 +284,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	} else {
 		budgetAnswer, err := p.Ask(Question{
 			Key: "agent.max_budget_usd", Label: "Agent max budget (USD)",
-			Help: "Dispatch stops if the agent's session cost exceeds this; 0 means no limit.", Default: "25",
+			Help: "Dispatch stops if the agent's session cost exceeds this; 0 means no limit, which is the recommended value.", Default: "0",
 			Validate: validateNonNegativeFloat,
 		})
 		if err != nil {
@@ -299,7 +299,7 @@ func Run(p Prompter, d Detected) (*config.Config, error) {
 	// 19. agent.timeout
 	timeoutAnswer, err := p.Ask(Question{
 		Key: "agent.timeout", Label: "Agent timeout",
-		Help: "Maximum wall time for one dispatch, e.g. 3h.", Default: "3h",
+		Help: "Last-resort bound on a wedged dispatch, not a budget; a stuck run is caught by the orphan breaker. Guessing low makes real long runs look flaky.", Default: "24h",
 		Validate: validatePositiveDuration,
 	})
 	if err != nil {

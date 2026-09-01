@@ -65,12 +65,26 @@ agent:
   effort: medium
   permission_mode: bypassPermissions
   worktree: per_issue
-  # Remediation is the expensive half, so this cap is the one that matters. The
-  # old combined loop's remediation averaged $11.36 per session at opus/high;
-  # this budget is set for sonnet/medium with room for a bad round rather than
-  # for the average.
-  max_budget_usd: 15
-  timeout: 4h
+  # No cost ceiling, and written out rather than omitted so it reads as a
+  # decision. A budget cap does not stop an expensive run; it stops it PART WAY
+  # THROUGH, which is the one outcome worth avoiding. The dispatch is recorded
+  # failed with its work half-applied and unpushed, the loop retries it from a
+  # resumed session, and the retry re-spends what the cap just refused. Cost is
+  # controlled here by model and effort, which shape the whole run, and by the
+  # findings artifact that keeps the expensive half short -- not by a ceiling
+  # that lands mid-edit.
+  #
+  # 0 means no ceiling: internal/runner/args.go omits --max-budget-usd for it.
+  # A negative value is rejected, because it would reach that same "> 0" gate
+  # and be silently identical to no cap.
+  max_budget_usd: 0
+  # Omitting this would default it to 24h; it is written out for the same reason
+  # as the line above. This is a last-resort bound on a wedged process, not a
+  # budget: a stuck dispatch is caught by the orphan breaker and `loop kill`,
+  # both of which act on evidence rather than a clock. Guessing low is the
+  # expensive mistake, because a killed dispatch is recorded FAILED and retried,
+  # so a real long run looks like a flaky agent.
+  timeout: 24h
 
 i_understand_bypass_permissions: true
 
@@ -79,16 +93,18 @@ i_understand_bypass_permissions: true
 # agent rebasing the same branch would race its push.
 #
 # Note where tending actually lands, because it is not where the label
-# transitions suggest. status:ready-for-review is this loop's labels.review AND
-# the execution loop's, but the EXECUTION agent already applied it when it
-# opened the pull request, and nothing removes it. So the branch is tended from
-# that point onward and this loop's final `add` is a re-assertion, not a first
-# application.
+# transitions suggest. This loop's labels.review, status:ready-for-review, is
+# the HUMAN's queue and nothing tends it directly. Tending is keyed to the
+# execution loop's status:pr-open, which the execution agent applied when it
+# opened the pull request and which nothing ever removes -- so the branch is
+# tended from that point onward, including while it sits here and while it waits
+# at the human gate this loop hands it to.
 #
 # Which means the veto list, not the label, is what keeps a tend agent off the
 # branch while this loop rewrites it: the execution loop vetoes
 # status:fixing-findings for exactly that window. That veto and this tend_pr are
-# the same guard seen from two sides, and both are required.
+# the same guard seen from two sides, and both are required. Giving this loop
+# tend_pr: true would put a second loop on the same pull request.
 tend_pr: false
 
 retry:

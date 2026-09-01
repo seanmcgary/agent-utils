@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"text/template"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -148,6 +149,18 @@ const (
 	HarnessPi     = "pi"
 )
 
+// DefaultAgentTimeout bounds a dispatch when agent.timeout is omitted.
+//
+// It is long on purpose. This deadline is not a budget and it is not a hang
+// detector -- the orphan breaker and `loop kill` handle a stuck dispatch on
+// evidence. It is the last resort that stops a wedged process living forever,
+// and the only cost of setting it high is how long that one case takes to
+// clear. The cost of setting it low is paid by every honest long run: a
+// dispatch killed at its deadline is recorded FAILED and retried from a resumed
+// session, so an agent doing real work on a large branch looks like a flaky
+// agent instead of like a number that was too small.
+const DefaultAgentTimeout = 24 * time.Hour
+
 // CleanupClosedPREnabled reports whether a closed pull request's worktrees are
 // removed. Absent means enabled; see Config.CleanupClosedPR.
 func (c *Config) CleanupClosedPREnabled() bool {
@@ -192,6 +205,27 @@ func Load(path string) (*Config, error) {
 	// exactly the divergence a tend section that only sets a cheaper model was
 	// never meant to introduce. runner.Effective and engine.effectiveHarness
 	// both read the empty string as "fall through to agent.harness."
+
+	// An omitted timeout means DefaultAgentTimeout, not an error.
+	//
+	// This field used to be required, and requiring it made every operator
+	// invent a number for the one setting they have no basis to choose. The
+	// number they invent is always too small, because the cost of guessing low
+	// is invisible: a dispatch killed at its deadline is recorded failed and
+	// retried from a resumed session, so a too-short timeout looks like a flaky
+	// agent rather than like a misconfiguration. A long default is the safe
+	// direction -- a dispatch that genuinely hangs is caught by the orphan
+	// breaker and by `loop kill`, both of which act on evidence rather than on
+	// a clock.
+	//
+	// Zero is the only value this can key on, and that is why validate() still
+	// rejects a NEGATIVE duration below: "unset" and "explicitly zero" are the
+	// same thing in YAML, and neither can mean "no deadline at all", since
+	// agent.timeout is the only bound on a dispatch once
+	// CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS is zeroed.
+	if cfg.Agent.Timeout.Std() == 0 {
+		cfg.Agent.Timeout = Duration(DefaultAgentTimeout)
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
@@ -328,8 +362,13 @@ func (c *Config) validate() error {
 			"agent.max_budget_usd must not be negative, got %v; use 0 for no limit",
 			c.Agent.MaxBudgetUSD))
 	}
-	if c.Agent.Timeout.Std() <= 0 {
-		errs = append(errs, errors.New("agent.timeout must be greater than zero"))
+	// Load defaults an omitted or zero timeout to DefaultAgentTimeout before
+	// this runs, so only a negative value can reach here -- and a negative
+	// duration would sort before every deadline and kill the dispatch at once.
+	if c.Agent.Timeout.Std() < 0 {
+		errs = append(errs, fmt.Errorf(
+			"agent.timeout must not be negative, got %s; omit it for the default of %s",
+			c.Agent.Timeout.Std(), DefaultAgentTimeout))
 	}
 
 	if c.Retry.Max < 0 {

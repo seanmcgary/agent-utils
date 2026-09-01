@@ -211,7 +211,7 @@ a five-dimension review of a large branch is not hypothetical.
 | pr      | #26                                                          |
 | gate    | approved 2026-09-01 (design fixed by the operator's brief)   |
 | round   | 0                                                            |
-| decisions | 5 (see Decisions below)                                    |
+| decisions | 7 (see Decisions below)                                    |
 
 ### Decisions
 
@@ -238,6 +238,31 @@ a five-dimension review of a large branch is not hypothetical.
   loop does not cause that and does not fix it; the missing terminal on `execution` is the cause.
   Leaving it would have shipped a four-loop chain whose graph does not resolve, in the same change
   that documents the graph.
+- **Policy change mid-run — two human touches, not four.** The operator changed the design while
+  this was in flight: the execution agent now applies `status:ready-for-pr-review` itself, so an
+  issue takes exactly two human touches (approve the plan, merge at the end) instead of four.
+  That forced a collision to be resolved. `execution.labels.review` was `status:ready-for-review`
+  and was applied mid-run, which under an automated chain summons the human before the branch has
+  been reviewed or fixed at all. Did: gave execution `review: status:pr-open`, a new label.
+  Why: `labels.review` does two jobs — "go read this" and "tend this" — and automating the chain
+  pulls them apart. Execution has no human-facing output state any more, but it is still the only
+  loop that tends, so the field is chosen for the tending job and named for what the agent
+  actually asserts when it applies it. Nothing removes `status:pr-open`, so tending now covers
+  every wait in the chain including the human gate, which is wider coverage than before, and
+  `status:ready-for-review` is left meaning one thing applied by one loop. Rejected the
+  alternative of moving `tend_pr: true` to the remediation loop: it leaves the review and
+  remediation queues, and every park, untended.
+  The hazard the old comment named is real and is solved rather than re-documented — the execution
+  prompt now has a numbered six-step completion order with the terminal as its strictly last
+  action, after the final push, and the comment says why terminal is safe to chain when review is
+  not: it is a property of WHEN a label is applied, not of which field it is.
+- **Policy change mid-run — no cost ceilings, 24h timeouts.** `agent.max_budget_usd` is `0` in
+  every example, and `agent.timeout` gained a `24h` default and stopped being required. Did:
+  wrote both out explicitly in the examples rather than omitting them. Why: the operator's lean,
+  and it matches the house preference for documented configuration over relying on a zero value —
+  a reader should see that "no ceiling" was decided, not forgotten. The timeout default is a real
+  Go change in `Load()`, and `validate()` now rejects only a NEGATIVE duration, because YAML
+  cannot distinguish an omitted field from an explicit zero.
 - **Task 4b — new Go and a new test.** Brief: "Your work should be YAML/skills/docs only." Did:
   two lines in `internal/wizard/templates.go` and two tests in
   `internal/config/examples_test.go`. Why: `examples/*.yaml` is byte-pinned to

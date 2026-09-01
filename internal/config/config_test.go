@@ -113,6 +113,45 @@ resume_prompt: rp
 	}
 }
 
+// agent.timeout is optional and defaults to 24 hours.
+//
+// It used to be required, which made every operator invent a number for the one
+// setting they have no basis to choose -- and the number is always too small,
+// because guessing low is invisible: the dispatch is recorded failed and
+// retried from a resumed session, so it reads as a flaky agent rather than a
+// misconfiguration.
+func TestLoadDefaultsAgentTimeout(t *testing.T) {
+	body := replaceOnce(validYAML, "  timeout: 3h\n", "")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatalf("agent.timeout must be optional: %v", err)
+	}
+	if got := cfg.Agent.Timeout.Std(); got != DefaultAgentTimeout {
+		t.Errorf("Agent.Timeout = %s, want %s", got, DefaultAgentTimeout)
+	}
+}
+
+// An explicit timeout is never overwritten by the default.
+func TestLoadKeepsAnExplicitAgentTimeout(t *testing.T) {
+	cfg, err := Load(writeTemp(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Agent.Timeout.Std(); got != 3*time.Hour {
+		t.Errorf("Agent.Timeout = %s, want 3h", got)
+	}
+}
+
+// A negative timeout is still an error. Zero cannot be one, because YAML cannot
+// distinguish it from an omitted field -- but a negative duration sorts before
+// every deadline and would kill the dispatch the moment it started.
+func TestLoadRejectsNegativeAgentTimeout(t *testing.T) {
+	body := replaceOnce(validYAML, "  timeout: 3h\n", "  timeout: -1h\n")
+	if _, err := Load(writeTemp(t, body)); err == nil {
+		t.Fatal("want error for a negative agent.timeout, got nil")
+	}
+}
+
 // labels.terminal is optional: the execution loop has no terminal label.
 func TestLoadAcceptsMissingTerminalLabel(t *testing.T) {
 	body := replaceOnce(validYAML, "  terminal: status:ready-for-execution\n", "")

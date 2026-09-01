@@ -27,8 +27,26 @@ agent:
   effort: high
   permission_mode: bypassPermissions
   worktree: per_issue
-  max_budget_usd: 25
-  timeout: 3h
+  # No cost ceiling, and written out rather than omitted so it reads as a
+  # decision. A budget cap does not stop an expensive run; it stops it PART WAY
+  # THROUGH, which is the one outcome worth avoiding. The dispatch is recorded
+  # failed with its work half-applied and unpushed, the loop retries it from a
+  # resumed session, and the retry re-spends what the cap just refused. Cost is
+  # controlled here by model and effort, which shape the whole run, and by the
+  # findings artifact that keeps the expensive half short -- not by a ceiling
+  # that lands mid-edit.
+  #
+  # 0 means no ceiling: internal/runner/args.go omits --max-budget-usd for it.
+  # A negative value is rejected, because it would reach that same "> 0" gate
+  # and be silently identical to no cap.
+  max_budget_usd: 0
+  # Omitting this would default it to 24h; it is written out for the same reason
+  # as the line above. This is a last-resort bound on a wedged process, not a
+  # budget: a stuck dispatch is caught by the orphan breaker and `loop kill`,
+  # both of which act on evidence rather than a clock. Guessing low is the
+  # expensive mistake, because a killed dispatch is recorded FAILED and retried,
+  # so a real long run looks like a flaky agent.
+  timeout: 24h
 
 i_understand_bypass_permissions: true
 

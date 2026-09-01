@@ -1,9 +1,14 @@
 # Propagating the review/remediation split to a live project
 
 `examples/` now carries four loops instead of three: `pr-review` reviews and stops, and a new
-`exec-pr-review-findings` applies what it found. This document is what to change in a project
-already running the old three-loop chain, in what order, and what to do with work that is
-in flight when you change it.
+`exec-pr-review-findings` applies what it found. The chain between them is also **automated** —
+the execution and review agents apply the next loop's trigger themselves, so an issue takes
+exactly two human touches instead of four. This document is what to change in a project already
+running the old three-loop chain, in what order, and what to do with work that is in flight when
+you change it.
+
+**This is a behaviour change, not a label rename.** The execution loop's prompt changes: it now
+applies `status:ready-for-pr-review` itself. Read that section before you decide when to swap.
 
 **Nothing here has been applied.** The four live configurations —
 `~/Documents/Claude/Projects/{Koinos,LawnDominator,ProjectWrangler,SnootSnap}/code/*/.agent-utils/configs/`
@@ -17,17 +22,20 @@ document to still be current.
 
 | | Before | After |
 |---|---|---|
+| human touches | four: approve plan, hand the branch to review, and read the result | **two**: approve the plan, merge at the end |
+| `execution` | opens the PR, applies `status:ready-for-review`, stops; **you** apply `status:ready-for-pr-review` when you want it reviewed | opens the PR, applies `status:pr-open`, finishes, then applies `status:ready-for-pr-review` itself as its strictly last action |
 | `pr-review` | reviews, then fixes what it finds, then applies `status:ready-for-review` | reviews, posts a findings comment, applies `status:ready-for-findings-exec`, stops |
 | remediation | inside the review session, in a context that grew to 321k tokens | a separate dispatch, one fresh subagent per **file** group |
 | findings | prose in a disposition table, re-located by whoever fixed them | anchored to `File:Line` with a prescribed fix, grouped by file |
 | handoff | none — one session did both | a comment ID in Pipeline State's `findings comment` field |
-| `status:ready-for-review` | re-asserted by `pr-review` at the end | re-asserted by `exec-pr-review-findings` instead — in both chains it is FIRST applied by `execution`, and nothing ever removes it |
+| `status:ready-for-review` | applied by `execution` when it opened the PR, then again by `pr-review` — it meant both "a PR exists" and "your turn" | applied only by `exec-pr-review-findings`, at the very end. It means one thing: the pipeline is finished and it is your turn to merge |
+| tending | keyed to `status:ready-for-review`, which happened to be present from execution onward | keyed to `status:pr-open`, which says exactly that and is applied for exactly that reason |
 
 The measurement behind it: over eight real sessions the reviewer fan-out cost $8.39 and the
 remediation that followed cost $90.86. A quarter of remediation's tool calls were re-reading code
 the reviewers had already read.
 
-## The three new labels
+## The four new labels
 
 Create these in **each** repository before touching any configuration file:
 
@@ -39,14 +47,23 @@ for r in koinos lawndominator projectwrangler snootsnap; do
     --description "A findings-execution agent is applying the review's findings"
   gh label create status:needs-findings-input --repo "mcgarylabs/$r-monorepo" \
     --description "Findings execution parked and needs a human answer"
+  gh label create status:pr-open --repo "mcgarylabs/$r-monorepo" \
+    --description "A pull request exists for this issue; keep it rebased"
 done
 ```
 
-Verify before continuing — three per repository:
+Verify before continuing — three `findings` labels plus `status:pr-open` per repository:
 
 ```bash
-gh label list --repo mcgarylabs/koinos-monorepo --limit 200 | grep -c findings   # want 3
+gh label list --repo mcgarylabs/koinos-monorepo --limit 200 | grep -c findings     # want 3
+gh label list --repo mcgarylabs/koinos-monorepo --limit 200 | grep -c 'pr-open'    # want 1
 ```
+
+**`status:pr-open` is the one that is easy to underestimate.** It is not cosmetic and it is not
+optional: it is the execution loop's `labels.review`, which is what makes an issue eligible for
+tending. If it does not exist when the swap lands, the execution agent's attempt to apply it fails
+and **nothing rebases any pull request in the project** — silently, because an untended pull
+request looks exactly like a fresh one until it is behind.
 
 **Do this first, and do not skip the verification.** A trigger label that does not exist in the
 repository produces no error anywhere: the tick lists every open issue, finds nothing carrying the
@@ -68,7 +85,8 @@ propagation is: take the new example's bodies, keep the three local values.
 | `labels.terminal` | absent | `status:ready-for-findings-exec` |
 | `labels.veto` | `blocked:*`, `status:ready-for-execution`, `status:executing` | add `status:ready-for-findings-exec` and `status:fixing-findings` |
 | `agent.effort` | `high` | `medium` |
-| `agent.max_budget_usd` | `50` | `10` |
+| `agent.max_budget_usd` | `50` | `0` — see the budget/timeout section below |
+| `agent.timeout` | `8h0m0s` | `24h` (or delete the line) |
 | `prompt` | `reviewing-commits`, "YOU FIX WHAT YOU FIND" | `producing-review-findings`, "YOU DO NOT FIX WHAT YOU FIND" — copy the example's body verbatim |
 | `resume_prompt` | repeats "you fix what you find" | copy the example's body verbatim |
 | header comment | says the loop "reviews and FIXES" | rewrite; it describes the old behaviour |
@@ -98,14 +116,36 @@ routing. Validate before going further (see step 3 of the migration).
 
 ### 3. `execution.yaml` — in all four projects
 
+**This is the file whose behaviour changes, not just its labels.** Copy the example's `prompt` and
+`resume_prompt` bodies verbatim, the same way you do for `pr-review.yaml`.
+
 | Field | From | To |
 |---|---|---|
+| `labels.review` | `status:ready-for-review` | `status:pr-open` |
 | `labels.terminal` | absent | `status:ready-for-pr-review` |
 | `labels.veto` | `blocked:*`, `status:pr-reviewing` | add `status:fixing-findings` |
 | `agent.model` | `opus` | `sonnet` |
+| `prompt` | "ON COMPLETION. Open the pull request … add `{{.Labels.Review}}`" | a numbered six-step completion order ending with `{{.Labels.Terminal}}` as the strictly last action — copy the example's body verbatim |
+| `resume_prompt` | silent on completion order | names the numbered order and the strictly-last terminal — copy verbatim |
+| header comment | says the human applies `status:ready-for-pr-review` by hand | rewrite; that is now the agent's job |
 
 `agent.effort` is already `medium` in all four live files; only the example needed changing.
-`max_budget_usd` is `0` (unlimited) in all four and this change does not touch it.
+`max_budget_usd` is already `0` in all four `execution.yaml` files, so only the `pr-review.yaml`
+caps need clearing. `agent.timeout` is `8h0m0s` everywhere — see below.
+
+**Why `labels.review` moves off `status:ready-for-review`.** The field does two jobs — "the agent
+finished, go read it" and "this issue is eligible for tending" — and automating the chain pulls
+them apart. Execution no longer has a human-facing output state: its work goes straight to
+pr-review. But it is still the only loop that tends. Leaving `status:ready-for-review` here would
+summon you the moment execution finished, before the branch had been reviewed or fixed at all,
+which defeats the whole point of the change. `status:pr-open` keeps the tending and drops the
+claim on your attention, and it is honest about what the agent is actually asserting when it
+applies it: a pull request now exists.
+
+The consequence to hold on to is that **nothing removes `status:pr-open`**. It is on the issue
+from the moment the pull request opens until the issue closes, so tending covers every wait in the
+chain — the review queue, the remediation queue, your gate at the end, and any park in between.
+That is a wider tending window than the old configuration had, not a narrower one.
 
 **The `terminal` line fixes a bug that predates this work.** `EntryLoop` picks the front of the
 pipeline as *the loop whose trigger is no OTHER loop's terminal or review label*. With
@@ -116,13 +156,21 @@ already disabled in all four projects** — its only symptom is a `WARN` reading
 downstream of `execution` and leaves `planning` alone at the front. Confirm afterwards that the
 warning has stopped.
 
-**This does not contradict the warning already in your `execution.yaml`.** That comment forbids
-pointing `labels.review` at `status:ready-for-pr-review`, and it is right: the agent applies
-`labels.review` before its last phase, so that would start the review on a branch the execution
-agent is still writing to. `labels.terminal` is a different field with different consequences —
-nothing in the engine reads it for selection, no agent applies it, and the execution prompt is not
-changed. It is read in exactly one place, `EntryLoop`. Keep the warning; it still applies to the
-line above it.
+**This supersedes the warning currently in your `execution.yaml`.** That comment says
+`status:ready-for-pr-review` "must NOT be" the execution loop's handoff, because the agent applies
+its label before its last phase and would start the review on a branch it is still writing to. The
+hazard is real and the comment was right about it. What has changed is the resolution: instead of
+avoiding the chain, the prompt now defines *when* the label is applied. `labels.review` stays
+early, because tending should start as soon as the pull request exists and that label is nobody's
+trigger. `labels.terminal` is applied only after the final push, as the numbered last step, and
+nothing follows it. Delete the old comment when you copy the new prompt in — leaving it beside a
+prompt that does the opposite is worse than either.
+
+**The prompt is the guard here, and there is no mechanical backstop for it.** If a project's
+`execution.yaml` gets the new `terminal` but keeps the old prompt, the agent never applies it and
+issues simply stop at the end of execution — visible, recoverable, and the safer failure. If it
+gets the new prompt but the agent applies the terminal early anyway, two agents land on one branch.
+That is why the prompt bodies are copied verbatim rather than summarised.
 
 `status:ready-for-pr-review` is declared as `terminal` but deliberately **not** added to
 `execution.yaml`'s `veto`. `veto` is checked before tend decisions too, so vetoing it would stop
@@ -143,18 +191,55 @@ file on every delivery and caches nothing, so a new file is live to webhooks the
 written. `agent-utils project loop new` is the interactive wizard and is not required — though it
 now offers `exec-pr-review-findings` as a template if you prefer to scaffold.
 
+## Budgets and timeouts, in every loop file
+
+Separate from the split, and applying to `planning.yaml` as well:
+
+| Field | Live value today | New value |
+|---|---|---|
+| `agent.max_budget_usd` | `50` in `pr-review.yaml`; `0` already in `execution.yaml` | `0` everywhere |
+| `agent.timeout` | `8h0m0s` in every file | `24h` |
+
+**`max_budget_usd: 0` means no cost ceiling, and that is now the recommendation.** A cap does not
+prevent an expensive run; it interrupts one, wherever it happens to be — often mid-edit and after
+the last push — and the loop then retries from a resumed session and spends again on work the cap
+just threw away. Cost is controlled by `model` and `effort`, which shape the whole run. The
+examples write the `0` out rather than omitting the field, so it reads as a decision.
+
+**`agent.timeout` is no longer required.** It now defaults to `24h`, so you may delete the line
+instead of setting it. Either is fine; the examples set it explicitly for the same
+documented-config reason. The timeout is a last resort on a wedged process, not a hang detector —
+`retry.breaker.orphan_threshold` and `loop kill` handle a stuck dispatch on evidence — and
+guessing low is the expensive mistake, because a killed dispatch is recorded failed and retried, so
+a real long run reads as a flaky agent.
+
+The four live files all carry explicit caps and `8h0m0s` timeouts written by the setup wizard.
+None of that clears itself; you have to edit each one. Nothing breaks if you do not — the old
+values remain valid — but a `pr-review.yaml` still capped at `50` will keep interrupting the runs
+you were trying to make cheaper by other means.
+
 ## Migration — the order is not negotiable
 
-1. **Create the three labels** in every repository, and verify (above).
+1. **Create the four labels** in every repository, and verify (above).
 2. **Copy `exec-pr-review-findings.yaml`** into each project's `.agent-utils/configs/`.
 3. **Validate it loads**, per project, before going further:
    `agent-utils project --name <p> loop status --name exec-pr-review-findings`
    must print the loop rather than an error.
 4. **Add the cron line** for the new loop.
-5. **Only now, swap `pr-review.yaml`** and edit `execution.yaml`. Keep a `pr-review.yaml.bak`.
+5. **Swap `pr-review.yaml`.** Keep a `pr-review.yaml.bak`.
+6. **Last, swap `execution.yaml`.** Keep an `execution.yaml.bak`.
 
-The reverse order strands work **silently**: a review that finishes before the new loop exists
-applies `status:ready-for-findings-exec`, and no loop watches it, and nothing logs that.
+Every step is downstream-first, and that is the whole rule: **never create a producer of a label
+before its consumer exists.** Step 5 before step 2 strands a finished review at
+`status:ready-for-findings-exec` with no loop watching it. Step 6 before step 5 hands a branch to
+a `pr-review` that still fixes what it finds, which is not wrong but is not the pipeline you are
+migrating to. Nothing logs either case — a label no loop watches produces silence, not an error.
+
+Step 6 last has a second benefit worth taking deliberately: between step 5 and step 6 the new
+review and remediation loops are live but nothing feeds them automatically, so you can promote one
+issue by hand with `gh issue edit N --add-label status:ready-for-pr-review` and watch the whole new
+chain run end to end before the execution loop starts feeding it on its own. Do that once per
+project.
 
 ### Where in-flight work lands
 
@@ -163,12 +248,14 @@ effect immediately and carries no state of its own. Every live state and what it
 
 | State at the swap | Where it lands | Action |
 |---|---|---|
-| `status:pr-reviewing`, dispatch running | Untouched. The dispatch record wins over labels, so the next tick skips the issue; the running agent keeps its **old** prompt, fixes what it found, and applies `status:ready-for-review` — the correct end state under either chain. | None while it runs. See the warning below if it dies. |
+| `status:executing`, dispatch running | Untouched — the dispatch record wins over labels. The running agent keeps its **old** prompt, so it finishes by applying `status:ready-for-review` and stops, exactly as before. It does **not** hand on to review. | Once it finishes, promote by hand: `gh issue edit N --add-label status:ready-for-pr-review`. This is the last issue in the project that will ever need that. |
+| `status:ready-for-execution`, queued | Dispatched on the next tick under the **new** execution prompt, and hands on to review by itself at the end. | None. |
+| `status:pr-reviewing`, dispatch running | Untouched, same reason. The running agent keeps its **old** prompt, fixes what it found, and applies `status:ready-for-review`. That is still a correct end state — it just skips the new remediation loop for this one issue. | None while it runs. See the resumed-session warning below if it dies. |
 | `status:ready-for-pr-review`, queued | Dispatched on the next tick under the new review-only prompt. | None, if the ordering above was followed. |
-| `status:ready-for-review` from the old flow | Nothing. The label means the same thing it always did — reviewed, fixed, waiting on you — and it is still what the execution loop tends. It is `review` for three loops and `trigger` for none, so no loop picks it up. | **None. Do not relabel these.** |
-| `status:needs-review-input` | Idles. `blocked:*` does not match it and it carries no trigger, so it waits for you to re-add `status:ready-for-pr-review`. | `loop reset` first — see below. |
+| `status:ready-for-review` from the old flow | Nothing. The label means what it always did — the work is done and it is your turn — and no loop triggers on it. | **None. Do not relabel these.** |
+| `status:needs-review-input` or `status:needs-execution-input` | Idles. `blocked:*` does not match either and neither carries a trigger, so it waits for you to re-add the loop's trigger. | `loop reset` first — see below. |
 | Parked at the retry cap, or operator-stopped | Unaffected; none of their labels move. | None. |
-| A live *tend* dispatch on a `status:ready-for-review` pull request | Unaffected. | None. |
+| **Any open pull request, in any of the above states** | It has no `status:pr-open` label, because that label did not exist when its execution agent ran. Execution's `labels.review` is now `status:pr-open`, so **none of these are tended any more.** They were tended before the swap and they silently stop being tended after it. | Backfill it once, per repository — see below. |
 
 **The one real hazard is a resumed session.** Dispatch state is keyed by loop name and repository,
 not by labels, and `pr-review`'s `trigger` and `in_flight` names do not change in this migration —
@@ -176,11 +263,29 @@ so a dispatch that dies is marked for retry and the next tick **resumes the same
 under the new review-only `resume_prompt`. That session's context says "you fix what you find" and
 its branch holds half-applied fixes. The two ways out:
 
-- **Preferred: drain.** Swap when no issue carries `status:pr-reviewing`.
+- **Preferred: drain.** Swap when no issue carries `status:pr-reviewing` or `status:executing`.
 - **If you swap hot:** for each such issue, once its agent has ended, run
   `agent-utils project --name <p> loop reset --name pr-review --issue N`
-  so any later dispatch starts a clean session. Do the same for any issue sitting at
-  `status:needs-review-input` **before** you re-add its trigger.
+  (or `--name execution`) so any later dispatch starts a clean session. Do the same for any issue
+  sitting at `status:needs-review-input` or `status:needs-execution-input` **before** you re-add
+  its trigger.
+
+**The tending backfill is not optional, and it is easy to forget** because nothing reports it. Every
+pull request that already exists was opened before `status:pr-open` did, so after the swap the
+execution loop tends none of them. Backfill once per repository, right after step 6:
+
+```bash
+gh issue list --repo mcgarylabs/koinos-monorepo --state open \
+  --json number,labels \
+  --jq '.[] | select([.labels[].name] | any(startswith("status:"))) | .number' \
+| while read -r n; do
+    gh issue edit "$n" --repo mcgarylabs/koinos-monorepo --add-label status:pr-open
+  done
+```
+
+That is deliberately wider than "issues with a pull request": adding the label to an issue that has
+no pull request is harmless, because tending also requires an open pull request that is behind. The
+opposite mistake — missing one — is a branch that quietly rots.
 
 ### Verifying the swap took
 

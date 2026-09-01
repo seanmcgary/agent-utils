@@ -200,7 +200,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.worktree` | enum | yes | — |
 | `agent.max_budget_usd` | number | no | `0`, meaning no limit |
 | `agent.background_tasks` | bool | no | `false` |
-| `agent.timeout` | duration | yes | — |
+| `agent.timeout` | duration | no | `24h` |
 | `tend.harness` | enum | no | falls back to `agent.harness` |
 | `tend.model` | string | no | falls back to `agent.model` |
 | `tend.effort` | enum | no | falls back to `agent.effort` |
@@ -428,6 +428,19 @@ The agent finished and its output is waiting for you to read. The **agent** appl
 
 If `tend_pr` is true, this label is also what makes an issue eligible for tending.
 
+**Those are two jobs, and in an automated chain they come apart.** A loop whose output goes
+straight to the next loop has no "waiting for you to read" state at all — but it may still be the
+loop that should tend. Naming the human's queue label here to obtain tending is the tempting fix
+and the wrong one: it summons the human at that loop's completion, before the rest of the pipeline
+has run. Give the loop a label that describes what it actually asserts, and let that label carry
+the tending.
+
+`examples/execution.yaml` is the worked case. It declares `review: status:pr-open`, applies it the
+moment the pull request opens, and never removes it — so the execution loop tends the branch
+continuously from then until the issue closes, through every downstream queue and park, while
+`status:ready-for-review` stays reserved for the end of the chain. Tending is paused for the
+windows where another agent is writing by `veto`, not by the absence of the label.
+
 ```yaml
 review: status:plan-ready-for-review
 ```
@@ -437,13 +450,18 @@ review: status:plan-ready-for-review
 The issue has left this loop, and the label that says so is usually the next loop's `trigger`.
 
 **Who applies it depends on what the handoff is.** Where the terminal is a *human gate*, only you
-apply it and the prompt must forbid the agent from ever doing so — that is planning, where the
-label is your approval of the spec and plan, and `examples/planning.yaml`'s prompt says
+apply it and the prompt must forbid the agent from ever doing so — that is `examples/planning.yaml`,
+where the label is your approval of the spec and plan, and whose prompt says
 `You NEVER apply {{.Labels.Terminal}}, under any circumstance`. Where the terminal is a *machine
-handoff*, the loop's own agent applies it, **as its strictly last action** — that is
-`examples/pr-review.yaml`, which hands a reviewed branch to the remediation loop. Order matters
-there: a downstream trigger applied before the upstream agent's final phase starts a second agent
-on a branch the first is still writing to.
+handoff*, the loop's own agent applies it — that is `examples/execution.yaml` and
+`examples/pr-review.yaml`, which pass a branch down the chain without stopping for you.
+
+**A machine handoff is only safe if the prompt makes it the agent's strictly final action**, after
+the last push, and says so in numbered steps. The terminal is the next loop's trigger, so applying
+it while the agent is still working starts a second agent on a branch the first is still writing
+to, and the two fight over the files and the labels alike. Note that this is a property of *when*
+the label is applied, not of *which field* it is: `labels.review` is applied mid-run by the same
+agents, and is safe there only because it is nobody's trigger.
 
 It is optional because not every loop has one. It is nonetheless the field most likely to be
 wrongly omitted, because two of its three effects are invisible:
@@ -679,21 +697,32 @@ worktree: per_issue
 Passed to the agent as `--max-budget-usd`. The dispatch is stopped when the session's cost
 exceeds it.
 
-**`0`, or omitting the field, disables the cap.** The flag is then not passed at all and the
-dispatch runs with no cost ceiling — bounded only by `agent.timeout`. That is deliberate and
-supported; set it knowingly.
+**`0`, or omitting the field, disables the cap**, and **`0` is what every reference loop sets.**
+The flag is then not passed at all and the dispatch runs with no cost ceiling.
+
+That is a considered default, not laziness. **A budget cap does not prevent an expensive run; it
+interrupts one.** The dispatch is stopped wherever it happens to be — mid-edit, after the agent's
+last push or before it — and recorded failed, so the loop retries it from a resumed session and
+spends again on work the cap just threw away. The cases where a cap helps are the ones where the
+run was going to be cheap anyway; the cases where it fires are the ones where it costs you the run
+*and* the retry.
+
+Control cost with the settings that shape the whole run — `agent.model` and `agent.effort`, and
+the structure of what you ask the agent to do — rather than with a ceiling that lands in the
+middle of it. The reference loops write `max_budget_usd: 0` out explicitly, rather than omitting
+the field, so a reader can see that no ceiling was a decision.
 
 A negative value is rejected at load. It would otherwise behave exactly like `0`, so `-25`
 typed for `25` would have run uncapped and said nothing.
 
-This is a per-dispatch ceiling, not a per-issue or per-day one. An issue that is retried
+If you do set a cap: it is per **dispatch**, not per issue or per day. An issue that is retried
 three times can spend up to three times this amount.
 
 claude-only: a `pi` dispatch — whether from `harness: pi` or a `harness:pi` label — ignores it,
-because pi exposes no cost-ceiling flag. Such a dispatch is bounded only by `agent.timeout`.
+because pi exposes no cost-ceiling flag.
 
 ```yaml
-max_budget_usd: 25   # or 0 for no cap
+max_budget_usd: 0   # no cost ceiling; the recommended value
 ```
 
 ### `agent.background_tasks` — optional
@@ -733,19 +762,33 @@ whether from `harness: pi` or a `harness:pi` label — never builds, so such a d
 background_tasks: false   # true only if you know why you want it
 ```
 
-### `agent.timeout` — required
+### `agent.timeout` — optional, defaults to `24h`
 
-How long one dispatch may run. A Go duration string: `90s`, `30m`, `3h`.
+How long one dispatch may run. A Go duration string: `90s`, `30m`, `3h`. **Omit it unless you have
+a specific reason.**
 
 On expiry the loop signals the agent's whole process group, not just the direct child, so a
 dev server or watcher the agent started does not survive it. The dispatch is recorded failed
 and becomes eligible for retry.
 
-Set it well above a realistic run. A timeout mid-way through useful work wastes everything
-after the agent's last push.
+**This is a last resort, not a hang detector and not a budget.** A genuinely stuck dispatch is
+caught by `retry.breaker.orphan_threshold` and by `agent-utils project loop kill`, both of which
+act on evidence. All the timeout adds is a bound on a wedged process that nothing else noticed, and
+the only cost of a high one is how long that rare case takes to clear.
+
+The default is high for that reason. This field used to be required, which made every operator
+invent a number for the setting they have least basis to choose — and the invented number is
+always too small, because guessing low is invisible: the dispatch is recorded failed and retried
+from a resumed session, so a real long run on a large branch reads as a flaky agent rather than as
+a number that needed raising. A timeout mid-way through useful work also wastes everything after
+the agent's last push.
+
+An explicitly set value is never overwritten. `0` means "unset" and takes the default, because
+YAML cannot distinguish an omitted field from an explicit zero; a negative value is rejected at
+load.
 
 ```yaml
-timeout: 3h
+timeout: 24h   # the default; omit the field for the same result
 ```
 
 ### `i_understand_bypass_permissions`
@@ -964,13 +1007,14 @@ force-pushes a whole round of them — so a tend agent rebasing the same branch 
 pushes. Tending stays in one place, on the execution loop.
 
 **What actually keeps the two apart is `veto`, not the label.** It is tempting to reason that a
-pull request waiting on review is untended because it has not reached `status:ready-for-review`
-yet. That is wrong: the execution agent applies `status:ready-for-review` when it opens the pull
-request, and nothing in the chain ever removes it, so the execution loop tends that branch
-continuously from then on — through the review queue and the remediation queue alike. `veto` is
-checked before tend decisions, so the execution loop must list `status:pr-reviewing` and
-`status:fixing-findings`: those two entries are the only thing that pauses its tend while another
-agent is rewriting the branch, and they resume it the moment that agent is done.
+pull request waiting on review is untended because it has not reached the tending loop's
+`labels.review` yet. That is backwards: the execution agent applies `status:pr-open` when it opens
+the pull request and nothing in the chain ever removes it, so the execution loop tends that branch
+continuously from then on — through the review queue, the remediation queue, the human gate, and
+any park in between. `veto` is checked before tend decisions, so the execution loop must list
+`status:pr-reviewing` and `status:fixing-findings`: those two entries are the only thing that
+pauses its tend while another agent is rewriting the branch, and they resume it the moment that
+agent is done.
 
 **Two things trigger a tend, and either alone is enough.** The pull request is behind its base —
 the trigger this section led with — or review activity on it is newer than the last *finished*
@@ -1220,7 +1264,7 @@ Beyond the required fields in the quick reference:
 | `agent.permission_mode` is a real claude mode or empty | `… is not a valid claude permission mode` |
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
 | `agent.max_budget_usd` ≥ 0 (`0` means no cap) | `agent.max_budget_usd must not be negative` |
-| `agent.timeout` > 0 | `agent.timeout must be greater than zero` |
+| `agent.timeout` not negative (omitted or `0` takes the `24h` default) | `agent.timeout must not be negative` |
 | `retry.max` ≥ 0 | `retry.max must not be negative` |
 | `len(retry.backoff)` ≥ `retry.max` | `it needs one entry per retry` |
 | `retry.backoff_ticks` must be empty | `is no longer supported; ... replace it with retry.backoff` |

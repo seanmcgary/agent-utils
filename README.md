@@ -418,15 +418,23 @@ chain, each loop's `trigger` being the loop before its `terminal`:
 
 | Loop | Trigger | Hands on with | Does |
 |---|---|---|---|
-| `planning.yaml` | `status:ready-for-spec` | `status:ready-for-execution` (**you** apply it) | spec and plan, parked for your approval |
-| `execution.yaml` | `status:ready-for-execution` | `status:ready-for-pr-review` (**you** apply it) | builds the branch, opens the pull request |
-| `pr-review.yaml` | `status:ready-for-pr-review` | `status:ready-for-findings-exec` (its agent applies it) | runs the strongest model over the branch and posts a findings comment — it decides, it does not fix |
-| `exec-pr-review-findings.yaml` | `status:ready-for-findings-exec` | `status:ready-for-review` (present since execution; its agent re-asserts it) | applies that findings comment, one fresh subagent per file group, then hands the pull request to you |
+| `planning.yaml` | `status:ready-for-spec` | `status:ready-for-execution` — **human touch 1** | spec and plan, parked for your approval |
+| `execution.yaml` | `status:ready-for-execution` | `status:ready-for-pr-review` (its agent, last action) | builds the branch, opens the pull request |
+| `pr-review.yaml` | `status:ready-for-pr-review` | `status:ready-for-findings-exec` (its agent, last action) | runs the stronger model over the branch and posts a findings comment — it decides, it does not fix |
+| `exec-pr-review-findings.yaml` | `status:ready-for-findings-exec` | `status:ready-for-review` — **human touch 2** | applies that findings comment, one fresh subagent per file group, then hands the pull request to you to merge |
+
+**An issue takes exactly two human touches.** You approve the plan, and you merge. Everything
+between is machine handoff: each loop's agent applies the next loop's trigger as its own strictly
+final action, after its last push, so a second agent never starts on a branch the first is still
+writing to. `status:ready-for-review` means one thing — the pipeline is finished and it is your
+turn — and exactly one loop applies it.
 
 The first two are ported from the reference planning and execution orchestrators. The last two
 used to be one loop that reviewed and fixed in a single session; splitting them is what lets the
 review run a strong model on a small budget while the fixing runs a cheaper one in a fresh
-context per fix. `examples/pi.yaml` is the execution loop again under the `pi` harness, not a
+context per fix. Tending is keyed to a fifth label, `status:pr-open`, which the execution agent
+applies when it opens the pull request and nothing removes — so the branch keeps being rebased
+through every wait in the chain, including the one at your gate. `examples/pi.yaml` is the execution loop again under the `pi` harness, not a
 fifth stage. If you are running the older three-loop chain,
 [`docs/review-loop-split.md`](docs/review-loop-split.md) is the propagation and migration guide —
 what changes in each file, in what order, and where work already in flight lands.

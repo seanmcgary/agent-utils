@@ -128,6 +128,58 @@ func TestExampleLoopsResolveToOneEntryLoop(t *testing.T) {
 	}
 }
 
+// status:ready-for-review must be declared by exactly ONE loop, and it must be
+// the loop at the END of the chain.
+//
+// The pipeline allows the human exactly two touches: applying planning's
+// terminal to approve a plan, and merging at the end. Every handoff between
+// those is machine-to-machine. labels.review is where that policy is easiest to
+// break, because the field does two jobs -- "the agent finished, go read it" and
+// "this issue is eligible for tending" -- and a loop that needs the second one
+// can quietly acquire the first by naming the human's label to get it.
+//
+// That is exactly what the execution loop used to do. It declared
+// review: status:ready-for-review and applied it mid-run, when it opened the
+// pull request, which under an automated chain summons the human before the
+// branch has been reviewed or fixed at all. It now declares status:pr-open --
+// same tending behaviour, no claim on the human's attention. A future edit that
+// points an earlier loop back at status:ready-for-review to get tending would
+// reintroduce the same defect, and nothing else in the suite would notice: every
+// file still loads, every loop still dispatches, and the entry-loop graph is
+// unchanged.
+func TestOnlyTheFinalLoopSummonsTheHuman(t *testing.T) {
+	const humanQueue = "status:ready-for-review"
+	const finalLoop = "exec-pr-review-findings"
+
+	entries, err := os.ReadDir(filepath.Join("..", "..", "examples"))
+	if err != nil {
+		t.Fatalf("read examples: %v", err)
+	}
+
+	var declaring []string
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+			continue
+		}
+		cfg, err := config.Load(filepath.Join("..", "..", "examples", e.Name()))
+		if err != nil {
+			t.Fatalf("load %s: %v", e.Name(), err)
+		}
+		if cfg.Labels.Review == humanQueue {
+			declaring = append(declaring, cfg.Name)
+		}
+		// The same label as a TRIGGER would be worse still: a loop would run
+		// on the human's queue rather than merely filling it.
+		if cfg.Labels.Trigger == humanQueue {
+			t.Errorf("loop %q triggers on %s, which is the human's merge queue", cfg.Name, humanQueue)
+		}
+	}
+
+	if len(declaring) != 1 || declaring[0] != finalLoop {
+		t.Errorf("loops declaring review: %s = %v, want exactly [%s]", humanQueue, declaring, finalLoop)
+	}
+}
+
 // The pi example must be a pi harness with the claude-only fields absent.
 func TestPiExampleIsPiHarness(t *testing.T) {
 	cfg, err := config.Load(filepath.Join("..", "..", "examples", "pi.yaml"))

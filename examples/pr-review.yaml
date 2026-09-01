@@ -8,7 +8,7 @@
 # 8% was subsidising a 92% that ran in the same accumulating context, so the two
 # could not be tuned, budgeted, or retried separately. Splitting them is what
 # lets this loop keep the strongest model at a small budget while the fixing
-# runs cheaper, and it is why max_budget_usd here is 10 rather than 50.
+# runs cheaper.
 name: pr-review
 repo: mcgarylabs/lawndominator-monorepo
 
@@ -85,12 +85,26 @@ agent:
   effort: medium
   permission_mode: bypassPermissions
   worktree: per_issue
-  # Review only. The measured phase is about $1.05 a session and the cap that
-  # matters now lives in exec-pr-review-findings.yaml. Ten leaves room for a
-  # large branch and for the mechanical gates' own fixes without leaving room
-  # for a run that has quietly started fixing findings.
-  max_budget_usd: 10
-  timeout: 4h
+  # No cost ceiling, and written out rather than omitted so it reads as a
+  # decision. A budget cap does not stop an expensive run; it stops it PART WAY
+  # THROUGH, which is the one outcome worth avoiding. The dispatch is recorded
+  # failed with its work half-applied and unpushed, the loop retries it from a
+  # resumed session, and the retry re-spends what the cap just refused. Cost is
+  # controlled here by model and effort, which shape the whole run, and by the
+  # findings artifact that keeps the expensive half short -- not by a ceiling
+  # that lands mid-edit.
+  #
+  # 0 means no ceiling: internal/runner/args.go omits --max-budget-usd for it.
+  # A negative value is rejected, because it would reach that same "> 0" gate
+  # and be silently identical to no cap.
+  max_budget_usd: 0
+  # Omitting this would default it to 24h; it is written out for the same reason
+  # as the line above. This is a last-resort bound on a wedged process, not a
+  # budget: a stuck dispatch is caught by the orphan breaker and `loop kill`,
+  # both of which act on evidence rather than a clock. Guessing low is the
+  # expensive mistake, because a killed dispatch is recorded FAILED and retried,
+  # so a real long run looks like a flaky agent.
+  timeout: 24h
 
 i_understand_bypass_permissions: true
 
@@ -100,10 +114,10 @@ i_understand_bypass_permissions: true
 #
 # Be exact about where tending actually lands, because the obvious reading is
 # wrong. A loop tends whatever ITS labels.review names, and for the execution
-# loop that is status:ready-for-review -- which the EXECUTION agent applies when
-# it opens the pull request, and which nothing in this chain ever removes. So
-# the branch is tended continuously from that moment on, including while it sits
-# in this loop's queue. It is not the case that a pull request waiting on review
+# loop that is status:pr-open -- which the EXECUTION agent applies the moment it
+# opens the pull request, and which nothing in this chain ever removes. So the
+# branch is tended continuously from that moment on, including while it sits in
+# this loop's queue. It is not the case that a pull request waiting on review
 # goes untended.
 #
 # What stops the race is therefore not the absence of the label; it is the veto
@@ -215,8 +229,9 @@ prompt: |
     6. Add {{.Labels.Terminal}}. THIS IS YOUR LAST ACTION. Nothing follows it.
   This loop's {{.Labels.Review}} and {{.Labels.Terminal}} are the same label, so
   step 6 applies both roles at once and there is no second label to add. Add no
-  other status label; in particular status:ready-for-review now means "fixed and
-  waiting for the human" and belongs to the remediation loop.
+  other status label; in particular status:ready-for-review means "the whole
+  pipeline is finished and it is the human's turn to merge", and only the
+  remediation loop after you applies it.
 
   PARKING. Park only when you cannot proceed: a mechanical gate still red after
   your fixes, a rejected lease, or a pull request that cannot be resolved from

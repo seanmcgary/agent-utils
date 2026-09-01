@@ -7,7 +7,8 @@
 #     (for example anthropic/claude-sonnet-4-5 or openrouter/...).
 #   - agent.permission_mode is claude-only and must be omitted.
 #   - agent.max_budget_usd is claude-only; for pi it is accepted but has no
-#     effect. It is omitted here.
+#     effect. It is omitted here. It would be 0 either way -- see
+#     execution.yaml for why the reference loops set no cost ceiling.
 name: pi
 repo: mcgarylabs/lawndominator-monorepo
 
@@ -19,16 +20,28 @@ labels:
   trigger:   status:ready-for-execution
   in_flight: status:executing
   blocked:   status:needs-execution-input
-  review:    status:ready-for-review
+  # Mirrors execution.yaml, including the label topology: status:pr-open is the
+  # tend key and the "a pull request exists" marker, and the terminal is the
+  # review loop's trigger, applied by the agent as its strictly last action.
+  # Leaving review at status:ready-for-review here would summon the human at
+  # execution time, before the branch has been reviewed or fixed.
+  review:    status:pr-open
+  terminal:  status:ready-for-pr-review
   veto:
     - "blocked:*"
+    # The states the review and remediation loops own. This loop does not tend,
+    # so these only stop a re-dispatch, but keeping them identical to
+    # execution.yaml is what lets one be swapped for the other.
+    - status:pr-reviewing
+    - status:fixing-findings
 
 agent:
   harness: pi
   model: anthropic/claude-sonnet-4-5
   effort: high
   worktree: per_issue
-  timeout: 4h
+  # Matches execution.yaml. Omitting it would default to the same 24h.
+  timeout: 24h
 
 tend_pr: false
 
@@ -45,7 +58,10 @@ prompt: |
   {{.Labels.InFlight}} first. Run in the isolated worktree given by
   {{.Worktree}}. Self-contained; never ask the human through the CLI. On a
   blocker, park: comment and add {{.Labels.Blocked}}. On success, remove
-  {{.Labels.InFlight}} and add {{.Labels.Review}}. Never merge.
+  {{.Labels.InFlight}} and add {{.Labels.Review}} as soon as the pull request is
+  open. Then, and only after your final push, add {{.Labels.Terminal}} as your
+  strictly last action -- it is the review loop's trigger, so applying it while
+  you are still working starts a second agent on your branch. Never merge.
 
 resume_prompt: |
   Resume issue #{{.Issue.Number}} in {{.Repo}} in the SAME session. Remove
