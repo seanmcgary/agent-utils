@@ -1000,18 +1000,85 @@ func (s *Store) DeleteIssueState(loop, repo string, number int) error {
 	return nil
 }
 
+// ErrDispatchClaimed reports that this issue already carries a live dispatch on
+// the other side of the tend/loop divide, so the row was not inserted.
+//
+// It is a distinct error because it is not a failure of anything: it is the
+// claim below doing its job, and the caller answers it by not dispatching.
+var ErrDispatchClaimed = errors.New(
+	"another live dispatch already holds this issue: a loop agent and a tend agent must never be in one branch at once")
+
 // CreateDispatch inserts a running dispatch row and returns its identifier.
+//
+// # The row is a CLAIM on the issue, not just a record of one
+//
+// A loop agent and a tend agent must never work one branch at once: both
+// rebase, both commit, and both `git push --force-with-lease`, and their
+// worktrees are detached, so git refuses nothing. Two independent passes decide
+// that -- engine.Decide for the loops, engine.DecideTend for the project's tend
+// dispatcher -- and each is given the other's live rows so it can decline.
+//
+// A check alone is not enough, and it is the LOCKS that make it not enough. The
+// two passes take different flocks (<loop>.lock and tend.lock), so they run
+// concurrently by design; each can therefore read "no live dispatch on the
+// other side", and both then insert. The window between the read and the insert
+// is a whole GitHub round trip wide.
+//
+// So the insert itself carries the test, in ONE statement, which SQLite
+// executes atomically: the row goes in only while no running dispatch for the
+// same (project, repository, issue) sits on the other side of the divide. The
+// loser gets ErrDispatchClaimed and dispatches nothing, whichever way the race
+// fell. This is the guarantee; the two decision-time checks are what make the
+// refusal rare enough to be an anomaly rather than a routine outcome.
+//
+// The divide is tend-versus-everything-else, not row-versus-row. Two dispatches
+// of the SAME side are governed by their own pass, which holds a lock that
+// serialises them: a loop's issue is guarded by engine.Decide under the loop's
+// lock, and two tends of one pull request by DecideTend under the dispatcher's.
+// Widening this to refuse those as well would refuse legitimate work -- two
+// loops of a pipeline can hold one issue -- for a hazard that is already held
+// shut somewhere with more context than this statement has.
+//
+// A dead-but-unreaped row on the other side blocks the claim, which is the
+// conservative direction and matches what both passes already do: neither
+// reaps the other's rows (see loopcmd.tendState), so both already treat a
+// foreign row as live. The row is retired by its own pass, and the next
+// trigger dispatches.
 func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
+	// 1 when the new row is a tend, 0 otherwise. The WHERE clause compares it
+	// with the same expression evaluated over each candidate row, so "the other
+	// side of the divide" is one inequality rather than two branches.
+	tend := 0
+	if d.Kind == KindTend {
+		tend = 1
+	}
 	res, err := s.db.Exec(`
 		INSERT INTO dispatches (project_id, loop, repo, number, kind, session_id,
 		                        status, started_at, log_path, pr_number, title,
 		                        model, harness, effort, provider, review_pending)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (
+		  SELECT 1 FROM dispatches
+		  WHERE project_id = ? AND repo = ? AND number = ? AND status = ?
+		    AND (CASE WHEN kind = ? THEN 1 ELSE 0 END) <> ?
+		)`,
 		s.projectID, d.Loop, d.Repo, d.Number, d.Kind, d.SessionID,
 		StatusRunning, time.Now().UTC(), d.LogPath, d.PRNumber, d.Title,
-		d.Model, d.Harness, d.Effort, d.Provider, d.ReviewPending)
+		d.Model, d.Harness, d.Effort, d.Provider, d.ReviewPending,
+		s.projectID, d.Repo, d.Number, StatusRunning, KindTend, tend)
 	if err != nil {
 		return 0, fmt.Errorf("create dispatch: %w", err)
+	}
+	// RowsAffected, not LastInsertId: a refused claim inserts nothing, and
+	// LastInsertId would then hand back the identifier of whatever this
+	// connection inserted last -- an id belonging to somebody else's live row,
+	// which the caller would go on to finish.
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("create dispatch: %w", err)
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("create dispatch for issue %d: %w", d.Number, ErrDispatchClaimed)
 	}
 	return res.LastInsertId()
 }

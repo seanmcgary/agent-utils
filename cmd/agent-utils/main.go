@@ -184,17 +184,10 @@ func resolveLoopConfig(c *cli.Command, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// The tend dispatcher is NAMED in the ambiguity error, and it must be. A
-	// project that tends has a dispatcher an operator can tick, inspect and
-	// read logs from, and an error listing only the loop files would say it
-	// does not exist. It is deliberately not a candidate for the
-	// only-one-configuration shortcut below, and not offered in the
-	// interactive prompt either: both of those pick a default, and "the thing
-	// that force-pushes branches" must never be picked by default.
-	names := config.Names(entries)
-	if _, err := config.LoadTend(dir); err == nil {
-		names = append(names, project.Reserved)
-	}
+	// The tend dispatcher is deliberately not a candidate for the
+	// only-one-configuration shortcut, and not offered in the interactive
+	// prompt either: both of those pick a default, and "the thing that
+	// force-pushes branches" must never be picked by default.
 	if len(entries) == 1 {
 		return entries[0].Path, nil
 	}
@@ -207,6 +200,20 @@ func resolveLoopConfig(c *cli.Command, dir string) (string, error) {
 				example = e.Name
 				break
 			}
+		}
+		// The tend dispatcher is NAMED in the ambiguity error, and it must be.
+		// A project that tends has a dispatcher an operator can tick, inspect
+		// and read logs from, and an error listing only the loop files would
+		// say it does not exist.
+		//
+		// Built HERE rather than above the shortcut, because LoadTend is not
+		// free: it is a project.Load plus a full config.List with a config.Load
+		// per file, and every unambiguous resolution -- the common case, and
+		// the one every daemon-free cron invocation takes -- paid for it and
+		// then discarded the answer.
+		names := config.Names(entries)
+		if _, err := config.LoadTend(dir); err == nil {
+			names = append(names, project.Reserved)
 		}
 		// FullName already includes the root command name.
 		return "", fmt.Errorf("%w: %s\n\nName one, for example:\n  %s --name %s",

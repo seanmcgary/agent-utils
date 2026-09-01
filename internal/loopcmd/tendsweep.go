@@ -210,6 +210,7 @@ func tendDispatch(
 	}
 
 	plan := engine.DecideTend(cfg, snap, st)
+	logTendSkips(cfg, plan)
 
 	// Issue order, so a capped sweep takes the low-numbered batch every time
 	// and the next sweep takes the next one. DecideTend already walks issues in

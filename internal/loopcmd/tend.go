@@ -3,6 +3,7 @@ package loopcmd
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
@@ -113,6 +114,38 @@ func tendAct(
 			slog.Error("decision failed", "loop", cfg.Name, "kind", d.Kind,
 				"issue", d.Issue, "pr", d.PR, "err", err)
 		}
+	}
+}
+
+// logTendSkips reports, per issue, why an eligible-looking pull request got no
+// decision this pass.
+//
+// TendPlan.Skips is the answer to the only question an operator has after a
+// pass that did nothing -- was the pull request current, already being tended,
+// a draft, stopped, or not linked at all -- and it was computed and then thrown
+// away by both sweeps. That mattered most exactly where there is least other
+// evidence: on a machine with no daemon the cron sweep is the ONLY trigger
+// tending has, so "tend tick complete" with an all-zero summary was the whole
+// of what an operator could see.
+//
+// The scoped delivery path does NOT call this. It decides one issue and already
+// names that issue's reason on its own completion line, so calling it here too
+// would print the same sentence twice for every delivery.
+//
+// One line per skipped issue, in issue order, rather than one line carrying a
+// map: every other line in this package is keyed by "loop" and "issue", and
+// that is what makes them greppable per issue. The list is bounded by the
+// issues carrying the tend label, because DecideTend records no reason for an
+// issue it never considered.
+func logTendSkips(cfg *config.Config, plan engine.TendPlan) {
+	numbers := make([]int, 0, len(plan.Skips))
+	for n := range plan.Skips {
+		numbers = append(numbers, n)
+	}
+	sort.Ints(numbers)
+	for _, n := range numbers {
+		slog.Info("not tending this issue", "loop", cfg.Name, "issue", n,
+			"reason", plan.Skips[n])
 	}
 }
 

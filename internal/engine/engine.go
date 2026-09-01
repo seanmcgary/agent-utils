@@ -23,26 +23,16 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		}
 	}
 
+	// Every kind blocks its issue, tends included. A loop no longer dispatches
+	// tends, so a KindTend row under a loop's own name can only be one written
+	// before tending became its own dispatcher, still draining -- and it used to
+	// be admitted here unless it held the issue's session, on the grounds that a
+	// tend with a session of its own "shares nothing". That was the wrong test:
+	// what a tend and a loop agent share is the BRANCH, which both force-push,
+	// and no session identifier says anything about that. The rows drain either
+	// way, and until they do the conservative answer is the correct one.
 	liveIssues := make(map[int]bool, len(st.Running))
 	for _, d := range st.Running {
-		if d.Kind == store.KindTend {
-			// A loop no longer dispatches tends at all, so a KindTend row under
-			// a loop's name can only be one written before tending became its
-			// own dispatcher, still draining. It blocks this loop's issue only
-			// if it actually HOLDS the issue's session -- which is what the old
-			// inheriting tend did, and what makes two claude processes resuming
-			// one identifier the same hazard as two agents in one branch. A
-			// tend carrying its own session shares nothing and blocks nothing,
-			// so this costs nothing once the old rows have drained.
-			//
-			// The project's live tends are not tracked here. The dispatcher
-			// that needs them reads every loop's rows, not one loop's; see
-			// engine.TendLiveness.
-			if s := st.Issues[d.Number]; s.SessionID != "" && s.SessionID == d.SessionID {
-				liveIssues[d.Number] = true
-			}
-			continue
-		}
 		liveIssues[d.Number] = true
 	}
 
@@ -76,6 +66,22 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			//
 			decided[iss.Number] = true
 			skips[iss.Number] = "a dispatch is already live for this issue"
+			continue
+		}
+		if st.Tended[iss.Number] {
+			// The other half of the same guard, from outside this loop's scope.
+			// The tend dispatcher declines an issue any loop of the project is
+			// working (TendState.LiveIssues); this is a loop declining an issue
+			// the dispatcher is working. Without it the guard was one-directional
+			// and a loop whose veto list did not happen to cover the tend label
+			// would start an agent on a branch a tend was rebasing and
+			// force-pushing.
+			//
+			// Its own skip reason, not the one above: "a dispatch is already
+			// live" sends an operator looking through this loop's sessions for a
+			// row that is filed under the dispatcher's name.
+			decided[iss.Number] = true
+			skips[iss.Number] = "the project's tend dispatcher holds a live dispatch for this issue"
 			continue
 		}
 

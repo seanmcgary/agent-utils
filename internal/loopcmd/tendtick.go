@@ -146,6 +146,7 @@ func TendTick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, erro
 
 	plan := engine.DecideTend(cfg, snap, st)
 	tendAct(ctx, cfg, deps, plan, now, &sum)
+	logTendSkips(cfg, plan)
 
 	body, _ := json.Marshal(sum)
 	if _, err := deps.Store.RecordTick(cfg.Name, false, string(body)); err != nil {
@@ -182,12 +183,6 @@ func tendIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	var sum Summary
 	now := deps.Now()
 
-	if deps.Fetch != nil {
-		if err := deps.Fetch(ctx); err != nil {
-			return sum, err
-		}
-	}
-
 	owner, repo := cfg.RepoOwner(), cfg.RepoName()
 
 	// subject resolves a delivery that named a PULL REQUEST to the issue it
@@ -203,9 +198,28 @@ func tendIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 		return sum, nil
 	}
 	if !iss.HasLabel(cfg.Tend.Label) {
-		// Not tendable. No pull request fetch, no comparison, no review read:
-		// most deliveries land here, and this is what keeps the fast path cheap.
+		// Not tendable. No git fetch, no pull request fetch, no comparison, no
+		// review read: most deliveries land here, and this is what keeps the
+		// fast path cheap.
 		return sum, nil
+	}
+
+	// AFTER the label test, not before it. This is `git fetch origin --prune`
+	// on the primary checkout, and every issue and pull request delivery in a
+	// tending project reaches this function -- so fetching first charged a
+	// whole fetch to every delivery this dispatcher was never going to act on,
+	// and turned a transient network failure into a "tend delivery failed" for
+	// work tending would not have done. Nothing above needs it: subject reads
+	// GitHub, not git, and the pull request number it resolves is only used
+	// below.
+	//
+	// It stays fatal once it does run, for the reason TendTick gives: the
+	// comparisons below read remote tracking refs, and a stale answer there
+	// reports a branch as current after its base has moved.
+	if deps.Fetch != nil {
+		if err := deps.Fetch(ctx); err != nil {
+			return sum, err
+		}
 	}
 
 	snap := engine.Snapshot{

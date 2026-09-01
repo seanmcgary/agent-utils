@@ -34,12 +34,25 @@ func TendPath(agentUtilsDir string) string { return project.Path(agentUtilsDir) 
 
 // IsTendPath reports whether a --config path names the tend dispatcher.
 //
-// It tests the base name, not the directory, because the descriptor is the only
-// file called config.yaml this program ever passes as a --config: loop files
-// live in configs/ and are named for their loops, and config.Load's own error
-// covers anything else that finds its way here.
+// BOTH halves matter: the base name AND the directory holding it. Testing the
+// base name alone was wrong, because config.yaml is a legal LOOP file name --
+// List accepts every *.yaml and *.yml in configs/ and takes the loop's name
+// from inside the file, never from the file name. So
+// `--config .../.agent-utils/configs/config.yaml`, and `--name <that loop>`
+// resolving to it, and the detached runner spawned with it, all used to be
+// routed to LoadTend(".../configs"), which then parsed a loop file as a project
+// descriptor and failed naming a file the operator never mentioned.
+//
+// The directory test is "the parent is the .agent-utils directory", which is
+// exactly what distinguishes the descriptor (<dir>/config.yaml) from a loop
+// file (<dir>/configs/<anything>.yaml). It reads the name of the directory
+// rather than the filesystem, so this stays pure -- the same assumption
+// DirFromPath already makes about where a project's files live.
 func IsTendPath(path string) bool {
-	return filepath.Base(path) == project.FileName
+	if filepath.Base(path) != project.FileName {
+		return false
+	}
+	return filepath.Base(filepath.Dir(path)) == DirName
 }
 
 // LoadTend builds the configuration for a project's tend dispatcher.

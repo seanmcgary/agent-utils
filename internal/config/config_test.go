@@ -678,6 +678,54 @@ func TestTendPathRoundTripsThroughIsTendPath(t *testing.T) {
 	}
 }
 
+// A loop file may legally be CALLED config.yaml. List accepts every *.yaml and
+// *.yml in configs/ and takes the loop's name from inside the file, never from
+// the file name -- so recognising the dispatcher by base name alone routed
+// `--config .../configs/config.yaml` (and `--name <that loop>`, and the
+// detached runner spawned with it) into LoadTend(".../configs"), which then
+// parsed a loop file as a project descriptor and failed naming a file the
+// operator never mentioned.
+func TestALoopFileNamedConfigYAMLIsNotTheTendDispatcher(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), DirName)
+	loop := filepath.Join(ConfigsDir(dir), project.FileName)
+	if IsTendPath(loop) {
+		t.Errorf("IsTendPath(%q) = true: a loop file in configs/ is not the project descriptor", loop)
+	}
+	// The control, so this cannot pass by IsTendPath simply never saying yes.
+	if !IsTendPath(TendPath(dir)) {
+		t.Errorf("IsTendPath(%q) = false, want true", TendPath(dir))
+	}
+}
+
+// That the loop file really is loadable through the ordinary discovery path,
+// which is what makes the case above reachable rather than hypothetical.
+func TestListLoadsALoopFileNamedConfigYAML(t *testing.T) {
+	t.Setenv("AGENT_UTILS_DIR", "")
+	dir := filepath.Join(t.TempDir(), DirName)
+	if err := os.MkdirAll(ConfigsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(ConfigsDir(dir), project.FileName), []byte(validYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := List(dir)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Err != nil {
+		t.Fatalf("entries = %+v, want one that loads", entries)
+	}
+	path, err := Resolve(dir, entries[0].Name)
+	if err != nil {
+		t.Fatalf("Resolve(%q): %v", entries[0].Name, err)
+	}
+	if IsTendPath(path) {
+		t.Errorf("Resolve(%q) = %q, which IsTendPath claims is the tend dispatcher",
+			entries[0].Name, path)
+	}
+}
+
 // A loop file taking the reserved name is reported by DISCOVERY, not merely by
 // a direct Load: List is what the operator commands and the webhook router
 // walk, and an entry that silently did not appear would be harder to debug

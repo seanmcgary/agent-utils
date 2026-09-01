@@ -733,10 +733,12 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 		return
 	}
 
-	// The tend dispatcher answers a delivery with two things and nothing else:
-	// the sweep a moved default branch arms, and the scoped pass for the issue
-	// the delivery named. It has no epic sweep -- promotion is a loop's label
-	// write -- and no worktree cleanup of its own; see tendDeliver.
+	// The tend dispatcher answers a delivery with three things and nothing else:
+	// the sweep a moved default branch arms, the scoped pass for the issue the
+	// delivery named, and worktree cleanup when a pull request closes -- it holds
+	// worktrees of its own, under its reserved name, that nothing else would ever
+	// remove. It has no epic sweep, because promotion is a loop's label write.
+	// See tendDeliver.
 	if t.IsTend() {
 		w.tendDeliver(ctx, t, d, cfg, deps)
 		return
@@ -776,8 +778,9 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	}
 
 	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
-	// for the operator's decision -- so it is gated on ClosedPR alone. The tend
-	// dispatcher runs its own, over its own worktrees; see tendDeliver.
+	// for the operator's decision -- so it is gated on ClosedPR alone. This is
+	// the LOOP's cleanup, over the loop's issue worktrees; the tend dispatcher
+	// runs the same pass over its own pr-N worktrees, from tendDeliver.
 	//
 	// d.Number > 0 for the reason the epic pass carries it: prNumber IS
 	// d.Number here, and a cleanup for pull request 0 would ask the worktree

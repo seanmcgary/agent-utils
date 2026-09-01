@@ -430,6 +430,33 @@ another review round while the previous round's handoff label is still on the is
 also clears the stale terminal itself on re-dispatch, so this only bites when the issue never gets
 dispatched at all.
 
+### Stale `pr_links` rows under a loop's name
+
+Loops no longer write `pr_links`. Tending does, under the reserved `tend` name, and `TendCheck` —
+the only thing that prunes the table — deletes only rows filed under that name. So whatever
+`pr_links` rows your loops wrote before the upgrade stay in the database forever, and nothing after
+the upgrade updates them.
+
+That matters in exactly one place. When the detached runner renders a prompt for a **loop**
+dispatch it looks the issue up in `pr_links`, so `.PR.HeadRef`, `.PR.BaseRef` and `.PR.BehindBy`
+render from a row that stopped being maintained at the upgrade — a plausible-looking branch name
+and commit count describing a pull request that may since have merged, closed, or been force-pushed
+somewhere else. `.PR.Number` is read from the dispatch row instead and renders `0` for a loop
+dispatch, which at least reads as obviously wrong; the other three do not.
+
+The shipped loop prompts do not read `.PR.*` at all, and the ones in this migration tell the agent
+not to trust it, so a project on those prompts is unaffected. **If you carry an operator-written
+prompt that renders `.PR.HeadRef`, `.PR.BaseRef` or `.PR.BehindBy` in a loop, stop rendering
+it** — the pull request the agent needs is the one it can read from the issue with `gh`, which is
+current by construction. There is no automatic prune: deleting a row a downgrade would want back is
+not something a migration should do on its own. To clear them by hand once you are certain you are
+not rolling back:
+
+```sql
+-- ~/.agent-utils/state.db; <project-id> is the id in the project descriptor.
+DELETE FROM pr_links WHERE project_id = '<project-id>' AND loop <> 'tend';
+```
+
 ### Rollback
 
 Rolling back is not just restoring the files, because labels would be left watched by nothing and

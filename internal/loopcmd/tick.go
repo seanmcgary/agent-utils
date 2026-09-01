@@ -251,8 +251,13 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	if err != nil {
 		return sum, err
 	}
+	tended, err := tendedIssues(cfg, deps)
+	if err != nil {
+		return sum, err
+	}
 	st := engine.State{
-		Issues: states, Running: live, CooldownUntil: time.Time{}, Force: deps.Force,
+		Issues: states, Running: live, Tended: tended,
+		CooldownUntil: time.Time{}, Force: deps.Force,
 		Providers: resolveProviders(ctx, cfg, snap.Issues),
 	}
 	sum.Live = len(live)
@@ -420,6 +425,44 @@ func reapDead(
 		sum.Orphans++
 	}
 	return live, nil
+}
+
+// tendedIssues reads the issues the project's TEND DISPATCHER is currently
+// working, so a loop can decline them.
+//
+// It is the loop's side of a guard the tend dispatcher already applied from its
+// own: tendState reads store.RunningDispatchesForRepo to refuse an issue any
+// loop holds. A loop reads the SAME query for the opposite reason -- its own
+// scope holds only its own rows, and a tend's are filed under the dispatcher's
+// reserved name -- and keeps only the tend rows, which are the ones it could not
+// otherwise see.
+//
+// EVERY tend row counts, including one under this loop's own name. Such a row is
+// a pre-upgrade leftover, from when a loop dispatched its own tends, and while
+// its runner is alive it is an agent force-pushing a branch exactly like the
+// dispatcher's. engine.Decide independently blocks it through st.Running; this
+// is what makes the two agree rather than leaving the loop to rely on which of
+// them fired.
+//
+// A failed read returns the error and abandons the pass. Every other store read
+// in a tick does the same, and this one guards against two agents in one branch,
+// which is the last thing to degrade quietly.
+//
+// The dead rows of ANOTHER scope are counted as live, exactly as the tend
+// dispatcher counts a loop's; whoever owns a row retires it, and reaping it from
+// here would finish a dispatch this pass holds no lock for.
+func tendedIssues(cfg *config.Config, deps Deps) (map[int]bool, error) {
+	rows, err := deps.Store.RunningDispatchesForRepo(cfg.Repo)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int]bool, len(rows))
+	for _, d := range rows {
+		if d.Kind == store.KindTend {
+			out[d.Number] = true
+		}
+	}
+	return out, nil
 }
 
 // clearStaleLocks removes the git lock files a dead dispatch left behind.
@@ -606,13 +649,10 @@ func dispatch(
 	now time.Time,
 	kind string,
 ) error {
-	// A tend is included here, and used to be excluded. It inherits the issue's
-	// session when the engine offered one, so the rebase agent arrives knowing
-	// the branch it is rebasing. The earlier rule -- always a fresh identifier,
-	// on the grounds that a rebase is idempotent and needs no memory -- gave
-	// every tend a throwaway conversation and a cold read of the diff. The
-	// engine still offers nothing when the issue has no STARTED session, and
-	// that case lands on the same fresh identifier as before.
+	// An empty identifier means "mint a fresh one". That is the whole of the
+	// rule, and a TEND always takes it: engine.DecideTend emits no session
+	// deliberately -- see the long note on that field for the three reasons a
+	// tend no longer inherits the issue's conversation.
 	sessionID := d.SessionID
 	if sessionID == "" {
 		sessionID = uuid.NewString()
@@ -638,6 +678,40 @@ func dispatch(
 	// decision can use. The column stays in the table because dropping one
 	// costs a rebuild and buys nothing.
 	isRetry := d.Kind == engine.KindRetryStart || d.Kind == engine.KindRetryResume
+
+	// The dispatch row comes FIRST, before the worktree and before the issue
+	// state, because it is the CLAIM on this issue -- see store.CreateDispatch.
+	// Nothing this function does may be visible before the claim is won: the
+	// loop's pass and the tend dispatcher's take different locks, so the only
+	// thing standing between two agents in one branch is that this insert
+	// either wins or returns store.ErrDispatchClaimed. Stamping the issue's
+	// session first would leave the loser having rewritten the winner's session
+	// identifier.
+	//
+	// It also keeps the property the old ordering was written for: a worktree
+	// failure or a spawn failure is recorded as a FAILED dispatch rather than
+	// vanishing into a log line, because the row already exists by then.
+	dispatchID, err := deps.Store.CreateDispatch(store.Dispatch{
+		Loop: cfg.Name, Repo: cfg.Repo, Number: d.Issue, Kind: kind,
+		SessionID: sessionID, LogPath: logPath, PRNumber: d.PR, Title: d.Title,
+		// A tend carries the issue's Overrides like every other dispatch: a
+		// model: or harness: label on an issue is the operator saying "run THIS
+		// issue's agents like so", and a tend is one of them.
+		Model:   d.Overrides.Model,
+		Harness: d.Overrides.Harness,
+		Effort:  d.Overrides.Effort,
+		// Not an override, and so not read from d.Overrides: no label names a
+		// provider. It is the resolved value the engine compared, carried here
+		// so a park comment can name the account that actually failed.
+		Provider: d.Provider,
+		// ReviewPending travels here, not on pr_links: see
+		// store.Dispatch.ReviewPending for why.
+		ReviewPending: d.ReviewPending,
+	})
+	if err != nil {
+		return err
+	}
+
 	if kind != store.KindTend {
 		// The stamps are the EFFECTIVE configuration, not the override alone.
 		// dispatches.model and dispatches.harness record only the label and are
@@ -652,29 +726,6 @@ func dispatch(
 			harness, d.Provider, isRetry, now); err != nil {
 			return err
 		}
-	}
-
-	// Create the dispatch row BEFORE the worktree, so a worktree failure is
-	// recorded as a failed dispatch rather than vanishing into a log line.
-	dispatchID, err := deps.Store.CreateDispatch(store.Dispatch{
-		Loop: cfg.Name, Repo: cfg.Repo, Number: d.Issue, Kind: kind,
-		SessionID: sessionID, LogPath: logPath, PRNumber: d.PR, Title: d.Title,
-		// A tend carries the issue's Overrides like every other dispatch: it
-		// inherits the issue's session, and that session only means something
-		// to the harness that minted it. See spec section 6.7.
-		Model:   d.Overrides.Model,
-		Harness: d.Overrides.Harness,
-		Effort:  d.Overrides.Effort,
-		// Not an override, and so not read from d.Overrides: no label names a
-		// provider. It is the resolved value the engine compared, carried here
-		// so a park comment can name the account that actually failed.
-		Provider: d.Provider,
-		// ReviewPending travels here, not on pr_links: see
-		// store.Dispatch.ReviewPending for why.
-		ReviewPending: d.ReviewPending,
-	})
-	if err != nil {
-		return err
 	}
 
 	workDir := cfg.CheckoutBaseDir

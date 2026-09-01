@@ -116,10 +116,20 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	// because the pass is; `loop status` reads the store, not this number.
 	sum.Live = len(live)
 
+	// Project-wide, unlike everything else this pass reads, and for the reason
+	// tendedIssues gives: a tend's rows are filed under the dispatcher's
+	// reserved name, so this loop's own scope can never show one. It is not
+	// narrowed to this issue -- the query is one indexed lookup either way, and
+	// engine.Decide reads only the issues in the snapshot.
+	tended, err := tendedIssues(cfg, deps)
+	if err != nil {
+		return sum, err
+	}
+
 	// Scoped to this issue's snapshot, so a webhook-driven tick spawns at most
 	// one `pi --list-models` rather than one per issue in the loop.
 	st := engine.State{
-		Issues: states, Running: live,
+		Issues: states, Running: live, Tended: tended,
 		Providers: resolveProviders(ctx, cfg, snap.Issues),
 	}
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {

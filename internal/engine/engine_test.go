@@ -430,11 +430,13 @@ func TestLiveTendHoldingTheIssueSessionSuppressesResume(t *testing.T) {
 	}
 }
 
-func TestLiveTendOnItsOwnSessionDoesNotSuppressResume(t *testing.T) {
+// A live tend blocks the issue whatever session it carries. The rule used to be
+// "only if it holds the issue's session", on the grounds that a tend with a
+// session of its own shares nothing with the issue's work. What the two share is
+// the BRANCH, which both force-push, and no session identifier says anything
+// about that.
+func TestLiveTendWithItsOwnSessionStillBlocksTheIssue(t *testing.T) {
 	cfg := testConfig()
-	// A tend that minted its own session -- a row written before tend inherited
-	// the issue's, or one dispatched when no session had started -- shares
-	// nothing with the issue, so it must not block the issue's own work.
 	snap := Snapshot{
 		Issues:   []ghub.Issue{issue(1, cfg.Tend.Label, cfg.Labels.Trigger)},
 		PRs:      []ghub.PullRequest{{Number: 20, Body: "Closes #1", Trusted: true}},
@@ -445,8 +447,38 @@ func TestLiveTendOnItsOwnSessionDoesNotSuppressResume(t *testing.T) {
 		Running: []store.Dispatch{{Number: 1, PRNumber: 20, Kind: store.KindTend, SessionID: "throwaway"}},
 	}
 	p := Decide(cfg, snap, st, time.Now())
-	if len(p.Decisions) != 1 || p.Decisions[0].Kind != KindResume {
-		t.Fatalf("decisions = %v, want one resume", kinds(p))
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none while a tend agent is in the branch", kinds(p))
+	}
+}
+
+// The reciprocal of the guard the tend dispatcher applies from its own side.
+// The dispatcher refuses an issue any loop of the project is working; this is a
+// loop refusing an issue the dispatcher is working. Without it the guard is
+// one-directional: the tend rows are filed under the dispatcher's reserved name,
+// so State.Running -- which is loop-scoped -- can never show one, and a loop
+// whose veto list does not happen to cover the tend label starts an agent on a
+// branch a tend is rebasing and force-pushing.
+func TestLiveTendInTheProjectsDispatcherBlocksTheIssue(t *testing.T) {
+	cfg := testConfig()
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+
+	// The control first: with no tend live, the trigger label starts an agent.
+	free := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(free.Decisions) != 1 || free.Decisions[0].Kind != KindStart {
+		t.Fatalf("control decisions = %v, want one start", kinds(free))
+	}
+
+	st := State{Issues: map[int]store.IssueState{}, Tended: map[int]bool{1: true}}
+	p := Decide(cfg, snap, st, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none while the tend dispatcher holds issue 1", kinds(p))
+	}
+	// The reason must name the dispatcher. "A dispatch is already live for this
+	// issue" sends an operator looking through this loop's sessions for a row
+	// filed under another name.
+	if reason := p.NoDecisionReason(1); !strings.Contains(reason, "tend dispatcher") {
+		t.Errorf("skip reason = %q, want it to name the tend dispatcher", reason)
 	}
 }
 
