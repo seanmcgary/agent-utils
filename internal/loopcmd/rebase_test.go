@@ -44,6 +44,10 @@ type fakeGit struct {
 	// through and the ordinary conflict path (abort, dispatch) runs.
 	conflictedPaths    []string
 	conflictedPathsErr error
+	// liveConflictedPaths is the worktree's CURRENT conflicted state, as
+	// opposed to conflictedPaths, which is the fixture. Rebase sets it on a
+	// failure and AbortRebase clears it; see those two methods.
+	liveConflictedPaths []string
 	// conflictedPathsCalls counts how many times ConflictedPaths was read, so
 	// a test can assert it ran on the detached cleanup context and only once
 	// per conflict.
@@ -120,13 +124,26 @@ func (g *fakeGit) HeadSHA(context.Context, string) (string, error) {
 	return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil
 }
 
+// Rebase re-creates the conflicted state on every failing attempt, the way a
+// real rebase does. conflictedPaths is the test's FIXTURE -- what this branch
+// conflicts on -- and liveConflictedPaths is the worktree's current state,
+// which only exists between a failed rebase and its abort. Modelling the two
+// separately is what lets one fixture drive several act calls, as a repeat
+// conflict across sweeps really does.
 func (g *fakeGit) Rebase(context.Context, string, string) error {
 	g.rebases++
+	if g.rebaseErr != nil {
+		g.liveConflictedPaths = g.conflictedPaths
+	}
 	return g.rebaseErr
 }
 
 func (g *fakeGit) AbortRebase(ctx context.Context, _ string) error {
 	g.aborts++
+	// A real abort discards the conflicted state. Clearing it here is what
+	// makes "the paths are read BEFORE the abort" a tested property rather
+	// than a comment.
+	g.liveConflictedPaths = nil
 	if ctx.Err() != nil {
 		g.cleanupSawDeadCtx = true
 		return ctx.Err()
@@ -158,12 +175,27 @@ func (g *fakeGit) PushWithLease(_ context.Context, _, _, lease string) error {
 	return g.pushErr
 }
 
-func (g *fakeGit) ConflictedPaths(context.Context, string) ([]string, error) {
+// ConflictedPaths models the two ordering properties the real thing depends
+// on, so that getting either wrong fails a test rather than passing silently.
+//
+//   - It fails on a DEAD context, like every other worktree helper: they use
+//     exec.CommandContext, so an expired context fails the command without
+//     running git. gitRebase must therefore read the paths on the detached
+//     cleanup context, never on the caller's, whose commonest way of reaching
+//     the conflict branch is expiring.
+//   - AbortRebase CLEARS the paths, like a real "git rebase --abort". The read
+//     must happen BEFORE the abort, and a read moved after it sees an empty
+//     list, which the gate reads as "no conflict" and never backs off.
+func (g *fakeGit) ConflictedPaths(ctx context.Context, _ string) ([]string, error) {
 	g.conflictedPathsCalls++
+	if ctx.Err() != nil {
+		g.cleanupSawDeadCtx = true
+		return nil, ctx.Err()
+	}
 	if g.conflictedPathsErr != nil {
 		return nil, g.conflictedPathsErr
 	}
-	return g.conflictedPaths, nil
+	return g.liveConflictedPaths, nil
 }
 
 // fakeLeaseSHA is worktree.leaseSHA, which is unexported. A full lowercase
@@ -937,5 +969,100 @@ func TestCleanRebaseWithoutReviewPendingDispatchesNoAgent(t *testing.T) {
 	}
 	if sum.Rebased != 1 || sum.Tended != 0 {
 		t.Errorf("Rebased = %d, Tended = %d, want 1 and 0", sum.Rebased, sum.Tended)
+	}
+}
+
+// An unreadable conflicted-path list dispatches the agent. The gate fails
+// OPEN, and that direction is the whole point: a gate whose job is to DECLINE
+// to spend money must never be able to strand a pull request on a read it
+// could not make. A rebase that failed with no readable conflict is also not a
+// conflict this gate understands.
+func TestUnreadableConflictedPathsDispatchesTheAgent(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	git.conflictedPathsErr = errors.New("git diff exploded")
+	now := time.Now()
+
+	var sum Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Tended != 1 {
+		t.Errorf("Tended = %d, want 1: an unreadable path list must fail open", sum.Tended)
+	}
+	if sum.Backoff != 0 {
+		t.Errorf("Backoff = %d, want 0", sum.Backoff)
+	}
+	// No fingerprint could be computed, so nothing may be recorded: a row
+	// written from an unreadable conflict would back off a conflict nobody
+	// ever identified.
+	if _, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12); err != nil || ok {
+		t.Errorf("TendConflict: ok=%v err=%v, want no row", ok, err)
+	}
+}
+
+// A failed abort dispatches no agent, so it must record no sighting either.
+//
+// seen_count counts agent DISPATCHES that met a fingerprint. The abort sits
+// between the gate and the dispatch, and a failed abort destroys the worktree
+// and returns doneNoRebase, so committing the row before it would let repeated
+// abort failures at a stable head walk a pull request to the 24h tier without
+// the agent having seen the conflict once.
+func TestFailedAbortRecordsNoConflictSighting(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	git.abortErr = errors.New("abort failed")
+	now := time.Now()
+
+	var sum Summary
+	if err := act(context.Background(), cfg, deps, tendDecision(), now, &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Tended != 0 {
+		t.Errorf("Tended = %d, want 0: a failed abort dispatches nobody", sum.Tended)
+	}
+	if git.removes != 1 {
+		t.Errorf("removes = %d, want 1: a worktree left mid-rebase must be destroyed", git.removes)
+	}
+	if _, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12); err != nil || ok {
+		t.Errorf("TendConflict: ok=%v err=%v, want no row: no agent was dispatched", ok, err)
+	}
+}
+
+// The conflicted paths are read on the DETACHED cleanup context, not the
+// caller's.
+//
+// The commonest way to reach the conflict branch at all is the caller's
+// context expiring -- that is why the abort was moved to a detached context in
+// the first place. The worktree helpers use exec.CommandContext, so a read on
+// an expired context fails without running git, and the backoff would be
+// silently unreachable in exactly the case it exists for.
+func TestConflictedPathsAreReadOnTheDetachedContext(t *testing.T) {
+	cfg := rebaseConfig(t)
+	deps, git := rebaseDeps(t, cfg)
+	git.rebaseErr = errors.New("CONFLICT (content): Merge conflict in a.go")
+	git.conflictedPaths = []string{"a.go"}
+	now := time.Now()
+
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var sum Summary
+	if err := act(dead, cfg, deps, tendDecision(), now, &sum); err != nil {
+		t.Fatal(err)
+	}
+	if git.cleanupSawDeadCtx {
+		t.Error("a cleanup command was handed an expired context")
+	}
+	row, ok, err := deps.Store.TendConflict(rebaseLoop, "o/r", 12)
+	if err != nil || !ok {
+		t.Fatalf("TendConflict: ok=%v err=%v, want a row: the gate must run on a dead caller context", ok, err)
+	}
+	if row.SeenCount != 1 {
+		t.Errorf("SeenCount = %d, want 1", row.SeenCount)
 	}
 }

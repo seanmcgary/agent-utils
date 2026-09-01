@@ -1164,8 +1164,8 @@ func (s *Store) RunningDispatches(loop, repo string) ([]Dispatch, error) {
 //     which is exactly the feedback the review-activity trigger exists to
 //     answer.
 //   - finished_at IS NOT NULL. dispatch writes the row before the agent starts
-//     (internal/loopcmd/tick.go:562), and engine.Decide's liveTendPRs already
-//     suppresses a second pass while one runs (engine.go:26-30,434). Counting a
+//     (internal/loopcmd/tick.go, dispatch), and engine.Decide's liveTendPRs already
+//     suppresses a second pass while one runs (internal/engine/engine.go, liveTendPRs). Counting a
 //     running row here would be a second, weaker copy of that guard.
 //   - A FAILED tend still counts. The alternative -- counting only a succeeded
 //     tend, so a crashed agent gets another turn at the same feedback -- was
@@ -1188,30 +1188,6 @@ func (s *Store) RunningDispatches(loop, repo string) ([]Dispatch, error) {
 // recovers. Comparing MAX(started_at) against started_at in a WHERE clause
 // sidesteps the conversion entirely: SQLite compares the two as text, which
 // sorts and compares correctly because ISO-8601 timestamps do.
-//
-// LastTendAt returns the start time of the most recently FINISHED tend
-// dispatch for one pull request, and the zero time when it has never been
-// tended.
-//
-// Three choices here are deliberate, and each is load-bearing on its own:
-//
-//   - kind = 'tend' only. A kind = 'rebase' row records a rebase git performed
-//     with no conversation, so it read no review and answered no comment.
-//     Counting it would suppress the first tend after every automatic rebase,
-//     which is exactly the feedback the review-activity trigger exists to
-//     answer.
-//   - finished_at IS NOT NULL. dispatch writes the row before the agent starts
-//     (internal/loopcmd/tick.go:562), and engine.Decide's liveTendPRs already
-//     suppresses a second pass while one runs (engine.go:26-30,434). Counting a
-//     running row here would be a second, weaker copy of that guard.
-//   - A FAILED tend still counts. The alternative -- counting only a succeeded
-//     tend, so a crashed agent gets another turn at the same feedback -- was
-//     rejected: runner.finish deliberately writes no retry state for a tend
-//     (internal/runner/runner.go:353), so nothing would bound how many times a
-//     persistently failing tend is redispatched, and unbounded unattended spend
-//     is the failure this whole change exists to remove. The cost is that
-//     feedback which met a crashed agent waits for the next review comment; the
-//     dispatch row records the failure, and `project logs --list` shows it.
 //
 // A row that matches is returned like LastTick's ORDER BY ... LIMIT 1: no row
 // means the zero time via sql.ErrNoRows, compared with errors.Is.

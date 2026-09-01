@@ -41,13 +41,21 @@ type Client interface {
 type GitHubClient struct {
 	c *github.Client
 
-	// loginOnce and login memoise AuthenticatedLogin for the life of this
+	// loginMu and login memoise AuthenticatedLogin for the life of this
 	// client. The token this client holds does not change while the process
 	// runs, so the account it belongs to is a constant -- and a call per tend
 	// candidate would spend a request to learn that constant over and over.
-	loginOnce sync.Once
-	loginErr  error
-	login     string
+	//
+	// Only SUCCESS is cached, which is why this is a mutex and not a
+	// sync.Once. A Once would remember the first FAILURE for the life of the
+	// daemon, so one network blip on the first lookup would disable the
+	// self-comment filter until somebody restarted the process -- and that
+	// filter is the only thing standing between the tend agent's own review
+	// comments and a dispatch loop. The read fails closed either way (no
+	// login, no review activity, no trigger), but a permanent silent
+	// degradation is not a failure mode worth keeping to save one retry.
+	loginMu sync.Mutex
+	login   string
 }
 
 // New returns a client authenticated with token.
@@ -263,15 +271,17 @@ func (g *GitHubClient) BehindBy(ctx context.Context, owner, repo, base, head str
 // tend prompt tells the agent to comment, so without knowing this login,
 // LatestReviewActivity cannot tell the agent's own reply from a reviewer's.
 func (g *GitHubClient) AuthenticatedLogin(ctx context.Context) (string, error) {
-	g.loginOnce.Do(func() {
-		u, _, err := g.c.Users.Get(ctx, "")
-		if err != nil {
-			g.loginErr = fmt.Errorf("get authenticated user: %w", err)
-			return
-		}
-		g.login = u.GetLogin()
-	})
-	return g.login, g.loginErr
+	g.loginMu.Lock()
+	defer g.loginMu.Unlock()
+	if g.login != "" {
+		return g.login, nil
+	}
+	u, _, err := g.c.Users.Get(ctx, "")
+	if err != nil {
+		return "", fmt.Errorf("get authenticated user: %w", err)
+	}
+	g.login = u.GetLogin()
+	return g.login, nil
 }
 
 // maxReviewPages bounds the walk over a pull request's reviews. ListReviews
@@ -300,7 +310,7 @@ const maxReviewPages = 10
 //     comment and dispatches again, forever, at about $0.75 a turn.
 //  2. An author whose AuthorAssociation is not OWNER, MEMBER, or COLLABORATOR
 //     is skipped -- the same three values convertPR requires before it will
-//     trust a pull request (ghub.go:113). A review comment can be written by
+//     trust a pull request (see convertPR). A review comment can be written by
 //     anyone with read access to the repository. Without this filter a
 //     stranger can spend the loop's budget at will, and can put chosen text
 //     in front of an agent that holds push rights on the branch.

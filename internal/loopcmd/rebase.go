@@ -247,7 +247,7 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 		// on the same detached cleanupCtx, because the abort clears the
 		// conflicted paths this gate needs to fingerprint the conflict -- see
 		// worktree.Manager.ConflictedPaths and conflictFingerprint.
-		backedOff := checkConflictBackoff(cleanupCtx, cfg, deps, d, path, lease, now)
+		backedOff, pendingConflict := checkConflictBackoff(cleanupCtx, cfg, deps, d, path, lease, now)
 
 		// Unconditional, and its own error is logged rather than returned: a
 		// worktree left mid-rebase fails every later pass for this pull
@@ -265,15 +265,20 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 				slog.Error("could not remove a worktree left mid-rebase",
 					"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", rmErr)
 			}
-			// The failed-abort path still returns doneNoRebase and writes
-			// nothing, which is consistent even when checkConflictBackoff
-			// decided to back off above: no agent was dispatched here
-			// either way, so no sighting is counted or lost.
+			// pendingConflict is deliberately DROPPED here. No agent is
+			// dispatched on this path, and seen_count counts agent
+			// dispatches; committing it would let repeated abort failures
+			// escalate a pull request to the 24h tier without the agent ever
+			// having seen the conflict once.
 			return doneNoRebase, nil
 		}
 		if backedOff {
 			return doneBackedOff, nil
 		}
+		// The agent IS about to be dispatched, and the abort succeeded, so
+		// this pass really is a dispatch at this fingerprint. Only now is the
+		// sighting committed.
+		recordConflictDispatch(cfg, deps, d, pendingConflict)
 		slog.Info("rebase did not replay cleanly; dispatching the tend agent",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
 		return notDone, nil
@@ -340,7 +345,7 @@ func checkConflictBackoff(
 	d engine.Decision,
 	path, headSHA string,
 	now time.Time,
-) bool {
+) (backedOff bool, pending *store.TendConflict) {
 	paths, err := deps.Git.ConflictedPaths(ctx, path)
 	if err != nil {
 		// A rebase failure that leaves no readable conflicted-path list is
@@ -348,13 +353,13 @@ func checkConflictBackoff(
 		// the pull request on a read it could not make.
 		slog.Warn("could not read conflicted paths; skipping the repeat-conflict backoff",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
-		return false
+		return false, nil
 	}
 	if len(paths) == 0 {
 		// A rebase can fail for reasons that leave no conflicted path -- a
 		// dead context, a bad ref -- and refusing to dispatch on THAT would
 		// be a silent stall, not a backoff.
-		return false
+		return false, nil
 	}
 
 	fp := conflictFingerprint(headSHA, paths)
@@ -362,7 +367,7 @@ func checkConflictBackoff(
 	if err != nil {
 		slog.Warn("could not read the tend-conflict backoff row; dispatching the agent",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
-		return false
+		return false, nil
 	}
 
 	// d.ReviewPending is checked HERE, inside the backoff, rather than by
@@ -386,7 +391,7 @@ func checkConflictBackoff(
 			"seen_count", row.SeenCount, "retry_after", row.RetryAfter,
 			"conflicted_paths", len(paths),
 			"paths", truncate(strings.Join(paths, ", "), 200))
-		return true
+		return true, nil
 	}
 
 	// The agent is about to be dispatched at this fingerprint. count is 1 on
@@ -411,13 +416,30 @@ func checkConflictBackoff(
 	} else {
 		newRow.FirstSeenAt = now
 	}
-	// A failed write is logged, not returned: the agent still runs, and
-	// losing one backoff round is better than abandoning the pass.
-	if err := deps.Store.PutTendConflict(newRow); err != nil {
+	// The row is RETURNED, not written here. Between this point and the
+	// dispatch sits the abort, and a failed abort destroys the worktree and
+	// returns doneNoRebase -- no agent. Writing here would advance seen_count
+	// for a dispatch that never happened, and repeated abort failures at a
+	// stable head would walk a pull request to the 24h tier without the agent
+	// ever having seen the conflict once. seen_count means agent dispatches,
+	// so only the caller, which knows whether it is really about to dispatch,
+	// may commit it.
+	return false, &newRow
+}
+
+// recordConflictDispatch commits the row checkConflictBackoff prepared, at the
+// point the caller has committed to dispatching the agent.
+//
+// A failed write is logged, not returned: the agent still runs, and losing one
+// backoff round is better than abandoning the pass.
+func recordConflictDispatch(cfg *config.Config, deps Deps, d engine.Decision, row *store.TendConflict) {
+	if row == nil {
+		return
+	}
+	if err := deps.Store.PutTendConflict(*row); err != nil {
 		slog.Error("could not write the tend-conflict backoff row",
 			"loop", cfg.Name, "issue", d.Issue, "pr", d.PR, "err", err)
 	}
-	return false
 }
 
 // recordRebase writes the row that gives a force-push a cause.
