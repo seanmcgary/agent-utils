@@ -52,6 +52,14 @@ type State struct {
 	// confirmed alive. The caller performs the liveness check, so Decide stays
 	// pure.
 	Running []store.Dispatch
+	// Providers maps an issue number to the pi provider that would serve the
+	// model its next dispatch runs. The CALLER resolves it: resolution shells
+	// out to `pi --list-models`, and Decide performs no I/O.
+	//
+	// A missing entry means unresolved, which is never read as a provider
+	// change. Callers that can never retire a cap -- the tend sweep, which
+	// makes no retry decision -- leave it nil.
+	Providers map[int]string
 	// CooldownUntil is the time before which the loop must not dispatch.
 	CooldownUntil time.Time
 	// Force is the operator override behind `loop tick --force`. It is the one
@@ -87,6 +95,15 @@ type Decision struct {
 	// override reaches it: on the row, the same way title and behind_by
 	// already travel.
 	Overrides config.Overrides
+	// Provider is the pi provider serving this dispatch's model, copied from
+	// State.Providers. It travels on the decision so the tick can stamp it
+	// through BeginDispatch without resolving a second time -- and so the
+	// value the engine COMPARED is the value the store records, which is what
+	// keeps the comparison stable from one tick to the next.
+	//
+	// A KindTend decision carries none. A tend makes no retry decision, can
+	// never retire a cap, and does not reach BeginDispatch at all.
+	Provider string
 }
 
 // Plan is the full output of one decision pass.

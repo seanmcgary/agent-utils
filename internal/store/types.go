@@ -69,6 +69,20 @@ type IssueState struct {
 	// created before it was recorded. An unknown harness never counts as a
 	// mismatch -- guessing would restart every in-flight session on upgrade.
 	SessionHarness string
+	// DispatchHarness is the effective harness of the most recent dispatch,
+	// whether or not that dispatch created a session. SessionHarness answers
+	// "may this session be resumed"; this answers "what did the loop last
+	// try", and only the second question can safely retire a retry budget --
+	// see engine.configRetired.
+	//
+	// Empty means unknown: the row predates the column, or no dispatch has run
+	// since it was added. Unknown is never a change.
+	DispatchHarness string
+	// DispatchProvider is the provider serving the most recent dispatch's
+	// model, as resolved by `pi --list-models`. It is empty for claude, which
+	// reaches one vendor one way, and empty whenever resolution failed. Both
+	// read as unknown.
+	DispatchProvider string
 	// Parked records that the loop gave up after the retry cap.
 	Parked bool
 	// RetryAfter is the deadline before which no retry for this issue may run.
@@ -136,6 +150,14 @@ type Dispatch struct {
 	Model   string
 	Harness string
 	Effort  string
+	// Provider is the pi provider that served Model, resolved when the
+	// dispatch was decided. It is the same value stamped on the issue row, so
+	// a park comment naming it names what the engine actually compared.
+	//
+	// Unlike the three fields above it is EFFECTIVE, not an override: no label
+	// sets a provider, it is derived from whichever model is in play. Empty
+	// means claude, or a resolution that failed.
+	Provider string
 }
 
 // RunnerID is the dispatch identifier the runner process actually carries.

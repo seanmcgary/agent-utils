@@ -393,7 +393,7 @@ func TestStoppedSurvivesBeginDispatchMarkSucceededAndPutIssueState(t *testing.T)
 		t.Fatal(err)
 	}
 
-	if err := s.BeginDispatch("planning", "o/r", 1, "sess-1", false, now); err != nil {
+	if err := s.BeginDispatch("planning", "o/r", 1, "sess-1", "claude", "", false, now); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.IssueState("planning", "o/r", 1)
@@ -743,5 +743,81 @@ func TestRecentDispatchesWithLogsSkipsRowsWithNoLogFile(t *testing.T) {
 	}
 	if len(all) != 61 {
 		t.Errorf("unfiltered rows = %d, want 61", len(all))
+	}
+}
+
+func TestBeginDispatchStampsHarnessAndProvider(t *testing.T) {
+	s := openTemp(t)
+
+	if err := s.BeginDispatch("execution", "o/r", 7, "sess-1", "pi", "openrouter", false, time.Now()); err != nil {
+		t.Fatalf("begin dispatch: %v", err)
+	}
+
+	st, err := s.IssueState("execution", "o/r", 7)
+	if err != nil {
+		t.Fatalf("issue state: %v", err)
+	}
+	if st.DispatchHarness != "pi" {
+		t.Errorf("DispatchHarness = %q, want %q", st.DispatchHarness, "pi")
+	}
+	if st.DispatchProvider != "openrouter" {
+		t.Errorf("DispatchProvider = %q, want %q", st.DispatchProvider, "openrouter")
+	}
+}
+
+// A second dispatch under a different configuration must REPLACE the stamps,
+// not accumulate them. The rule reads "what was attempted last", so a stale
+// value would keep reporting a change that has already been acted on and
+// retire the cap forever.
+func TestBeginDispatchReplacesStamps(t *testing.T) {
+	s := openTemp(t)
+	now := time.Now()
+
+	if err := s.BeginDispatch("execution", "o/r", 7, "sess-1", "pi", "openrouter", false, now); err != nil {
+		t.Fatalf("begin dispatch: %v", err)
+	}
+	if err := s.BeginDispatch("execution", "o/r", 7, "sess-2", "claude", "", true, now); err != nil {
+		t.Fatalf("begin dispatch: %v", err)
+	}
+
+	st, err := s.IssueState("execution", "o/r", 7)
+	if err != nil {
+		t.Fatalf("issue state: %v", err)
+	}
+	if st.DispatchHarness != "claude" {
+		t.Errorf("DispatchHarness = %q, want %q", st.DispatchHarness, "claude")
+	}
+	if st.DispatchProvider != "" {
+		t.Errorf("DispatchProvider = %q, want empty", st.DispatchProvider)
+	}
+}
+
+// PutIssueState must not clobber the stamps. Its one caller is the park path,
+// which does a read-modify-write over state read before the dispatch that
+// wrote them, and BeginDispatch is their only writer.
+func TestPutIssueStatePreservesTheStamps(t *testing.T) {
+	s := openTemp(t)
+	now := time.Now()
+
+	if err := s.BeginDispatch("execution", "o/r", 7, "sess-1", "pi", "openrouter", false, now); err != nil {
+		t.Fatalf("begin dispatch: %v", err)
+	}
+	st, err := s.IssueState("execution", "o/r", 7)
+	if err != nil {
+		t.Fatalf("issue state: %v", err)
+	}
+	st.DispatchHarness, st.DispatchProvider = "", ""
+	st.Parked = true
+	if err := s.PutIssueState(st); err != nil {
+		t.Fatalf("put issue state: %v", err)
+	}
+
+	got, err := s.IssueState("execution", "o/r", 7)
+	if err != nil {
+		t.Fatalf("issue state: %v", err)
+	}
+	if got.DispatchHarness != "pi" || got.DispatchProvider != "openrouter" {
+		t.Errorf("stamps = %q/%q, want pi/openrouter",
+			got.DispatchHarness, got.DispatchProvider)
 	}
 }

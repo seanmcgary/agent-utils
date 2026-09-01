@@ -442,14 +442,14 @@ func TestBeginDispatchSpendsTheBudgetRecordedOnTheRow(t *testing.T) {
 	// Two failures: retry_count is still 0 (MarkNeedsRetry does not spend it),
 	// so drive it up the way a real retry does, then have the "other process"
 	// record one more failure before this dispatch writes.
-	if err := s.BeginDispatch("planning", "o/r", 1, "s1", true, retryNow); err != nil {
+	if err := s.BeginDispatch("planning", "o/r", 1, "s1", "claude", "", true, retryNow); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.MarkNeedsRetry("planning", "o/r", 1, retryNow, retryBackoff()); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.BeginDispatch("planning", "o/r", 1, "s2", true, retryNow); err != nil {
+	if err := s.BeginDispatch("planning", "o/r", 1, "s2", "claude", "", true, retryNow); err != nil {
 		t.Fatalf("BeginDispatch: %v", err)
 	}
 
@@ -475,14 +475,14 @@ func TestBeginDispatchSpendsTheBudgetRecordedOnTheRow(t *testing.T) {
 // budget and drop the deadline left from the previous one.
 func TestBeginDispatchOnAHumanTriggerResetsTheBudget(t *testing.T) {
 	s := openTemp(t)
-	if err := s.BeginDispatch("planning", "o/r", 1, "s1", true, retryNow); err != nil {
+	if err := s.BeginDispatch("planning", "o/r", 1, "s1", "claude", "", true, retryNow); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.MarkNeedsRetry("planning", "o/r", 1, retryNow, retryBackoff()); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.BeginDispatch("planning", "o/r", 1, "s2", false, retryNow); err != nil {
+	if err := s.BeginDispatch("planning", "o/r", 1, "s2", "claude", "", false, retryNow); err != nil {
 		t.Fatalf("BeginDispatch: %v", err)
 	}
 
@@ -500,7 +500,7 @@ func TestBeginDispatchOnAHumanTriggerResetsTheBudget(t *testing.T) {
 // land in. This write must therefore touch nothing but the path.
 func TestSetWorktreePathLeavesTheFailureColumnsAlone(t *testing.T) {
 	s := openTemp(t)
-	if err := s.BeginDispatch("planning", "o/r", 1, "s1", true, retryNow); err != nil {
+	if err := s.BeginDispatch("planning", "o/r", 1, "s1", "claude", "", true, retryNow); err != nil {
 		t.Fatal(err)
 	}
 	// The runner process records its failure while git is still working.

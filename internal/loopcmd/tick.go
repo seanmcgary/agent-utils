@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +20,47 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 )
+
+// resolveProviders returns the pi provider serving each issue's next dispatch,
+// keyed by issue number.
+//
+// It is built here rather than inside the engine because resolution shells out
+// and engine.Decide is pure. Only a pi dispatch has a provider worth
+// comparing: claude reaches one vendor one way, so there is nothing a provider
+// comparison could say about it, and resolving would spend a subprocess to
+// learn "".
+//
+// One resolution per distinct MODEL, not per issue. A loop of thirty issues
+// almost always runs one model, and `pi --list-models` is a process spawn.
+func resolveProviders(ctx context.Context, cfg *config.Config, issues []ghub.Issue) map[int]string {
+	out := make(map[int]string, len(issues))
+	byModel := map[string]string{}
+	for _, iss := range issues {
+		// A label this loop cannot parse is not this function's problem: Decide
+		// turns it into a KindStop, and an unresolved provider changes nothing
+		// about that.
+		ov, err := config.ParseOverrides(iss.Labels)
+		if err != nil {
+			continue
+		}
+		if engine.EffectiveHarness(cfg, ov) != config.HarnessPi {
+			continue
+		}
+		model := runner.Effective(cfg, ov).Model
+		if model == "" {
+			continue
+		}
+		provider, seen := byModel[model]
+		if !seen {
+			provider = runner.ResolveProvider(ctx, model)
+			byModel[model] = provider
+		}
+		if provider != "" {
+			out[iss.Number] = provider
+		}
+	}
+	return out
+}
 
 // Deps holds everything a tick needs. Each field is replaceable in a test.
 type Deps struct {
@@ -230,6 +273,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	}
 	st := engine.State{
 		Issues: states, Running: live, CooldownUntil: time.Time{}, Force: deps.Force,
+		Providers: resolveProviders(ctx, cfg, snap.Issues),
 	}
 	sum.Live = len(live)
 	sum.Forced = deps.Force
@@ -552,7 +596,17 @@ func dispatch(
 	// costs a rebuild and buys nothing.
 	isRetry := d.Kind == engine.KindRetryStart || d.Kind == engine.KindRetryResume
 	if kind != store.KindTend {
-		if err := deps.Store.BeginDispatch(cfg.Name, cfg.Repo, d.Issue, sessionID, isRetry, now); err != nil {
+		// The stamps are the EFFECTIVE configuration, not the override alone.
+		// dispatches.model and dispatches.harness record only the label and are
+		// empty whenever the loop default was used -- an ambiguity the
+		// retirement rule cannot carry, because "empty" there would mean both
+		// "claude, by default" and "not recorded".
+		harness := runner.Effective(cfg, d.Overrides).Harness
+		if harness == "" {
+			harness = config.HarnessClaude
+		}
+		if err := deps.Store.BeginDispatch(cfg.Name, cfg.Repo, d.Issue, sessionID,
+			harness, d.Provider, isRetry, now); err != nil {
 			return err
 		}
 	}
@@ -568,6 +622,10 @@ func dispatch(
 		Model:   d.Overrides.Model,
 		Harness: d.Overrides.Harness,
 		Effort:  d.Overrides.Effort,
+		// Not an override, and so not read from d.Overrides: no label names a
+		// provider. It is the resolved value the engine compared, carried here
+		// so a park comment can name the account that actually failed.
+		Provider: d.Provider,
 	})
 	if err != nil {
 		return err
@@ -622,9 +680,99 @@ func dispatch(
 	return nil
 }
 
-const retryCapComment = `🔁 **Orphan retry cap reached (%d/%d)** — %d consecutive agent dispatches for this issue failed to complete. This usually indicates a sustained platform-side issue rather than a problem with the issue itself. Parking here rather than retrying indefinitely.
+const retryCapComment = `🔁 **Orphan retry cap reached (%d/%d)** — %d consecutive agent dispatches for this issue failed to complete.%s
 
-To proceed: re-add the ` + "`%s`" + ` label once the underlying issue has cleared, and this resumes normally.`
+To proceed: re-add the ` + "`%s`" + ` label once the underlying issue has cleared, and this resumes normally. Changing the harness, or the model to one on a different provider, clears the cap on its own.`
+
+// capFallback is the wording for a park with no recorded reason. It was once
+// the whole comment, and an operator reading it learned nothing actionable --
+// the 402 that caused the park was sitting in the dispatch row the entire
+// time. It is the fallback now, never the default.
+const capFallback = " This usually indicates a sustained platform-side issue rather than a problem with the issue itself. Parking here rather than retrying indefinitely."
+
+// urlPattern matches an absolute URL. Deliberately greedy to the next space: a
+// partially redacted URL is worse than none, because the surviving prefix
+// still identifies the resource.
+var urlPattern = regexp.MustCompile(`https?://\S+`)
+
+// capCause renders the sentence between the cap line and the instruction: what
+// actually went wrong, and what was running when it did.
+func capCause(d store.Dispatch) string {
+	reason := failureSentence(d.APIError)
+	if reason == "" {
+		return capFallback
+	}
+	where := ""
+	if parts := nonEmpty(d.Harness, d.Model, d.Provider); len(parts) > 0 {
+		where = " under " + strings.Join(parts, ", ")
+	}
+	return fmt.Sprintf(
+		"\n\nThe last failure reported:\n\n> %s\n\nThat ran%s. Parking here rather than retrying indefinitely.",
+		reason, where)
+}
+
+// nonEmpty drops the empty strings, so a claude dispatch -- which records no
+// provider -- does not render an empty slot in the parenthetical.
+func nonEmpty(vals ...string) []string {
+	var out []string
+	for _, v := range vals {
+		if s := strings.TrimSpace(v); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// failureSentence renders a dispatch's api_error for a PUBLIC GitHub comment,
+// or "" when nothing was recorded.
+//
+// api_error is often a bare status followed by the provider's JSON body --
+// `402: {"message":"...","code":402,...}`. The message field is the sentence a
+// human needs and the rest is envelope. Extracting it is best-effort: anything
+// that does not parse is redacted and truncated as it stands, which still
+// beats saying nothing.
+func failureSentence(apiError string) string {
+	s := strings.TrimSpace(apiError)
+	if s == "" {
+		return ""
+	}
+	if i := strings.Index(s, "{"); i >= 0 {
+		var body struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(s[i:]), &body); err == nil && body.Message != "" {
+			prefix := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s[:i]), ":"))
+			if prefix != "" {
+				return redactForComment(prefix + ": " + body.Message)
+			}
+			return redactForComment(body.Message)
+		}
+	}
+	return redactForComment(s)
+}
+
+// redactForComment strips what must not be published and caps the length.
+//
+// A provider is free to put anything in an error string, and OpenRouter's 402
+// puts a key-management URL in it:
+// https://openrouter.ai/workspaces/default/keys/<id>. That names the key and is
+// credential-adjacent, so every URL goes. The unredacted text stays on the
+// dispatch row and in the run log, where `agent-utils project logs` can still
+// reach it.
+func redactForComment(s string) string {
+	// A marker rather than nothing: providers put URLs mid-sentence ("To
+	// increase, visit <url> and adjust the limit"), and deleting one outright
+	// leaves a sentence that reads as though a word is missing.
+	s = urlPattern.ReplaceAllString(s, "[link redacted]")
+	s = strings.Join(strings.Fields(s), " ")
+	const max = 300
+	if r := []rune(s); len(r) > max {
+		// Cut on a rune boundary. Slicing the byte string would split a
+		// multi-byte rune and put mojibake in a GitHub comment.
+		s = strings.TrimSpace(string(r[:max])) + "…"
+	}
+	return s
+}
 
 // parkRetryExhausted is the ONE GitHub write this program performs. Every other
 // comment and label change belongs to the dispatched agent. The exception
@@ -656,8 +804,21 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 		return err
 	}
 
+	// Best-effort. The park is the point of this function, so a read that fails
+	// must not stop the comment or the label edits: the cause is omitted and
+	// the fallback wording stands.
+	var last store.Dispatch
+	if runs, err := deps.Store.RecentDispatches(cfg.Name, cfg.Repo, d.Issue, 5); err == nil {
+		for _, r := range runs {
+			if r.Status == store.StatusFailed {
+				last = r
+				break
+			}
+		}
+	}
+
 	body := fmt.Sprintf(retryCapComment,
-		cfg.Retry.Max, cfg.Retry.Max, cfg.Retry.Max, cfg.Labels.Trigger)
+		cfg.Retry.Max, cfg.Retry.Max, cfg.Retry.Max, capCause(last), cfg.Labels.Trigger)
 	if err := deps.GH.PostComment(ctx, owner, repo, d.Issue, body); err != nil {
 		return err
 	}

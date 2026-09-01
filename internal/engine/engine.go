@@ -109,6 +109,10 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		// KindParkRetryExhausted, which are repair actions.
 		ov, ovErr := config.ParseOverrides(iss.Labels)
 
+		// Resolved by the caller, because Decide is pure. An absent entry means
+		// unresolved, and unresolved never counts as a provider change.
+		provider := st.Providers[iss.Number]
+
 		// FAILURE PATH. NeedsRetry is durable state written when a dispatch died
 		// or exited non-zero. It covers both a dead runner and a clean non-zero
 		// exit, so a failing dispatch can never redispatch without a cap.
@@ -146,7 +150,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				})
 				continue
 			}
-			d, eligible, skip := retryDecision(cfg, iss.Number, state, ov, now, st.Force)
+			d, eligible, skip := retryDecision(cfg, iss.Number, state, ov, provider, now, st.Force)
 			// Convert to a stop BEFORE counting toward the breaker. A retry
 			// that becomes a stop never dispatches, so counting it would let
 			// a label push the circuit breaker over its threshold and drop
@@ -180,8 +184,14 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 		}
 
 		// A parked issue needs no separate guard here. parkRetryExhausted removes
-		// the trigger label, so the check below already skips it, and a human who
-		// re-applies that label deliberately un-parks the issue.
+		// the trigger label, so the check below already skips it.
+		//
+		// Re-applying that label reaches this branch only once needs_retry is
+		// clear, which the park itself does. While the flag is still set the
+		// failure path above owns the issue, and it un-parks only when the
+		// CONFIGURATION changed -- see configRetired. That asymmetry is
+		// deliberate: a configuration that failed its whole budget will fail
+		// the same way again, and a label edit on its own is not new evidence.
 		if !iss.HasLabel(cfg.Labels.Trigger) {
 			// Not final: tendDecisions may still act on this issue below, and
 			// it replaces this reason with its own when it does not.
@@ -206,6 +216,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				SessionID: state.SessionID,
 				Reason:    "trigger label present and a started session exists",
 				Overrides: ov,
+				Provider:  provider,
 			})
 			continue
 		}
@@ -217,7 +228,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			sessionID = ""
 			reason = fmt.Sprintf(
 				"starting a new session: the existing one was created by %s and this dispatch runs %s",
-				state.SessionHarness, effectiveHarness(cfg, ov))
+				state.SessionHarness, EffectiveHarness(cfg, ov))
 		}
 		decisions = append(decisions, Decision{
 			Kind:      KindStart,
@@ -226,6 +237,7 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			SessionID: sessionID,
 			Reason:    reason,
 			Overrides: ov,
+			Provider:  provider,
 		})
 	}
 
@@ -290,7 +302,28 @@ func finish(p Plan) Plan {
 // tick a loop at any moment, so a tick count no longer names a stable wait.
 // MarkNeedsRetry stamps the deadline where the failure is recorded.
 func retryDecision(cfg *config.Config, number int, state store.IssueState,
-	ov config.Overrides, now time.Time, force bool) (*Decision, bool, string) {
+	ov config.Overrides, provider string, now time.Time, force bool) (*Decision, bool, string) {
+	// ABOVE the cap and above the backoff window, because it retires both. The
+	// window was sized to let the old configuration's platform recover, and
+	// that platform is not the one about to be used.
+	//
+	// KindStart, not KindRetryStart: loopcmd dispatches a start with
+	// isRetry=false, and store.BeginDispatch then clears parked, retry_count
+	// and retry_after in one statement. That reset IS the retirement; there is
+	// no separate unpark. The second result is false so a retirement never
+	// counts toward the circuit breaker -- a human reconfiguring the loop is
+	// not evidence of a platform fault, and counting it would drop every other
+	// issue's dispatch for the whole cooldown.
+	if reason := configRetired(cfg, state, ov, provider); reason != "" {
+		return &Decision{
+			Kind:      KindStart,
+			Issue:     number,
+			SessionID: "",
+			Reason:    reason,
+			Provider:  provider,
+		}, false, ""
+	}
+
 	if state.RetryCount >= cfg.Retry.Max {
 		return &Decision{
 			Kind:   KindParkRetryExhausted,
@@ -320,6 +353,7 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 			Issue:     number,
 			SessionID: state.SessionID,
 			Reason:    fmt.Sprintf("retry %d/%d, resuming the existing session", state.RetryCount+1, cfg.Retry.Max),
+			Provider:  provider,
 		}, true, ""
 	}
 	// A session the running harness cannot see is no better than no session:
@@ -328,13 +362,14 @@ func retryDecision(cfg *config.Config, number int, state store.IssueState,
 	why := "the previous attempt never started one"
 	if state.SessionStarted && state.SessionID != "" {
 		why = fmt.Sprintf("the existing one was created by %s and this retry runs %s",
-			state.SessionHarness, effectiveHarness(cfg, ov))
+			state.SessionHarness, EffectiveHarness(cfg, ov))
 	}
 	return &Decision{
 		Kind:      KindRetryStart,
 		Issue:     number,
 		SessionID: "",
 		Reason:    fmt.Sprintf("retry %d/%d with a new session; %s", state.RetryCount+1, cfg.Retry.Max, why),
+		Provider:  provider,
 	}, true, ""
 }
 
@@ -358,14 +393,64 @@ func resumable(cfg *config.Config, state store.IssueState, ov config.Overrides) 
 	if state.SessionHarness == "" {
 		return true
 	}
-	return state.SessionHarness == effectiveHarness(cfg, ov)
+	return state.SessionHarness == EffectiveHarness(cfg, ov)
 }
 
-// effectiveHarness is the harness a dispatch will actually run under: the
+// configRetired reports whether the issue's accumulated retry failures still
+// describe the configuration the next dispatch will run under. It returns the
+// reason when they do not, and "" when they still do.
+//
+// A retry cap is evidence about ONE configuration. Three OpenRouter 402s say
+// nothing about whether claude/opus can build the issue, and holding the cap
+// across that change makes the change unusable: the park removes the trigger
+// label, so the operator's only move is to re-apply it, and the failure path
+// above the trigger branch meets the cap again and re-parks before the new
+// configuration has run once.
+//
+// It compares against what was last ATTEMPTED (DispatchHarness,
+// DispatchProvider), never against what last succeeded in creating a session.
+// A dispatch that dies before the harness emits a session identifier -- which
+// is exactly what a misconfigured harness does -- never updates
+// SessionHarness, so a rule written against that field would read "changed" on
+// every tick and redispatch forever with no human in the loop. BeginDispatch
+// stamps these before the agent runs, so one change buys one retirement.
+//
+// Both comparisons treat an empty recorded value as UNKNOWN rather than as a
+// change, which is the reading resumable applies and for the same reason: rows
+// predating those columns would otherwise all retire at once on upgrade.
+//
+// provider is the provider serving the model this dispatch would use, resolved
+// by the caller because Decide is pure. It is empty for claude, which reaches
+// one vendor one way, and empty whenever resolution failed; either way the
+// provider comparison is skipped and the cap stands.
+func configRetired(cfg *config.Config, state store.IssueState, ov config.Overrides, provider string) string {
+	if h := EffectiveHarness(cfg, ov); state.DispatchHarness != "" && state.DispatchHarness != h {
+		return fmt.Sprintf(
+			"retiring the retry history: it belongs to %s and this dispatch runs %s",
+			state.DispatchHarness, h)
+	}
+	// A model change WITHIN one provider is not a retirement. Swapping one
+	// OpenRouter model for another while OpenRouter is out of credits changes
+	// nothing the failures were about, so the cap must still hold. Crossing to
+	// another provider is a different account with its own balance, and the
+	// failures stop being evidence.
+	if state.DispatchProvider != "" && provider != "" && state.DispatchProvider != provider {
+		return fmt.Sprintf(
+			"retiring the retry history: it belongs to provider %s and this dispatch runs %s",
+			state.DispatchProvider, provider)
+	}
+	return ""
+}
+
+// EffectiveHarness is the harness a dispatch will actually run under: the
 // issue's override when it carries one, and the loop's configured harness
 // otherwise. ov is already parsed and validated by ParseOverrides, so its
 // Harness is either empty or a known harness name.
-func effectiveHarness(cfg *config.Config, ov config.Overrides) string {
+//
+// Exported because loopcmd stamps the same value on the issue row through
+// BeginDispatch. Two copies of "which harness will actually run" is how the
+// stamp and the comparison drift apart.
+func EffectiveHarness(cfg *config.Config, ov config.Overrides) string {
 	if ov.Harness != "" {
 		return ov.Harness
 	}
@@ -394,6 +479,10 @@ func stoppedSkipReason(reason string) string {
 // trigger label") is true but useless for a review issue: what the operator
 // needs is that the pull request is current, or already being tended, or not
 // linked at all.
+//
+// A tend decision carries no resolved Provider. It makes no retry decision and
+// can never retire a cap, and loopcmd skips BeginDispatch entirely for a tend,
+// so there is nothing for the value to reach.
 //
 // states is the issue state of THIS loop only, which is what makes the
 // inherited session the right one without a lookup. An issue is worked by
