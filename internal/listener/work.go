@@ -248,6 +248,17 @@ type Worker struct {
 	// label writes, which is what makes it safe for a delivery to act on more
 	// than the issue it names. See loopcmd.EpicSweep.
 	RunEpic func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, closed int) (loopcmd.Summary, error)
+	// RunEpicReady sweeps ONE epic because an operator pressed the button --
+	// epic.ReadyLabel applied to the epic. Production wires it to
+	// loopcmd.EpicReady, which takes the loop's lock itself and consumes the
+	// label afterwards.
+	//
+	// It is a second seam rather than a mode of RunEpic because the two answer
+	// different deliveries and enter the sweep at different issues: RunEpic is
+	// handed a closed CHILD and walks up, this one is handed the EPIC. Folding
+	// them together would need a flag saying which, and a caller that got the
+	// flag wrong would sweep the wrong issue silently.
+	RunEpicReady func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, number int) (loopcmd.Summary, error)
 	// RunTendCheck answers "is any pull request of this loop behind its base",
 	// as cheaply as it can. Production wires it to loopcmd.TendCheck. It is a
 	// seam because the real one shells out to git and reads a database, and
@@ -366,6 +377,7 @@ func NewWorker(db *store.DB) *Worker {
 		RunTendIssue:    loopcmd.TendIssue,
 		RunCleanup:      loopcmd.CleanupClosedPR,
 		RunEpic:         loopcmd.EpicSweep,
+		RunEpicReady:    loopcmd.EpicReady,
 		RunTendCheck:    loopcmd.TendCheck,
 		ScanTargets:     Scan,
 		ReapOrphans:     loopcmd.ReapOrphans,
@@ -438,6 +450,17 @@ type Delivery struct {
 	// would sweep the epic of whichever issue happens to carry that number.
 	// The event is checked as well as the action.
 	ClosedIssue bool
+	// EpicReady is true when this delivery APPLIED epic.ReadyLabel to an
+	// issue. It is what arms the requested epic sweep -- the one case a
+	// closure cannot cover, because an epic whose children have never closed
+	// produces no close delivery at all. See loopcmd.EpicReady.
+	//
+	// It is narrowed by the event exactly as ClosedIssue is, and for the same
+	// reason: issues and pull requests share a number space, so a
+	// pull_request delivery that set this would sweep whichever ISSUE carries
+	// the pull request's number. It is narrowed by the ACTION too -- applying
+	// the label presses the button, removing it does not.
+	EpicReady bool
 	// Reopened is true when this delivery REOPENED an issue or a pull
 	// request. It is what erases a recorded closure, so a reopened issue's
 	// sessions come back into `sessions list`.
@@ -775,6 +798,19 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	// condition and removes the coupling.
 	if d.Number > 0 && d.ClosedIssue {
 		w.epicPass(ctx, t, d, cfg, deps)
+	}
+
+	// The requested sweep, on the same terms as the closure sweep above: after
+	// the issue's own pass, independent of whether it succeeded, on no timer,
+	// and with the same d.Number > 0 guard -- this pass reads d.Number as the
+	// EPIC, so a delivery that set the flag without naming an issue would
+	// sweep issue 0.
+	//
+	// It is a separate branch, not an `||` with the condition above, because
+	// the two enter the sweep at different issues. A press and a close cannot
+	// arrive in one delivery, so at most one of them runs.
+	if d.Number > 0 && d.EpicReady {
+		w.epicReadyPass(ctx, t, d, cfg, deps)
 	}
 
 	// Cleanup runs on EVERY close, merged or not -- see loopcmd.CleanupClosedPR
@@ -1424,6 +1460,32 @@ func (w *Worker) epicPass(
 	}
 	if sum.Promoted > 0 {
 		slog.Info("epic sweep promoted sub-issues", "loop", cfg.Name,
+			"project", t.ProjectName, "issue", d.Number, "promoted", sum.Promoted)
+	}
+}
+
+// epicReadyPass sweeps the epic an operator asked to have swept.
+//
+// A failure is logged and dropped, exactly as epicPass's is. It schedules no
+// retry: loopcmd.EpicReady leaves the label in place when the sweep itself
+// fails, so the request is still visible on the issue and a re-press is the
+// recovery -- there is no state here for a retry to rebuild.
+func (w *Worker) epicReadyPass(
+	ctx context.Context, t Target, d Delivery, cfg *config.Config, deps loopcmd.Deps,
+) {
+	sum, err := w.RunEpicReady(ctx, cfg, deps, d.Number)
+	if err != nil {
+		if errors.Is(err, lock.ErrHeld) {
+			slog.Info("skipping the requested epic sweep: another tick holds the loop lock",
+				"loop", cfg.Name, "project", t.ProjectName, "issue", d.Number)
+			return
+		}
+		slog.Error("requested epic sweep failed", "loop", cfg.Name,
+			"project", t.ProjectName, "issue", d.Number, "err", err)
+		return
+	}
+	if sum.Promoted > 0 {
+		slog.Info("requested epic sweep promoted sub-issues", "loop", cfg.Name,
 			"project", t.ProjectName, "issue", d.Number, "promoted", sum.Promoted)
 	}
 }

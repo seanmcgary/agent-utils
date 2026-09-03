@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v77/github"
+	"github.com/seanmcgary/agent-utils/internal/epic"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 )
 
@@ -569,6 +570,27 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// the only layer that has it.
 		closedIssue := event == "issues" && body.Action == "closed"
 
+		// epicReady is the epic-ready BUTTON: epic.ReadyLabel applied to an
+		// issue. It is the one arm of the epic sweep a closure cannot cover --
+		// an epic whose sub-issues have never closed produces no close
+		// delivery, so its FIRST promotion has nothing else to start it.
+		//
+		// Three things are checked, and each rules out a real delivery:
+		//
+		//   - the EVENT, because a pull request cannot be an epic and the two
+		//     share a number space, exactly as closedIssue above;
+		//   - the ACTION, because "labeled" is the press and "unlabeled" is
+		//     the release, and only one of them should start a pass that
+		//     writes labels;
+		//   - the LABEL, because every status transition in the pipeline is
+		//     also an issues.labeled delivery, and arming on any of them would
+		//     sweep on every move the loops make.
+		//
+		// body.Label.Name is attacker-shaped free text, compared here rather
+		// than trusted: an exact match against one constant is the whole test.
+		epicReady := event == "issues" && body.Action == "labeled" &&
+			body.Label.Name == epic.ReadyLabel
+
 		// reopened covers BOTH events, unlike the two close flags. It arms
 		// neither the epic sweep nor the worktree cleanup -- it only erases a
 		// recorded closure, which is keyed by GitHub's own number space, and
@@ -700,6 +722,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				s.Tick(ctx, Delivery{
 					Repo: repo, Number: number, MergedInto: mergedInto, PushedTo: pushedTo,
 					ClosedPR: closedPR, ClosedIssue: closedIssue, Reopened: reopened,
+					EpicReady: epicReady,
 				})
 			}()
 		default:

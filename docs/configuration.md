@@ -417,15 +417,16 @@ quietly relying on it: tend eligibility (now `tend.label`) and the epic sweep's 
 machine: it applies its terminal and stops. What makes a terminal a human gate is that no loop
 triggers on it.
 
-**The loop writes a label in two situations**, and never in any other. It applies `blocked` when
-an issue exhausts its retry budget — see `retry.max`. And it applies `trigger` to a sub-issue of
-an epic that a closing sibling unblocked — see [Epics](../README.md#epics), which also explains
+**The loop writes a label in three situations**, and never in any other. It applies `blocked` when
+an issue exhausts its retry budget — see `retry.max`. It applies `trigger` to an unblocked
+sub-issue of an epic. And it removes `status:epic-ready` from an epic it has just swept on
+request. The last two are the epic sweep — see [Epics](../README.md#epics), which also explains
 why only one loop of a project ever does that. Everything else is the agent's to apply.
 
 ### `labels.trigger` — required
 
 The "go" signal. **You** apply it — and so does the epic sweep, for the loop at the front of the
-pipeline, when a sub-issue's blockers all close. It means both "start this" and "resume this",
+pipeline, when a sub-issue's blockers are all closed. It means both "start this" and "resume this",
 and it never means "approved".
 
 The loop starts an issue that carries it, and the agent's first act is to remove it and apply
@@ -988,6 +989,12 @@ agents.
 
 `epic.loop` names the one loop allowed to promote an epic's unblocked sub-issues into its trigger
 label. Nothing else is configurable; see [Epics](../README.md#epics).
+
+The two labels the sweep works from are not configurable either. `epic`, on the parent, is the
+switch that makes an issue an epic. `status:epic-ready`, on the parent, asks for a sweep now and
+is consumed by it — it is how an epic's **first** sub-issue is promoted, since until something
+closes there is no closure to arm the sweep with. Both are fixed strings, so the label an operator
+applies is the same one in every project.
 
 Exactly one loop may do it: if every loop promoted into its own trigger, the execution loop would
 push a fresh issue straight to `status:ready-for-execution` and planning would be skipped —

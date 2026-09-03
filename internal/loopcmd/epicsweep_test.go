@@ -35,6 +35,10 @@ type fakeEpic struct {
 
 	// added records every (number, label) EditLabels was asked to add.
 	added map[int][]string
+	// removed records every (number, label) EditLabels was asked to remove.
+	// It is separate from added because the epic-ready pass makes both calls
+	// and a test that could not tell them apart would pass on either.
+	removed map[int][]string
 	// blockedByCalls counts the lookups, so a test can prove a call was saved.
 	blockedByCalls []int
 	// subIssuesCalls counts the sub-issue listings. It is separate from
@@ -55,6 +59,7 @@ func newFakeEpic() *fakeEpic {
 		blockerErr: map[int]error{},
 		labelErr:   map[int]error{},
 		added:      map[int][]string{},
+		removed:    map[int][]string{},
 		subErr:     map[int]error{},
 	}
 }
@@ -89,13 +94,14 @@ func (f *fakeEpic) BlockedBy(_ context.Context, _, _ string, n int) ([]ghub.Issu
 	return f.blockers[n], nil
 }
 
-func (f *fakeEpic) EditLabels(_ context.Context, _, _ string, n int, add, _ []string) error {
+func (f *fakeEpic) EditLabels(_ context.Context, _, _ string, n int, add, remove []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.labelErr[n]; err != nil {
 		return err
 	}
 	f.added[n] = append(f.added[n], add...)
+	f.removed[n] = append(f.removed[n], remove...)
 	return nil
 }
 
@@ -103,7 +109,14 @@ func (f *fakeEpic) promotedNumbers() []int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []int
-	for n := range f.added {
+	for n, labels := range f.added {
+		// A number whose entry is EMPTY was never promoted. EditLabels is also
+		// how a label is removed, and an add-nothing call still creates the
+		// key, so counting keys alone would report the epic-ready pass's own
+		// consume as a promotion of the epic.
+		if len(labels) == 0 {
+			continue
+		}
 		out = append(out, n)
 	}
 	sort.Ints(out)

@@ -17,6 +17,29 @@ import (
 // label from a parent is how an operator opts an epic out.
 const Label = "epic"
 
+// ReadyLabel is the label an operator applies to an epic to say "the graph is
+// entered; sweep it now". It answers the one case a closure cannot: the FIRST
+// promotion, before any sub-issue has ever closed.
+//
+// It is a separate label from Label, and the separation is the whole point.
+// Applying Label is how an issue BECOMES an epic, which happens before its
+// sub-issues and dependencies exist -- a sweep armed on it would walk an empty
+// epic and promote nothing. This one is applied last, when the graph is ready,
+// which is the moment the sweep has something to decide.
+//
+// It is CONSUMED: the sweep removes it. GitHub sends no delivery for applying a
+// label that is already present, so a label left in place could never arm a
+// second sweep, and an operator who adds children later would have no way to
+// press it again. Removing it makes the label a button rather than a state.
+//
+// It lives in the status: namespace deliberately, so an epic that is itself
+// some other epic's sub-issue is held by StatusPrefix while its own button is
+// pressed, rather than being promoted mid-sweep.
+//
+// Hard-coded, like Label and for the same reason: there is no configuration
+// field, so the label an operator applies is the same one in every project.
+const ReadyLabel = "status:epic-ready"
+
 // StatusPrefix matches every pipeline status label, using the "prefix*" rule
 // ghub.Issue.HasAnyLabel implements.
 //

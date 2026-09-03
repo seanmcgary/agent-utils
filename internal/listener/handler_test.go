@@ -85,6 +85,7 @@ type tickCall struct {
 	closedPR    bool
 	closedIssue bool
 	reopened    bool
+	epicReady   bool
 }
 
 // newServer builds a Server wired to tickCh: the fake Tick sends the repo
@@ -98,7 +99,7 @@ func newServer(t *testing.T, tickCh chan<- tickCall) *Server {
 		Tick: func(_ context.Context, d Delivery) {
 			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto,
 				pushedTo: d.PushedTo, closedPR: d.ClosedPR, closedIssue: d.ClosedIssue,
-				reopened: d.Reopened}
+				reopened: d.Reopened, epicReady: d.EpicReady}
 		},
 	})
 	if err != nil {
@@ -1372,6 +1373,81 @@ func TestPushRefsThatAreNotSafeBranchesLeavePushedToEmpty(t *testing.T) {
 			got := waitTick(t, tickCh)
 			if got.pushedTo != "" {
 				t.Errorf("ref %q gave pushedTo %q, want empty", ref, got.pushedTo)
+			}
+		})
+	}
+}
+
+// The epic-ready button. It is derived from the EVENT, the ACTION and the
+// LABEL: an issues delivery, the labeled action, and epic.ReadyLabel. Nothing
+// else presses it.
+func TestEpicReadyIsDerivedFromTheEventActionAndLabel(t *testing.T) {
+	cases := []struct {
+		name    string
+		event   string
+		payload string
+		want    bool
+	}{
+		{
+			name:  "the ready label applied to an issue",
+			event: "issues",
+			payload: `{"action":"labeled","repository":{"full_name":"o/r"},` +
+				`"issue":{"number":48},"label":{"name":"status:epic-ready"}}`,
+			want: true,
+		},
+		{
+			// Removing the button is not pressing it. The pass would re-read
+			// the issue and find nothing set, but a delivery that arms a
+			// GitHub-writing pass on an UNLABEL is wrong at this layer.
+			name:  "the ready label removed",
+			event: "issues",
+			payload: `{"action":"unlabeled","repository":{"full_name":"o/r"},` +
+				`"issue":{"number":48},"label":{"name":"status:epic-ready"}}`,
+			want: false,
+		},
+		{
+			// The epic label is what makes an issue an epic, and it is applied
+			// BEFORE the graph exists. Arming here would sweep an empty epic.
+			name:  "the epic label applied",
+			event: "issues",
+			payload: `{"action":"labeled","repository":{"full_name":"o/r"},` +
+				`"issue":{"number":48},"label":{"name":"epic"}}`,
+			want: false,
+		},
+		{
+			name:  "some other label applied",
+			event: "issues",
+			payload: `{"action":"labeled","repository":{"full_name":"o/r"},` +
+				`"issue":{"number":48},"label":{"name":"status:ready-for-spec"}}`,
+			want: false,
+		},
+		{
+			// A pull request cannot be an epic, and the two share a number
+			// space -- the same reasoning that keeps ClosedPR out of the epic
+			// sweep. Only the EVENT tells them apart.
+			name:  "the ready label applied to a pull request",
+			event: "pull_request",
+			payload: `{"action":"labeled","repository":{"full_name":"o/r"},` +
+				`"pull_request":{"number":48},"label":{"name":"status:epic-ready"}}`,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tickCh := make(chan tickCall, 1)
+			s := newServer(t, tickCh)
+			srv := httptest.NewServer(s.Handler(context.Background()))
+			t.Cleanup(srv.Close)
+
+			body := []byte(tc.payload)
+			resp := doRequest(t, srv.URL+"/webhook", body, map[string]string{
+				github.EventTypeHeader:       tc.event,
+				github.SHA256SignatureHeader: sha256Sig(testSecret, body),
+			})
+			defer resp.Body.Close()
+
+			if got := waitTick(t, tickCh); got.epicReady != tc.want {
+				t.Errorf("epicReady = %v, want %v", got.epicReady, tc.want)
 			}
 		})
 	}
