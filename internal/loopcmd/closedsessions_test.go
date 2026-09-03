@@ -228,3 +228,47 @@ func TestAllSessionsMarksClosedFromTheDatabase(t *testing.T) {
 func sessionIDFor(n int) string {
 	return string(rune('a'+n)) + "-sess"
 }
+
+// A live session survives its issue's closure.
+//
+// The closure marks every session that ever worked the issue, so an agent that
+// is running RIGHT NOW on an issue somebody closed under it gets marked too.
+// Hiding that row hides the one session an operator can still act on -- it is
+// burning tokens, and `sessions kill` needs its identifier -- so the default
+// report keeps it and the hidden count does not count it.
+func TestVisibleKeepsALiveSessionOnAClosedIssue(t *testing.T) {
+	sessions := []Session{
+		{ID: "sess-live", Issue: 9, Closed: true, Live: true},
+		{ID: "sess-done", Issue: 9, Closed: true},
+	}
+
+	shown, hidden := visible(sessions, false)
+	if len(shown) != 1 || shown[0].ID != "sess-live" {
+		t.Fatalf("the live session must survive the closure: %+v", shown)
+	}
+	if hidden != 1 {
+		t.Errorf("only the finished session is hidden, so the count is 1, got %d", hidden)
+	}
+}
+
+// The renderers show it, and show it as running rather than CLOSED.
+func TestRenderSessionsShowsALiveSessionOnAClosedIssue(t *testing.T) {
+	p := &Project{Config: &projectConfigStub, Root: "/p", Dir: "/p/.agent-utils"}
+	live := []Session{{ID: "sess-live", Loop: "execution", Issue: 9,
+		Dispatches: 2, LastStatus: store.StatusRunning, Closed: true, Live: true}}
+
+	for name, got := range map[string]string{
+		"RenderSessions":    RenderSessions(p, live, false),
+		"RenderAllSessions": RenderAllSessions(live, SessionFilter{}),
+	} {
+		if !strings.Contains(got, "sess-live") {
+			t.Errorf("%s must list the running session:\n%s", name, got)
+		}
+		if !strings.Contains(got, "running") {
+			t.Errorf("%s must mark it running, not CLOSED:\n%s", name, got)
+		}
+		if strings.Contains(got, "hidden") {
+			t.Errorf("%s hid nothing, so it must report no hidden count:\n%s", name, got)
+		}
+	}
+}
