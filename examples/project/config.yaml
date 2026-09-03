@@ -21,6 +21,13 @@ id: 00000000-0000-0000-0000-000000000000
 # epic: which loop may add the pipeline's first trigger label to the siblings a
 # closing sub-issue unblocked. Exactly one may, or the execution loop would
 # promote a fresh issue straight past planning.
+#
+# Two labels drive the sweep from the issue side, and neither is configurable:
+# `epic` on the parent makes an issue an epic, and `status:epic-ready` on the
+# parent asks for a sweep NOW and is removed by it. Apply the second one last,
+# after the sub-issues and their blocked_by edges exist -- it is what promotes
+# an epic's FIRST sub-issue, since until something closes there is no closure
+# to arm the sweep with.
 epic:
   loop: planning
 

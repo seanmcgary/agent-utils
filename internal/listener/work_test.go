@@ -3009,3 +3009,109 @@ func TestAPushRunsNeitherTheEpicPassNorTheCleanupPass(t *testing.T) {
 		t.Errorf("cleaned = %v, want none for a push", cleaned)
 	}
 }
+
+// --- The epic-ready button --------------------------------------------------
+
+// readyNumbers captures the issues the epic-ready pass was asked to sweep. It
+// is separate from sweptNumbers because the two passes answer different
+// deliveries, and a test that could not tell them apart would pass on either.
+func readyNumbers(h *harness) (*[]int, *sync.Mutex) {
+	var mu sync.Mutex
+	var ready []int
+	h.w.RunEpicReady = func(
+		_ context.Context, _ *config.Config, _ loopcmd.Deps, n int,
+	) (loopcmd.Summary, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		ready = append(ready, n)
+		return loopcmd.Summary{}, nil
+	}
+	return &ready, &mu
+}
+
+// The button's whole purpose: a sweep with nothing closed.
+func TestEpicReadyRunsTheRequestedSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	ready, mu := readyNumbers(h)
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 48, EpicReady: true})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*ready) != 1 || (*ready)[0] != 48 {
+		t.Fatalf("epic-ready sweep ran for %v, want [48]", *ready)
+	}
+}
+
+func TestANonReadyDeliveryRunsNoRequestedSweep(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	ready, mu := readyNumbers(h)
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 48, ClosedIssue: true})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*ready) != 0 {
+		t.Fatalf("epic-ready sweep ran for %v; only the label starts one", *ready)
+	}
+}
+
+// The two passes are independent. A press arms only the requested sweep, and a
+// close arms only the closure sweep -- neither stands in for the other.
+func TestTheTwoEpicPassesDoNotArmEachOther(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	swept, smu := sweptNumbers(h)
+	ready, rmu := readyNumbers(h)
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 48, EpicReady: true})
+
+	smu.Lock()
+	defer smu.Unlock()
+	rmu.Lock()
+	defer rmu.Unlock()
+	if len(*swept) != 0 {
+		t.Errorf("the closure sweep ran for %v on a label press", *swept)
+	}
+	if len(*ready) != 1 {
+		t.Errorf("the requested sweep ran for %v, want one entry", *ready)
+	}
+}
+
+// A number a delivery could not name must reach no pass. The guard mirrors the
+// epic sweep's: this pass reads d.Number as the EPIC, so a delivery whose body
+// set the flag without a number would sweep issue 0.
+func TestEpicReadyNeedsANumber(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	ready, mu := readyNumbers(h)
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 0, EpicReady: true})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*ready) != 0 {
+		t.Fatalf("epic-ready sweep ran for %v with no issue named", *ready)
+	}
+}
+
+// A failing requested sweep must not cost the issue its own pass, and must
+// schedule no retry -- the same contract the closure sweep has.
+func TestTheLabelledIssuesOwnPassStillRuns(t *testing.T) {
+	h := newHarness(nil)
+	h.targets = []Target{h.target("planning")}
+	h.w.RunEpicReady = func(context.Context, *config.Config, loopcmd.Deps, int) (loopcmd.Summary, error) {
+		return loopcmd.Summary{}, errBoom
+	}
+
+	h.w.Deliver(context.Background(), Delivery{Repo: "o/r", Number: 48, EpicReady: true})
+
+	if got := h.ranNumbers(); len(got) != 1 || got[0] != 48 {
+		t.Fatalf("the issue pass ran for %v, want [48]", got)
+	}
+	if n := h.timers.len(); n != 0 {
+		t.Errorf("armed %d retry timers for a failed sweep, want 0", n)
+	}
+}

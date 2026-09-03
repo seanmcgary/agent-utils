@@ -902,7 +902,8 @@ this machine is not already trusted network-wide.
 ## Epics
 
 An epic is an issue carrying the `epic` label whose sub-issues are the work. When a sub-issue
-closes, the loop promotes every sibling that closure unblocked, up to 25 per sweep: it adds the
+closes — or when you apply `status:epic-ready` to the epic, which is how the *first* one starts —
+the loop promotes every sibling that is unblocked, up to 25 per sweep: it adds the
 pipeline's first trigger label — `status:ready-for-spec` in the reference setup — and nothing
 else. Anything past the cap waits for the next sweep, which logs the numbers it deferred.
 
@@ -957,13 +958,38 @@ A declaration that is missing, names a loop that does not exist, or names one wa
 repository, promotes nothing and says why in the log. So does a project whose loop files will not
 all load — the broken one may be the loop that was named.
 
-Two things drive it: an `issues` delivery reporting a close, and `loop tick` under cron, which
-walks every open epic. The delivery is the fast path and cron is the backstop for a delivery that
-never arrived.
+**Starting an epic: `status:epic-ready`.** A closure is what unblocks a sibling, so a closure is
+what arms the sweep — which leaves one case uncovered. An epic whose sub-issues have *never*
+closed produces no close delivery at all, so its **first** promotion has nothing to start it, and
+a first sub-issue that is unblocked from the start would wait forever with no sign anything is
+wrong. Applying `status:epic-ready` to the epic sweeps it immediately.
 
-The sweep never removes a label, never comments, never closes an issue, and never writes a
-dependency. Entering an epic's graph is a human's job, or an agent's, and both use the GitHub UI
-or its API.
+Apply it **last**, once the sub-issues and their `blocked_by` edges are entered. That is the
+whole reason it is a second label rather than the `epic` label itself: `epic` is what an issue
+gets when you *start* building the graph, and a sweep armed there would walk an epic with no
+children yet.
+
+The label is **consumed** — the sweep removes it. GitHub sends no delivery for applying a label
+that is already present, so a label left in place could never arm a second sweep, and adding
+children later would give you no way to press it again. Treat it as a button: apply it, it
+sweeps, it clears itself. It is checked against the issue as it stands when the sweep runs, not
+as the delivery described it, so an epic that lost the label in the meantime is left alone, and
+an issue that does not also carry `epic` is ignored entirely.
+
+If the sweep itself fails the label **stays**, so an unanswered request is visible on the issue.
+If only the removal fails, every promotion still stands and the log says the label needs clearing
+by hand.
+
+Three things drive the sweep: an `issues` delivery reporting a close, an `issues` delivery
+applying `status:epic-ready`, and `loop tick` under cron, which walks every open epic. The two
+deliveries are the fast path and cron is the backstop for a delivery that never arrived — a
+machine driven entirely by webhooks needs the label to start each epic, since nothing else enters
+an epic that has no closed child.
+
+The sweep never comments, never closes an issue, and never writes a dependency. The only label it
+removes is `status:epic-ready`, from the epic it was asked to sweep; it removes nothing from a
+sub-issue. Entering an epic's graph is a human's job, or an agent's, and both use the GitHub UI or
+its API.
 
 ## Upgrading
 
