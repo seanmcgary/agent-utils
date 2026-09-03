@@ -223,7 +223,17 @@ func visible(sessions []Session, all bool) ([]Session, int) {
 	kept := make([]Session, 0, len(sessions))
 	hidden := 0
 	for _, s := range sessions {
-		if s.Closed {
+		// Live outranks Closed, matching the renderers' state column. A
+		// closure marks EVERY session that ever worked the issue (see
+		// Session.Closed), including one whose agent is running right now
+		// because the issue was closed under it. That row is the opposite of
+		// finished work: it is burning tokens, and `sessions kill` needs the
+		// identifier this report is the only place to read it from.
+		//
+		// Orphaned is NOT excepted. An orphan on a closed issue is a run that
+		// ended without recording an outcome, which is still finished work;
+		// --all is what surfaces it.
+		if s.Closed && !s.Live {
 			hidden++
 			continue
 		}
