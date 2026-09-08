@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
+	"strings"
 	"text/template"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
@@ -107,6 +108,46 @@ func Effective(cfg *config.Config, ov config.Overrides) Settings {
 	return s
 }
 
+// deferralTools are the claude tools that let an agent hand work to a future
+// that never arrives, and BuildArgs denies every one of them on every dispatch.
+//
+// This is the same failure as config.Agent.BackgroundTasks, reached by a
+// different route. A dispatch is a single "claude -p" run: when its turn ends,
+// the process exits and nothing wakes it again. ScheduleWakeup is a /loop tool
+// whose wakeup is fired by the loop runtime, and there is no loop runtime here,
+// so an agent that schedules one simply stops -- mid-handoff, with a clean
+// result line. Observed on snootsnap-monorepo#77: the executor opened its pull
+// request, scheduled a wakeup to check CI in eight minutes and ended its turn.
+// The run was recorded SUCCEEDED at $28.64, having never applied the terminal
+// label, so no retry fired, the orphan breaker saw nothing wrong, and the issue
+// sat in status:executing until a human noticed. A cheap deny is worth more
+// than a prompt line here, because the failure looks like success from every
+// angle the engine can see.
+//
+// The Cron tools go with it for a second reason. They write to the USER's
+// schedule, which outlives the dispatch entirely: an agent acting on an issue
+// comment has no business creating a routine that runs forever, and less
+// business deleting one it did not create.
+//
+// Monitor is deliberately NOT here. It blocks inside the run, so it cannot end
+// a turn with work outstanding and agent.timeout still bounds it. Denying it
+// too would leave an agent no sanctioned way to wait for CI at all -- foreground
+// sleep is blocked as well -- and an agent with no way to wait invents a worse
+// one. "gh pr checks <n> --watch" blocks in-process and is the answer.
+//
+// Denying by name removes a tool from the model's context entirely rather than
+// refusing it at call time: verified against claude 2.1.263, the tool leaves the
+// init event's tool list and ToolSearch no longer resolves it. There is nothing
+// to route around and no turn is spent being refused. That is also why this is
+// a constant and not a config knob -- a dispatch has no correct use for any of
+// them, and a knob is only an invitation to reproduce #77.
+var deferralTools = []string{
+	"ScheduleWakeup",
+	"CronCreate",
+	"CronDelete",
+	"CronList",
+}
+
 // BuildArgs returns the argument list for claude.
 //
 // The stream-json output format is mandatory, because it gives the log file and
@@ -120,6 +161,14 @@ func BuildArgs(cfg *config.Config, inv Invocation) []string {
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
+		// --disallowed-tools is VARIADIC: it consumes every following
+		// argument until the next one starting with "-". It is emitted HERE,
+		// and not beside the other agent settings below, because the prompt is
+		// positional and last -- a deny list emitted last would swallow the
+		// prompt, and claude then exits 1 on a missing prompt. The session flag
+		// that follows is unconditional, so something starting with "-" always
+		// terminates the list.
+		"--disallowed-tools", strings.Join(deferralTools, ","),
 	}
 
 	if inv.Resume {

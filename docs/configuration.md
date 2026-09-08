@@ -775,6 +775,39 @@ whether from `harness: pi` or a `harness:pi` label — never builds, so such a d
 background_tasks: false   # true only if you know why you want it
 ```
 
+### Tools a dispatch never gets — not configurable
+
+Every claude dispatch is launched with `--disallowed-tools ScheduleWakeup,CronCreate,CronDelete,CronList`.
+There is no setting for this and there is not meant to be one.
+
+These are the tools that let an agent hand work to a **future that never arrives**. A dispatch is
+a single `claude -p` run: when its turn ends the process exits, and nothing wakes it again.
+`ScheduleWakeup` is a `/loop` tool whose wakeup is fired by the loop runtime, and there is no loop
+runtime behind a dispatch — so an agent that schedules one simply stops, mid-handoff, with a clean
+result line.
+
+That is not hypothetical. An executor opened its pull request, scheduled a wakeup to check CI in
+eight minutes, and ended its turn. The run was recorded **succeeded** at $28.64 having never
+applied its terminal label, so no retry fired, the orphan breaker saw nothing wrong, and the issue
+sat in `status:executing` until a human noticed. It is the same shape as the
+[`agent.background_tasks`](#agentbackground_tasks--optional) failure above, reached by a different
+route: work abandoned behind an exit that looks like success from every angle the engine can see.
+A prompt line is not enough against that, because nothing downstream can detect it.
+
+The `Cron` tools are denied for a second reason. They write to the **user's** schedule, which
+outlives the dispatch entirely: an agent acting on an issue comment has no business creating a
+routine that runs forever, and less business deleting one it did not create.
+
+**`Monitor` is deliberately still available.** It blocks *inside* the run, so it cannot end a turn
+with work outstanding, and `agent.timeout` still bounds it. Denying it too would leave an agent no
+sanctioned way to wait for CI at all — foreground `sleep` is blocked as well — and an agent with no
+way to wait invents a worse one. `gh pr checks <n> --watch` blocks in-process and is the answer
+worth putting in a prompt.
+
+Denying by name removes a tool from the model's context rather than refusing it at call time, so
+no turn is spent being refused and there is nothing to route around. claude-only: `pi` has no
+equivalent flag and a `pi` dispatch never emits one.
+
 ### `agent.timeout` — optional, defaults to `24h`
 
 How long one dispatch may run. A Go duration string: `90s`, `30m`, `3h`. **Omit it unless you have
