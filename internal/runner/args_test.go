@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -301,3 +302,56 @@ func TestPiBuildArgsUsesTheEffectiveOverride(t *testing.T) {
 // for a tend as for anything else: a label is an instruction about one issue,
 // and a tend is one of that issue's agents. It is covered by the override
 // tests above, which no longer need a kind to say so.
+
+func TestBuildArgsDisallowsTheDeferralTools(t *testing.T) {
+	j := joined(BuildArgs(cfg(), Invocation{SessionID: "s", Prompt: "p"}))
+	if !strings.Contains(j, "--disallowed-tools ") {
+		t.Fatalf("a dispatch must deny the deferral tools: %s", j)
+	}
+	for _, want := range deferralTools {
+		if !strings.Contains(j, want) {
+			t.Errorf("missing %q in the deny list: %s", want, j)
+		}
+	}
+}
+
+// Monitor blocks INSIDE the run, so it cannot end a turn with work
+// outstanding and agent.timeout still bounds it. It is deliberately not
+// denied: an agent with no way at all to wait for CI invents a worse one.
+func TestBuildArgsDoesNotDisallowMonitor(t *testing.T) {
+	j := joined(BuildArgs(cfg(), Invocation{SessionID: "s", Prompt: "p"}))
+	if strings.Contains(j, "Monitor") {
+		t.Errorf("Monitor blocks in-run and must stay available: %s", j)
+	}
+}
+
+// --disallowed-tools is VARIADIC: it swallows every following argument up to
+// the next flag. Verified by running the binary -- with the list emitted
+// immediately before the positional prompt, claude exits 1 with "Input must be
+// provided either through stdin or as a prompt argument". This pins the only
+// property that keeps that from happening: something starting with "-" follows
+// the list, so the prompt is never read as another tool name.
+func TestBuildArgsDeferralDenyListDoesNotEatThePrompt(t *testing.T) {
+	args := BuildArgs(cfg(), Invocation{SessionID: "s", Prompt: "the prompt"})
+
+	if got := args[len(args)-1]; got != "the prompt" {
+		t.Fatalf("prompt must be last, got %q", got)
+	}
+
+	i := slices.Index(args, "--disallowed-tools")
+	if i < 0 {
+		t.Fatal("no --disallowed-tools flag")
+	}
+	// The list is one argv element; the element after it must be a flag.
+	if next := i + 2; next >= len(args) || !strings.HasPrefix(args[next], "-") {
+		t.Errorf("the deny list must be followed by a flag, not the prompt: %v", args)
+	}
+}
+
+// pi has no equivalent flag, so emitting one would be an unknown argument.
+func TestPiBuildArgsOmitsTheDeferralDenyList(t *testing.T) {
+	j := joined(PiBuildArgs(piCfg(), Invocation{SessionID: "s", Prompt: "p"}))
+	if strings.Contains(j, "--disallowed-tools") {
+		t.Errorf("pi has no deny-list flag: %s", j)
+	}
+}
