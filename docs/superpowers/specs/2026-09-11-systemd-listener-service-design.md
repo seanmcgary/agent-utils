@@ -229,11 +229,20 @@ whether or not the placement succeeded.
 When the effective user identifier is already zero, every `sudo` prefix is dropped. The commands
 are otherwise identical.
 
+`Install` refuses one case before it does anything else: an effective user identifier of zero
+together with a set `SUDO_USER`. That combination means the operator ran the whole program under
+`sudo`. The program would then resolve the home directory to root's and install a service that
+reads a state directory the operator does not use. The error tells the operator to run the
+command as themselves, because the program calls `sudo` for the steps that need it.
+
 `Install` is idempotent. `install` overwrites an existing unit file, and `enable --now` on an
 already-enabled unit is not an error.
 
 ### Uninstall
 
+0. Return with no action when the unit file does not exist. Nothing is registered, so there is
+   nothing to remove, and an operator who asks to uninstall on a machine with no service must not
+   get a `sudo` password prompt for it.
 1. Run `sudo systemctl disable --now agent-utils-listener.service`. A non-zero exit is logged and
    ignored, because the unit may already be gone.
 2. Run `sudo rm -f /etc/systemd/system/agent-utils-listener.service`.
@@ -244,8 +253,8 @@ have removed the unit by hand.
 
 ### Status
 
-`Status` runs `systemctl show agent-utils-listener.service --property=LoadState
---property=ActiveState --property=MainPID`. That form is machine-readable, needs no privilege,
+`Status` runs `systemctl show agent-utils-listener.service --property=ActiveState
+--property=MainPID`. That form is machine-readable, needs no privilege,
 and needs no `sudo` prompt from a command an operator runs to ask a question.
 
 - `Installed` is true when the unit file exists on disk. This matches what the darwin
