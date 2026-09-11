@@ -119,6 +119,13 @@ That is unchanged from today.
 `uninstall` calls `Manager.Uninstall`, which is idempotent. It prints what it removed, or reports
 that nothing was installed.
 
+It separates two reasons for "nothing to remove" from a third case that is not one. A platform
+with no service manager, and a machine with no registration, both print that nothing is installed.
+Any other failure to read the registration is surfaced as an error. That failure means a
+root-owned, boot-persistent unit may still be installed, so reporting success would be a lie at
+the one moment it matters. `Manager` gains an exported `ErrUnsupported` sentinel so the command
+can tell the cases apart.
+
 ### `listener status`
 
 `status` prints two lines, as it does today. The first line changes its label from `launchd:` to
@@ -190,19 +197,40 @@ overridden home would install a service that reads a different directory than th
 
 ### Rendering the unit
 
-`unit.go` builds the file as text. A unit file is line-oriented and has no escape for a newline
-inside a value, so a value containing a newline would end its directive and open a sibling
-directive of the caller's choosing, in a file that root executes at every boot. The renderer
-therefore refuses any value that contains a control character, which includes a carriage return
-and a line feed, and returns an error instead of a document.
+`unit.go` builds the file as text. A unit file is line-oriented and metacharacter-rich, and four
+different constructs can carry an injection. None of them can be escaped the same way, and some
+cannot be escaped at all:
 
-Each `ExecStart` argument is written inside double quotes, with a backslash and a double quote
-escaped by a backslash. This is systemd's own quoting rule. It makes a path that contains a space
-safe, and it removes any question about where one argument ends.
+- A newline ends a directive. A value containing one opens a sibling directive of the caller's
+  choosing, in a file that root executes at every boot.
+- A percent sign is systemd's specifier escape. It is expanded inside `ExecStart`, `Environment`,
+  `WorkingDirectory`, and `Description`, whether or not the value is quoted.
+- A dollar sign is expanded inside `ExecStart`.
+- A line that ends in a backslash is joined with the next line. That deletes the following
+  directive rather than adding one, and the directives it can delete include the `User=` line that
+  keeps the service from running as root.
+
+So the renderer refuses. Any value that contains a control character, a percent sign, a dollar
+sign, or a backslash produces an error and no document. The error names the offending field.
+
+The double quote is the single exception. It is escaped with a backslash rather than refused,
+because it is the delimiter of the quoting the renderer itself applies.
+
+Each `ExecStart` argument and each `Environment` assignment is written inside double quotes. That
+makes a path containing a space safe and removes any question about where one argument ends.
+`User`, `Group`, and `WorkingDirectory` are written raw, because systemd does not read a quoted
+value as an account name. That is safe only because the refusal above has already removed every
+rune that could end one of those lines early or run past it.
 
 This is a narrower guarantee than `plist.go` gets from `encoding/xml`, which escapes everything.
-The refusal is what closes the gap: a value that cannot be represented is rejected rather than
-written.
+A unit file has no total escape scheme to delegate to. The refusal is what closes the gap: a value
+that cannot be represented is rejected rather than written, and a refusal is auditable in a way
+that an escape scheme invented here would not be.
+
+The renderer does not rely on the caller having validated anything. The `webhook.listen_addr`
+setting's validator is a non-empty check and a loopback warning, not an address parser, so
+`--listen-addr` arrives as an arbitrary string. The renderer is the control, not a second line of
+defense behind one.
 
 ### Install
 
@@ -216,24 +244,44 @@ and would write a unit that names root's directories.
 3. Resolve the agent-utils home directory with `home.EnsureDir`, so `WorkingDirectory` exists
    before systemd starts the service.
 4. Render the unit.
-5. Write it to a private temporary file, created with mode `0600` in the operator's own temporary
-   directory.
-6. Place it with `sudo install -m 0644 -o root -g root <temp> /etc/systemd/system/<unit>`.
+5. Write it to root's standard input with `sudo tee /etc/systemd/system/<unit>`.
+6. Run `sudo chmod 0644 /etc/systemd/system/<unit>`.
 7. Run `sudo systemctl daemon-reload`.
 8. Run `sudo systemctl enable --now agent-utils-listener.service`.
 
-Step 6 uses `install`, not a shell redirect and not `sudo tee`. No argument passes through a
-shell, so there is no quoting to get wrong. The temporary file is removed after the placement,
-whether or not the placement succeeded.
+The rendered unit goes from memory to root's standard input. It is never staged in a file first.
 
-When the effective user identifier is already zero, every `sudo` prefix is dropped. The commands
-are otherwise identical.
+Staging would open a window. Between the moment this process closes a staged file and the moment
+root reads it, anything that runs as the operator can rewrite those bytes or replace the path with
+a symbolic link. That is not a remote threat for this program: it dispatches coding agents that
+run with permission prompts disabled on untrusted text. Root would then place content the renderer
+never produced, and every guarantee the renderer makes is bypassed without the renderer being
+wrong about anything.
 
-`Install` refuses one case before it does anything else: an effective user identifier of zero
-together with a set `SUDO_USER`. That combination means the operator ran the whole program under
-`sudo`. The program would then resolve the home directory to root's and install a service that
-reads a state directory the operator does not use. The error tells the operator to run the
-command as themselves, because the program calls `sudo` for the steps that need it.
+No shell is involved either. The command runner builds an explicit argument list, so `tee` gets
+the destination as one argument. There is no redirect, no quoting, and no word splitting.
+
+`chmod` is a separate step because `tee` creates the file with root's umask applied. The mode is
+normalized rather than assumed. No `chown` step is needed: `tee` ran as root, so the file is
+already root's.
+
+`Install` refuses one case before it does anything else: an effective user identifier of zero.
+That means the operator ran the whole program as root. Every directory the program resolves would
+then be root's, and the installed service would run as root and read a state directory the
+operator has never written to.
+
+The test is the identifier alone, not the identifier together with a set `SUDO_USER`. A root login
+shell, `su -`, `doas`, and `sudo env -u SUDO_USER agent-utils listener install` all arrive with an
+effective user identifier of zero and no `SUDO_USER`. Each one would otherwise install a service
+that runs the agent dispatcher as root at every boot. There is no case in which running the whole
+program as root is correct, because it calls `sudo` itself for the three steps that need it.
+
+The unit directory override has the same shape of hazard, and the same answer. That environment
+variable exists only so the test suite does not touch `/etc/systemd/system`. It steers the
+destination of a root-owned write and a root-owned delete, so honoring it while still escalating
+would turn an environment variable into "create or delete a root-owned file at a path of my
+choosing". So the `sudo` prefix is dropped whenever the override is set. A test does not need
+root, and setting the variable outside a test makes the install fail rather than redirect it.
 
 `Install` is idempotent. `install` overwrites an existing unit file, and `enable --now` on an
 already-enabled unit is not an error.
@@ -284,7 +332,17 @@ neutral opening sentence and keeps the Homebrew explanation as the macOS example
 
 The systemd backend is tested the way the launchd backend is tested. The command runner is a
 package-level variable, so no test ever runs a real `systemctl` and no test ever prompts for a
-password.
+password. Two more seams are added for the same reason. `service.New` becomes a variable, so a
+test in `cmd/agent-utils` can substitute a fake `Manager` instead of running a real `launchctl
+print` or `systemctl show`. `os.Geteuid` becomes a variable, so the refusal to install as root can
+be tested without running the suite as root.
+
+Test fixtures for the self-install check are rooted under the operator's home directory, not under
+`t.TempDir()`. The check walks every parent to the filesystem root, and on Linux `t.TempDir()`
+lands under `/tmp`, which is mode 1777. The existing launchd test passes only because the macOS
+temporary directory is a private per-user tree. A home directory is conventionally mode 0755 on
+both platforms, which carries no group-write or other-write bit, so a 0700 directory inside it
+passes the walk.
 
 - `unit_test.go` — the rendered document for a plain install, for an install with listen
   overrides, and for an install with `AGENT_UTILS_HOME` set. One test per refused value: a line
@@ -301,9 +359,16 @@ password.
   cleanup in `status`.
 
 Continuous integration runs on `ubuntu-latest`, so the Linux backend is compiled, vetted, linted,
-and tested natively on every push. The `GOOS=darwin go vet` line in the `vet` target stays, and a
-`GOOS=linux go vet` line is added beside it so a developer on macOS still type-checks the new
-file.
+and tested natively on every push. The `vet` target gains two lines beside the existing
+`GOOS=darwin` one.
+
+`GOOS=linux go vet` lets a developer on macOS type-check the new file. `GOOS=windows go vet`
+covers the stub, and it closes a real hole: once the stub's build tag is narrowed to
+`!darwin && !linux`, nothing else selects it. Not the host build, not the two other `GOOS` lines,
+not `make test`, not `make lint`, and not the release targets, which build Linux and macOS only.
+Without that line the stub and its test compile for nobody and rot in place. `go vet` analyzes
+test files, so the line type-checks both. Nothing ever runs the stub's test, and that is the
+honest state of a stub for platforms this project ships no binary for.
 
 ## Documentation
 

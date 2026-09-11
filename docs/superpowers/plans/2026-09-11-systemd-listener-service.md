@@ -11,54 +11,83 @@ file that mirrors what `plist.go` does for launchd. Move the shared self-install
 out of the darwin file. In `cmd/agent-utils/listener.go`, delete the `--daemon` flag and the
 `start`/`stop` verbs, and add `install` and `uninstall`.
 
-**Tech Stack:** Go 1.25, `urfave/cli/v3`, `os/exec`, systemd, launchd.
+**Tech Stack:** Go 1.25, `urfave/cli/v3` v3.11.0, `os/exec`, systemd, launchd.
 
 **Spec:** `docs/superpowers/specs/2026-09-11-systemd-listener-service-design.md`
 
 ## Global Constraints
 
 This repository has no conventions document at its root. The binding rules come from the
-`Makefile` and from patterns the package already enforces. Each one bites for this change:
+`Makefile`, from `.golangci.yml`, and from patterns the code already enforces. Each one bites for
+this change:
 
 - `make check` is the gate: `fmtcheck`, `vet`, `lint`, `test`. `vet` runs `go vet ./...` and
-  `GOOS=darwin go vet ./...`. Task 5 adds `GOOS=linux go vet ./...`.
-- Tests run with `-p 1` and `-count=1`. No test may shell out to a real `systemctl`, a real
-  `launchctl`, or a real `sudo`.
-- Every shell-out in `internal/service` is a package-level variable, so a test can replace it.
-  `launchctl` (`service_darwin.go:55`) is the precedent.
+  `GOOS=darwin go vet ./...`. Task 5 adds `GOOS=linux` and `GOOS=windows` lines.
+- `.golangci.yml` enables exactly `errcheck`, `errorlint`, `govet`, `ineffassign`, `staticcheck`,
+  and `unused`. `unused` analyzes test files, so an orphaned unexported test helper fails the
+  gate. `gosec`, `lll`, `revive`, and `unparam` are NOT enabled.
+- Tests run with `-p 1` and `-count=1`. No test may run a real `systemctl`, `launchctl`, `sudo`,
+  `tee`, `chmod`, or `rm`.
+- Every privileged or external call in `internal/service` is a package-level variable, so a test
+  can replace it. `launchctl` (`service_darwin.go:55`) and `executablePath` (`service_darwin.go:44`)
+  are the precedents. This plan adds `runCommand`, `geteuid`, and makes `New` one.
 - Comments in this repository explain WHY, at length, and cross-reference the code that depends
   on them. Match that density. A security decision gets a paragraph, not a line.
+- Commit messages are `type(scope): lowercase imperative`. Makefile and CI work uses `build:`
+  (precedent: `64f03ed build: VERSION file, version subcommand, and CI/release workflows`).
+  **Never add a `Co-Authored-By` trailer.**
+- No `VERSION` bump. This repository bumps the version in a standalone
+  `chore: bump version to vX.Y.Z` commit at release time, never inside a feature commit.
 - Exact values that must not change: the launchd label `com.seanmcgary.agent-utils.listener`, and
   the refusal text `writable by group or other`, which `containsWritableRefusal`
-  (`cmd/agent-utils/listener.go:277`) matches on.
+  (`cmd/agent-utils/listener.go:276`) matches on.
 
 ## Verified external API (do not re-derive)
 
-Read from source in this checkout. Do not re-derive these.
+Read from source in this checkout, or measured. Do not re-derive these.
 
 - `service.Manager` — `Install(binary string, args []string) error`, `Uninstall() error`,
   `Status() (Status, error)`, `ServiceFilePath() (string, error)`. `internal/service/service.go:44`.
 - `service.Status` — `struct{ Installed bool; Running bool; PID int }`.
   `internal/service/service.go:37`.
-- `home.EnsureDir() (string, error)` — resolves and creates the agent-utils home directory.
-  `internal/home/home.go:64`.
+- `service.LaunchAgentsDirEnvVar` — **pre-existing**, `internal/service/service.go:31`.
+- `home.EnsureDir() (string, error)` — `internal/home/home.go:64`.
 - `home.EnvVar` — the constant `"AGENT_UTILS_HOME"`. `internal/home/home.go:25`.
-- `settings.Load() (*Settings, error)`; `(Settings).WithDefaults() Settings`.
-  `internal/settings/settings.go:184` and `:153`.
-- `setField(st *settings.Settings, key, value string) error` — the shared validator
-  `config set` uses. `cmd/agent-utils/config.go`.
-- systemd `Environment=` takes one `KEY=value` per directive, and accepts the whole assignment
-  inside double quotes. `ExecStart=` splits on whitespace and accepts double-quoted arguments,
-  with `\` and `"` escaped by a backslash.
+- `settings.Load() (*Settings, error)` (`:184`), `settings.Save(*Settings) error` (`:333`),
+  `(Settings).WithDefaults() Settings` (`:153`), `settings.Settings` (`:82`),
+  `settings.Webhook` (`:130`).
+- `setField(st *settings.Settings, key, value string) error` — `cmd/agent-utils/config.go:151`.
+- `withHome(t *testing.T)` — sets `AGENT_UTILS_HOME` to a scratch dir.
+  `cmd/agent-utils/config_test.go:20`.
+- `runListenerCLI(t, args...) (string, error)` — `cmd/agent-utils/listener_test.go:57`.
+- `writePidfile(path string, pid int, addr string, port int) error` — `listener.go:839`.
+- `readPidfile(path string) (pidfileContent, error)` — `listener.go:850`.
+- `listenerLive(lockPath string) (bool, error)` — `listener.go:887`.
+- **`urfave/cli` v3.11.0 does NOT return an error for an unknown subcommand.** Measured against
+  the exact tree shape `runListenerCLI` builds: `root.Run(ctx, []string{"agent-utils","listener",
+  "start"})` prints `No help topic for 'start'` and calls `cli.OsExiter(3)`, which by default is
+  `os.Exit`. A test that asserts on a returned error kills the whole test binary. Override
+  `cli.OsExiter` to observe the exit code instead.
+- **`--help` output is not safe to assert on with `strings.Contains`.** The header line is
+  `agent-utils listener - run the webhook listener that dispatches loops on GitHub deliveries`,
+  so `Contains(out, "run")` passes with zero subcommands registered. Assert on the `COMMANDS:`
+  block lines.
+- **`refuseIfWritableByOthers` walks every parent to the filesystem root.** On Linux `t.TempDir()`
+  lands under `/tmp`, which is mode 1777, so a fixture built there is REFUSED. The existing darwin
+  test passes only because macOS `TMPDIR` is a private `/var/folders/...` tree. Every fixture in
+  this plan is rooted under `os.UserHomeDir()` for that reason.
+- **systemd unit-file metacharacters.** `%` is the specifier escape and is expanded inside
+  `ExecStart=`, `Environment=`, `WorkingDirectory=`, and `Description=`, quoted or not. `$` is
+  expanded in `ExecStart=`. A line ending in `\` is joined with the next line. None of these is a
+  control character, so a control-character check alone does not close the injection.
+- **systemd `Group=` accepts a numeric GID**, so a failed group-name lookup has a correct
+  fallback rather than a fatal error.
 - `systemctl show <unit> --property=<p>` prints one `Property=value` line per requested property
   and exits zero even for an unknown unit.
 
 ---
 
-### Task 1: Move the self-install check into shared code
-
-The systemd backend needs `resolveSelf` and `refuseIfWritableByOthers`, which live behind the
-`darwin` build tag today. Move them, unchanged, and add the two new platform-neutral constants.
+### Task 1: Share the self-install check and add the platform-neutral seams
 
 **Files:**
 - Modify: `internal/service/service.go`
@@ -66,10 +95,18 @@ The systemd backend needs `resolveSelf` and `refuseIfWritableByOthers`, which li
 - Test: `internal/service/selfinstall_test.go` (create)
 
 **Interfaces:**
-- Consumes: nothing from earlier tasks.
-- Produces: `UnitName` (`const`, `"agent-utils-listener.service"`), `SystemdUnitDirEnvVar`
-  (`const`, `"AGENT_UTILS_SYSTEMD_DIR"`), `executablePath` (`var func() (string, error)`),
-  `resolveSelf() (string, error)`, `refuseIfWritableByOthers(real string) error`.
+- Consumes: `service.LaunchAgentsDirEnvVar` (pre-existing, `service.go:31`).
+- Produces:
+  - `UnitName` — `const`, `"agent-utils-listener.service"`.
+  - `SystemdUnitDirEnvVar` — `const`, `"AGENT_UTILS_SYSTEMD_DIR"`.
+  - `ErrUnsupported` — `var error`, the exported sentinel every non-darwin, non-linux `Manager`
+    method returns. Renamed from the unexported `errUnsupported`.
+  - `New` — changed from a func to `var New = func() Manager { return newManager() }`, so a test
+    in `cmd/agent-utils` can substitute a fake `Manager`.
+  - `executablePath` — `var func() (string, error)`, moved from `service_darwin.go`.
+  - `geteuid` — `var func() int`, new.
+  - `resolveSelf() (string, error)` — moved from `service_darwin.go`.
+  - `refuseIfWritableByOthers(real string) error` — moved from `service_darwin.go`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -85,18 +122,89 @@ import (
 	"testing"
 )
 
+// privateDir returns a 0700 directory whose every ancestor is free of the
+// group-write and other-write bits, plus a cleanup.
+//
+// t.TempDir() is NOT usable for a refuseIfWritableByOthers fixture. That
+// function walks every parent up to the filesystem root, and on Linux
+// t.TempDir() lands under /tmp, which is mode 1777. The existing darwin
+// helper (service_darwin_test.go's writableSelf) gets away with t.TempDir()
+// only because macOS TMPDIR is a private /var/folders/... tree that is 0700
+// the whole way up; its "t.TempDir() defaults to 0700" comment is true of
+// the leaf, not of the ancestry.
+//
+// The user's home directory is the portable answer: ~ and the directories
+// above it are conventionally 0755 on both platforms, which has no group or
+// other WRITE bit, so a 0700 directory created inside it passes the walk.
+//
+// If a future change makes these tests fail on a machine whose home
+// directory is group-writable, the fix is this helper. It is NOT to relax
+// refuseIfWritableByOthers -- read the sticky-bit paragraph in that
+// function before touching it.
+func privateDir(t *testing.T) string {
+	t.Helper()
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("locate home directory: %v", err)
+	}
+	dir, err := os.MkdirTemp(userHome, ".agent-utils-test-")
+	if err != nil {
+		t.Fatalf("create a private fixture directory: %v", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod the fixture directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			t.Errorf("remove the fixture directory: %v", rmErr)
+		}
+	})
+	return dir
+}
+
+// privateSelf creates a fake "agent-utils" binary at 0755 inside a private
+// directory and returns its path.
+func privateSelf(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(privateDir(t), "agent-utils")
+	if err := os.WriteFile(path, []byte("fake binary"), 0o755); err != nil {
+		t.Fatalf("write fake binary: %v", err)
+	}
+	return path
+}
+
+// stubExecutable points executablePath at path for the test. Install must
+// never resolve the real `go test` binary: its location and permissions are
+// outside this test's control.
+func stubExecutable(t *testing.T, path string) {
+	t.Helper()
+	prev := executablePath
+	executablePath = func() (string, error) { return path, nil }
+	t.Cleanup(func() { executablePath = prev })
+}
+
+// stubGeteuid makes the process look like it is running under the given
+// effective user identifier. Install refuses euid 0 outright, and that
+// refusal needs a test that does not require running the suite as root.
+func stubGeteuid(t *testing.T, uid int) {
+	t.Helper()
+	prev := geteuid
+	geteuid = func() int { return uid }
+	t.Cleanup(func() { geteuid = prev })
+}
+
 // TestRefuseIfWritableByOthersRejectsAWritableParent pins the check that
 // keeps a service definition from naming a binary another local account can
 // replace. It lives in a file with no build tag because both the launchd
 // backend and the systemd backend depend on it, and the systemd one is the
 // stronger case: a system unit is started by root.
 func TestRefuseIfWritableByOthersRejectsAWritableParent(t *testing.T) {
-	dir := t.TempDir()
-	loose := filepath.Join(dir, "loose")
-	if err := os.Mkdir(loose, 0o777); err != nil {
+	loose := filepath.Join(privateDir(t), "loose")
+	if err := os.Mkdir(loose, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// t.TempDir applies the process umask, so set the mode explicitly.
+	// Set explicitly: os.Mkdir applies the process umask, so the mode
+	// argument alone does not produce a world-writable directory.
 	if err := os.Chmod(loose, 0o777); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
@@ -117,31 +225,21 @@ func TestRefuseIfWritableByOthersRejectsAWritableParent(t *testing.T) {
 }
 
 // TestRefuseIfWritableByOthersAcceptsAPrivateDirectory proves the check is
-// not simply always-refuse.
+// not simply always-refuse, and that privateDir produces a fixture it
+// accepts on this machine.
 func TestRefuseIfWritableByOthersAcceptsAPrivateDirectory(t *testing.T) {
-	dir := t.TempDir() // 0700
-	bin := filepath.Join(dir, "agent-utils")
-	if err := os.WriteFile(bin, []byte("fake binary"), 0o755); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := refuseIfWritableByOthers(bin); err != nil {
+	if err := refuseIfWritableByOthers(privateSelf(t)); err != nil {
 		t.Errorf("refuseIfWritableByOthers rejected a private path: %v", err)
 	}
 }
 
 // TestResolveSelfUsesExecutablePathVariable proves resolveSelf reads the
 // running binary through the seam a test can replace, not through a path a
-// caller supplies. That is the property that keeps a service definition
-// from being pointed at an arbitrary path.
+// caller supplies. That is the property that keeps a service definition from
+// being pointed at an arbitrary path.
 func TestResolveSelfUsesExecutablePathVariable(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "agent-utils")
-	if err := os.WriteFile(bin, []byte("fake binary"), 0o755); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	prev := executablePath
-	executablePath = func() (string, error) { return bin, nil }
-	t.Cleanup(func() { executablePath = prev })
+	bin := privateSelf(t)
+	stubExecutable(t, bin)
 
 	got, err := resolveSelf()
 	if err != nil {
@@ -155,30 +253,48 @@ func TestResolveSelfUsesExecutablePathVariable(t *testing.T) {
 		t.Errorf("resolveSelf = %q, want %q", got, want)
 	}
 }
+
+// TestNewIsReplaceable pins the seam cmd/agent-utils's tests depend on. If
+// New goes back to being a plain function, those tests start running a real
+// launchctl or systemctl.
+func TestNewIsReplaceable(t *testing.T) {
+	prev := New
+	t.Cleanup(func() { New = prev })
+
+	called := false
+	New = func() Manager {
+		called = true
+		return prev()
+	}
+	_ = New()
+	if !called {
+		t.Error("New is not a replaceable variable")
+	}
+}
 ```
 
 - [ ] **Step 2: Run the test and confirm it fails**
 
-Run: `go test ./internal/service/ -run 'RefuseIfWritable|ResolveSelf' -count=1`
-Expected on Linux: FAIL to build, `undefined: refuseIfWritableByOthers`, `undefined: resolveSelf`,
-`undefined: executablePath`.
+Run: `go test ./internal/service/ -run 'RefuseIfWritable|ResolveSelf|NewIsReplaceable' -count=1`
+Expected on Linux: FAIL to build, with `undefined: refuseIfWritableByOthers`,
+`undefined: resolveSelf`, `undefined: executablePath`, and `undefined: geteuid`.
 
-- [ ] **Step 3: Move the three declarations into `service.go`**
+- [ ] **Step 3: Move the declarations and add the seams**
 
-Cut `executablePath`, `resolveSelf`, and `refuseIfWritableByOthers` out of
-`internal/service/service_darwin.go` — the declarations AND their whole doc comments, unchanged —
+First, the move. Cut `executablePath`, `resolveSelf`, and `refuseIfWritableByOthers` out of
+`internal/service/service_darwin.go` — the declarations AND their whole comments, unchanged —
 and paste them into `internal/service/service.go`, after the `Manager` interface and before
-`New`. Add `"os"`, `"fmt"`, and `"path/filepath"` to `service.go`'s imports, and remove any
-import that `service_darwin.go` no longer uses.
+`New`. Add `"fmt"`, `"os"`, and `"path/filepath"` to `service.go`'s imports, and remove any
+import `service_darwin.go` no longer uses.
 
-Change exactly two things in the moved text:
+Then make these five edits. Each names the real current location; verify it before editing.
 
-1. In `refuseIfWritableByOthers`'s doc comment, the sentence that names
-   `cmd/agent-utils/listener.go`'s `explainInstallErr` stays as it is. Add one sentence after the
-   paragraph about prompt-injected agents:
+1. **`service_darwin.go:95`**, the last sentence of `resolveSelf`'s doc comment, currently ending
+   `...the binary launchd runs at every login, i.e. persistence across reboots.` Append a new
+   paragraph to that doc comment:
 
 ```go
-	// This matters more for a systemd system unit than for a launchd user
+	// This binds harder for a systemd system unit than for a launchd user
 	// agent. A launchd agent runs as the operator, so a writable binary path
 	// buys an attacker persistence as that operator. A systemd system unit
 	// is started by root at every boot, so the same writable path is both
@@ -186,11 +302,27 @@ Change exactly two things in the moved text:
 	// account that can write that directory.
 ```
 
-2. In `resolveSelf`'s doc comment, replace the phrase `the darwin implementation refuses` with
-   `each platform implementation refuses`, and replace `in a file launchd executes at every login`
-   with `in a file the OS service manager executes without the operator present`.
+2. **`service.go:47`**, inside `Manager.Install`'s doc comment (NOT `resolveSelf`'s): change
+   `the darwin implementation refuses to install anything other than the binary it is currently
+   running as, since a service definition with RunAtLoad+KeepAlive is permanent login-time
+   execution of whatever path it names` to `each platform implementation refuses to install
+   anything other than the binary it is currently running as, since a service definition with
+   RunAtLoad+KeepAlive (launchd) or Restart=always (systemd) is permanent execution of whatever
+   path it names, without the operator present`.
 
-Add the two new constants to `service.go`, next to `Label`:
+3. **`service.go:55`**, inside `Manager.Uninstall`'s doc comment: change
+   `since `listener stop` may run against a registration a user already removed by hand` to
+   `since `listener uninstall` may run against a registration a user already removed by hand`.
+
+4. **`service.go:66-68`**, `New`'s doc comment, which currently reads
+   `the launchd-backed implementation on darwin, and an unsupported stub everywhere else. The stub
+   exists so `listener start` (no --daemon) keeps working on every platform even though `--daemon`
+   is macOS-only.` Replace the whole comment with the text in the `New` block below.
+
+5. **`service_darwin.go:236`**, inside `darwinManager.Uninstall`'s doc comment, which names
+   `listener stop`: change that reference to `listener uninstall`.
+
+Now add the new declarations to `service.go`. Put the two constants next to `Label`:
 
 ```go
 // UnitName is the systemd unit's filename. It doubles as the unit
@@ -207,39 +339,96 @@ const UnitName = "agent-utils-listener.service"
 // and `systemctl enable` would register the result on the developer's own
 // machine.
 //
+// It carries one guarantee LaunchAgentsDirEnvVar does not need. The launchd
+// plist is written by an ordinary os.WriteFile running as the operator, so
+// that override can never reach a path the operator could not already
+// write. The systemd unit is placed by root. So service_linux.go's
+// privileged() drops the sudo prefix whenever THIS variable is set: an
+// environment variable must never be able to direct a root-privileged write
+// or delete at a path of its choosing. Setting it outside a test therefore
+// does not redirect a privileged install; it makes the install fail.
+//
 // Declared here rather than in service_linux.go so a test file with no
-// build tag can reference it on every GOOS the suite runs under. Both
-// constants living behind //go:build darwin once broke `go vet ./...` on
-// ubuntu-latest for exactly that reason.
+// build tag can reference it on every GOOS the suite runs under. Label and
+// LaunchAgentsDirEnvVar living behind //go:build darwin once broke
+// `go vet ./...` on ubuntu-latest for exactly that reason.
 const SystemdUnitDirEnvVar = "AGENT_UTILS_SYSTEMD_DIR"
 ```
 
-Update the package doc comment at the top of `service.go`. Replace the sentence
-`launchd on darwin now, systemd meant to follow later` with
-`launchd on darwin and systemd on linux`.
+Add the `geteuid` seam beside `executablePath`:
 
-Update `service.go`'s comment on `Label` so it no longer implies it is the only identifier: after
-the existing text, append `UnitName is the systemd equivalent.`
+```go
+// geteuid reports this process's effective user identifier. It is a
+// variable, not a direct os.Geteuid call, so a test can exercise the
+// linux backend's refusal to install as root without the suite having to
+// run as root.
+var geteuid = os.Geteuid
+```
+
+Rename `errUnsupported` to `ErrUnsupported` and move its declaration from `service_other.go` into
+`service.go`, so every platform can compare against it:
+
+```go
+// ErrUnsupported is returned by every Manager method on a platform with no
+// service-manager backend. It is exported, and callers compare against it
+// with errors.Is, because "this platform cannot register a service" and
+// "this machine's service registration could not be read" need different
+// answers: cmd/agent-utils/listener.go's `uninstall` reports the first as
+// "nothing is installed" and must surface the second as the error it is.
+var ErrUnsupported = errors.New(
+	"service management (`listener install` / `listener uninstall`) is supported on macOS and Linux only; " +
+		"run `agent-utils listener run` in the foreground instead")
+```
+
+Add `"errors"` to `service.go`'s imports.
+
+Change `New` from a function to a variable:
+
+```go
+// New returns the Manager for the current platform: launchd on darwin,
+// systemd on linux, and an unsupported stub everywhere else. The stub exists
+// so `listener run` keeps working on every platform even though `listener
+// install` needs a service manager this program knows how to drive.
+//
+// It is a variable, not a plain function, so cmd/agent-utils's tests can
+// substitute a fake Manager. Without that seam, every `listener status` and
+// `listener uninstall` test in that package runs a real `launchctl print` or
+// a real `systemctl show` against the developer's own machine.
+var New = func() Manager {
+	return newManager()
+}
+```
+
+Finally, update `service.go`'s package doc comment: replace
+`launchd on darwin now, systemd meant to follow later` with
+`launchd on darwin and systemd on linux`. And append one sentence to `Label`'s comment:
+`UnitName is the systemd equivalent.`
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `go test ./internal/service/ -count=1`
-Expected: PASS.
+Expected: PASS. `service_other.go` still refers to `errUnsupported` at this point, so if the
+build fails there, change those four references to `ErrUnsupported` now rather than in Task 3.
 
 Run: `GOOS=darwin go build ./internal/service/... && GOOS=darwin go vet ./internal/service/...`
-Expected: no output. This is the only thing that type-checks the darwin file.
+Expected: no output.
+
+Run: `gofmt -l internal/service/`
+Expected: no output.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/service/service.go internal/service/service_darwin.go internal/service/selfinstall_test.go
-git commit -m "refactor(service): share the self-install check across platforms"
+git add internal/service/service.go internal/service/service_darwin.go internal/service/service_other.go internal/service/selfinstall_test.go
+git commit -m "refactor(service): share the self-install check and add platform-neutral seams"
 ```
 
 **Acceptance criteria:** `go test ./internal/service/ -count=1` passes on Linux.
 `GOOS=darwin go vet ./internal/service/...` is clean. `service_darwin.go` no longer declares
 `resolveSelf`, `refuseIfWritableByOthers`, or `executablePath`. The refusal text is byte-identical
-to what it was.
+to what it was. No comment in `internal/service` names `listener start`, `listener stop`, or
+`--daemon`; verify with
+`grep -rn 'listener start\|listener stop\|--daemon' internal/service/`.
 
 **review: yes** — this moves a security check across a build-tag boundary.
 
@@ -253,9 +442,12 @@ to what it was.
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `systemdUnit` (struct with fields `Description string`, `ExecStart []string`,
-  `User string`, `Group string`, `WorkingDirectory string`, `Environment []string`,
-  `RestartSec int`) and `renderUnit(u systemdUnit) ([]byte, error)`.
+- Produces:
+  - `systemdUnit` — struct with fields `Description string`, `ExecStart []string`, `User string`,
+    `Group string`, `WorkingDirectory string`, `Environment []string`, `RestartSec int`.
+  - `renderUnit(u systemdUnit) ([]byte, error)`.
+  - `unsafeRune(s string) (rune, bool)`.
+  - `quoteValue(s string) string`, `quoteArgs(args []string) string`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -322,10 +514,9 @@ func TestRenderUnitOmitsAnyLogSinkDirective(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renderUnit: %v", err)
 	}
-	text := string(doc)
 	for _, bad := range []string{"StandardOutput=", "StandardError="} {
-		if strings.Contains(text, bad) {
-			t.Errorf("unit sets %s, but the design sends output to journald:\n%s", bad, text)
+		if strings.Contains(string(doc), bad) {
+			t.Errorf("unit sets %s, but the design sends output to journald:\n%s", bad, doc)
 		}
 	}
 }
@@ -364,37 +555,75 @@ func TestRenderUnitQuotesAnArgumentContainingASpace(t *testing.T) {
 	}
 }
 
-// TestRenderUnitEscapesQuoteAndBackslash covers systemd's own escape rule.
-func TestRenderUnitEscapesQuoteAndBackslash(t *testing.T) {
+// TestRenderUnitEscapesADoubleQuote covers the one metacharacter that is
+// escaped rather than refused, because it is the delimiter of the quoting
+// this renderer applies.
+func TestRenderUnitEscapesADoubleQuote(t *testing.T) {
 	u := sampleUnit()
-	u.ExecStart = []string{"/home/sean/bin/agent-utils", `--listen-addr`, `a"b\c`}
+	u.ExecStart = []string{"/home/sean/bin/agent-utils", "--listen-addr", `a"b`}
 	doc, err := renderUnit(u)
 	if err != nil {
 		t.Fatalf("renderUnit: %v", err)
 	}
-	if !strings.Contains(string(doc), `"a\"b\\c"`) {
-		t.Errorf("unit does not escape the quote and backslash:\n%s", doc)
+	if !strings.Contains(string(doc), `"a\"b"`) {
+		t.Errorf("unit does not escape the double quote:\n%s", doc)
 	}
 }
 
-// TestRenderUnitRefusesAControlCharacter is the injection test. A unit file
-// is line-oriented and has no escape for a newline inside a value, so a
-// value carrying one would end its directive and open a sibling directive
-// in a file root executes at every boot. renderUnit must refuse rather than
-// produce a document.
-func TestRenderUnitRefusesAControlCharacter(t *testing.T) {
+// TestRenderUnitRefusesAnUnsafeRune is the injection test, and it is the
+// reason this renderer exists as its own function.
+//
+// A unit file is line-oriented, so a newline ends a directive. It is also
+// full of metacharacters that are NOT control characters: % is systemd's
+// specifier escape and is expanded inside ExecStart, Environment,
+// WorkingDirectory and Description; $ is expanded inside ExecStart; and a
+// line ending in a backslash is joined with the next line, which DELETES the
+// following directive -- including, depending on which field carries it, the
+// User= line that keeps the service from running as root.
+//
+// None of those can be escaped reliably across every directive type, so all
+// of them are refused. Each case below is a real construct, not a
+// placeholder.
+func TestRenderUnitRefusesAnUnsafeRune(t *testing.T) {
 	cases := []struct {
 		name string
 		mut  func(u *systemdUnit)
 	}{
-		{"line feed in an ExecStart argument", func(u *systemdUnit) {
-			u.ExecStart = []string{"/home/sean/bin/agent-utils", "listener", "run\nExecStartPre=/bin/sh -c id"}
+		{"line feed opens a sibling directive", func(u *systemdUnit) {
+			u.ExecStart = []string{"/home/sean/bin/agent-utils", "run\nExecStartPre=/bin/sh -c id"}
 		}},
-		{"carriage return in an ExecStart argument", func(u *systemdUnit) {
+		{"carriage return in an argument", func(u *systemdUnit) {
 			u.ExecStart = []string{"/home/sean/bin/agent-utils", "run\rUser=root"}
 		}},
-		{"delete character in an ExecStart argument", func(u *systemdUnit) {
+		{"delete character in an argument", func(u *systemdUnit) {
 			u.ExecStart = []string{"/home/sean/bin/agent-utils", "run\x7f"}
+		}},
+		{"specifier in an argument", func(u *systemdUnit) {
+			u.ExecStart = []string{"/home/sean/bin/agent-utils", "%h"}
+		}},
+		{"specifier in the working directory", func(u *systemdUnit) {
+			u.WorkingDirectory = "%h/.agent-utils"
+		}},
+		{"specifier in the description", func(u *systemdUnit) {
+			u.Description = "listener %I"
+		}},
+		{"specifier in an environment entry", func(u *systemdUnit) {
+			u.Environment = []string{"HOME=%h"}
+		}},
+		{"variable expansion in an argument", func(u *systemdUnit) {
+			u.ExecStart = []string{"/home/sean/bin/agent-utils", "${HOME}"}
+		}},
+		{"trailing backslash in the working directory swallows the next line", func(u *systemdUnit) {
+			u.WorkingDirectory = `/home/sean/.agent-utils\`
+		}},
+		{"trailing backslash in the user", func(u *systemdUnit) {
+			u.User = `sean\`
+		}},
+		{"trailing backslash in the group", func(u *systemdUnit) {
+			u.Group = `sean\`
+		}},
+		{"backslash in an argument", func(u *systemdUnit) {
+			u.ExecStart = []string{"/home/sean/bin/agent-utils", `a\b`}
 		}},
 		{"line feed in the user", func(u *systemdUnit) {
 			u.User = "sean\nUser=root"
@@ -418,12 +647,25 @@ func TestRenderUnitRefusesAControlCharacter(t *testing.T) {
 			tc.mut(&u)
 			doc, err := renderUnit(u)
 			if err == nil {
-				t.Fatalf("renderUnit accepted a control character and produced:\n%s", doc)
+				t.Fatalf("renderUnit accepted an unsafe value and produced:\n%s", doc)
 			}
 			if doc != nil {
 				t.Errorf("renderUnit returned a document alongside its error: %s", doc)
 			}
 		})
+	}
+}
+
+// TestRenderUnitNamesTheOffendingField proves the refusal is diagnosable.
+func TestRenderUnitNamesTheOffendingField(t *testing.T) {
+	u := sampleUnit()
+	u.User = "sean\nUser=root"
+	_, err := renderUnit(u)
+	if err == nil {
+		t.Fatal("renderUnit accepted a line feed in User")
+	}
+	if !strings.Contains(err.Error(), "User") {
+		t.Errorf("refusal %q does not name the offending field", err)
 	}
 }
 
@@ -459,6 +701,15 @@ import (
 // service reads its GitHub token from ~/.agent-utils/env at every delivery,
 // which keeps the token out of a file that lives in /etc at mode 0644,
 // world readable, and that `systemctl cat` prints on request.
+//
+// Deliberately absent, so a reader does not have to wonder: no
+// NoNewPrivileges, no ProtectSystem, no ProtectHome, no PrivateTmp. This
+// service exists to spawn coding agents that write the operator's
+// repositories and run the operator's toolchain, so the filesystem
+// protections would break it outright. NoNewPrivileges alone would not, and
+// is worth revisiting -- it is left off only because an agent that needs to
+// run a privileged step would fail in a way that points at the unit rather
+// than at itself.
 type systemdUnit struct {
 	Description      string
 	ExecStart        []string
@@ -471,58 +722,66 @@ type systemdUnit struct {
 
 // renderUnit renders u as a complete systemd unit file.
 //
-// Unlike plist.go, this cannot delegate escaping to an encoder. A unit file
-// is line-oriented: a directive ends at the first newline, and the format
-// offers no escape that hides a newline inside a value. A value carrying
-// one would therefore terminate its own directive and open a sibling
-// directive of the caller's choosing -- ExecStartPre, or a User=root -- in a
-// file systemd executes as root at every boot.
+// Unlike plist.go, this cannot delegate escaping to an encoder, and unlike
+// an XML document there is no total escape scheme to delegate TO. A unit
+// file is line-oriented and metacharacter-rich:
 //
-// So this function closes the hole from the other side. Any value that
-// cannot be represented safely is REFUSED, and no document is returned. That
-// is a narrower guarantee than "escape everything", and it is deliberate: a
-// refusal is auditable, while an escape scheme for a format with no escape
-// would be invented here and wrong.
+//   - a newline ends a directive, so a value carrying one opens a sibling
+//     directive of the caller's choosing -- ExecStartPre, or User=root -- in
+//     a file systemd runs as root at every boot;
+//   - '%' is systemd's specifier escape, expanded inside ExecStart,
+//     Environment, WorkingDirectory and Description, quoted or not;
+//   - '$' is expanded inside ExecStart;
+//   - a line ending in '\' is joined with the next one, which DELETES the
+//     following directive rather than adding one -- and the deletable set
+//     includes the User= line that keeps this service from running as root.
 //
-// The caller-supplied values that reach this function are the --listen-addr
-// and --listen-port overrides, which cmd/agent-utils/listener.go has already
-// put through settings.FieldFor(...).Set, plus the resolved binary path, the
-// account name, and the home directory. None of them should ever contain a
-// control character. This function does not assume that.
+// Each of those has a different escape in a different directive type, and
+// some have none. So this function closes the hole from the other side: any
+// value that cannot be represented safely is REFUSED, and no document is
+// returned. That is a narrower guarantee than "escape everything", and it is
+// deliberate. A refusal is auditable; an escape scheme invented here for a
+// format that does not have one would be wrong.
+//
+// The double quote is the single exception. It is escaped rather than
+// refused, because it is the delimiter of the quoting this renderer itself
+// applies, and its escape inside a systemd double-quoted value is
+// unambiguous.
+//
+// Do NOT add a sentence here claiming the caller has already validated these
+// values. `webhook.listen_addr`'s validator is a non-empty check and a
+// loopback warning (internal/settings/settings.go), not an address parser,
+// so --listen-addr reaches this function as an arbitrary string. This
+// function is the control, not a second line of defense behind one.
 func renderUnit(u systemdUnit) ([]byte, error) {
 	if len(u.ExecStart) == 0 {
 		return nil, fmt.Errorf("render unit: ExecStart is empty")
 	}
 
-	// Every caller-supplied string, checked before a single byte is
-	// written. Building the document first and validating after would leave
-	// a half-built buffer to reason about on the error path.
-	checks := []struct {
-		field string
+	// Every caller-supplied string, checked before a single byte is written.
+	// Building the document first and validating after would leave a
+	// half-built buffer to reason about on the error path.
+	type field struct {
+		name  string
 		value string
-	}{
+	}
+	fields := []field{
 		{"Description", u.Description},
 		{"User", u.User},
 		{"Group", u.Group},
 		{"WorkingDirectory", u.WorkingDirectory},
 	}
 	for i, arg := range u.ExecStart {
-		checks = append(checks, struct {
-			field string
-			value string
-		}{fmt.Sprintf("ExecStart[%d]", i), arg})
+		fields = append(fields, field{fmt.Sprintf("ExecStart[%d]", i), arg})
 	}
 	for i, env := range u.Environment {
-		checks = append(checks, struct {
-			field string
-			value string
-		}{fmt.Sprintf("Environment[%d]", i), env})
+		fields = append(fields, field{fmt.Sprintf("Environment[%d]", i), env})
 	}
-	for _, c := range checks {
-		if hasControlChar(c.value) {
+	for _, f := range fields {
+		if r, bad := unsafeRune(f.value); bad {
 			return nil, fmt.Errorf(
-				"refusing to render unit: %s contains a control character, "+
-					"which would end its directive and open a sibling directive", c.field)
+				"refusing to render unit: %s contains %q, which systemd reads as syntax "+
+					"rather than as text", f.name, r)
 		}
 	}
 
@@ -542,6 +801,13 @@ func renderUnit(u systemdUnit) ([]byte, error) {
 	// there is no notify or forking type to claim.
 	b.WriteString("Type=simple\n")
 	b.WriteString("ExecStart=" + quoteArgs(u.ExecStart) + "\n")
+	// User, Group and WorkingDirectory are written raw rather than quoted.
+	// systemd does not treat a quoted value as a name for User= and Group=,
+	// so quoting them would install a unit that fails to start. That is safe
+	// here only because unsafeRune has already refused every rune that would
+	// let one of them end its line early or run past it -- the newline and
+	// the trailing backslash in particular. If that refusal is ever relaxed,
+	// these three lines are where it bites.
 	b.WriteString("User=" + u.User + "\n")
 	b.WriteString("Group=" + u.Group + "\n")
 	b.WriteString("WorkingDirectory=" + u.WorkingDirectory + "\n")
@@ -559,8 +825,8 @@ func renderUnit(u systemdUnit) ([]byte, error) {
 	b.WriteString("RestartSec=" + strconv.Itoa(u.RestartSec) + "\n")
 	// No StandardOutput and no StandardError: the default sink is journald,
 	// which is where `journalctl -u agent-utils-listener` reads from. The
-	// launchd plist writes two files instead, because launchd has no
-	// journal.
+	// launchd plist writes two files under ~/.agent-utils instead, because
+	// launchd has no journal.
 	b.WriteString("\n")
 
 	b.WriteString("[Install]\n")
@@ -572,18 +838,24 @@ func renderUnit(u systemdUnit) ([]byte, error) {
 	return []byte(b.String()), nil
 }
 
-// hasControlChar reports whether s contains any C0 control character or the
-// delete character. Newline and carriage return are the two that matter --
-// they end a directive -- but there is no value this program writes into a
-// unit file that legitimately contains any of the others, so the check
-// covers the whole class rather than two special cases.
-func hasControlChar(s string) bool {
+// unsafeRune reports the first rune of s that systemd would read as syntax
+// rather than as text, and whether it found one. See renderUnit's comment
+// for what each rune does and why refusing beats escaping.
+//
+// The control-character class is refused whole rather than narrowed to the
+// newline and the carriage return that actually end a directive. No value
+// this program writes into a unit file legitimately contains any of the
+// others, so the wider class costs nothing and removes a question.
+func unsafeRune(s string) (rune, bool) {
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
-			return true
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return r, true
+		case r == '%' || r == '$' || r == '\\':
+			return r, true
 		}
 	}
-	return false
+	return 0, false
 }
 
 // quoteArgs renders an argv as a systemd ExecStart value: each argument
@@ -598,17 +870,18 @@ func quoteArgs(args []string) string {
 	return strings.Join(quoted, " ")
 }
 
-// quoteValue wraps s in double quotes, escaping a backslash and a double
-// quote with a backslash. That is systemd's own quoting rule, and it is
-// total for every input this function can receive: renderUnit has already
-// refused anything containing a control character, and no other byte has
-// meaning inside a double-quoted systemd value.
+// quoteValue wraps s in double quotes, escaping a double quote with a
+// backslash.
+//
+// The backslash itself needs no escape here, because unsafeRune refuses it
+// outright -- so the only backslash this function can ever emit is the one
+// it writes itself, in front of a quote.
 func quoteValue(s string) string {
 	var b strings.Builder
 	b.Grow(len(s) + 2)
 	b.WriteByte('"')
 	for _, r := range s {
-		if r == '\\' || r == '"' {
+		if r == '"' {
 			b.WriteByte('\\')
 		}
 		b.WriteRune(r)
@@ -621,7 +894,7 @@ func quoteValue(s string) string {
 - [ ] **Step 4: Run the tests and confirm they pass**
 
 Run: `go test ./internal/service/ -run RenderUnit -count=1 -v`
-Expected: PASS, every subtest of `TestRenderUnitRefusesAControlCharacter` included.
+Expected: PASS, every subtest of `TestRenderUnitRefusesAnUnsafeRune` included.
 
 Run: `gofmt -l internal/service/ && go vet ./internal/service/`
 Expected: no output.
@@ -634,8 +907,8 @@ git commit -m "feat(service): render a systemd unit file for the listener"
 ```
 
 **Acceptance criteria:** every test in `unit_test.go` passes. `renderUnit` returns a nil document
-together with its error on every refusal. No `StandardOutput` or `StandardError` directive appears
-in the output.
+together with its error on every refusal, and the error names the offending field. No
+`StandardOutput` or `StandardError` directive appears in the output.
 
 **review: yes** — this is the injection boundary for a file root executes.
 
@@ -650,10 +923,17 @@ in the output.
 - Modify: `internal/service/service_other_test.go`
 
 **Interfaces:**
-- Consumes: `UnitName`, `SystemdUnitDirEnvVar`, `resolveSelf`, `executablePath` (Task 1);
+- Consumes: `UnitName`, `SystemdUnitDirEnvVar`, `ErrUnsupported`, `resolveSelf`,
+  `executablePath`, `geteuid`, `privateSelf`, `stubExecutable`, `stubGeteuid` (Task 1);
   `systemdUnit`, `renderUnit` (Task 2).
-- Produces: `linuxManager` implementing `Manager`, and the package-level seam
-  `runCommand var func(name string, args ...string) ([]byte, error)` that tests replace.
+- Produces:
+  - `runCommand` — `var func(stdin []byte, name string, args ...string) ([]byte, error)`, the
+    single external-command seam every test replaces.
+  - `privileged(stdin []byte, name string, args ...string) ([]byte, error)`.
+  - `systemdUnitDir() string`.
+  - `parseShowProperties(output string) map[string]string`.
+  - `linuxManager` implementing `Manager`, and `newManager() Manager` for linux.
+  - `unitDescription`, `restartSeconds` — package constants.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -670,67 +950,59 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/seanmcgary/agent-utils/internal/home"
 )
 
 // call records one invocation of the runCommand seam.
 type call struct {
-	name string
-	args []string
+	stdin string
+	name  string
+	args  []string
+}
+
+// line renders a call the way the assertions below compare them.
+func (c call) line() string {
+	return strings.TrimSpace(c.name + " " + strings.Join(c.args, " "))
 }
 
 // errStubLinux stands in for the error exec.Command returns for a non-zero
 // exit status. Only its non-nilness matters to any assertion here.
 var errStubLinux = errors.New("stub command failure")
 
-// stubRunCommand replaces the runCommand variable so no test in this
-// package ever runs a real systemctl, a real install(1), or a real sudo.
-// This is not a convenience: `systemctl enable --now` would register the
-// listener on the developer's own machine, and `sudo` would block the suite
-// on a password prompt.
-func stubRunCommand(t *testing.T, fn func(name string, args ...string) ([]byte, error)) *[]call {
+// stubRunCommand replaces the runCommand variable so no test in this package
+// ever runs a real systemctl, tee, chmod, rm, or sudo. This is not a
+// convenience: `systemctl enable --now` would register the listener on the
+// developer's own machine, `sudo` would block the suite on a password
+// prompt, and `tee` would write a file.
+func stubRunCommand(t *testing.T, fn func(stdin []byte, name string, args ...string) ([]byte, error)) *[]call {
 	t.Helper()
 	var calls []call
 	prev := runCommand
-	runCommand = func(name string, args ...string) ([]byte, error) {
-		calls = append(calls, call{name: name, args: args})
+	runCommand = func(stdin []byte, name string, args ...string) ([]byte, error) {
+		calls = append(calls, call{stdin: string(stdin), name: name, args: args})
 		if fn == nil {
 			return nil, nil
 		}
-		return fn(name, args...)
+		return fn(stdin, name, args...)
 	}
 	t.Cleanup(func() { runCommand = prev })
 	return &calls
 }
 
-// stubExecutableLinux points executablePath at path for the test. Install
-// must never resolve the real `go test` binary: its location and its
-// permissions are outside this test's control.
-func stubExecutableLinux(t *testing.T, path string) {
-	t.Helper()
-	prev := executablePath
-	executablePath = func() (string, error) { return path, nil }
-	t.Cleanup(func() { executablePath = prev })
-}
-
-// privateSelf creates a fake binary at 0755 inside a 0700 directory and
-// returns its path.
-func privateSelf(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "agent-utils")
-	if err := os.WriteFile(path, []byte("fake binary"), 0o755); err != nil {
-		t.Fatalf("write fake binary: %v", err)
-	}
-	return path
-}
-
 // isolate points the unit directory and the agent-utils home directory at
 // scratch directories and returns the unit directory.
+//
+// Setting SystemdUnitDirEnvVar also drops the sudo prefix from privileged(),
+// by design -- see that function. So every test that calls isolate asserts
+// on UNPRIVILEGED command names. TestInstallUsesSudoAndTheDefaultUnitPath is
+// the one test that does not call isolate, and it is what proves the
+// privileged form.
 func isolate(t *testing.T) string {
 	t.Helper()
 	unitDir := t.TempDir()
 	t.Setenv(SystemdUnitDirEnvVar, unitDir)
-	t.Setenv("AGENT_UTILS_HOME", t.TempDir())
+	t.Setenv(home.EnvVar, t.TempDir())
 	return unitDir
 }
 
@@ -740,87 +1012,91 @@ func TestServiceFilePathUsesTheOverrideDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ServiceFilePath: %v", err)
 	}
-	want := filepath.Join(unitDir, UnitName)
-	if got != want {
+	if want := filepath.Join(unitDir, UnitName); got != want {
 		t.Fatalf("ServiceFilePath = %q, want %q", got, want)
 	}
 }
 
-func TestInstallRunsPlacementThenReloadThenEnable(t *testing.T) {
+// TestInstallUsesSudoAndTheDefaultUnitPath is the only test here that leaves
+// SystemdUnitDirEnvVar unset, and it covers the two things that only the
+// unset case can show: the default unit directory, and the sudo prefix.
+// Nothing is actually written or run, because runCommand is stubbed.
+func TestInstallUsesSudoAndTheDefaultUnitPath(t *testing.T) {
+	t.Setenv(SystemdUnitDirEnvVar, "")
+	t.Setenv(home.EnvVar, t.TempDir())
+	self := privateSelf(t)
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
+	calls := stubRunCommand(t, nil)
+
+	if err := New().Install(self, []string{"listener", "run"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if len(*calls) == 0 {
+		t.Fatal("Install ran no commands")
+	}
+	wantPath := "/etc/systemd/system/" + UnitName
+	first := (*calls)[0]
+	if first.name != "sudo" {
+		t.Errorf("first command ran as %q, want sudo", first.name)
+	}
+	if first.args[0] != "tee" || first.args[len(first.args)-1] != wantPath {
+		t.Errorf("first command = %v, want tee writing %s", first.args, wantPath)
+	}
+	for _, c := range *calls {
+		if c.name != "sudo" {
+			t.Errorf("command %q did not go through sudo", c.line())
+		}
+	}
+}
+
+func TestInstallTeesThenChmodsThenReloadsThenEnables(t *testing.T) {
 	unitDir := isolate(t)
 	self := privateSelf(t)
-	stubExecutableLinux(t, self)
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
 	calls := stubRunCommand(t, nil)
 
 	if err := New().Install(self, []string{"listener", "run", "--listen-port", "8788"}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 
-	if len(*calls) != 3 {
-		t.Fatalf("Install ran %d commands, want 3: %+v", len(*calls), *calls)
-	}
 	unitPath := filepath.Join(unitDir, UnitName)
-
-	// 1. the placement
-	c0 := (*calls)[0]
-	if c0.name != "sudo" {
-		t.Errorf("placement ran %q, want sudo", c0.name)
+	want := []string{
+		"tee " + unitPath,
+		"chmod 0644 " + unitPath,
+		"systemctl daemon-reload",
+		"systemctl enable --now " + UnitName,
 	}
-	wantTail := []string{"install", "-m", "0644", "-o", "root", "-g", "root"}
-	if len(c0.args) != len(wantTail)+2 {
-		t.Fatalf("placement args = %v", c0.args)
+	if len(*calls) != len(want) {
+		t.Fatalf("Install ran %d commands, want %d: %+v", len(*calls), len(want), *calls)
 	}
-	for i, w := range wantTail {
-		if c0.args[i] != w {
-			t.Errorf("placement arg %d = %q, want %q", i, c0.args[i], w)
+	for i, w := range want {
+		if got := (*calls)[i].line(); got != w {
+			t.Errorf("command %d = %q, want %q", i, got, w)
 		}
-	}
-	tmpPath := c0.args[len(c0.args)-2]
-	if c0.args[len(c0.args)-1] != unitPath {
-		t.Errorf("placement destination = %q, want %q", c0.args[len(c0.args)-1], unitPath)
-	}
-	// The temporary file must be gone once Install returns.
-	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
-		t.Errorf("temporary unit file %q survived Install", tmpPath)
-	}
-
-	// 2. the reload
-	c1 := (*calls)[1]
-	if c1.name != "sudo" || len(c1.args) != 2 || c1.args[0] != "systemctl" || c1.args[1] != "daemon-reload" {
-		t.Errorf("second command = %q %v, want sudo systemctl daemon-reload", c1.name, c1.args)
-	}
-
-	// 3. the enable
-	c2 := (*calls)[2]
-	wantEnable := []string{"systemctl", "enable", "--now", UnitName}
-	if c2.name != "sudo" || strings.Join(c2.args, " ") != strings.Join(wantEnable, " ") {
-		t.Errorf("third command = %q %v, want sudo %v", c2.name, c2.args, wantEnable)
 	}
 }
 
-// TestInstallWritesTheUnitBeforePlacingIt proves the document that reaches
-// the placement is the rendered unit, naming the resolved binary and every
-// argument the caller passed.
-func TestInstallWritesTheUnitBeforePlacingIt(t *testing.T) {
+// TestInstallSendsTheUnitOnStdinAndNeverStagesAFile is the core security
+// assertion of this task. The rendered unit goes from memory to root's
+// stdin. It is never written to a file that a non-root process could
+// rewrite between the write and the privileged read.
+func TestInstallSendsTheUnitOnStdinAndNeverStagesAFile(t *testing.T) {
 	isolate(t)
 	self := privateSelf(t)
-	stubExecutableLinux(t, self)
-
-	var doc string
-	stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
-		if name == "sudo" && len(args) > 0 && args[0] == "install" {
-			b, err := os.ReadFile(args[len(args)-2])
-			if err != nil {
-				t.Fatalf("read the temporary unit: %v", err)
-			}
-			doc = string(b)
-		}
-		return nil, nil
-	})
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
+	calls := stubRunCommand(t, nil)
 
 	args := []string{"listener", "run", "--listen-addr", "127.0.0.1"}
 	if err := New().Install(self, args); err != nil {
 		t.Fatalf("Install: %v", err)
+	}
+
+	doc := (*calls)[0].stdin
+	if doc == "" {
+		t.Fatal("Install did not send the unit on stdin")
 	}
 	if !strings.Contains(doc, self) {
 		t.Errorf("unit does not name the resolved binary %q:\n%s", self, doc)
@@ -833,64 +1109,38 @@ func TestInstallWritesTheUnitBeforePlacingIt(t *testing.T) {
 	if !strings.Contains(doc, "[Install]") {
 		t.Errorf("unit is not a complete unit file:\n%s", doc)
 	}
+	// No command may name a path this process wrote. The placement reads
+	// stdin, not a staged file.
+	for _, c := range *calls {
+		for _, a := range c.args {
+			if strings.Contains(a, os.TempDir()) && os.TempDir() != "/" {
+				t.Errorf("command %q names a staged temporary path", c.line())
+			}
+		}
+	}
 }
 
 // TestInstallCarriesAgentUtilsHomeIntoTheUnit covers the override case:
 // without the Environment line, a machine with a moved home directory would
-// install a service that reads a different directory than its operator.
+// install a service that reads a directory its operator never looks at.
 func TestInstallCarriesAgentUtilsHomeIntoTheUnit(t *testing.T) {
 	isolate(t)
 	moved := t.TempDir()
-	t.Setenv("AGENT_UTILS_HOME", moved)
+	t.Setenv(home.EnvVar, moved)
 	self := privateSelf(t)
-	stubExecutableLinux(t, self)
-
-	var doc string
-	stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
-		if name == "sudo" && len(args) > 0 && args[0] == "install" {
-			b, _ := os.ReadFile(args[len(args)-2])
-			doc = string(b)
-		}
-		return nil, nil
-	})
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
+	calls := stubRunCommand(t, nil)
 
 	if err := New().Install(self, []string{"listener", "run"}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	if !strings.Contains(doc, `Environment="AGENT_UTILS_HOME=`+moved+`"`) {
-		t.Errorf("unit does not carry AGENT_UTILS_HOME:\n%s", doc)
+	doc := (*calls)[0].stdin
+	if !strings.Contains(doc, `Environment="`+home.EnvVar+`=`+moved+`"`) {
+		t.Errorf("unit does not carry %s:\n%s", home.EnvVar, doc)
 	}
 	if !strings.Contains(doc, "WorkingDirectory="+moved) {
 		t.Errorf("unit's WorkingDirectory is not the overridden home:\n%s", doc)
-	}
-}
-
-// TestInstallRemovesTheTemporaryUnitWhenPlacementFails pins the cleanup on
-// the error path. A rendered unit left in /tmp is not a secret, but leaving
-// one behind on every failed sudo prompt is a leak of files.
-func TestInstallRemovesTheTemporaryUnitWhenPlacementFails(t *testing.T) {
-	isolate(t)
-	self := privateSelf(t)
-	stubExecutableLinux(t, self)
-
-	var tmpPath string
-	stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
-		if name == "sudo" && len(args) > 0 && args[0] == "install" {
-			tmpPath = args[len(args)-2]
-			return []byte("install: permission denied"), errStubLinux
-		}
-		return nil, nil
-	})
-
-	err := New().Install(self, []string{"listener", "run"})
-	if err == nil {
-		t.Fatal("Install did not report the failed placement")
-	}
-	if tmpPath == "" {
-		t.Fatal("the placement never ran")
-	}
-	if _, statErr := os.Stat(tmpPath); !os.IsNotExist(statErr) {
-		t.Errorf("temporary unit file %q survived a failed Install", tmpPath)
 	}
 }
 
@@ -899,24 +1149,59 @@ func TestInstallRemovesTheTemporaryUnitWhenPlacementFails(t *testing.T) {
 func TestInstallStopsAtTheFirstFailure(t *testing.T) {
 	isolate(t)
 	self := privateSelf(t)
-	stubExecutableLinux(t, self)
-	calls := stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
-		return nil, errStubLinux
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
+	calls := stubRunCommand(t, func(stdin []byte, name string, args ...string) ([]byte, error) {
+		return []byte("tee: permission denied"), errStubLinux
 	})
 
-	if err := New().Install(self, []string{"listener", "run"}); err == nil {
+	err := New().Install(self, []string{"listener", "run"})
+	if err == nil {
 		t.Fatal("Install did not report the failure")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("error %q does not carry the command's own output", err)
 	}
 	if len(*calls) != 1 {
 		t.Errorf("Install ran %d commands after a failed placement, want 1: %+v", len(*calls), *calls)
 	}
 }
 
+// TestInstallRefusesToRunAsRoot is the guard against the worst outcome in
+// this change: a unit that runs the agent dispatcher as root at every boot.
+// The refusal is on the effective user identifier alone, NOT on SUDO_USER
+// being set -- `su -`, a root login shell, `doas`, and
+// `sudo env -u SUDO_USER ...` all reach Install with euid 0 and no
+// SUDO_USER.
+func TestInstallRefusesToRunAsRoot(t *testing.T) {
+	isolate(t)
+	self := privateSelf(t)
+	stubExecutable(t, self)
+	calls := stubRunCommand(t, nil)
+
+	for _, sudoUser := range []string{"sean", ""} {
+		t.Run("SUDO_USER="+sudoUser, func(t *testing.T) {
+			t.Setenv("SUDO_USER", sudoUser)
+			stubGeteuid(t, 0)
+
+			err := New().Install(self, []string{"listener", "run"})
+			if err == nil {
+				t.Fatal("Install accepted an effective user identifier of 0")
+			}
+			if !strings.Contains(err.Error(), "as yourself") {
+				t.Errorf("refusal %q does not tell the operator what to do instead", err)
+			}
+			if len(*calls) != 0 {
+				t.Errorf("Install ran %d commands before refusing: %+v", len(*calls), *calls)
+			}
+		})
+	}
+}
+
 func TestInstallRefusesAWorldWritableBinaryDirectory(t *testing.T) {
 	isolate(t)
-	dir := t.TempDir()
-	loose := filepath.Join(dir, "loose")
-	if err := os.Mkdir(loose, 0o777); err != nil {
+	loose := filepath.Join(privateDir(t), "loose")
+	if err := os.Mkdir(loose, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	if err := os.Chmod(loose, 0o777); err != nil {
@@ -926,7 +1211,8 @@ func TestInstallRefusesAWorldWritableBinaryDirectory(t *testing.T) {
 	if err := os.WriteFile(self, []byte("fake binary"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	stubExecutableLinux(t, self)
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
 	calls := stubRunCommand(t, nil)
 
 	err := New().Install(self, []string{"listener", "run"})
@@ -947,12 +1233,34 @@ func TestInstallRefusesAWorldWritableBinaryDirectory(t *testing.T) {
 func TestInstallRefusesAMismatchedBinaryArgument(t *testing.T) {
 	isolate(t)
 	self := privateSelf(t)
-	stubExecutableLinux(t, self)
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
 	calls := stubRunCommand(t, nil)
 
 	other := privateSelf(t)
 	if err := New().Install(other, []string{"listener", "run"}); err == nil {
 		t.Fatal("Install accepted a binary argument that is not the running binary")
+	}
+	if len(*calls) != 0 {
+		t.Errorf("Install ran %d commands before refusing: %+v", len(*calls), *calls)
+	}
+}
+
+// TestInstallRefusesAnUnsafeArgumentAndRunsNothing proves renderUnit's
+// refusal reaches all the way out, and that it happens before any command.
+func TestInstallRefusesAnUnsafeArgumentAndRunsNothing(t *testing.T) {
+	isolate(t)
+	self := privateSelf(t)
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
+	calls := stubRunCommand(t, nil)
+
+	err := New().Install(self, []string{"listener", "run", "--listen-addr", "%h"})
+	if err == nil {
+		t.Fatal("Install accepted an argument containing a systemd specifier")
+	}
+	if !strings.Contains(err.Error(), "render") {
+		t.Errorf("error %q does not name the render step", err)
 	}
 	if len(*calls) != 0 {
 		t.Errorf("Install ran %d commands before refusing: %+v", len(*calls), *calls)
@@ -971,28 +1279,35 @@ func TestUninstallWithNoUnitFileRunsNothing(t *testing.T) {
 	}
 }
 
-func TestUninstallDisablesRemovesThenReloads(t *testing.T) {
-	unitDir := isolate(t)
-	unitPath := filepath.Join(unitDir, UnitName)
-	if err := os.WriteFile(unitPath, []byte("[Unit]\n"), 0o644); err != nil {
+// seedUnit writes a unit file into the override directory so Uninstall and
+// Status have something to find.
+func seedUnit(t *testing.T, unitDir string) string {
+	t.Helper()
+	path := filepath.Join(unitDir, UnitName)
+	if err := os.WriteFile(path, []byte("[Unit]\n"), 0o644); err != nil {
 		t.Fatalf("seed unit file: %v", err)
 	}
+	return path
+}
+
+func TestUninstallDisablesRemovesThenReloads(t *testing.T) {
+	unitDir := isolate(t)
+	unitPath := seedUnit(t, unitDir)
 	calls := stubRunCommand(t, nil)
 
 	if err := New().Uninstall(); err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
 	want := []string{
-		"sudo systemctl disable --now " + UnitName,
-		"sudo rm -f " + unitPath,
-		"sudo systemctl daemon-reload",
+		"systemctl disable --now " + UnitName,
+		"rm -f " + unitPath,
+		"systemctl daemon-reload",
 	}
 	if len(*calls) != len(want) {
 		t.Fatalf("Uninstall ran %d commands, want %d: %+v", len(*calls), len(want), *calls)
 	}
 	for i, w := range want {
-		got := (*calls)[i].name + " " + strings.Join((*calls)[i].args, " ")
-		if got != w {
+		if got := (*calls)[i].line(); got != w {
 			t.Errorf("command %d = %q, want %q", i, got, w)
 		}
 	}
@@ -1002,12 +1317,9 @@ func TestUninstallDisablesRemovesThenReloads(t *testing.T) {
 // already be disabled, and `listener uninstall` must still remove the file.
 func TestUninstallContinuesAfterAFailedDisable(t *testing.T) {
 	unitDir := isolate(t)
-	unitPath := filepath.Join(unitDir, UnitName)
-	if err := os.WriteFile(unitPath, []byte("[Unit]\n"), 0o644); err != nil {
-		t.Fatalf("seed unit file: %v", err)
-	}
-	calls := stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
-		if len(args) > 1 && args[1] == "disable" {
+	seedUnit(t, unitDir)
+	calls := stubRunCommand(t, func(stdin []byte, name string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "disable" {
 			return []byte("Failed to disable unit: Unit file does not exist."), errStubLinux
 		}
 		return nil, nil
@@ -1021,12 +1333,28 @@ func TestUninstallContinuesAfterAFailedDisable(t *testing.T) {
 	}
 }
 
+// TestUninstallFailsOnAFailedRemoval proves the tolerance above is scoped to
+// the disable step. A unit file that could not be removed is still installed,
+// and saying otherwise would be a lie.
+func TestUninstallFailsOnAFailedRemoval(t *testing.T) {
+	unitDir := isolate(t)
+	seedUnit(t, unitDir)
+	stubRunCommand(t, func(stdin []byte, name string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "-f" {
+			return []byte("rm: permission denied"), errStubLinux
+		}
+		return nil, nil
+	})
+
+	if err := New().Uninstall(); err == nil {
+		t.Fatal("Uninstall did not report a failed removal")
+	}
+}
+
 func TestStatusReportsActiveUnitWithItsPID(t *testing.T) {
 	unitDir := isolate(t)
-	if err := os.WriteFile(filepath.Join(unitDir, UnitName), []byte("[Unit]\n"), 0o644); err != nil {
-		t.Fatalf("seed unit file: %v", err)
-	}
-	calls := stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
+	seedUnit(t, unitDir)
+	calls := stubRunCommand(t, func(stdin []byte, name string, args ...string) ([]byte, error) {
 		return []byte("ActiveState=active\nMainPID=4242\n"), nil
 	})
 
@@ -1038,7 +1366,9 @@ func TestStatusReportsActiveUnitWithItsPID(t *testing.T) {
 		t.Errorf("Status = %+v, want installed, running, pid 4242", st)
 	}
 	// Status must never prompt for a password: an operator asking a question
-	// should not be asked for their credentials to get an answer.
+	// should not be asked for their credentials to get an answer. Under the
+	// override privileged() would be unprivileged anyway, so assert the
+	// stronger property -- Status does not call privileged at all.
 	if len(*calls) != 1 || (*calls)[0].name != "systemctl" {
 		t.Errorf("Status ran %+v, want a single unprivileged systemctl", *calls)
 	}
@@ -1046,10 +1376,8 @@ func TestStatusReportsActiveUnitWithItsPID(t *testing.T) {
 
 func TestStatusReportsInstalledButInactive(t *testing.T) {
 	unitDir := isolate(t)
-	if err := os.WriteFile(filepath.Join(unitDir, UnitName), []byte("[Unit]\n"), 0o644); err != nil {
-		t.Fatalf("seed unit file: %v", err)
-	}
-	stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
+	seedUnit(t, unitDir)
+	stubRunCommand(t, func(stdin []byte, name string, args ...string) ([]byte, error) {
 		return []byte("ActiveState=inactive\nMainPID=0\n"), nil
 	})
 
@@ -1064,7 +1392,7 @@ func TestStatusReportsInstalledButInactive(t *testing.T) {
 
 func TestStatusReportsNotInstalledWithNoUnitFile(t *testing.T) {
 	isolate(t)
-	stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
+	stubRunCommand(t, func(stdin []byte, name string, args ...string) ([]byte, error) {
 		return []byte("ActiveState=inactive\nMainPID=0\n"), nil
 	})
 
@@ -1077,13 +1405,14 @@ func TestStatusReportsNotInstalledWithNoUnitFile(t *testing.T) {
 	}
 }
 
-// TestStatusTreatsAFailedSystemctlAsNotRunning mirrors the darwin
-// implementation's handling of a failed `launchctl print`: a machine with no
-// systemd, or a systemctl that cannot be run, is not an error from a status
-// query.
-func TestStatusTreatsAFailedSystemctlAsNotRunning(t *testing.T) {
-	isolate(t)
-	stubRunCommand(t, func(name string, args ...string) ([]byte, error) {
+// TestStatusTreatsAFailedSystemctlAsInstalledButNotRunning mirrors the
+// darwin implementation's handling of a failed `launchctl print`. The unit
+// file is seeded first, so the assertion distinguishes "stat succeeded,
+// systemctl failed" from "returned the zero Status".
+func TestStatusTreatsAFailedSystemctlAsInstalledButNotRunning(t *testing.T) {
+	unitDir := isolate(t)
+	seedUnit(t, unitDir)
+	stubRunCommand(t, func(stdin []byte, name string, args ...string) ([]byte, error) {
 		return nil, errStubLinux
 	})
 
@@ -1091,19 +1420,61 @@ func TestStatusTreatsAFailedSystemctlAsNotRunning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status reported an error for a failed systemctl: %v", err)
 	}
-	if st.Running {
+	if !st.Installed {
+		t.Error("Status lost the unit file it had already found")
+	}
+	if st.Running || st.PID != 0 {
 		t.Errorf("Status = %+v, want not running", st)
+	}
+}
+
+// TestParseShowPropertiesSplitsOnTheFirstEqualsSign covers the case the
+// function's own comment calls out: a property value may itself contain an
+// equals sign.
+func TestParseShowPropertiesSplitsOnTheFirstEqualsSign(t *testing.T) {
+	props := parseShowProperties("ActiveState=active\nEnvironment=HOME=/home/sean\nMainPID=7\n")
+	if got := props["Environment"]; got != "HOME=/home/sean" {
+		t.Errorf("Environment = %q, want %q", got, "HOME=/home/sean")
+	}
+	if got := props["ActiveState"]; got != "active" {
+		t.Errorf("ActiveState = %q, want %q", got, "active")
+	}
+	if got := props["MainPID"]; got != "7" {
+		t.Errorf("MainPID = %q, want %q", got, "7")
+	}
+}
+
+// TestParseShowPropertiesIgnoresALineWithNoEqualsSign guards the parser
+// against a blank trailing line and against any banner systemctl might emit.
+func TestParseShowPropertiesIgnoresALineWithNoEqualsSign(t *testing.T) {
+	props := parseShowProperties("\nActiveState=active\nnonsense\n\n")
+	if len(props) != 1 {
+		t.Errorf("parsed %d properties, want 1: %v", len(props), props)
 	}
 }
 ```
 
-Modify `internal/service/service_other_test.go`: change its build tag to
-`//go:build !darwin && !linux`, and change every `strings.Contains(err.Error(), "macOS")` check to
-`strings.Contains(err.Error(), "macOS and Linux")`. Update the test's doc comment: replace
-`--daemon is launchd-only for now` with `service management is launchd and systemd only`, and
-replace the final sentence about ubuntu-latest compiling this file with
-`CI (ubuntu-latest) now compiles service_linux.go instead, so this file's contract is held by the
-GOOS builds in the Makefile's vet target.`
+Modify `internal/service/service_other_test.go`:
+
+- Change its build tag to `//go:build !darwin && !linux`.
+- Change every `strings.Contains(err.Error(), "macOS")` check to
+  `errors.Is(err, ErrUnsupported)`, and add `"errors"` to the imports, dropping `"strings"` if it
+  becomes unused. Comparing against the sentinel is what `cmd/agent-utils`'s `uninstall` now does,
+  so the test holds the contract that caller depends on.
+- Replace the test's doc comment with:
+
+```go
+// TestOtherManagerReportsUnsupported pins the fail-closed behavior of every
+// Manager method on a platform with no service-manager backend: each must
+// return ErrUnsupported rather than silently doing nothing or panicking.
+//
+// Nothing in CI RUNS this test. CI is ubuntu-latest, and the Makefile's vet
+// target type-checks this file under GOOS=windows -- vet analyzes test files,
+// so a compile error here fails `make check`, but no assertion below is ever
+// executed. That is the honest state of a stub for platforms this project
+// ships no binary for (see the Makefile's release targets: linux and darwin
+// only). Keep the assertions cheap and the file compiling.
+```
 
 - [ ] **Step 2: Run the test and confirm it fails**
 
@@ -1125,6 +1496,7 @@ Create `internal/service/service_linux.go`:
 package service
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1146,13 +1518,23 @@ const unitDescription = "agent-utils webhook listener"
 // See renderUnit for why a delay is required rather than optional.
 const restartSeconds = 5
 
-// runCommand runs a command and returns its combined output. It is a
-// variable, not a direct exec.Command call at each use site, for the same
-// reason internal/service/service_darwin.go's launchctl is: without it, this
-// package's tests would run `systemctl enable --now` against the developer's
-// own machine and would block on a real sudo password prompt.
-var runCommand = func(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).CombinedOutput()
+// runCommand runs a command with stdin and returns its combined output. It
+// is a variable, not a direct exec.Command call at each use site, for the
+// same reason service_darwin.go's launchctl is: without it, this package's
+// tests would run `systemctl enable --now` against the developer's own
+// machine and would block on a real sudo password prompt.
+//
+// The command name is resolved through PATH, as launchctl's is. That is a
+// real dependency on the operator's PATH and, for the sudo'd commands, on
+// sudo's own secure_path -- and it is not a new exposure: this program
+// already executes git, gh, and the agent harness by name on every dispatch,
+// so a PATH an attacker controls has already lost the machine.
+var runCommand = func(stdin []byte, name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	return cmd.CombinedOutput()
 }
 
 // systemdUnitDir resolves the directory the unit file lives in.
@@ -1163,24 +1545,32 @@ func systemdUnitDir() string {
 	return "/etc/systemd/system"
 }
 
-// privileged runs name with args, through sudo unless this process is
-// already root.
+// privileged runs name with args as root, through sudo.
 //
-// Only the three steps that write to /etc or talk to the system manager go
-// through here. The rest of Install runs as the operator, deliberately: a
-// program running under sudo for its whole life resolves HOME to /root and
-// would install a service naming root's state directory rather than the
-// operator's. Install refuses that case outright; see its first check.
+// Only the steps that write to /etc or talk to the system manager go through
+// here. The rest of Install runs as the operator, deliberately: a program
+// running under sudo for its whole life resolves HOME to /root and would
+// install a service naming root's state directory rather than the operator's.
+// Install refuses that case outright; see its first check.
 //
 // sudo is invoked without -n, so it prompts on a terminal when it needs to.
 // That prompt is the point: `listener install` is an interactive command an
 // operator runs by hand, and asking them for their own password to write a
 // root-owned unit is the expected cost.
-func privileged(name string, args ...string) ([]byte, error) {
-	if os.Geteuid() == 0 {
-		return runCommand(name, args...)
+//
+// The sudo prefix is dropped when SystemdUnitDirEnvVar is set. That variable
+// steers the DESTINATION of a root-owned write and a root-owned delete, so
+// honoring it while still escalating would turn an environment variable into
+// "create or delete a root-owned file at a path of my choosing" -- which
+// AGENT_UTILS_SYSTEMD_DIR=/etc/cron.d makes concrete. The variable exists
+// only so the test suite does not touch /etc/systemd/system, and a test does
+// not need root. Setting it outside a test does not redirect a privileged
+// install; it makes the install fail, which is the correct outcome.
+func privileged(stdin []byte, name string, args ...string) ([]byte, error) {
+	if strings.TrimSpace(os.Getenv(SystemdUnitDirEnvVar)) != "" {
+		return runCommand(stdin, name, args...)
 	}
-	return runCommand("sudo", append([]string{name}, args...)...)
+	return runCommand(stdin, "sudo", append([]string{name}, args...)...)
 }
 
 type linuxManager struct{}
@@ -1202,18 +1592,25 @@ func (linuxManager) ServiceFilePath() (string, error) {
 // trusted as the SOURCE of the installed path. The reason binds harder here
 // than on darwin: this unit is started by root at every boot.
 func (m linuxManager) Install(binary string, args []string) error {
-	// Refused first, before anything reads a path. SUDO_USER set together
-	// with an effective uid of 0 means the operator ran the whole program
-	// under sudo. Every directory this method resolves would then be root's:
-	// the unit would name /root/.agent-utils as its WorkingDirectory and
-	// /root as HOME, so the installed service would read a state database,
-	// an env file, and a project registry that the operator has never
-	// written to. It would come up looking healthy and do nothing.
-	if os.Geteuid() == 0 && strings.TrimSpace(os.Getenv("SUDO_USER")) != "" {
+	// Refused first, before anything reads a path.
+	//
+	// The test is the effective user identifier alone, NOT euid 0 together
+	// with a set SUDO_USER. `su -`, a root login shell, `doas`, and
+	// `sudo env -u SUDO_USER agent-utils listener install` all arrive here
+	// with euid 0 and no SUDO_USER, and every one of them would otherwise
+	// produce a unit with User=root, Group=root, HOME=/root and
+	// Restart=always -- the program that dispatches coding agents with
+	// permission prompts disabled, running as root, permanently, from the
+	// most ordinary operator mistake in this whole command.
+	//
+	// There is no case in which running the whole program as root is
+	// correct: it calls sudo itself for exactly the three steps that need
+	// it, and every directory it resolves must be the operator's.
+	if geteuid() == 0 {
 		return errors.New(
-			"run `agent-utils listener install` as yourself, not under sudo: " +
-				"it calls sudo itself for the steps that need root, and under sudo it would " +
-				"install a service that reads root's home directory instead of yours")
+			"run `agent-utils listener install` as yourself, not as root: " +
+				"it calls sudo itself for the steps that need root, and as root it would " +
+				"install a service that runs as root and reads root's home directory")
 	}
 
 	self, err := resolveSelf()
@@ -1244,9 +1641,16 @@ func (m linuxManager) Install(binary string, args []string) error {
 	if err != nil {
 		return fmt.Errorf("locate the current user: %w", err)
 	}
-	grp, err := user.LookupGroupId(acct.Gid)
-	if err != nil {
-		return fmt.Errorf("locate the current user's group: %w", err)
+	// The numeric gid is the fallback, not an error. A gid with no
+	// /etc/group entry is ordinary in a minimal container, and systemd's
+	// Group= accepts a number, so there is nothing here worth failing an
+	// install over.
+	group := acct.Gid
+	if grp, lookupErr := user.LookupGroupId(acct.Gid); lookupErr == nil {
+		group = grp.Name
+	} else {
+		slog.Warn("no group name for this gid, using the number",
+			"gid", acct.Gid, "err", lookupErr)
 	}
 	userHome, err := os.UserHomeDir()
 	if err != nil {
@@ -1269,13 +1673,13 @@ func (m linuxManager) Install(binary string, args []string) error {
 		Description:      unitDescription,
 		ExecStart:        append([]string{self}, args...),
 		User:             acct.Username,
-		Group:            grp.Name,
+		Group:            group,
 		WorkingDirectory: homeDir,
 		Environment:      env,
 		RestartSec:       restartSeconds,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("render the systemd unit: %w", err)
 	}
 
 	path, err := m.ServiceFilePath()
@@ -1283,46 +1687,38 @@ func (m linuxManager) Install(binary string, args []string) error {
 		return err
 	}
 
-	// The unit is staged in a file this process owns, then PLACED by root.
-	// The alternative -- piping the document through `sudo tee` or a shell
-	// redirect -- would put the document and the destination path through a
-	// shell, which is exactly the quoting problem renderUnit's refusal
-	// exists to avoid re-opening from a different direction.
-	tmp, err := os.CreateTemp("", "agent-utils-unit-*")
-	if err != nil {
-		return fmt.Errorf("stage the unit file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	// Removed on every path out of this function, including the ones where
-	// the placement fails and the ones where the write below fails.
-	defer func() {
-		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			slog.Warn("remove the staged unit file", "path", tmpPath, "err", rmErr)
-		}
-	}()
-	if _, err := tmp.Write(doc); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write the staged unit file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close the staged unit file: %w", err)
-	}
-
 	slog.Info("installing systemd unit", "unit", UnitName, "path", path, "binary", self)
 
-	// install(1), not cp: it sets the mode, the owner, and the group in one
-	// operation, so the unit is never briefly on disk owned by the wrong
-	// account. 0644 because systemd only reads it, and it carries no secret
-	// by design.
-	if out, err := privileged("install", "-m", "0644", "-o", "root", "-g", "root", tmpPath, path); err != nil {
-		return fmt.Errorf("place %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+	// The rendered unit goes from memory straight to root's stdin. It is
+	// never staged in a file first.
+	//
+	// Staging would open a window: between this process closing the staged
+	// file and root reading it, anything running as the operator -- which is
+	// precisely this program's threat model, since it dispatches agents with
+	// permission prompts disabled on untrusted text -- could rewrite those
+	// bytes or replace the path with a symlink. Root would then place
+	// content that renderUnit never produced, and every guarantee renderUnit
+	// makes would be bypassed without renderUnit being wrong about anything.
+	//
+	// There is no shell here to worry about, either: runCommand is
+	// exec.Command with an explicit argv, so `tee` receives the destination
+	// as one argument with no quoting, redirect, or word splitting anywhere.
+	if out, err := privileged(doc, "tee", path); err != nil {
+		return fmt.Errorf("write %s: %w: %s", path, err, strings.TrimSpace(string(out)))
 	}
-	if out, err := privileged("systemctl", "daemon-reload"); err != nil {
+	// tee creates the file with root's umask applied to 0666, so the mode is
+	// normalized rather than assumed. 0644 because systemd only reads it,
+	// and it carries no secret by design. Ownership needs no command: tee
+	// ran as root, so the file is already root's.
+	if out, err := privileged(nil, "chmod", "0644", path); err != nil {
+		return fmt.Errorf("chmod %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+	}
+	if out, err := privileged(nil, "systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	// enable --now does both halves: enable writes the multi-user.target
 	// link that starts it at boot, --now starts it in this boot as well.
-	if out, err := privileged("systemctl", "enable", "--now", UnitName); err != nil {
+	if out, err := privileged(nil, "systemctl", "enable", "--now", UnitName); err != nil {
 		return fmt.Errorf("systemctl enable --now %s: %w: %s", UnitName, err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -1336,10 +1732,10 @@ func (m linuxManager) Uninstall() error {
 	}
 	if _, statErr := os.Stat(path); statErr != nil {
 		if os.IsNotExist(statErr) {
-			// Nothing is registered, so there is nothing to remove. Returning
-			// here rather than running the commands anyway is what keeps
-			// `listener uninstall` from asking for a sudo password on a
-			// machine that never had the service installed.
+			// Nothing is registered, so there is nothing to remove.
+			// Returning here rather than running the commands anyway is what
+			// keeps `listener uninstall` from asking for a sudo password on
+			// a machine that never had the service installed.
 			return nil
 		}
 		return fmt.Errorf("stat %s: %w", path, statErr)
@@ -1347,15 +1743,16 @@ func (m linuxManager) Uninstall() error {
 
 	// A non-zero exit here means the unit is already disabled, or was never
 	// loaded. Uninstall must be idempotent -- an operator may have disabled
-	// it by hand -- so this is logged and the removal continues.
-	if out, err := privileged("systemctl", "disable", "--now", UnitName); err != nil {
-		slog.Info("systemctl disable reported non-zero, continuing",
-			"unit", UnitName, "output", strings.TrimSpace(string(out)))
+	// it by hand -- so this is logged and the removal continues. The removal
+	// itself is NOT tolerant: a unit file still on disk is still installed.
+	if out, err := privileged(nil, "systemctl", "disable", "--now", UnitName); err != nil {
+		slog.Warn("systemctl disable reported non-zero, continuing",
+			"unit", UnitName, "output", strings.TrimSpace(string(out)), "err", err)
 	}
-	if out, err := privileged("rm", "-f", path); err != nil {
+	if out, err := privileged(nil, "rm", "-f", path); err != nil {
 		return fmt.Errorf("remove %s: %w: %s", path, err, strings.TrimSpace(string(out)))
 	}
-	if out, err := privileged("systemctl", "daemon-reload"); err != nil {
+	if out, err := privileged(nil, "systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -1382,12 +1779,14 @@ func (m linuxManager) Status() (Status, error) {
 	// find out. --property twice, rather than `systemctl status`, because
 	// show prints one Property=value per line and is the only form of this
 	// command with a documented machine-readable output.
-	out, err := runCommand("systemctl", "show", UnitName, "--property=ActiveState", "--property=MainPID")
+	out, err := runCommand(nil, "systemctl", "show", UnitName,
+		"--property=ActiveState", "--property=MainPID")
 	if err != nil {
 		// No systemd, or a systemctl this process cannot run. Either way
 		// there is no live pid to report, and a status query is not the
 		// place to fail. service_darwin.go treats a failed `launchctl
-		// print` the same way.
+		// print` the same way. Note this keeps `installed`, which was
+		// answered by a stat that already succeeded.
 		return Status{Installed: installed}, nil
 	}
 	props := parseShowProperties(string(out))
@@ -1404,7 +1803,8 @@ func (m linuxManager) Status() (Status, error) {
 
 // parseShowProperties reads `systemctl show --property=...` output into a
 // map. Each line is Property=value, and a value may itself contain an equals
-// sign, so the split is on the FIRST one only.
+// sign -- Environment= is the one this program would notice -- so the split
+// is on the FIRST one only. A line with no equals sign is skipped.
 func parseShowProperties(output string) map[string]string {
 	props := make(map[string]string)
 	for _, line := range strings.Split(output, "\n") {
@@ -1422,19 +1822,23 @@ func parseShowProperties(output string) map[string]string {
 Modify `internal/service/service_other.go`:
 
 - Change the build tag to `//go:build !darwin && !linux`.
-- Change the file's leading comment: replace
-  `--daemon integration with an OS service manager is launchd-only for now (systemd is meant to
-  follow); on every other platform the foreground `listener start` command is the only supported
-  mode` with
-  `Service registration is implemented for launchd on darwin and systemd on linux. On every other
-  platform `listener run` in the foreground is the only supported mode`.
-- Change `errUnsupported`'s message to:
+- Replace the file's leading comment with:
 
 ```go
-var errUnsupported = errors.New(
-	"service management (`listener install` / `listener uninstall`) is supported on macOS and Linux only; " +
-		"run `agent-utils listener run` in the foreground instead")
+// This file backs Manager on every platform with no service-manager
+// implementation. Registration is launchd on darwin and systemd on linux; on
+// every other platform `listener run` in the foreground is the only supported
+// mode, and this stub says so instead of pretending to support a service it
+// cannot register.
+//
+// Nothing compiles this file except the Makefile's `GOOS=windows go vet`
+// line, and nothing runs its test. That is deliberate and is the honest
+// state: the release targets build linux and darwin only.
 ```
+
+- Delete the local `errUnsupported` declaration (Task 1 moved it to `service.go` as
+  `ErrUnsupported`) and change all four method bodies to return `ErrUnsupported`. Drop the
+  `"errors"` import if it becomes unused.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
@@ -1442,7 +1846,7 @@ Run: `go test ./internal/service/ -count=1 -v`
 Expected: PASS, every test in `service_linux_test.go` included.
 
 Run: `GOOS=darwin go vet ./internal/service/... && GOOS=windows go vet ./internal/service/...`
-Expected: no output. The second one is what type-checks the narrowed `service_other.go`.
+Expected: no output. The second is what type-checks the narrowed `service_other.go` and its test.
 
 Run: `gofmt -l internal/service/`
 Expected: no output.
@@ -1454,10 +1858,11 @@ git add internal/service/service_linux.go internal/service/service_linux_test.go
 git commit -m "feat(service): register the listener as a systemd system unit on linux"
 ```
 
-**Acceptance criteria:** `go test ./internal/service/ -count=1` passes on Linux. No test invokes a
-real `systemctl`, `install`, `rm`, or `sudo`. `Install` runs exactly three commands on the success
-path and stops at the first failure. `Uninstall` runs none when no unit file exists. `Status` runs
-one unprivileged command.
+**Acceptance criteria:** `go test ./internal/service/ -count=1` passes on Linux. No test runs a
+real `systemctl`, `tee`, `chmod`, `rm`, or `sudo`. The rendered unit reaches root on stdin and is
+never staged in a file. `Install` refuses an effective user identifier of 0 with and without
+`SUDO_USER` set. `Install` runs exactly four commands on the success path and stops at the first
+failure. `Uninstall` runs none when no unit file exists. `Status` runs one unprivileged command.
 
 **review: yes** — this calls `sudo` and writes a root-owned unit.
 
@@ -1468,77 +1873,171 @@ one unprivileged command.
 **Files:**
 - Modify: `cmd/agent-utils/listener.go`
 - Modify: `cmd/agent-utils/listener_test.go`
+- Modify: `internal/settings/settings.go`, `internal/listener/env.go`, `internal/listener/route.go`,
+  `cmd/agent-utils/config_token_test.go` (comment text only)
 
 **Interfaces:**
-- Consumes: `service.Manager` (unchanged), `service.LaunchAgentsDirEnvVar`,
-  `service.SystemdUnitDirEnvVar` (Task 1).
-- Produces: `listenerRunCommand()`, `listenerInstallCommand()`, `listenerUninstallCommand()`,
-  `listenerStatusCommand()`, and `listenerPreflight(c *cli.Command) (*settings.Settings, []string, error)`.
+- Consumes: `service.Manager`, `service.Status` (pre-existing); `service.New` (now a variable),
+  `service.ErrUnsupported`, `service.SystemdUnitDirEnvVar` (Task 1);
+  `service.LaunchAgentsDirEnvVar` (pre-existing, `service.go:31`).
+- Produces:
+  - `listenerRunCommand()`, `listenerInstallCommand()`, `listenerUninstallCommand()`,
+    `listenerStatusCommand()` — all `*cli.Command`.
+  - `listenerPreflight(c *cli.Command) (*settings.Settings, []string, error)`.
+  - `installService(overrideArgs []string) error` — renamed from `installDaemon`.
+- Removes: `listenerStartCommand`, `listenerStopCommand`, `installDaemon`, `isolateLaunchd`,
+  `testSleepCmd`.
 
 - [ ] **Step 1: Write the failing test**
 
-In `cmd/agent-utils/listener_test.go`, replace the `isolateLaunchd` helper with a helper that
-isolates both backends, and update its doc comment to name both:
+In `cmd/agent-utils/listener_test.go`, replace the `isolateLaunchd` helper with the two helpers
+below, and replace every call to `isolateLaunchd(t)` with `isolateService(t)`:
 
 ```go
 // isolateService points service.New at scratch directories instead of the
 // operator's real ~/Library/LaunchAgents (darwin) and /etc/systemd/system
 // (linux).
 //
-// Without this, any test that runs `listener uninstall` or `listener status`
-// calls into internal/service, which falls back to the REAL directory
-// whenever the override is unset. A developer who has ever run `listener
-// install` on their own machine would have `go test ./cmd/...` silently tear
-// down their real service. Both override variables exist precisely so a test
-// can opt out; see internal/service/service_darwin_test.go and
-// service_linux_test.go for the same pattern one layer down.
+// Without this, any test that reaches internal/service falls back to the REAL
+// directory whenever the override is unset. A developer who has ever run
+// `listener install` on their own machine would have `go test ./cmd/...`
+// silently tear down their real service. Both override variables exist
+// precisely so a test can opt out; see internal/service/selfinstall_test.go
+// and service_linux_test.go for the same pattern one layer down.
+//
+// Note this isolates the DIRECTORY, not the command. A real `launchctl print`
+// or `systemctl show` still runs for a `status` query -- both are read-only
+// and neither can find anything under a scratch directory. Use fakeService
+// below wherever a test needs the Manager itself under control.
 func isolateService(t *testing.T) {
 	t.Helper()
 	t.Setenv(service.LaunchAgentsDirEnvVar, t.TempDir())
 	t.Setenv(service.SystemdUnitDirEnvVar, t.TempDir())
 }
-```
 
-Replace every call to `isolateLaunchd(t)` with `isolateService(t)`.
+// fakeManager records what the CLI asks of a Manager and answers with what
+// the test tells it to.
+type fakeManager struct {
+	status        service.Status
+	statusErr     error
+	installBinary string
+	installArgs   []string
+	installErr    error
+	uninstalled   bool
+	uninstallErr  error
+}
+
+func (f *fakeManager) Install(binary string, args []string) error {
+	f.installBinary = binary
+	f.installArgs = args
+	return f.installErr
+}
+func (f *fakeManager) Uninstall() error { f.uninstalled = true; return f.uninstallErr }
+func (f *fakeManager) Status() (service.Status, error) { return f.status, f.statusErr }
+func (f *fakeManager) ServiceFilePath() (string, error) { return "/scratch/" + service.UnitName, nil }
+
+// fakeService substitutes m for the real platform Manager, so a cmd-level
+// test can assert what the CLI asked for without running launchctl,
+// systemctl, or sudo.
+func fakeService(t *testing.T, m *fakeManager) {
+	t.Helper()
+	prev := service.New
+	service.New = func() service.Manager { return m }
+	t.Cleanup(func() { service.New = prev })
+}
+
+// runListenerCLINoExit runs the listener command tree with cli.OsExiter
+// replaced, and reports the exit code the library asked for.
+//
+// urfave/cli v3.11.0 does NOT return an error for an unknown subcommand: it
+// prints "No help topic for '<verb>'" and calls cli.OsExiter(3), which by
+// default is os.Exit. A test that asserts on a returned error therefore kills
+// the whole test binary mid-suite with no failure attribution. Measured
+// against this exact tree shape.
+func runListenerCLINoExit(t *testing.T, args ...string) (stdout string, exitCode int) {
+	t.Helper()
+	prev := cli.OsExiter
+	cli.OsExiter = func(code int) { exitCode = code }
+	t.Cleanup(func() { cli.OsExiter = prev })
+	out, _ := runListenerCLI(t, args...)
+	return out, exitCode
+}
+```
 
 Rename the three `start` tests and point them at `run`:
 
-- `TestListenerStartDisabledWebhookFailsAndNamesEnableCommand` becomes
-  `TestListenerRunDisabledWebhookFailsAndNamesEnableCommand`; its CLI arguments change from
-  `"listener", "start"` to `"listener", "run"`.
-- `TestListenerStartEmptySecretFails` becomes `TestListenerRunEmptySecretFails`, same argument
-  change.
-- `TestListenerStartInvalidPortOverrideFails` becomes
-  `TestListenerRunInvalidPortOverrideFails`, same argument change.
+- `TestListenerStartDisabledWebhookFailsAndNamesEnableCommand` →
+  `TestListenerRunDisabledWebhookFailsAndNamesEnableCommand`; CLI arguments change from
+  `"listener", "start"` to `"listener", "run"`, and the failure strings in the test change to
+  match.
+- `TestListenerStartEmptySecretFails` → `TestListenerRunEmptySecretFails`, same changes.
+- `TestListenerStartInvalidPortOverrideFails` → `TestListenerRunInvalidPortOverrideFails`, same
+  changes.
 
-Replace `TestListenerHelpListsThreeSubcommands` with:
+Replace `TestListenerHelpListsThreeSubcommands` with the two tests below. The old one asserted
+with `strings.Contains` on the whole help text, which passes with zero subcommands registered:
+the header line alone contains the word `run`, and `install` is a substring of `uninstall`.
 
 ```go
-// TestListenerHelpListsTheFourSubcommands pins the command surface. `start`
-// and `stop` were removed: a registered service is started and stopped with
-// systemctl or launchctl, and a foreground `listener run` is stopped with
-// Ctrl-C. This test fails if either verb comes back.
-func TestListenerHelpListsTheFourSubcommands(t *testing.T) {
+// helpCommands returns the subcommand names listed in the COMMANDS: block of
+// a urfave/cli help screen. Each row is indented and starts with the name.
+func helpCommands(t *testing.T, out string) []string {
+	t.Helper()
+	var names []string
+	inBlock := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "COMMANDS:") {
+			inBlock = true
+			continue
+		}
+		if inBlock {
+			if strings.TrimSpace(line) == "" {
+				break
+			}
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			names = append(names, strings.TrimSuffix(fields[0], ","))
+		}
+	}
+	return names
+}
+
+// TestListenerHelpListsExactlyTheFourSubcommands pins the command surface.
+// `start` and `stop` are gone: a registered service is started and stopped
+// with systemctl or launchctl, and a foreground `listener run` is stopped
+// with Ctrl-C. This test fails if either verb comes back, and -- unlike the
+// substring check it replaces -- it fails if the subcommands disappear.
+func TestListenerHelpListsExactlyTheFourSubcommands(t *testing.T) {
 	out, err := runListenerCLI(t, "listener", "--help")
 	if err != nil {
 		t.Fatalf("listener --help: %v", err)
 	}
-	for _, want := range []string{"run", "install", "uninstall", "status"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("listener --help does not list %q:\n%s", want, out)
+	got := helpCommands(t, out)
+	want := []string{"run", "install", "uninstall", "status"}
+	if len(got) != len(want) {
+		t.Fatalf("listener --help lists %v, want exactly %v\n%s", got, want, out)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("subcommand %d = %q, want %q", i, got[i], w)
 		}
 	}
 }
 
 // TestListenerRejectsTheRemovedVerbs proves the removal is real rather than
-// a rename that left an alias behind.
+// a rename that left an alias behind. It goes through runListenerCLINoExit
+// because the library exits the process rather than returning an error; see
+// that helper's comment.
 func TestListenerRejectsTheRemovedVerbs(t *testing.T) {
 	for _, verb := range []string{"start", "stop"} {
 		t.Run(verb, func(t *testing.T) {
 			withHome(t)
 			isolateService(t)
-			if _, err := runListenerCLI(t, "listener", verb); err == nil {
-				t.Fatalf("listener %s did not report an unknown command", verb)
+			out, code := runListenerCLINoExit(t, "listener", verb)
+			if code == 0 {
+				t.Fatalf("listener %s exited 0; it should be an unknown command\n%s", verb, out)
 			}
 		})
 	}
@@ -1546,23 +2045,33 @@ func TestListenerRejectsTheRemovedVerbs(t *testing.T) {
 ```
 
 Delete `TestListenerStopSignalsLiveForegroundPid` and
-`TestListenerStopRemovesStalePidfileWithoutSignalingAnyone`. Replace the second one with the
-`status` equivalent, since `status` takes over the cleanup:
+`TestListenerStopRemovesStalePidfileWithoutSignalingAnyone`. Delete `testSleepCmd`
+(`cmd/agent-utils/listener_test.go:333`) with them: the first of those two tests is its only
+caller, and `.golangci.yml` enables `unused`, which analyzes test files, so an orphan helper fails
+`make lint`.
+
+Fold the stale-pidfile cleanup into the existing `TestListenerStatusReportsStaleePidfileAsNotAlive`
+rather than adding a near-duplicate test. Its fixture is already exactly right, and the plan's
+change to the output line (`alive=false` gains a `(stale, removed)` suffix) keeps its existing
+assertion passing. Rename it and add the removal assertion:
 
 ```go
-// TestListenerStatusRemovesAStalePidfile covers the cleanup `stop` used to
-// perform. A pidfile whose lock is free was left by a process that died
-// without running its own shutdown -- a kill -9, or a crash. Without this,
-// `status` would report the same dead pid forever.
-func TestListenerStatusRemovesAStalePidfile(t *testing.T) {
+// TestListenerStatusReportsAndRemovesAStalePidfile proves two things about
+// the same fixture. First, status's liveness comes from the lock, not from
+// kill(pid, 0): it writes a pidfile naming this TEST process's own pid
+// (genuinely alive) but does NOT hold the lock, simulating a listener that
+// was killed -9 and left its pidfile behind. A pid-based check would wrongly
+// report this alive.
+//
+// Second, status now REMOVES that pidfile. `listener stop` used to own the
+// cleanup and no longer exists, so without this, status would report the same
+// dead pid forever.
+func TestListenerStatusReportsAndRemovesAStalePidfile(t *testing.T) {
 	withHome(t)
 	isolateService(t)
 
 	homeDir := os.Getenv("AGENT_UTILS_HOME")
 	pidPath := filepath.Join(homeDir, pidFileName)
-	// This test process's own pid, genuinely alive, with the lock NOT held:
-	// the same shape TestListenerStatusReportsStaleePidfileAsNotAlive uses.
-	// Liveness comes from the lock, so this pidfile is stale.
 	if err := writePidfile(pidPath, os.Getpid(), "127.0.0.1", 8787); err != nil {
 		t.Fatalf("writePidfile: %v", err)
 	}
@@ -1571,38 +2080,49 @@ func TestListenerStatusRemovesAStalePidfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listener status: %v", err)
 	}
+	if !strings.Contains(out, "alive=false") {
+		t.Errorf("status output = %q, want alive=false: the lock is not held, "+
+			"so this pidfile is stale regardless of whether its pid happens to be alive", out)
+	}
+	if !strings.Contains(out, "stale") {
+		t.Errorf("status output = %q, want it to say the pidfile was stale", out)
+	}
 	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
 		t.Errorf("listener status left the stale pidfile at %s", pidPath)
 	}
-	if !strings.Contains(out, "stale") {
-		t.Errorf("listener status did not say it removed a stale pidfile:\n%s", out)
-	}
 }
+```
 
+Add these new tests:
+
+```go
 // TestListenerStatusLabelsTheBackendNeutrally pins the rename from
 // "launchd:" to "service:". The backend is launchd on darwin and systemd on
 // linux, and the label must not name one of them.
 func TestListenerStatusLabelsTheBackendNeutrally(t *testing.T) {
 	withHome(t)
 	isolateService(t)
+	fakeService(t, &fakeManager{status: service.Status{Installed: true, Running: true, PID: 7}})
 
 	out, err := runListenerCLI(t, "listener", "status")
 	if err != nil {
 		t.Fatalf("listener status: %v", err)
 	}
-	if !strings.Contains(out, "service:") {
-		t.Errorf("listener status does not carry the neutral label:\n%s", out)
+	if !strings.Contains(out, "service: installed=true running=true pid=7") {
+		t.Errorf("listener status does not report the Manager's answer:\n%s", out)
 	}
 	if strings.Contains(out, "launchd:") {
 		t.Errorf("listener status still names launchd:\n%s", out)
 	}
 }
 
-// TestListenerUninstallWithNothingInstalledSaysSo covers the idempotent
-// path an operator hits on a machine that never ran `listener install`.
+// TestListenerUninstallWithNothingInstalledSaysSo covers the idempotent path
+// an operator hits on a machine that never ran `listener install`.
 func TestListenerUninstallWithNothingInstalledSaysSo(t *testing.T) {
 	withHome(t)
 	isolateService(t)
+	fake := &fakeManager{status: service.Status{Installed: false}}
+	fakeService(t, fake)
 
 	out, err := runListenerCLI(t, "listener", "uninstall")
 	if err != nil {
@@ -1611,12 +2131,94 @@ func TestListenerUninstallWithNothingInstalledSaysSo(t *testing.T) {
 	if !strings.Contains(out, "no listener service is installed") {
 		t.Errorf("listener uninstall did not report an empty machine:\n%s", out)
 	}
+	if fake.uninstalled {
+		t.Error("listener uninstall called Uninstall with nothing installed")
+	}
 }
-```
 
-Add the check that `install` validates before it touches the service manager:
+// TestListenerUninstallOnAnUnsupportedPlatformSaysSo covers the other reason
+// there is nothing to remove.
+func TestListenerUninstallOnAnUnsupportedPlatformSaysSo(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fakeService(t, &fakeManager{statusErr: service.ErrUnsupported})
 
-```go
+	out, err := runListenerCLI(t, "listener", "uninstall")
+	if err != nil {
+		t.Fatalf("listener uninstall: %v", err)
+	}
+	if !strings.Contains(out, "no listener service is installed") {
+		t.Errorf("listener uninstall did not report an unsupported platform:\n%s", out)
+	}
+}
+
+// TestListenerUninstallSurfacesARealStatusFailure is the fail-closed case.
+// A Status error that is NOT ErrUnsupported means this machine's
+// registration could not be READ -- a permission problem, an I/O error --
+// and a root-owned, boot-persistent unit may well still be installed.
+// Telling the operator "nothing is installed" and exiting 0 would be a lie
+// at the one moment it matters.
+func TestListenerUninstallSurfacesARealStatusFailure(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fakeService(t, &fakeManager{statusErr: errors.New("permission denied")})
+
+	if _, err := runListenerCLI(t, "listener", "uninstall"); err == nil {
+		t.Fatal("listener uninstall reported success for an unreadable registration")
+	}
+}
+
+// TestListenerUninstallRemovesAnInstalledService covers the ordinary path.
+func TestListenerUninstallRemovesAnInstalledService(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fake := &fakeManager{status: service.Status{Installed: true}}
+	fakeService(t, fake)
+
+	out, err := runListenerCLI(t, "listener", "uninstall")
+	if err != nil {
+		t.Fatalf("listener uninstall: %v", err)
+	}
+	if !fake.uninstalled {
+		t.Error("listener uninstall did not call Uninstall")
+	}
+	if !strings.Contains(out, "uninstalled") {
+		t.Errorf("listener uninstall said nothing about what it did:\n%s", out)
+	}
+}
+
+// TestListenerInstallRegistersListenerRunNeverInstall is the test for the
+// one hazard installService's own comment names: the registered command must
+// be `listener run`. Registering `listener install` would make the service
+// reinstall itself at every start.
+func TestListenerInstallRegistersListenerRunNeverInstall(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	if err := settings.Save(&settings.Settings{
+		Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "a-secret"},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("GITHUB_TOKEN", "")
+	writeEnvFile(t)
+
+	fake := &fakeManager{}
+	fakeService(t, fake)
+
+	if _, err := runListenerCLI(t, "listener", "install", "--listen-port", "8788"); err != nil {
+		t.Fatalf("listener install: %v", err)
+	}
+	want := []string{"listener", "run", "--listen-port", "8788"}
+	if strings.Join(fake.installArgs, " ") != strings.Join(want, " ") {
+		t.Errorf("installed args = %v, want %v", fake.installArgs, want)
+	}
+	for _, a := range fake.installArgs {
+		if a == "install" || a == "--daemon" {
+			t.Errorf("installed args name a service-management verb: %v", fake.installArgs)
+		}
+	}
+}
+
 // TestListenerInstallDisabledWebhookFailsBeforeTouchingTheServiceManager
 // pins the check order. `install` must make exactly the checks `run` makes,
 // and make them first: a service registered against a disabled webhook, an
@@ -1625,9 +2227,11 @@ Add the check that `install` validates before it touches the service manager:
 func TestListenerInstallDisabledWebhookFailsBeforeTouchingTheServiceManager(t *testing.T) {
 	withHome(t)
 	isolateService(t)
+	fake := &fakeManager{}
+	fakeService(t, fake)
 
 	// No settings file at all: settings.Load returns the zero value, whose
-	// Webhook.Enabled is false. Same shape as the `run` test above.
+	// Webhook.Enabled is false.
 	_, err := runListenerCLI(t, "listener", "install")
 	if err == nil {
 		t.Fatal("listener install with the webhook disabled: want an error, got nil")
@@ -1635,12 +2239,17 @@ func TestListenerInstallDisabledWebhookFailsBeforeTouchingTheServiceManager(t *t
 	if !strings.Contains(err.Error(), "config webhook --enable") {
 		t.Errorf("error %q does not name the command that fixes it", err)
 	}
+	if fake.installArgs != nil {
+		t.Error("listener install reached the service manager before its checks")
+	}
 }
 
 // TestListenerInstallEmptySecretFails is the second of the four checks.
 func TestListenerInstallEmptySecretFails(t *testing.T) {
 	withHome(t)
 	isolateService(t)
+	fake := &fakeManager{}
+	fakeService(t, fake)
 
 	if err := settings.Save(&settings.Settings{
 		Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: ""},
@@ -1652,37 +2261,73 @@ func TestListenerInstallEmptySecretFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("listener install with an empty secret: want an error, got nil")
 	}
-	if !strings.Contains(err.Error(), "unauthenticated") {
-		t.Errorf("error %q does not say why an empty secret is refused", err)
+	if fake.installArgs != nil {
+		t.Error("listener install reached the service manager before its checks")
+	}
+}
+
+// TestExplainInstallErrStillMatchesTheRealRefusal keeps the two halves of the
+// text match from drifting apart. internal/service/selfinstall_test.go pins
+// the PRODUCER side (the refusal's wording); this pins the CONSUMER side.
+func TestExplainInstallErrStillMatchesTheRealRefusal(t *testing.T) {
+	loose := filepath.Join(t.TempDir(), "loose")
+	if err := os.Mkdir(loose, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(loose, 0o777); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	bin := filepath.Join(loose, "agent-utils")
+	if err := os.WriteFile(bin, []byte("fake"), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Produce the real refusal by running a real Install against a
+	// world-writable path, through the real platform Manager.
+	isolateService(t)
+	real := service.New()
+	err := real.Install(bin, []string{"listener", "run"})
+	if err == nil {
+		t.Skip("this platform's Manager does not refuse a writable path here")
+	}
+	if !containsWritableRefusal(err) {
+		t.Fatalf("containsWritableRefusal no longer matches the real refusal: %v", err)
+	}
+	explained := explainInstallErr(err)
+	if !strings.Contains(explained.Error(), "~/bin") {
+		t.Errorf("explainInstallErr dropped its operator guidance: %v", explained)
 	}
 }
 ```
 
-Both tests use the helpers this file already has: `withHome` (`cmd/agent-utils/config_test.go:20`,
-which sets `AGENT_UTILS_HOME` to a scratch directory) and `settings.Save`. Do not add a second way
-to seed a settings file.
+`writeEnvFile` is whatever the existing token tests use to satisfy `ensureToken`. Read
+`cmd/agent-utils/config_token_test.go` and reuse it; if there is no such helper, write the env
+file the same way those tests do and factor it into one helper called from both places. Do not
+invent a second way to write the env file.
 
 - [ ] **Step 2: Run the tests and confirm they fail**
 
 Run: `go test ./cmd/agent-utils/ -run Listener -count=1`
-Expected: FAIL to build, `undefined: isolateService`, and failures reporting that `run`,
-`install`, and `uninstall` are unknown commands.
+Expected: FAIL to build, `undefined: isolateService`, `undefined: fakeManager`, and failures
+reporting that `run`, `install`, and `uninstall` are unknown commands.
 
 - [ ] **Step 3: Rewrite the command tree in `cmd/agent-utils/listener.go`**
 
-Replace `listenerCommand`:
+Replace `listenerCommand`, and DELETE `listenerStartCommand` in full (including its
+`&cli.BoolFlag{Name: "daemon"}`). An unexported function with no callers fails `unused` in
+`make lint`.
 
 ```go
 // listenerCommand groups the webhook listener's lifecycle: run it here,
 // register it with the OS service manager, remove that registration, and ask
-// what it is doing. It is top level, not project-scoped, because one
-// listener serves every project on the machine.
+// what it is doing. It is top level, not project-scoped, because one listener
+// serves every project on the machine.
 //
 // There is deliberately no `start` and no `stop`. Once `install` has
 // registered the listener, starting and stopping it belongs to the platform's
-// own tool -- `systemctl` on linux, `launchctl` on darwin -- and a second
-// pair of verbs here would only be a worse wrapper around them. A foreground
-// `run` is stopped with Ctrl-C.
+// own tool -- `systemctl` on linux, `launchctl` on darwin -- and a second pair
+// of verbs here would only be a worse wrapper around them. A foreground `run`
+// is stopped with Ctrl-C.
 func listenerCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "listener",
@@ -1715,15 +2360,18 @@ func listenerPreflight(c *cli.Command) (*settings.Settings, []string, error) {
 			"the webhook daemon is disabled; run `agent-utils config webhook --enable` first")
 	}
 
-	// --listen-port/--listen-addr validate through the exact same
+	// --listen-port/--listen-addr go through the exact same
 	// settings.FieldFor(...).Set path `config set` and `config webhook` use
 	// (setField, in config.go), and are applied to an in-memory copy only --
-	// they are never saved to config.yaml. An override that reached
-	// service.Install unvalidated would be rendered into a file the OS
-	// service manager executes without the operator present; going through
-	// the shared validator is what keeps `--listen-port 0` rejected here
-	// exactly as it is in `config set webhook.listen_port` and in
-	// listener.New itself.
+	// they are never saved to config.yaml. That is what keeps
+	// `--listen-port 0` rejected here exactly as it is in `config set
+	// webhook.listen_port` and in listener.New itself.
+	//
+	// It is NOT what makes these values safe to render into a service
+	// definition. `webhook.listen_addr`'s Set is a non-empty check and a
+	// loopback warning, not an address parser, so --listen-addr reaches
+	// service.Install as an arbitrary string. The renderer is the control
+	// there; see renderUnit in internal/service/unit.go.
 	var overrideArgs []string
 	if c.IsSet("listen-addr") {
 		v := c.String("listen-addr")
@@ -1742,18 +2390,17 @@ func listenerPreflight(c *cli.Command) (*settings.Settings, []string, error) {
 
 	// Refuse to run an unauthenticated listener. listener.New refuses an
 	// empty secret too, but that check happens only after a database is
-	// opened and a pidfile written; this one fails before any of that, with
-	// a message that names what is actually wrong rather than New's generic
-	// one.
+	// opened and a pidfile written; this one fails before any of that, with a
+	// message that names what is actually wrong rather than New's generic one.
 	if st.Webhook.Secret == "" {
 		return nil, nil, errors.New(
 			"webhook.secret is empty; refusing to start an unauthenticated listener")
 	}
 
 	// Checked up front, once, before opening the database or binding a
-	// socket: without this a listener started against a 0644 (or missing)
-	// env file comes up looking healthy and then fails every single tick,
-	// since Worker reads the token fresh on every delivery (see
+	// socket: without this a listener started against a 0644 (or missing) env
+	// file comes up looking healthy and then fails every single tick, since
+	// Worker reads the token fresh on every delivery (see
 	// internal/listener/env.go's Token).
 	if err := ensureToken(os.Stdin, os.Stderr, isInteractive()); err != nil {
 		return nil, nil, err
@@ -1807,11 +2454,20 @@ func listenerUninstallCommand() *cli.Command {
 		Action: func(_ context.Context, _ *cli.Command) error {
 			mgr := service.New()
 			status, err := mgr.Status()
-			if err != nil || !status.Installed {
-				// A Status error means an unsupported platform, or a service
-				// manager this process cannot query. Either way there is
-				// nothing here to remove, and saying so is a better answer
-				// than reporting the query failure.
+			switch {
+			case errors.Is(err, service.ErrUnsupported):
+				// This platform has no service manager, so there is nothing
+				// registered and never was.
+				fmt.Println("no listener service is installed")
+				return nil
+			case err != nil:
+				// Anything else means this machine's registration could not
+				// be READ -- a permission problem, an I/O error. A
+				// root-owned, boot-persistent unit may well still be
+				// installed, so reporting "nothing is installed" here would
+				// be a lie at the one moment it matters.
+				return fmt.Errorf("check whether a listener service is installed: %w", err)
+			case !status.Installed:
 				fmt.Println("no listener service is installed")
 				return nil
 			}
@@ -1825,14 +2481,13 @@ func listenerUninstallCommand() *cli.Command {
 }
 ```
 
-Rename `installDaemon` to `installService` and update its comment. The body is unchanged except
-for the argument list it builds:
+Rename `installDaemon` to `installService`:
 
 ```go
 // installService registers this program with the OS service manager, to be
-// started without the operator present and kept alive, running `listener
-// run` (never `install` again -- that would reinstall itself in a loop) plus
-// any validated listen override.
+// started without the operator present and kept alive, running `listener run`
+// (never `install` again -- that would reinstall itself in a loop) plus any
+// validated listen override.
 func installService(overrideArgs []string) error {
 	// self is passed to Install for its own sake (a caller that names a
 	// binary other than the one it is actually running as is confused about
@@ -1862,21 +2517,21 @@ func installService(overrideArgs []string) error {
 }
 ```
 
-Rewrite `explainInstallErr` so it names neither platform in its opening, and keeps the Homebrew
-case as the macOS example it is:
+Rewrite `explainInstallErr` so its opening names neither platform, and the Homebrew case stays the
+macOS example it is:
 
 ```go
-// explainInstallErr adds operator-facing context to an Install failure
-// caused by a group- or world-writable install path (see
-// refuseIfWritableByOthers in internal/service/service.go). That refusal is
-// the correct security default -- a service definition started without the
-// operator present is permanent execution of whatever path it names, and a
-// writable parent directory would let another local account replace the
-// binary the machine runs at every boot or login -- but the bare error from
-// os.Lstat-driven mode checks reads like a bug report, not an explanation.
-// The common case it is guarding against, an Intel-Mac Homebrew install
-// under /usr/local (commonly drwxrwxr-x, group admin), is named explicitly
-// so the operator understands why and knows the fix.
+// explainInstallErr adds operator-facing context to an Install failure caused
+// by a group- or world-writable install path (see refuseIfWritableByOthers in
+// internal/service/service.go). That refusal is the correct security default
+// -- a service definition started without the operator present is permanent
+// execution of whatever path it names, and a writable parent directory would
+// let another local account replace the binary the machine runs at every boot
+// or login -- but the bare error from os.Lstat-driven mode checks reads like a
+// bug report, not an explanation. The common case it is guarding against, an
+// Intel-Mac Homebrew install under /usr/local (commonly drwxrwxr-x, group
+// admin), is named explicitly so the operator understands why and knows the
+// fix.
 func explainInstallErr(err error) error {
 	if err == nil {
 		return nil
@@ -1902,8 +2557,9 @@ func explainInstallErr(err error) error {
 Update `containsWritableRefusal`'s doc comment: change the path it cites from
 `internal/service/service_darwin.go` to `internal/service/service.go`.
 
-Delete `listenerStopCommand` in full, along with the `syscall` import if nothing else in the file
-uses it. Check first: `grep -n 'syscall\.' cmd/agent-utils/listener.go`.
+Delete `listenerStopCommand` in full. Check whether the `syscall` import is still needed with
+`grep -n 'syscall\.' cmd/agent-utils/listener.go` before removing it; at the time of writing it is
+still used at `listener.go:433`, so it stays.
 
 In `runListener`, update the already-running message, which names a removed verb:
 
@@ -1911,14 +2567,14 @@ In `runListener`, update the already-running message, which names a removed verb
 	if errors.Is(err, lock.ErrHeld) {
 		return errors.New(
 			"a listener is already running (its lock is held); " +
-				"run `agent-utils listener status` to check, or stop it with Ctrl-C in its own " +
-				"terminal, or with `systemctl stop agent-utils-listener` / " +
-				"`launchctl bootout gui/$(id -u)/com.seanmcgary.agent-utils.listener` if it is installed")
+				"run `agent-utils listener status` to check, stop a foreground one with Ctrl-C " +
+				"in its own terminal, or stop an installed one with " +
+				"`systemctl stop agent-utils-listener` (linux) or " +
+				"`launchctl bootout gui/$(id -u)/com.seanmcgary.agent-utils.listener` (macOS)")
 	}
 ```
 
-Rewrite `listenerStatusCommand`'s Action so it uses the neutral label and takes over the
-stale-pidfile cleanup:
+Rewrite `listenerStatusCommand`'s Action for the neutral label and the stale-pidfile cleanup:
 
 ```go
 func listenerStatusCommand() *cli.Command {
@@ -1964,10 +2620,10 @@ func listenerStatusCommand() *cli.Command {
 				// The lock is free, so whatever the pidfile says is stale:
 				// left by a process that died without running its own
 				// shutdown (a kill -9, a crash). Clean it up here so status
-				// does not keep reporting a dead pid forever. A listener's
-				// own drainAndClose removes this on an ordinary shutdown, so
-				// this only ever fires on the unclean path. `listener stop`
-				// used to own this cleanup; it no longer exists.
+				// does not keep reporting a dead pid forever. A listener's own
+				// drainAndClose removes this on an ordinary shutdown, so this
+				// only ever fires on the unclean path. `listener stop` used to
+				// own this cleanup; it no longer exists.
 				fmt.Printf("pidfile: pid=%d alive=false addr=%s:%d (stale, removed)\n",
 					pf.PID, pf.Addr, pf.Port)
 				if rmErr := os.Remove(pidPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
@@ -1983,24 +2639,44 @@ func listenerStatusCommand() *cli.Command {
 }
 ```
 
-- [ ] **Step 4: Run the tests and confirm they pass**
+- [ ] **Step 4: Fix the comments that name a removed verb**
 
-Run: `go test ./cmd/agent-utils/ -count=1`
-Expected: PASS.
-
-Run: `gofmt -l cmd/ && go vet ./cmd/... && GOOS=darwin go vet ./cmd/...`
-Expected: no output.
-
-- [ ] **Step 5: Commit**
+`listener start` and `listener stop` appear in comments across the tree. Every one is now wrong.
+Find them with:
 
 ```bash
-git add cmd/agent-utils/listener.go cmd/agent-utils/listener_test.go
+grep -rn -e 'listener start' -e 'listener stop' -e '--daemon' \
+  --include='*.go' cmd/ internal/ | grep -v '_test.go:.*listener run'
+```
+
+Change each to the verb that now does that job: a foreground run is `listener run`, removing a
+registration is `listener uninstall`, and inspecting one is `listener status`. At the time of
+writing the sites are `cmd/agent-utils/listener.go` (the `pidFileName` and `lockFileName`
+comments near line 55, plus lines 630, 748, 880, 885), `cmd/agent-utils/config_token_test.go:130`,
+`:202`, `:424`, `internal/settings/settings.go:552`, `internal/listener/env.go:30`, and
+`internal/listener/route.go:63`, `:139`, `:247`. Re-run the grep and fix whatever it reports;
+do not work from that list alone.
+
+- [ ] **Step 5: Run the tests and confirm they pass**
+
+Run: `go test ./cmd/agent-utils/ ./internal/... -count=1 -p 1`
+Expected: PASS.
+
+Run: `gofmt -l cmd/ internal/ && go vet ./... && GOOS=darwin go vet ./...`
+Expected: no output.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add cmd/agent-utils/listener.go cmd/agent-utils/listener_test.go cmd/agent-utils/config_token_test.go internal/settings/settings.go internal/listener/env.go internal/listener/route.go
 git commit -m "feat(listener): split the listener verbs into run, install, and uninstall"
 ```
 
-**Acceptance criteria:** `go test ./cmd/agent-utils/ -count=1` passes. `listener --help` lists
-exactly `run`, `install`, `uninstall`, and `status`. `listener start` and `listener stop` both
-report an unknown command. No string in `listener.go` names `--daemon`.
+**Acceptance criteria:** `go test ./... -count=1 -p 1` passes. `make lint` passes, which proves no
+orphaned helper was left behind. `listener --help` lists exactly `run`, `install`, `uninstall`,
+and `status`, in that order. `listener start` and `listener stop` both exit non-zero.
+`grep -rn -e 'listener start' -e 'listener stop' -e '--daemon' --include='*.go' cmd/ internal/`
+reports nothing.
 
 **review: yes** — this removes two published commands and moves the preflight checks.
 
@@ -2011,60 +2687,91 @@ report an unknown command. No string in `listener.go` names `--daemon`.
 **Files:**
 - Modify: `Makefile`
 - Modify: `README.md`
-- Modify: `docs/configuration.md`
 
 **Interfaces:**
-- Consumes: everything from Tasks 1 to 4.
-- Produces: nothing other tasks read.
+- Consumes: the four verb names (`run`, `install`, `uninstall`, `status`) from Task 4, and the
+  literal value of `UnitName` (`agent-utils-listener.service`) from Task 1, for the README
+  walkthrough's `journalctl` and `systemctl` lines.
+- Produces: nothing another task reads.
 
-- [ ] **Step 1: Add the Linux cross-vet to the Makefile**
+- [ ] **Step 1: Add the two cross-vet lines to the Makefile**
 
-In the `vet` target, after the existing `GOOS=darwin $(GO) vet ./...` line, add:
+`internal/service` now has three mutually exclusive build-tag worlds, and the `vet` target covers
+only two of them. In the `vet` target, after the existing `GOOS=darwin $(GO) vet ./...` line, add:
 
 ```make
-	# internal/service/service_linux.go only compiles under GOOS=linux. CI
-	# runs on ubuntu-latest so it is vetted there natively, but a developer
-	# on macOS running `make check` would otherwise never type-check it.
+	# internal/service/service_linux.go only compiles under GOOS=linux. CI is
+	# ubuntu-latest so it is vetted, linted and tested there natively; this
+	# line is what type-checks it for a developer running `make check` on
+	# macOS.
 	GOOS=linux $(GO) vet ./...
+	# internal/service/service_other.go is the !darwin && !linux stub, and
+	# NOTHING else selects it: not `go vet ./...` (host GOOS), not the two
+	# lines above, not `make test`, not `make lint`, and not the release
+	# targets, which build linux and darwin only. Without this line the stub
+	# and its test compile for nobody and rot silently. go vet analyzes test
+	# files too, so this type-checks both.
+	GOOS=windows $(GO) vet ./...
 ```
 
 - [ ] **Step 2: Run the gate and confirm it is clean**
 
 Run: `make vet`
-Expected: no output, and three vet passes run.
+Expected: no output, and four vet passes run.
 
 - [ ] **Step 3: Update the README**
 
-Make these changes in `README.md`. Find each site with
-`grep -n 'listener start\|listener stop\|--daemon\|launchd' README.md`.
+Run `grep -n -e 'listener start' -e 'listener stop' -e '--daemon' -e 'launchd' README.md` first.
+At the time of writing it reports 22 hits, at lines 138, 221, 414, 701, 704, 715, 716, 736, 760,
+762, 777, 785, 789, 875, 878, 881, 883, 886, 887, 889, 891, 893, and 897. Work from the live grep,
+not from that list.
 
-1. The command table row at line 138 becomes two rows:
+Apply these rules to every hit:
+
+1. `agent-utils listener start` with no `--daemon` becomes `agent-utils listener run`.
+2. `listener start --daemon` becomes `listener install`.
+3. `listener stop` becomes `listener uninstall` where it means removing a registration. Where it
+   means signalling a foreground process, rewrite the sentence: Ctrl-C in that terminal.
+4. A sentence that names launchd as THE mechanism becomes a sentence that names the service
+   manager, with launchd and systemd as the two platform cases.
+
+These four hits need more than a substitution. Handle each explicitly:
+
+- **Line 138**, the command table row, becomes two rows:
 
 ```markdown
 | `agent-utils listener run [--listen-addr <a>] [--listen-port <p>]` | Run the webhook listener in this terminal until Ctrl-C |
 | `agent-utils listener install [--listen-addr <a>] [--listen-port <p>] \| uninstall \| status` | Register the listener as an OS service, remove that registration, or inspect it |
 ```
 
-2. Every prose reference to `agent-utils listener start` (with no `--daemon`) becomes
-   `agent-utils listener run`. Every reference to `listener start --daemon` becomes
-   `listener install`. Every reference to `listener stop` becomes `listener uninstall` where it
-   means removing the registration, and is rewritten where it means signalling a foreground
-   process.
+- **Line 414** describes `listener.pid` and `listener.lock` as "the liveness source `listener
+  stop` and `listener status` trust". `stop` is gone and `status` now owns the cleanup. Rewrite:
+  the lock is the liveness source `listener status` trusts, and `status` removes a pidfile whose
+  lock is free, because that pidfile was left by a process that died without shutting down.
 
-3. The daemon section gains a Linux walkthrough beside the macOS one. Write it as:
+- **Line 716** says "the `--daemon` form writes its override into the launchd plist, not into
+  config.yaml". Rewrite: `listener install` writes its override into the service definition
+  (the launchd property list on macOS, the systemd unit on Linux), not into config.yaml.
+
+- **Lines 760-762** describe the two log files as where the daemon's output goes. That is now
+  macOS-only. Scope the sentence to launchd, and point Linux at the journal.
+
+- **Line 789** lists the non-interactive contexts "(launchd, cron, CI)". Add systemd.
+
+Then add the Linux walkthrough to the daemon section:
 
 ```markdown
 On Linux, `agent-utils listener install` writes a systemd system unit to
 `/etc/systemd/system/agent-utils-listener.service` and enables it. The unit is owned by root and
 starts at every boot, with no login and no `loginctl enable-linger`. It runs as YOU, not as root:
-the unit sets `User=`, `Group=`, `HOME=`, and a `WorkingDirectory` of your own
-`~/.agent-utils`, so the service reads the same env file, the same state database, and the same
-project registry your own commands read.
+the unit sets `User=`, `Group=`, `HOME=`, and a `WorkingDirectory` of your own `~/.agent-utils`,
+so the service reads the same env file, the same state database, and the same project registry
+your own commands read.
 
-Writing into `/etc` needs root, so `listener install` runs three steps through `sudo` and lets
-sudo prompt you. Run the command as YOURSELF, not under `sudo`: under sudo every directory it
-resolves would be root's, and it refuses that case rather than install a service that reads a
-state directory you never write to.
+Writing into `/etc` needs root, so `listener install` runs four steps through `sudo` and lets sudo
+prompt you. Run the command as YOURSELF, not as root. As root every directory it resolves would be
+root's, and it would install a service that runs as root — so it refuses outright rather than do
+that.
 
 The listener logs to the journal:
 
@@ -2074,19 +2781,29 @@ systemctl status agent-utils-listener     # is it running
 agent-utils listener uninstall            # stop it and remove the unit
 ```
 
-On macOS, `agent-utils listener install` writes a launchd user agent instead, and that one keeps
-writing `~/.agent-utils/listener.stdout.log` and `~/.agent-utils/listener.stderr.log` at every
-login, because launchd has no journal.
+One thing to know about the journal: it is the SYSTEM journal, readable by every member of the
+`systemd-journal` and `adm` groups. The launchd agent on macOS writes to
+`~/.agent-utils/listener.stdout.log` and `~/.agent-utils/listener.stderr.log` instead, which only
+you can read. The listener logs which repositories and issues it dispatches, so on a shared Linux
+machine that activity is visible to more people than it was on macOS.
 ```
 
-4. The security section's paragraph about the writable-path refusal gains one sentence: the
-   refusal matters more on Linux, because a systemd system unit is started by root.
+Finally, the security section's paragraph about the writable-path refusal gains one sentence: the
+refusal matters more on Linux, because a systemd system unit is started by root, so a writable
+binary path is a route into the operator's account and not only persistence.
 
-- [ ] **Step 4: Update `docs/configuration.md`**
+- [ ] **Step 4: Confirm no other file names a removed verb**
 
-Run `grep -n 'listener start\|listener stop' docs/configuration.md` and change every hit to the
-new verb. At the time of writing this plan that grep reports no hits, so confirm the result rather
-than assume it; if it reports none, make no change to this file.
+Run:
+
+```bash
+grep -rn -e 'listener start' -e 'listener stop' -e '--daemon' -e 'launchd' \
+  README.md docs/configuration.md examples/ scripts/ .github/
+```
+
+Expected: hits only in `README.md`, and only ones where `launchd` is correct as the macOS case.
+`docs/configuration.md`, `examples/`, `scripts/`, and `.github/` were verified to have zero hits
+when this plan was written; confirm rather than assume.
 
 - [ ] **Step 5: Run the full gate and commit**
 
@@ -2094,16 +2811,42 @@ Run: `make check`
 Expected: PASS.
 
 ```bash
-git add Makefile README.md docs/configuration.md
+git add Makefile
+git commit -m "build: vet the linux and stub service backends"
+git add README.md
 git commit -m "docs: document the listener verbs and the systemd service"
 ```
 
-**Acceptance criteria:** `make check` passes. `grep -rn 'listener start\|listener stop\|--daemon'
-README.md docs/ --include='*.md'` reports hits only inside `docs/superpowers/`, which is a record
-of past work and is not rewritten.
+**Acceptance criteria:** `make check` passes, with four vet passes.
+`grep -rn -e 'listener start' -e 'listener stop' -e '--daemon' README.md docs/ --include='*.md'`
+reports hits only inside `docs/superpowers/`, which is a record of past work and is not rewritten.
+Every remaining `launchd` mention in `README.md` reads as the macOS case rather than as the only
+mechanism.
 
-**review: no** — documentation and one Makefile line, both verified by `make check` and by the
-grep above.
+**review: no** — documentation plus one Makefile hunk, both verified by `make check` and by the
+greps above.
+
+---
+
+## Deferred
+
+Recorded here rather than fixed, with where they belong:
+
+- **`--listen-addr` has no real validator.** `settings`'s `Set` for `webhook.listen_addr` is a
+  non-empty check plus a loopback warning, not an address parser. This plan does not add one: the
+  unit renderer refuses what would be dangerous, and `listener.New` fails on a bind it cannot
+  perform. A separate change should make that field parse as an address or a resolvable host,
+  which would improve `config set` and `listener run` too. Out of scope here.
+- **`config set webhook.listen_addr 0.0.0.0` only warns.** `listener install` makes that choice
+  boot-persistent, and the warning scrolls past above a sudo prompt. Worth a confirmation at
+  install time. Out of scope here; belongs with the validator change above.
+- **`NoNewPrivileges=yes` is not set on the unit.** It is compatible with what the listener does
+  and would block setuid escalation from a compromised listener, but it would also make a
+  dispatched agent's privileged step fail in a way that points at the unit rather than at itself.
+  Recorded in `systemdUnit`'s doc comment. Revisit with evidence about what agents actually run.
+- **`cmd/agent-utils` tests can now fake the `Manager`, but `internal/service`'s own command seam
+  stays unexported.** That is correct — `runCommand` is an implementation detail — and the
+  `fakeService` helper closes the gap the cmd layer had.
 
 ---
 
