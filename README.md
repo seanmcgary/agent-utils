@@ -703,6 +703,10 @@ agent-utils project register-webhook
 agent-utils listener install
 ```
 
+On Linux, that last command asks for your `sudo` password and registers a root-owned unit that
+starts at boot; see the [Linux walkthrough](#recovering-from-a-crash) below for what it does and
+why it needs root.
+
 `agent-utils listener run` speaks plain HTTP and never terminates TLS itself — it expects
 nginx, cloudflared, or ngrok in front of it to do that. `webhook.url` is therefore the proxy's
 public URL, not the listener's own bind address, and it must be `https`: over plain HTTP both
@@ -905,8 +909,12 @@ The listener logs to the journal:
 ```bash
 journalctl -u agent-utils-listener -f     # follow it
 systemctl status agent-utils-listener     # is it running
-agent-utils listener uninstall            # stop it and remove the unit
+agent-utils listener uninstall            # stop it and remove the unit -- this also sudo-prompts
 ```
+
+`journalctl` needs no root of its own, but it does need your account in the `systemd-journal` or
+`adm` group; if it is in neither, that command silently prints nothing rather than failing loudly,
+so use `sudo journalctl -u agent-utils-listener -f` instead.
 
 One thing to know about the journal: it is the SYSTEM journal, readable by every member of the
 `systemd-journal` and `adm` groups. The launchd agent on macOS writes to
@@ -1053,6 +1061,21 @@ and never ran `project init` or `project loop new` in that directory, commands t
 the project now fail — run `agent-utils project init --no-loop` there once to mint the missing
 descriptor without touching the loop files already in `configs/`, and everything that pointed at
 the directory before resumes working.
+
+**`listener start` and `listener stop` are gone.** Running the listener in the foreground is now
+`listener run`. Registering it as a boot-time service is `listener install`; removing that
+registration is `listener uninstall`. Stopping a service that is already registered, without
+removing it, is your platform's own tool (`systemctl stop agent-utils-listener` on Linux,
+`launchctl bootout` on macOS) — this program itself only installs and uninstalls, it does not
+pause a registration in place.
+
+**An agent already installed by the old `listener start --daemon` keeps working**, with nothing
+to hand-edit or hand-remove. The launchd label is unchanged
+(`com.seanmcgary.agent-utils.listener`, see `Label` in `internal/service/service.go`), so the new
+`listener status` reports on that same agent and `listener uninstall` removes it exactly as if
+you had installed it with the new command. Re-running `listener install` on macOS overwrites
+that same registration in place — same label, same plist path — so it is the supported way to
+move an old install onto the new form, not a second, competing one.
 
 ## Versioning and releases
 
