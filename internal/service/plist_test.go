@@ -74,7 +74,7 @@ func TestRenderPlistBasics(t *testing.T) {
 		t.Errorf("rendered plist missing label %q:\n%s", Label, text)
 	}
 	if got := p.ProgramArguments; got[len(got)-2] != "listener" || got[len(got)-1] != "start" {
-		t.Fatalf("test fixture bug: args do not end with listener/start: %v", got)
+		t.Fatalf("test fixture bug: args do not end with listener start: %v", got)
 	}
 	if !strings.Contains(text, "<key>ProgramArguments</key>") {
 		t.Errorf("rendered plist missing ProgramArguments key:\n%s", text)

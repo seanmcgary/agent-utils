@@ -75,6 +75,28 @@ func listenerCommand() *cli.Command {
 			listenerUninstallCommand(),
 			listenerStatusCommand(),
 		},
+		// CommandNotFound replaces urfave/cli's default "No help topic for
+		// '<verb>'" for exactly the two verbs an operator upgrading from an
+		// older agent-utils is most likely to type: `start` and `stop`, both
+		// removed by this rewrite. Losing two published verbs is a breaking
+		// change, and the moment an operator types the one that is gone is
+		// the one moment a pointer to its replacement is worth something.
+		//
+		// It still exits non-zero, via cli.OsExiter rather than os.Exit: this
+		// only fires for a genuinely unknown subcommand, so reporting success
+		// would be wrong regardless of how helpful the message is, and
+		// TestListenerRejectsTheRemovedVerbs's runListenerCLINoExit helper
+		// substitutes cli.OsExiter specifically so it can observe that code
+		// without the library's default path killing the test binary; see
+		// that helper's own comment.
+		CommandNotFound: func(_ context.Context, _ *cli.Command, name string) {
+			fmt.Printf("agent-utils listener %s: no such command\n\n"+
+				"`start` and `stop` were removed. `start` is now `run` (foreground) or\n"+
+				"`install` (as a service); `stop` is now `uninstall`, Ctrl-C for a\n"+
+				"foreground run, or your platform's own service tool (systemctl/launchctl).\n",
+				name)
+			cli.OsExiter(1)
+		},
 	}
 }
 
@@ -135,9 +157,9 @@ func listenerPreflight(c *cli.Command) (*settings.Settings, []string, error) {
 	}
 
 	// Checked up front, once, before opening the database or binding a
-	// socket: without this, starting a listener against a 0644 (or missing)
-	// env file comes up looking healthy and then fails every single tick,
-	// since Worker reads the token fresh on every delivery (see
+	// socket: without this a listener started against a 0644 (or missing) env
+	// file comes up looking healthy and then fails every single tick, since
+	// Worker reads the token fresh on every delivery (see
 	// internal/listener/env.go's Token).
 	if err := ensureToken(os.Stdin, os.Stderr, isInteractive()); err != nil {
 		return nil, nil, err
@@ -217,8 +239,8 @@ func listenerUninstallCommand() *cli.Command {
 	}
 }
 
-// ensureToken proves the GitHub token is readable before starting the
-// listener, and offers to write the env file when it is simply not there yet.
+// ensureToken proves the GitHub token is readable before the listener starts,
+// and offers to write the env file when it is simply not there yet.
 //
 // The prompt is offered for an ABSENT file only. A wrong mode, a symlink, or
 // a file owned by somebody else all still fail with the error Token
@@ -228,9 +250,9 @@ func listenerUninstallCommand() *cli.Command {
 //
 // interactive is a parameter rather than an isInteractive() call inside, so
 // this is testable without a pty. It must be false whenever stdin is not a
-// terminal: under launchd or cron stdin is /dev/null, and a prompt there
-// would hang the service forever on a question nobody will ever see -- the
-// same rule resolveLoopConfig documents.
+// terminal: under systemd, launchd, or cron stdin is /dev/null, and a prompt
+// there would hang the service forever on a question nobody will ever see --
+// the same rule resolveLoopConfig documents.
 func ensureToken(in io.Reader, out io.Writer, interactive bool) error {
 	_, err := listener.Token()
 	if err == nil {
@@ -390,7 +412,8 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 			"a listener is already running (its lock is held); " +
 				"run `agent-utils listener status` to check, stop a foreground one with Ctrl-C " +
 				"in its own terminal, or stop an installed one with " +
-				"`systemctl stop agent-utils-listener` (linux) or " +
+				"`sudo systemctl stop agent-utils-listener` (linux; the unit is a system unit " +
+				"under /etc/systemd/system) or " +
 				"`launchctl bootout gui/$(id -u)/com.seanmcgary.agent-utils.listener` (macOS)")
 	}
 	if err != nil {
@@ -492,12 +515,12 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 		return err
 	}
 
-	// Write the pidfile before Serve starts, not after: `status` and `stop`
-	// must be able to find this process from the moment it starts
-	// listening, and there is no point at which this process is "half
-	// running" that they should observe instead. Safe to do unconditionally
-	// here: the lock acquired above already proves no other listener could
-	// be holding this pidfile's identity.
+	// Write the pidfile before Serve starts, not after: `status` must be
+	// able to find this process from the moment it starts listening, and
+	// there is no point at which this process is "half running" that it
+	// should observe instead. Safe to do unconditionally here: the lock
+	// acquired above already proves no other listener could be holding this
+	// pidfile's identity.
 	if err := writePidfile(pidPath, os.Getpid(), addr, port); err != nil {
 		closeDB()
 		releaseLock()
@@ -529,20 +552,21 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 	// as the machine-readable record of the same event.
 	//
 	// Printed here, after ListenAndServe has been started and at the same
-	// moment the "started listener" line below is recorded, so a daemon that
-	// cannot bind still reports that failure as its outcome rather than this
-	// table becoming the last thing an operator reads.
+	// moment "listener started" is recorded, so a daemon that cannot bind
+	// still reports that failure as its outcome rather than this table
+	// becoming the last thing an operator reads.
 	printRoutingTable(out)
 	// tend_interval is in the banner line because it is the one thing about
 	// this daemon an operator cannot see from the routing table: whether the
 	// loops it just listed will have their stale pull requests noticed without
 	// a delivery. Zero means the periodic check is off.
-	slog.Info("started listener", "addr", addr, "port", port, "pid", os.Getpid(),
+	slog.Info("listener started", "addr", addr, "port", port, "pid", os.Getpid(),
 		"tend_interval", tendEvery)
 
-	// Whichever happens first -- an operator or launchd sending a signal, or
-	// the server exiting on its own (a bind failure surfacing late, or an
-	// unexpected internal error) -- both funnel into the same ordered
+	// Whichever happens first -- an operator or the platform's service
+	// manager (systemd or launchd) sending a signal, or the server exiting on
+	// its own (a bind failure surfacing late, or an unexpected internal
+	// error) -- both funnel into the same ordered
 	// shutdown below. serverStopped is a pure trigger; drainAndClose reads
 	// the actual result off serverDone itself, exactly once, regardless of
 	// which branch fired.
@@ -691,9 +715,10 @@ func routingTable(routes listener.Routes) string {
 //     The cost is bounded and self-correcting: the worst outcome is a park
 //     whose durable state was written but whose comment and label edit were
 //     not, and the next tick re-derives that from the issue's own labels. An
-//     unbounded shutdown is not similarly recoverable -- launchd SIGKILLs a
-//     daemon that takes too long, which is strictly worse than a cancelled
-//     GitHub call.
+//     unbounded shutdown is not similarly recoverable -- systemd SIGKILLs a
+//     service that outlives its TimeoutStopSec, and launchd does the
+//     equivalent for a daemon that takes too long, either of which is
+//     strictly worse than a cancelled GitHub call.
 //
 //  4. Only now close the database. A tickOne in flight when the database
 //     closes underneath it leaves the dispatches row it started stuck in
@@ -708,9 +733,9 @@ func routingTable(routes listener.Routes) string {
 //
 //  6. Release the lock last of all. Everything this process owns --
 //     socket, timers, in-flight ticks, database handle, pidfile -- is
-//     already gone by the time `stop`/`status` could observe the lock as
-//     free, so there is no window where the lock says "not running" while
-//     any of that is still true.
+//     already gone by the time `status` could observe the lock as free, so
+//     there is no window where the lock says "not running" while any of
+//     that is still true.
 func drainAndClose(
 	cancelShuttingDown, cancelServer, cancelWorker context.CancelFunc,
 	serverDone <-chan error, workerDone <-chan struct{},
@@ -906,10 +931,12 @@ type pidfileContent struct {
 
 // writePidfile records this process's identity and bound address.
 //
-// Mode 0600, not because this file holds a secret, but because it is a
-// trust anchor `stop` signals blindly: any other local account able to
-// overwrite it could redirect a later SIGTERM at a process of their
-// choosing.
+// Mode 0600, not because this file holds a secret, but because `status`
+// reads it back and reports its contents as fact: which pid is running and
+// what address it bound. A file another local account could overwrite is a
+// file that can lie to the operator about what is actually running, and
+// `status` has no independent way to catch that lie -- see listenerLive for
+// the one check it does make (the lock, not this file) before trusting it.
 func writePidfile(path string, pid int, addr string, port int) error {
 	body, err := json.Marshal(pidfileContent{PID: pid, Addr: addr, Port: port})
 	if err != nil {

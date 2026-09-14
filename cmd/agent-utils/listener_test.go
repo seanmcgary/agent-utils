@@ -190,6 +190,11 @@ func TestListenerRejectsTheRemovedVerbs(t *testing.T) {
 			if code == 0 {
 				t.Fatalf("listener %s exited 0; it should be an unknown command\n%s", verb, out)
 			}
+			// The CommandNotFound handler must point the operator at the
+			// verbs that replaced this one, not just report failure.
+			if !strings.Contains(out, "run") || !strings.Contains(out, "install") {
+				t.Errorf("listener %s output = %q, want it to name `run` and `install`", verb, out)
+			}
 		})
 	}
 }
@@ -483,11 +488,8 @@ func TestListenerInstallRegistersListenerRunNeverInstall(t *testing.T) {
 	if strings.Join(fake.installArgs, " ") != strings.Join(want, " ") {
 		t.Errorf("installed args = %v, want %v", fake.installArgs, want)
 	}
-	// removedDaemonFlag is split rather than a literal so this line does not
-	// itself match the repo-wide grep for the BoolFlag task 4 deleted.
-	removedDaemonFlag := "--" + "daemon"
 	for _, a := range fake.installArgs {
-		if a == "install" || a == removedDaemonFlag {
+		if a == "install" || a == "--daemon" {
 			t.Errorf("installed args name a service-management verb: %v", fake.installArgs)
 		}
 	}

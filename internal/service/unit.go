@@ -183,7 +183,7 @@ func renderUnit(u systemdUnit) ([]byte, error) {
 
 	b.WriteString("[Install]\n")
 	// multi-user.target is the system-unit equivalent of launchd's
-	// RunAtLoad: the listener comes up at boot, with no login and no
+	// RunAtLoad: the listener starts at boot, with no login and no
 	// `loginctl enable-linger`.
 	b.WriteString("WantedBy=multi-user.target\n")
 
