@@ -856,6 +856,10 @@ after you have unset the webhook configuration. Three cases are worth knowing:
 
 ### Recovering from a crash
 
+Upgrading from an older release that used `listener start --daemon`? Run `agent-utils listener
+install` once after upgrading the binary — see [Upgrading](#upgrading) for why the old
+registration stops working silently if you don't.
+
 An agent that dies without recording an outcome — the machine going down, an OOM kill, a
 `kill -9` — leaves its dispatch row marked `running` with no process behind it. **The listener
 finds these and queues each one's retry**: once when it starts, and every five minutes after.
@@ -1071,14 +1075,18 @@ removing it, is your platform's own tool (`systemctl stop agent-utils-listener` 
 `launchctl bootout` on macOS) — this program itself only installs and uninstalls, it does not
 pause a registration in place.
 
-**An agent already installed by the old `listener start --daemon` keeps working**, with nothing
-to hand-edit or hand-remove. The launchd label is unchanged
-(`com.seanmcgary.agent-utils.listener`, see `Label` in `internal/service/service.go`), so the new
-`listener status` reports on that same agent and `listener uninstall` removes it exactly as if
-you had installed it with the new command. Re-running `listener install` on macOS replaces that
-same registration — same label, same plist path, booting the old one out before bootstrapping
-the new plist in — so it is the supported way to move an old install onto the new form, not a
-second, competing one.
+**An agent already installed by the old `listener start --daemon` stops working the moment you
+upgrade the binary — run `agent-utils listener install` once, right after upgrading.** Its
+plist names `listener start`, which this branch removes, so upgrading the binary in place turns
+that plist into an exit-1 loop: launchd's `KeepAlive` respawns it roughly every ten seconds,
+forever, and no delivery is handled. The only symptom is a growing
+`~/.agent-utils/listener.stderr.log` — nothing crashes loudly. Nothing needs hand-editing or
+hand-removing to fix it: the launchd label is unchanged
+(`com.seanmcgary.agent-utils.listener`, see `Label` in `internal/service/service.go`), so
+`listener install` finds that same agent, boots it out, and bootstraps the new plist at the same
+path — the supported way to move an old install onto the new form, not a second, competing one.
+`listener status` and `listener uninstall` also operate on that same registration in the
+meantime, so either still finds the old agent if you check before running `install`.
 
 ## Versioning and releases
 
