@@ -15,18 +15,6 @@ import (
 // its non-nilness does.
 var errStub = errors.New("stub launchctl failure")
 
-// stubExecutable points executablePath at path for the duration of the
-// test, restoring the real os.Executable afterward. Tests must never let
-// Install resolve the actual `go test` binary: its location and
-// permissions are outside the test's control, and this file exists
-// specifically to make those inputs deterministic.
-func stubExecutable(t *testing.T, path string) {
-	t.Helper()
-	prev := executablePath
-	executablePath = func() (string, error) { return path, nil }
-	t.Cleanup(func() { executablePath = prev })
-}
-
 // stubLaunchctl replaces the launchctl variable so Install/Uninstall/Status
 // never shell out to the real binary. No test in this package may run
 // launchctl: bootstrap would register a plist in the developer's actual
