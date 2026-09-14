@@ -899,10 +899,12 @@ the unit sets `User=`, `Group=`, `HOME=`, and a `WorkingDirectory` of your own `
 so the service reads the same env file, the same state database, and the same project registry
 your own commands read.
 
-Writing into `/etc` needs root, so `listener install` runs four steps through `sudo` and lets sudo
-prompt you. Run the command as YOURSELF, not as root. As root every directory it resolves would be
-root's, and it would install a service that runs as root — so it refuses outright rather than do
-that.
+Writing into `/etc` needs root, so `listener install` runs five steps through `sudo` and lets sudo
+prompt you: writing the unit, `chmod`, `daemon-reload`, `enable`, and `restart` — the last of
+these is what makes re-running `install` over an already-running listener pick up a changed
+argument (a different `--listen-port`, say) immediately rather than only at the next reboot. Run
+the command as YOURSELF, not as root. As root every directory it resolves would be root's, and it
+would install a service that runs as root — so it refuses outright rather than do that.
 
 The listener logs to the journal:
 
