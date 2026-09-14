@@ -30,9 +30,9 @@ var errStubLinux = errors.New("stub command failure")
 
 // stubRunCommand replaces the runCommand variable so no test in this package
 // ever runs a real systemctl, tee, chmod, rm, or sudo. This is not a
-// convenience: `systemctl enable --now` would register the listener on the
-// developer's own machine, `sudo` would block the suite on a password
-// prompt, and `tee` would write a file.
+// convenience: `systemctl enable`/`restart` would register and start the
+// listener on the developer's own machine, `sudo` would block the suite on
+// a password prompt, and `tee` would write a file.
 func stubRunCommand(t *testing.T, fn func(stdin []byte, name string, args ...string) ([]byte, error)) *[]call {
 	t.Helper()
 	var calls []call
@@ -124,7 +124,7 @@ func TestInstallUsesSudoAndTheDefaultUnitPath(t *testing.T) {
 	}
 }
 
-func TestInstallTeesThenChmodsThenReloadsThenEnables(t *testing.T) {
+func TestInstallTeesThenChmodsThenReloadsThenEnablesThenRestarts(t *testing.T) {
 	unitDir := isolate(t)
 	self := privateSelf(t)
 	stubExecutable(t, self)
@@ -140,7 +140,8 @@ func TestInstallTeesThenChmodsThenReloadsThenEnables(t *testing.T) {
 		"tee " + unitPath,
 		"chmod 0644 " + unitPath,
 		"systemctl daemon-reload",
-		"systemctl enable --now " + UnitName,
+		"systemctl enable " + UnitName,
+		"systemctl restart " + UnitName,
 	}
 	if len(*calls) != len(want) {
 		t.Fatalf("Install ran %d commands, want %d: %+v", len(*calls), len(want), *calls)
@@ -149,6 +150,28 @@ func TestInstallTeesThenChmodsThenReloadsThenEnables(t *testing.T) {
 		if got := (*calls)[i].line(); got != w {
 			t.Errorf("command %d = %q, want %q", i, got, w)
 		}
+	}
+}
+
+// TestInstallEndsWithRestartNotEnableNow pins the fix for a real defect:
+// `systemctl enable --now` on an already-active unit only starts it, and
+// start on an active unit is a no-op that leaves the OLD process running
+// under the OLD ExecStart. This test fails loudly if a future change
+// reverts the last command back to `enable --now`.
+func TestInstallEndsWithRestartNotEnableNow(t *testing.T) {
+	isolate(t)
+	self := privateSelf(t)
+	stubExecutable(t, self)
+	stubGeteuid(t, 1000)
+	calls := stubRunCommand(t, nil)
+
+	if err := New().Install(self, []string{"listener", "run"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	last := (*calls)[len(*calls)-1]
+	if want := "systemctl restart " + UnitName; last.line() != want {
+		t.Fatalf("last command = %q, want %q", last.line(), want)
 	}
 }
 

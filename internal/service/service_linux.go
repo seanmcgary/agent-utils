@@ -43,7 +43,7 @@ var geteuid = os.Geteuid
 // runCommand runs a command with stdin and returns its combined output. It
 // is a variable, not a direct exec.Command call at each use site, for the
 // same reason service_darwin.go's launchctl is: without it, this package's
-// tests would run `systemctl enable --now` against the developer's own
+// tests would run `systemctl enable`/`restart` against the developer's own
 // machine and would block on a real sudo password prompt.
 //
 // The command name is resolved through PATH, as launchctl's is. That is a
@@ -145,9 +145,9 @@ func (m linuxManager) Install(binary string, args []string) error {
 	// most ordinary operator mistake in this whole command.
 	//
 	// There is no case in which running the whole program as root is
-	// correct: it calls sudo itself for exactly the four steps that need
-	// it (tee, chmod, daemon-reload, enable --now), and every directory it
-	// resolves must be the operator's.
+	// correct: it calls sudo itself for exactly the five steps that need
+	// it (tee, chmod, daemon-reload, enable, restart), and every directory
+	// it resolves must be the operator's.
 	if geteuid() == 0 {
 		return errors.New(
 			"run `agent-utils listener install` as yourself, not as root: " +
@@ -258,10 +258,30 @@ func (m linuxManager) Install(binary string, args []string) error {
 	if out, err := privileged(nil, "systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	// enable --now does both halves: enable writes the multi-user.target
-	// link that starts it at boot, --now starts it in this boot as well.
-	if out, err := privileged(nil, "systemctl", "enable", "--now", UnitName); err != nil {
-		return fmt.Errorf("systemctl enable --now %s: %w: %s", UnitName, err, strings.TrimSpace(string(out)))
+	// enable writes the multi-user.target link that starts the unit at boot.
+	// It does not start anything in THIS boot -- that is restart's job,
+	// below.
+	if out, err := privileged(nil, "systemctl", "enable", UnitName); err != nil {
+		return fmt.Errorf("systemctl enable %s: %w: %s", UnitName, err, strings.TrimSpace(string(out)))
+	}
+	// restart, not `enable --now`. `--now` only STARTS the unit, and start
+	// on an already-active unit is a no-op -- it does not reload the unit's
+	// ExecStart, so a reinstall over a running listener (a changed
+	// --listen-port, or a rebuilt binary) would tee the new unit to disk,
+	// daemon-reload would pick up its text, and then `--now` would see the
+	// unit already active and do nothing. Install would exit 0 while the
+	// OLD process, with the OLD arguments, kept running until the next
+	// reboot -- success reported, wrong outcome delivered. `restart` starts
+	// an inactive unit exactly as `start` would, and bounces an active one,
+	// so it is correct on both a first install and a reinstall: the running
+	// process is made to match the unit just written. This is the same
+	// problem service_darwin.go's Install solves by running `bootout`
+	// before `bootstrap` -- there, `bootstrap` on an already-loaded label
+	// fails outright rather than silently no-op'ing, but the fix is the
+	// same shape: stop treating "already registered" as "nothing to do."
+	// See that file's Install for the darwin half of this pair.
+	if out, err := privileged(nil, "systemctl", "restart", UnitName); err != nil {
+		return fmt.Errorf("systemctl restart %s: %w: %s", UnitName, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
