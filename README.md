@@ -561,6 +561,12 @@ wait for the next cron tick before an agent read it, and now it does not. It doe
 the trust rule above — point a loop, webhook-driven or not, only at a repository whose issue
 and pull request population you trust.
 
+`listener install` widens the privilege boundary further still: on Linux it calls `sudo` and
+registers a root-owned, boot-persistent systemd unit, and on both platforms it refuses to
+install against a binary path another local account could replace. See
+[Recovering from a crash](#recovering-from-a-crash) for what those privileged steps are and why
+each one needs root.
+
 ## Cron
 
 Cron is optional. `loop tick` is what any driver runs — a cron entry, or the webhook listener
