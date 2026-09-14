@@ -56,7 +56,7 @@ func mustReparse(t *testing.T, doc []byte) {
 func TestRenderPlistBasics(t *testing.T) {
 	p := launchdPlist{
 		Label:             Label,
-		ProgramArguments:  []string{"/opt/agent-utils/bin/agent-utils", "--listen-addr", "127.0.0.1", "--listen-port", "8787", "listener", "start"},
+		ProgramArguments:  []string{"/opt/agent-utils/bin/agent-utils", "--listen-addr", "127.0.0.1", "--listen-port", "8787", "listener", "run"},
 		RunAtLoad:         true,
 		KeepAlive:         true,
 		StandardOutPath:   "/Users/me/.agent-utils/listener.stdout.log",
@@ -73,17 +73,17 @@ func TestRenderPlistBasics(t *testing.T) {
 	if !strings.Contains(text, "<string>"+Label+"</string>") {
 		t.Errorf("rendered plist missing label %q:\n%s", Label, text)
 	}
-	if got := p.ProgramArguments; got[len(got)-2] != "listener" || got[len(got)-1] != "start" {
-		t.Fatalf("test fixture bug: args do not end with listener start: %v", got)
+	if got := p.ProgramArguments; got[len(got)-2] != "listener" || got[len(got)-1] != "run" {
+		t.Fatalf("test fixture bug: args do not end with listener run: %v", got)
 	}
 	if !strings.Contains(text, "<key>ProgramArguments</key>") {
 		t.Errorf("rendered plist missing ProgramArguments key:\n%s", text)
 	}
 	// The two arguments launchd must invoke last, rendered in order,
 	// immediately preceding the array's close tag.
-	last := "<string>listener</string>\n\t\t<string>start</string>\n\t</array>"
+	last := "<string>listener</string>\n\t\t<string>run</string>\n\t</array>"
 	if !strings.Contains(normalizeIndent(text), normalizeIndent(last)) {
-		t.Errorf("ProgramArguments does not end with listener/start:\n%s", text)
+		t.Errorf("ProgramArguments does not end with listener/run:\n%s", text)
 	}
 	// encoding/xml renders back-to-back start/end tokens with nothing
 	// between them as an explicit empty element ("<true></true>"), not the
@@ -113,7 +113,7 @@ func TestRenderPlistBasics(t *testing.T) {
 }
 
 // normalizeIndent collapses runs of tabs/spaces so the "ends with listener
-// start" assertion above does not depend on the encoder's exact indent
+// run" assertion above does not depend on the encoder's exact indent
 // width.
 func normalizeIndent(s string) string {
 	return strings.Join(strings.Fields(s), " ")
@@ -130,7 +130,7 @@ func TestRenderPlistEscapesInjectionAttempt(t *testing.T) {
 	injection := `</string></array><key>EnvironmentVariables</key><dict><key>GITHUB_TOKEN</key><string>x</string></dict><key>ProgramArguments</key><array><string>`
 	p := launchdPlist{
 		Label:             Label,
-		ProgramArguments:  []string{"/opt/agent-utils/bin/agent-utils", "--listen-addr", malicious, "--listen-addr", injection, "listener", "start"},
+		ProgramArguments:  []string{"/opt/agent-utils/bin/agent-utils", "--listen-addr", malicious, "--listen-addr", injection, "listener", "run"},
 		RunAtLoad:         true,
 		KeepAlive:         true,
 		StandardOutPath:   "/Users/me/.agent-utils/listener.stdout.log",
