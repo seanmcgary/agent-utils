@@ -2854,12 +2854,12 @@ Recorded here rather than fixed, with where they belong:
 
 | Field     | Value                                                                 |
 |-----------|-----------------------------------------------------------------------|
-| stage     | 2 (plan review)                                                       |
+| stage     | 3 (implementation)                                                    |
 | class     | large (installs a root-owned unit, calls sudo, removes two commands)  |
 | profile   | backend                                                               |
 | branch    | feat/systemd-listener-service                                         |
 | pr        | #31                                                                   |
-| gate      | pending                                                               |
+| gate      | approved 2026-09-13                                                   |
 | round     | 0                                                                     |
 | decisions | 0                                                                     |
 
