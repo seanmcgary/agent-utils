@@ -53,10 +53,20 @@ type systemdUnit struct {
 // deliberate. A refusal is auditable; an escape scheme invented here for a
 // format that does not have one would be wrong.
 //
-// The double quote is the single exception. It is escaped rather than
-// refused, because it is the delimiter of the quoting this renderer itself
-// applies, and its escape inside a systemd double-quoted value is
-// unambiguous.
+// The double quote is the single exception, and only in the two kinds of
+// field this renderer itself quotes: ExecStart arguments and Environment
+// values. There it is escaped rather than refused, because it is the
+// delimiter of the quoting this renderer applies, and its escape inside a
+// systemd double-quoted value is unambiguous.
+//
+// In the fields written raw -- User, Group, WorkingDirectory and
+// Description -- a double quote is neither escaped nor refused; it passes
+// through unchanged. That is not an injection, because systemd's quoting
+// is scoped to the single line it appears on, and the newline that would
+// let a caller reach a second line is already refused above. The worst a
+// stray quote can do in a raw field is leave that one directive malformed,
+// which systemd rejects wholesale when it loads the unit, rather than
+// parsing part of it as something else.
 //
 // Do NOT add a sentence here claiming the caller has already validated these
 // values. `webhook.listen_addr`'s validator is a non-empty check and a
@@ -66,6 +76,38 @@ type systemdUnit struct {
 func renderUnit(u systemdUnit) ([]byte, error) {
 	if len(u.ExecStart) == 0 {
 		return nil, fmt.Errorf("render unit: ExecStart is empty")
+	}
+
+	// User, Group and WorkingDirectory must be non-empty, for a reason a
+	// unit-file reader will not already know: systemd does not treat a bare
+	// "User=" line -- the key with nothing after the "=" -- as "no user
+	// configured". It reads that line as an explicit instruction to RESET
+	// User to its built-in default. The built-in default for a system unit's
+	// User is root. So a caller that leaves User zero-valued -- a config
+	// struct field nobody set, a template whose substitution silently
+	// failed -- does not get a unit that fails closed. It gets a unit that
+	// starts the listener as root, with nothing in the rendered file that
+	// looks like a mistake: "User=" is valid systemd syntax, not an error.
+	// The same reset-to-default semantics apply to Group and to
+	// WorkingDirectory, whose defaults are no safer to fall into by
+	// accident. ExecStart already gets this treatment above, for the
+	// structural reason that an empty command cannot start anything.
+	// Description is deliberately excluded: it is cosmetic text that grants
+	// no privilege, and systemd tolerates it empty without falling back to
+	// anything.
+	for _, f := range []struct {
+		name  string
+		value string
+	}{
+		{"User", u.User},
+		{"Group", u.Group},
+		{"WorkingDirectory", u.WorkingDirectory},
+	} {
+		if f.value == "" {
+			return nil, fmt.Errorf(
+				"render unit: %s is empty, which systemd reads as a reset to its "+
+					"default rather than as unset", f.name)
+		}
 	}
 
 	// Every caller-supplied string, checked before a single byte is written.

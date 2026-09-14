@@ -222,3 +222,53 @@ func TestRenderUnitRefusesAnEmptyExecStart(t *testing.T) {
 		t.Fatal("renderUnit accepted an empty ExecStart")
 	}
 }
+
+// TestRenderUnitRefusesAnEmptyRequiredField covers the field systemd itself
+// treats specially: a bare "Key=" line is not "unset" to systemd, it is an
+// explicit reset to that key's built-in default. For User and Group that
+// default is root, so an empty string here does not fail closed -- it
+// silently installs a unit that runs the listener as root. Each subtest also
+// requires renderUnit to return a nil document alongside its error, matching
+// every other refusal in this file.
+func TestRenderUnitRefusesAnEmptyRequiredField(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(u *systemdUnit)
+	}{
+		{"User", func(u *systemdUnit) { u.User = "" }},
+		{"Group", func(u *systemdUnit) { u.Group = "" }},
+		{"WorkingDirectory", func(u *systemdUnit) { u.WorkingDirectory = "" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := sampleUnit()
+			tc.mut(&u)
+			doc, err := renderUnit(u)
+			if err == nil {
+				t.Fatalf("renderUnit accepted an empty %s and produced:\n%s", tc.name, doc)
+			}
+			if doc != nil {
+				t.Errorf("renderUnit returned a document alongside its error: %s", doc)
+			}
+			if !strings.Contains(err.Error(), tc.name) {
+				t.Errorf("refusal %q does not name the offending field", err)
+			}
+		})
+	}
+}
+
+// TestRenderUnitAcceptsAnEmptyDescription pins the asymmetry with
+// TestRenderUnitRefusesAnEmptyRequiredField: Description has no systemd
+// default that grants anything, so an empty one is cosmetic, not a privilege
+// escalation, and renderUnit accepts it deliberately rather than by omission.
+func TestRenderUnitAcceptsAnEmptyDescription(t *testing.T) {
+	u := sampleUnit()
+	u.Description = ""
+	doc, err := renderUnit(u)
+	if err != nil {
+		t.Fatalf("renderUnit rejected an empty Description: %v", err)
+	}
+	if !strings.Contains(string(doc), "Description=\n") {
+		t.Errorf("unit does not contain an empty Description directive:\n%s", doc)
+	}
+}
