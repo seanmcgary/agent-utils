@@ -101,20 +101,18 @@ func runListenerCLINoExit(t *testing.T, args ...string) (stdout string, exitCode
 	return out, exitCode
 }
 
-// runListenerCLI runs the listener command tree against args and returns
-// what it printed to stdout and stderr combined, mirroring
-// project_init_test.go's TestProjectInitCLIPositionalNameNotFlag: a bare
-// root built from just listenerCommand() so a test cannot accidentally
-// exercise `project` or `config` and touch state this test does not
-// control.
+// runListenerCLISplit runs the listener command tree against args and
+// returns what it printed to stdout and stderr as two separate strings,
+// mirroring project_init_test.go's TestProjectInitCLIPositionalNameNotFlag:
+// a bare root built from just listenerCommand() so a test cannot
+// accidentally exercise `project` or `config` and touch state this test
+// does not control.
 //
-// Both streams are captured (and concatenated into the single returned
-// string) because CommandNotFound's guidance goes to os.Stderr -- matching
-// this repo's convention of stderr for an error report -- while every valid
-// command's own output still lands on stdout. Concatenating keeps every
-// existing strings.Contains assertion working regardless of which stream a
-// given command writes to.
-func runListenerCLI(t *testing.T, args ...string) (stdout string, err error) {
+// This is the primitive runListenerCLI concatenates. Use this form directly
+// whenever a test cares WHICH stream something landed on -- e.g.
+// TestListenerRemovedVerbGuidanceGoesToStderr, which is exactly the
+// distinction a concatenated capture cannot see.
+func runListenerCLISplit(t *testing.T, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	root := &cli.Command{
 		Name:     "agent-utils",
@@ -138,14 +136,30 @@ func runListenerCLI(t *testing.T, args ...string) (stdout string, err error) {
 	outW.Close()
 	errW.Close()
 
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, outR); err != nil {
+	var outBuf, errBuf bytes.Buffer
+	if _, err := io.Copy(&outBuf, outR); err != nil {
 		t.Fatalf("read captured stdout: %v", err)
 	}
-	if _, err := io.Copy(&buf, errR); err != nil {
+	if _, err := io.Copy(&errBuf, errR); err != nil {
 		t.Fatalf("read captured stderr: %v", err)
 	}
-	return buf.String(), runErr
+	return outBuf.String(), errBuf.String(), runErr
+}
+
+// runListenerCLI runs the listener command tree against args and returns
+// what it printed to stdout and stderr combined.
+//
+// Both streams are captured (and concatenated into the single returned
+// string) because CommandNotFound's guidance goes to os.Stderr -- matching
+// this repo's convention of stderr for an error report -- while every valid
+// command's own output still lands on stdout. Concatenating keeps every
+// existing strings.Contains assertion working regardless of which stream a
+// given command writes to; TestListenerRemovedVerbGuidanceGoesToStderr uses
+// runListenerCLISplit directly where the distinction itself is the point.
+func runListenerCLI(t *testing.T, args ...string) (stdout string, err error) {
+	t.Helper()
+	out, errOut, runErr := runListenerCLISplit(t, args...)
+	return out + errOut, runErr
 }
 
 // helpCommands returns the subcommand names listed in the COMMANDS: block of
@@ -214,6 +228,42 @@ func TestListenerRejectsTheRemovedVerbs(t *testing.T) {
 				t.Errorf("listener %s output = %q, want it to name `run` and `install`", verb, out)
 			}
 		})
+	}
+}
+
+// TestListenerRemovedVerbGuidanceGoesToStderr proves WHICH stream carries
+// the removed-verb guidance, a distinction runListenerCLI's concatenated
+// capture cannot see. CommandNotFound's fmt.Fprintf(os.Stderr, ...) calls
+// (see listener.go) are this repo's error-report convention -- stdout stays
+// reserved for a command's own completed output -- and nothing before this
+// test pinned that placement: reverting either call site back to
+// fmt.Printf broke no existing test.
+func TestListenerRemovedVerbGuidanceGoesToStderr(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	prevExiter := cli.OsExiter
+	cli.OsExiter = func(int) {}
+	t.Cleanup(func() { cli.OsExiter = prevExiter })
+
+	stdout, stderr, _ := runListenerCLISplit(t, "listener", "start")
+	if stdout != "" {
+		t.Errorf("listener start wrote to stdout, want the guidance on stderr only: %q", stdout)
+	}
+	if !strings.Contains(stderr, "run") || !strings.Contains(stderr, "install") {
+		t.Errorf("listener start stderr = %q, want it to name `run` and `install`", stderr)
+	}
+
+	// A valid command's own output is the other half of the claim: it must
+	// still land on stdout, not get swept onto stderr by the same change.
+	stdout, stderr, err := runListenerCLISplit(t, "listener", "--help")
+	if err != nil {
+		t.Fatalf("listener --help: %v", err)
+	}
+	if stderr != "" {
+		t.Errorf("listener --help wrote to stderr, want nothing there: %q", stderr)
+	}
+	if !strings.Contains(stdout, "run") {
+		t.Errorf("listener --help stdout = %q, want it to list the run command", stdout)
 	}
 }
 
