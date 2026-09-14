@@ -150,6 +150,11 @@ vet:
 	# without this the darwin-only service code is built by the cross-compile
 	# `build` job but never vetted or linted.
 	GOOS=darwin $(GO) vet ./...
+	# internal/service/service_linux.go only compiles under GOOS=linux. CI is
+	# ubuntu-latest so it is vetted, linted and tested there natively; this
+	# line is what type-checks it for a developer running `make check` on
+	# macOS.
+	GOOS=linux $(GO) vet ./...
 	# internal/service/service_other.go is the !darwin && !linux stub Manager,
 	# and nothing else in this target selects it: the native `go vet` above is
 	# darwin on a dev machine and linux in CI, and the GOOS=darwin line above
