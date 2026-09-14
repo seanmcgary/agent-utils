@@ -121,12 +121,6 @@ type Manager interface {
 // installed.
 var executablePath = os.Executable
 
-// geteuid reports this process's effective user identifier. It is a
-// variable, not a direct os.Geteuid call, so a test can exercise the
-// linux backend's refusal to install as root without the suite having to
-// run as root.
-var geteuid = os.Geteuid
-
 // resolveSelf returns the absolute, symlink-resolved path to the running
 // binary and refuses one that a user other than its owner could overwrite.
 //

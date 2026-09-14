@@ -29,6 +29,17 @@ const unitDescription = "agent-utils webhook listener"
 // See renderUnit for why a delay is required rather than optional.
 const restartSeconds = 5
 
+// geteuid reports this process's effective user identifier. It is a
+// variable, not a direct os.Geteuid call, so a test can exercise Install's
+// refusal to run as root without the suite having to run as root.
+//
+// Declared here, not in service.go: only Install below calls it, and
+// golangci-lint's unused check flagged both this variable and its test
+// helper stubGeteuid as unused under GOOS=darwin, since darwin has no caller
+// for either. Living beside the one call site that exists makes `make check`
+// clean on a darwin development machine as well as in CI.
+var geteuid = os.Geteuid
+
 // runCommand runs a command with stdin and returns its combined output. It
 // is a variable, not a direct exec.Command call at each use site, for the
 // same reason service_darwin.go's launchctl is: without it, this package's
@@ -82,6 +93,25 @@ func privileged(stdin []byte, name string, args ...string) ([]byte, error) {
 		return runCommand(stdin, name, args...)
 	}
 	return runCommand(stdin, "sudo", append([]string{name}, args...)...)
+}
+
+// firstLineOnly returns just the first line of a command's (already
+// trimmed) output, for use in an error message.
+//
+// Every privileged() call site in Install and Uninstall except the tee one
+// embeds the command's whole trimmed output, because chmod, systemctl, and
+// rm each fail with one short line that already IS the diagnosis. tee is
+// different: runCommand uses exec.Cmd.CombinedOutput, and tee copies its
+// entire stdin to stdout regardless of whether the write to its destination
+// argument succeeds. So a permission failure on the placement -- the
+// riskiest command in this file, since it is the one that lands root-owned
+// content on disk -- produces output whose first line names the real
+// problem and whose remaining lines are the entire rendered unit file. Using
+// only the first line in that one error keeps the message pointing at the
+// failure instead of at the document tee was asked to write.
+func firstLineOnly(output []byte) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(string(output)), "\n")
+	return line
 }
 
 type linuxManager struct{}
@@ -215,7 +245,7 @@ func (m linuxManager) Install(binary string, args []string) error {
 	// exec.Command with an explicit argv, so `tee` receives the destination
 	// as one argument with no quoting, redirect, or word splitting anywhere.
 	if out, err := privileged(doc, "tee", path); err != nil {
-		return fmt.Errorf("write %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("write %s: %w: %s", path, err, firstLineOnly(out))
 	}
 	// tee creates the file with root's umask applied to 0666, so the mode is
 	// normalized rather than assumed. 0644 because systemd only reads it,

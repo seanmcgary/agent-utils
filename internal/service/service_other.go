@@ -6,7 +6,7 @@
 // mode, and this stub says so instead of pretending to support a service it
 // cannot register.
 //
-// Nothing compiles this file except the Makefile's `GOOS=windows go vet`
+// Nothing compiles this file except the Makefile's `GOOS=freebsd go vet`
 // line, and nothing runs its test. That is deliberate and is the honest
 // state: the release targets build linux and darwin only.
 package service

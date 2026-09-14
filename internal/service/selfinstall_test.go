@@ -68,16 +68,6 @@ func stubExecutable(t *testing.T, path string) {
 	t.Cleanup(func() { executablePath = prev })
 }
 
-// stubGeteuid makes the process look like it is running under the given
-// effective user identifier. Install refuses euid 0 outright, and that
-// refusal needs a test that does not require running the suite as root.
-func stubGeteuid(t *testing.T, uid int) {
-	t.Helper()
-	prev := geteuid
-	geteuid = func() int { return uid }
-	t.Cleanup(func() { geteuid = prev })
-}
-
 // TestRefuseIfWritableByOthersRejectsAWritableParent pins the check that
 // keeps a service definition from naming a binary another local account can
 // replace. It lives in a file with no build tag because both the launchd

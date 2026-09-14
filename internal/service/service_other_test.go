@@ -12,7 +12,7 @@ import (
 // return ErrUnsupported rather than silently doing nothing or panicking.
 //
 // Nothing in CI RUNS this test. CI is ubuntu-latest, and the Makefile's vet
-// target type-checks this file under GOOS=windows -- vet analyzes test files,
+// target type-checks this file under GOOS=freebsd -- vet analyzes test files,
 // so a compile error here fails `make check`, but no assertion below is ever
 // executed. That is the honest state of a stub for platforms this project
 // ships no binary for (see the Makefile's release targets: linux and darwin

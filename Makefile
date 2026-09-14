@@ -150,6 +150,17 @@ vet:
 	# without this the darwin-only service code is built by the cross-compile
 	# `build` job but never vetted or linted.
 	GOOS=darwin $(GO) vet ./...
+	# internal/service/service_other.go is the !darwin && !linux stub Manager,
+	# and nothing else in this target selects it: the native `go vet` above is
+	# darwin on a dev machine and linux in CI, and the GOOS=darwin line above
+	# selects service_darwin.go instead. freebsd, not windows, exercises it
+	# here because this repo is Unix-only and targets only linux and darwin
+	# for release: GOOS=windows go vet ./... fails across the repo (internal/lock,
+	# internal/proc, internal/registry, and internal/settings all use
+	# syscall.Flock, syscall.Kill, syscall.Stat_t, or syscall.O_NOFOLLOW, none
+	# of which exist on Windows), while freebsd satisfies the stub's build tag
+	# and vets the whole repo clean.
+	GOOS=freebsd $(GO) vet ./...
 
 .PHONY: fmt
 fmt:

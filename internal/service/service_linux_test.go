@@ -48,6 +48,22 @@ func stubRunCommand(t *testing.T, fn func(stdin []byte, name string, args ...str
 	return &calls
 }
 
+// stubGeteuid makes the process look like it is running under the given
+// effective user identifier. Install refuses euid 0 outright, and that
+// refusal needs a test that does not require running the suite as root.
+//
+// Declared here, not in selfinstall_test.go: only the tests in this file
+// call it, and golangci-lint's unused check flagged both this helper and the
+// geteuid variable it stubs as unused under GOOS=darwin, since darwin has no
+// caller for either. Living beside the tests that exist makes `make check`
+// clean on a darwin development machine as well as in CI.
+func stubGeteuid(t *testing.T, uid int) {
+	t.Helper()
+	prev := geteuid
+	geteuid = func() int { return uid }
+	t.Cleanup(func() { geteuid = prev })
+}
+
 // isolate points the unit directory and the agent-utils home directory at
 // scratch directories and returns the unit directory.
 //
@@ -414,12 +430,44 @@ func TestStatusReportsActiveUnitWithItsPID(t *testing.T) {
 	if !st.Installed || !st.Running || st.PID != 4242 {
 		t.Errorf("Status = %+v, want installed, running, pid 4242", st)
 	}
-	// Status must never prompt for a password: an operator asking a question
-	// should not be asked for their credentials to get an answer. Under the
-	// override privileged() would be unprivileged anyway, so assert the
-	// stronger property -- Status does not call privileged at all.
+	// This assertion alone does not prove Status avoids privileged(): isolate(t)
+	// sets SystemdUnitDirEnvVar, and under that override privileged() drops its
+	// sudo prefix and calls runCommand directly -- so the command name here
+	// would still be "systemctl" even if Status called privileged() instead of
+	// runCommand(). TestStatusNeverCallsPrivileged is what actually pins that,
+	// with the override unset.
 	if len(*calls) != 1 || (*calls)[0].name != "systemctl" {
 		t.Errorf("Status ran %+v, want a single unprivileged systemctl", *calls)
+	}
+}
+
+// TestStatusNeverCallsPrivileged pins the property TestStatusReportsActiveUnitWithItsPID
+// cannot: that test runs under isolate(t), which sets SystemdUnitDirEnvVar, and
+// privileged() is unprivileged under that override regardless of which seam Status
+// calls, so a Status that switched from runCommand to privileged would leave that
+// test green. This test leaves SystemdUnitDirEnvVar unset instead, so if Status
+// ever called privileged(), the first command here would run as "sudo" rather
+// than "systemctl".
+//
+// Status must never prompt for a password in the first place: an operator asking
+// a question should not be asked for their credentials to get an answer.
+//
+// The unit-file stat misses under the default /etc/systemd/system path, since
+// nothing seeded a unit there, so Status reports Installed: false. That is
+// expected and this test does not assert on it -- only the command name matters
+// here.
+func TestStatusNeverCallsPrivileged(t *testing.T) {
+	t.Setenv(SystemdUnitDirEnvVar, "")
+	t.Setenv(home.EnvVar, t.TempDir())
+	calls := stubRunCommand(t, func(stdin []byte, name string, args ...string) ([]byte, error) {
+		return []byte("ActiveState=inactive\nMainPID=0\n"), nil
+	})
+
+	if _, err := New().Status(); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if len(*calls) != 1 || (*calls)[0].name != "systemctl" {
+		t.Errorf("Status ran %+v, want a single systemctl call with no sudo prefix", *calls)
 	}
 }
 
