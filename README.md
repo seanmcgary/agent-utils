@@ -135,7 +135,8 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
 | `agent-utils version` | Version and commit |
 | `agent-utils config show [--reveal] \| get <key> \| set <key> <value> \| unset <key> \| webhook ...` | Read and write the machine-wide `~/.agent-utils/config.yaml`: the webhook daemon's URL, bind address and secret |
-| `agent-utils listener start [--daemon] [--listen-addr <a>] [--listen-port <p>] \| stop \| status` | Run the webhook listener in the foreground, or install/remove/inspect it as a launchd agent |
+| `agent-utils listener run [--listen-addr <a>] [--listen-port <p>]` | Run the webhook listener in this terminal until Ctrl-C |
+| `agent-utils listener install [--listen-addr <a>] [--listen-port <p>] \| uninstall \| status` | Register the listener as an OS service, remove that registration, or inspect it |
 
 ### Project
 
@@ -218,7 +219,7 @@ many rows were hidden. `--all` is on both `agent-utils project sessions list` an
 
 That hiding needs the listener: a close reaches this machine as a webhook delivery, and the
 daemon also asks GitHub once at startup which of the issues it still believes are open have
-closed since it last ran. On a machine that has never run `agent-utils listener start`, nothing
+closed since it last ran. On a machine that has never run `agent-utils listener run`, nothing
 is ever marked closed and the report is what it always was.
 
 `ORPHANED` marks a session whose dispatch is still recorded as running but whose process is
@@ -410,9 +411,10 @@ sessions. `state_dir` still holds each loop's tick lock and its log tree, under
 `<project>/.agent-utils/state/<loop>/` by default. Only the database moved. `~/.agent-utils`
 also holds `config.yaml` (the machine-wide settings `agent-utils config` edits — see
 [Webhooks](#webhooks)), `env` (the `GITHUB_TOKEN` file `agent-utils config token` writes, read by
-[Cron](#cron) and [Webhooks](#webhooks)), `listener.pid` and `listener.lock` (the
-liveness source `listener stop` and `listener status` trust), and the webhook listener's own
-logs.
+[Cron](#cron) and [Webhooks](#webhooks)), `listener.pid` and `listener.lock` (the lock is the
+liveness source `listener status` trusts, and `status` removes a pidfile whose lock is free,
+because that pidfile was left by a process that died without shutting down), and the webhook
+listener's own logs.
 
 `agent-utils project loop new` writes a loop file for you, by asking; **[`docs/configuration.md`](docs/configuration.md)
 remains the reference for editing one by hand** — what each field means, what reads it, and
@@ -698,10 +700,10 @@ agent-utils config token                 # uses $GITHUB_TOKEN or gh's token if t
                                          # prompts without echoing; writes ~/.agent-utils/env 0600
 agent-utils config webhook --enable --url https://hooks.example.com/webhook
 agent-utils project register-webhook
-agent-utils listener start --daemon
+agent-utils listener install
 ```
 
-`agent-utils listener start` speaks plain HTTP and never terminates TLS itself — it expects
+`agent-utils listener run` speaks plain HTTP and never terminates TLS itself — it expects
 nginx, cloudflared, or ngrok in front of it to do that. `webhook.url` is therefore the proxy's
 public URL, not the listener's own bind address, and it must be `https`: over plain HTTP both
 the delivery body and the `X-Hub-Signature-256` header that authorizes running an agent would
@@ -712,10 +714,10 @@ end-to-end test needs no certificate. The listener itself binds `127.0.0.1:8787`
 that — so the reverse proxy is also what makes it reachable from GitHub at all. Point the proxy
 at `POST /webhook`; it also serves `GET /healthz`, unauthenticated, for the proxy's own health
 check. Change the bind address or port with `agent-utils config set webhook.listen_addr` /
-`webhook.listen_port`, or override either for a single run with `listener start --listen-addr`
-/ `--listen-port` (the `--daemon` form writes its override into the launchd plist, not into
-`config.yaml` — `config show` still reports the configured value, not what the installed agent
-actually binds).
+`webhook.listen_port`, or override either for a single run with `listener run --listen-addr`
+/ `--listen-port` (`listener install` writes its override into the service definition (the
+launchd property list on macOS, the systemd unit on Linux), not into `config.yaml` — `config
+show` still reports the configured value, not what the installed agent actually binds).
 
 #### `tend_interval`
 
@@ -733,7 +735,7 @@ staleness alone, whatever `tend_interval` is set to: review activity is not visi
 checkout, so it reaches a loop only through its own `pull_request_review` or
 `pull_request_review_comment` webhook delivery, never through this timer.
 
-As it comes up, a foreground `listener start` prints the routing table it will use — every
+As it comes up, a foreground `listener run` prints the routing table it will use — every
 repository it will accept deliveries for, and the loops each one dispatches. This is the
 "did my setup work" check, and it is the first thing to read when a webhook seems to do
 nothing:
@@ -757,9 +759,10 @@ API call per repository and a token on the startup path (`project register-webho
 that happens). The `skipped` block is everything the same scan a delivery uses had to pass
 over — a registered project whose directory is gone, a project with no `configs/` directory,
 a loop file that does not load — so a silent misconfiguration shows up at startup rather
-than never. `--daemon` prints nothing of the sort: it installs the launchd agent and returns
-without serving; the agent it installs writes this table to
-`~/.agent-utils/listener.stdout.log` at every login.
+than never. `listener install` prints nothing of the sort: it registers the service (a launchd
+agent on macOS, a systemd unit on Linux) and returns without serving. On macOS the agent it
+installs writes this table to `~/.agent-utils/listener.stdout.log` at every login; on Linux it
+goes to the journal instead (`journalctl -u agent-utils-listener`).
 
 When the scan finds no loops at all, the banner says so loudly, because that daemon still
 verifies signatures and returns 200 for every delivery before doing nothing with it:
@@ -774,7 +777,7 @@ nothing with them. Either:
 ```
 
 The listener needs the same `~/.agent-utils/env` file the [Cron](#cron) section has you
-create, with `GITHUB_TOKEN` in it: `listener start` refuses to start without it, and once
+create, with `GITHUB_TOKEN` in it: `listener run` refuses to start without it, and once
 running, the daemon re-reads it on every delivery so a rotated token needs no restart. If you
 have not stored one yet:
 
@@ -782,11 +785,11 @@ have not stored one yet:
 agent-utils config token
 ```
 
-`listener start` also offers that prompt itself when the file does not exist and you are at a
+`listener run` also offers that prompt itself when the file does not exist and you are at a
 terminal, so the setup above works even if you skip this step — and it discovers a token the
 same way, so with `$GITHUB_TOKEN` set or `gh` logged in there is nothing to type. It only
 offers: with no terminal
-(launchd, cron, CI) it fails with instructions instead, because a prompt nobody can answer
+(launchd, systemd, cron, CI) it fails with instructions instead, because a prompt nobody can answer
 would hang the daemon forever. And it only offers for a MISSING file — a wrong mode, a symlink,
 or a file owned by another account still fails outright, since something put a credential file
 into that state and you should look at it rather than overwrite it.
@@ -875,26 +878,57 @@ Two details worth knowing:
 An agent still running when the listener stops is **not** an orphan: agents are detached, so a
 graceful stop leaves them working and the sweep correctly ignores them.
 
-`agent-utils listener start --daemon` installs the listener as a launchd user agent (macOS
-only) instead of running it in your terminal — `RunAtLoad` and `KeepAlive`, so it starts at
-login and restarts if it dies — which is also what makes the crash recovery above run at all,
-since a listener that does not come back after a reboot never sweeps. Without `--daemon` it
-just runs in the foreground, useful for watching its logs while you get the proxy working. `agent-utils listener status` reports
-whether it is installed and running; `agent-utils listener stop` removes it, or signals a
-foreground instance, or both.
+`agent-utils listener install` registers the listener as an OS service — a launchd agent on
+macOS, a systemd unit on Linux — instead of running it in your terminal. Both are configured to
+start automatically and restart if the process dies (`RunAtLoad`/`KeepAlive` on macOS,
+`Restart=always` on Linux), which is also what makes the crash recovery above run at all, since
+a listener that does not come back after a reboot never sweeps. Run `agent-utils listener run`
+instead and it just runs in the foreground, useful for watching its logs while you get the
+proxy working. `agent-utils listener status` reports whether it is installed and running;
+`agent-utils listener uninstall` removes an installed registration, and Ctrl-C in that terminal
+stops a foreground run.
 
-**A launchd agent with `RunAtLoad` and `KeepAlive` is permanent login-time execution of
-whatever binary path it names**, so `listener start --daemon` refuses to install itself when
-that binary, or any parent directory of it, is group- or world-writable — another local
-account could otherwise replace the binary launchd runs at every login. This is a real
-operator gotcha on an Intel Mac with Homebrew, where `/usr/local/bin` is commonly
-`drwxrwxr-x`, owned by group `admin`, and the refusal fires the first time you try `--daemon`.
-The fix is the same either way: move the binary to a location only you can write to (for
-example `~/bin`) and run `listener start --daemon` again.
+On Linux, `agent-utils listener install` writes a systemd system unit to
+`/etc/systemd/system/agent-utils-listener.service` and enables it. The unit is owned by root and
+starts at every boot, with no login and no `loginctl enable-linger`. It runs as YOU, not as root:
+the unit sets `User=`, `Group=`, `HOME=`, and a `WorkingDirectory` of your own `~/.agent-utils`,
+so the service reads the same env file, the same state database, and the same project registry
+your own commands read.
+
+Writing into `/etc` needs root, so `listener install` runs four steps through `sudo` and lets sudo
+prompt you. Run the command as YOURSELF, not as root. As root every directory it resolves would be
+root's, and it would install a service that runs as root — so it refuses outright rather than do
+that.
+
+The listener logs to the journal:
+
+```bash
+journalctl -u agent-utils-listener -f     # follow it
+systemctl status agent-utils-listener     # is it running
+agent-utils listener uninstall            # stop it and remove the unit
+```
+
+One thing to know about the journal: it is the SYSTEM journal, readable by every member of the
+`systemd-journal` and `adm` groups. The launchd agent on macOS writes to
+`~/.agent-utils/listener.stdout.log` and `~/.agent-utils/listener.stderr.log` instead, which only
+you can read. The listener logs which repositories and issues it dispatches, so on a shared Linux
+machine that activity is visible to more people than it was on macOS.
+
+**A service with `RunAtLoad`/`KeepAlive` (launchd) or `Restart=always` (systemd) is permanent
+execution of whatever binary path it names**, so `listener install` refuses to install itself
+when that binary, or any parent directory of it, is group- or world-writable — another local
+account could otherwise replace the binary the service manager runs. This is a real operator
+gotcha on an Intel Mac with Homebrew, where `/usr/local/bin` is commonly `drwxrwxr-x`, owned by
+group `admin`, and the refusal fires the first time you try `install`. The fix is the same
+either way: move the binary to a location only you can write to (for example `~/bin`) and run
+`listener install` again. The refusal matters more on Linux: a systemd system unit is started
+by root at every boot, so a writable binary path there is a route into the operator's own
+account, not only persistence, the way it is for a launchd agent running as the operator.
 
 Every other step in this section that widens what can reach the machine is gated — a typed
 confirmation, an acknowledgement flag, a flat refusal. `config set webhook.listen_addr 0.0.0.0`
-is the one that is not: it prints nothing and takes effect on the next `listener start`, and
+is the one that is not: it prints nothing and takes effect on the next `listener run` or
+restart of the installed service, and
 the endpoint it widens is the one that starts agents. Treat it the way you would treat any
 other change that opens a port to the LAN — deliberately, and behind your own firewall rule if
 this machine is not already trusted network-wide.
