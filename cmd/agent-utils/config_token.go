@@ -57,7 +57,8 @@ func configTokenCommand() *cli.Command {
 // to the env file, reporting where it went on out.
 //
 // in and out are parameters rather than os.Stdin/os.Stderr directly so this
-// is testable without a pty, and so `listener start` can reuse it.
+// is testable without a pty, and so `listener run` and `listener install`
+// (via ensureToken/listenerPreflight) can reuse it.
 func storeToken(in io.Reader, out io.Writer) error {
 	token, err := readToken(in, out)
 	if err != nil {

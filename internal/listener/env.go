@@ -27,9 +27,10 @@ const maxEnvFileSize = 64 * 1024
 // Its text is a fragment because it is only ever printed inside the sentence
 // readTokenFile builds ("<path> does not exist. ..."); it exists so a caller
 // can tell the ordinary first-run case apart from a wrong mode, a symlink or
-// a bad owner. `listener start` makes exactly that distinction: it offers to
-// write the file only when it is absent, because every other failure is a
-// condition the operator has to look at rather than answer a prompt about.
+// a bad owner. listenerPreflight (shared by `listener run` and `listener
+// install`) makes exactly that distinction: it offers to write the file only
+// when it is absent, because every other failure is a condition the operator
+// has to look at rather than answer a prompt about.
 var ErrEnvFileMissing = errors.New("does not exist")
 
 // Token reads GITHUB_TOKEN from ~/.agent-utils/env.

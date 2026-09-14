@@ -29,7 +29,7 @@ import (
 
 // pidFileName is the listener's pidfile, at <home>/listener.pid. It records
 // which pid and address a running listener bound, for `status` to report
-// and for `stop` to signal.
+// and remove if stale.
 //
 // It is NOT the source of truth for whether a listener is alive -- see
 // lockFileName. internal/proc.IsAlive cannot be reused to find this process
@@ -42,115 +42,183 @@ const pidFileName = "listener.pid"
 // (see runListener) and released by drainAndClose.
 //
 // This, not kill(pid, 0) against the pid recorded in the pidfile, is what
-// `stop` and `status` trust to answer "is a listener actually running":
-// pids are recycled by the OS, so a listener that was killed -9 or panicked
-// -- leaving its pidfile behind, since only drainAndClose's own clean
-// shutdown removes it -- can have its old pid handed to an unrelated
-// process this same user later starts. kill(pid, 0) would then report that
-// unrelated process alive, and `stop` would SIGTERM it. flock, by contrast,
-// is released by the kernel the instant the holding process's file
-// descriptor closes, on a clean exit OR a crash OR a kill -9, so
-// lock.Acquire succeeding is proof, not a guess, that nothing currently
+// `status` trusts to answer "is a listener actually running": pids are
+// recycled by the OS, so a listener that was killed -9 or panicked -- leaving
+// its pidfile behind, since only drainAndClose's own clean shutdown removes
+// it -- can have its old pid handed to an unrelated process this same user
+// later starts. kill(pid, 0) would then report that unrelated process alive.
+// flock, by contrast, is released by the kernel the instant the holding
+// process's file descriptor closes, on a clean exit OR a crash OR a kill -9,
+// so lock.Acquire succeeding is proof, not a guess, that nothing currently
 // holds it. It doubles as this command's single-instance guard: a second
-// `listener start` fails fast at lock.Acquire, before it can overwrite a
-// live listener's pidfile out from under it.
+// `listener run` fails fast at lock.Acquire, before it can overwrite a live
+// listener's pidfile out from under it.
 const lockFileName = "listener.lock"
 
-// listenerCommand groups the webhook daemon's lifecycle: run it, stop it,
-// and ask what it is doing. It is top level, not project-scoped, because one
-// listener serves every project on the machine.
+// listenerCommand groups the webhook listener's lifecycle: run it here,
+// register it with the OS service manager, remove that registration, and ask
+// what it is doing. It is top level, not project-scoped, because one listener
+// serves every project on the machine.
+//
+// There is deliberately no `start` and no `stop`. Once `install` has
+// registered the listener, starting and stopping it belongs to the platform's
+// own tool -- `systemctl` on linux, `launchctl` on darwin -- and a second pair
+// of verbs here would only be a worse wrapper around them. A foreground `run`
+// is stopped with Ctrl-C.
 func listenerCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "listener",
 		Usage: "run the webhook listener that dispatches loops on GitHub deliveries",
 		Commands: []*cli.Command{
-			listenerStartCommand(),
-			listenerStopCommand(),
+			listenerRunCommand(),
+			listenerInstallCommand(),
+			listenerUninstallCommand(),
 			listenerStatusCommand(),
 		},
 	}
 }
 
-func listenerStartCommand() *cli.Command {
+// listenerPreflight makes the four checks `run` and `install` both need, in
+// the order they must happen, and returns the settings with any listen
+// override applied plus the argument list that reproduces that override.
+//
+// `install` makes exactly the same checks as `run`, and that is the point: a
+// service registered against a disabled webhook, an empty secret, or an
+// unreadable token starts, looks healthy, and then fails every single
+// delivery. The failure has to land here, at a terminal, while the operator
+// is still watching.
+func listenerPreflight(c *cli.Command) (*settings.Settings, []string, error) {
+	st, err := settings.Load()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !st.Webhook.Enabled {
+		return nil, nil, errors.New(
+			"the webhook daemon is disabled; run `agent-utils config webhook --enable` first")
+	}
+
+	// --listen-port/--listen-addr go through the exact same
+	// settings.FieldFor(...).Set path `config set` and `config webhook` use
+	// (setField, in config.go), and are applied to an in-memory copy only --
+	// they are never saved to config.yaml. That is what keeps
+	// `--listen-port 0` rejected here exactly as it is in `config set
+	// webhook.listen_port` and in listener.New itself.
+	//
+	// It is NOT what makes these values safe to render into a service
+	// definition. `webhook.listen_addr`'s Set is a non-empty check and a
+	// loopback warning, not an address parser, so --listen-addr reaches
+	// service.Install as an arbitrary string. The renderer is the control
+	// there; see renderUnit in internal/service/unit.go.
+	var overrideArgs []string
+	if c.IsSet("listen-addr") {
+		v := c.String("listen-addr")
+		if err := setField(st, "webhook.listen_addr", v); err != nil {
+			return nil, nil, err
+		}
+		overrideArgs = append(overrideArgs, "--listen-addr", v)
+	}
+	if c.IsSet("listen-port") {
+		v := c.Int("listen-port")
+		if err := setField(st, "webhook.listen_port", strconv.Itoa(v)); err != nil {
+			return nil, nil, err
+		}
+		overrideArgs = append(overrideArgs, "--listen-port", strconv.Itoa(v))
+	}
+
+	// Refuse to run an unauthenticated listener. listener.New refuses an
+	// empty secret too, but that check happens only after a database is
+	// opened and a pidfile written; this one fails before any of that, with a
+	// message that names what is actually wrong rather than New's generic one.
+	if st.Webhook.Secret == "" {
+		return nil, nil, errors.New(
+			"webhook.secret is empty; refusing to start an unauthenticated listener")
+	}
+
+	// Checked up front, once, before opening the database or binding a
+	// socket: without this, starting a listener against a 0644 (or missing)
+	// env file comes up looking healthy and then fails every single tick,
+	// since Worker reads the token fresh on every delivery (see
+	// internal/listener/env.go's Token).
+	if err := ensureToken(os.Stdin, os.Stderr, isInteractive()); err != nil {
+		return nil, nil, err
+	}
+
+	return st, overrideArgs, nil
+}
+
+func listenerRunCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "start",
-		Usage: "run the listener in the foreground, or install it as a launchd agent with --daemon",
+		Name:  "run",
+		Usage: "run the listener in the foreground until Ctrl-C",
 		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: "daemon",
-				Usage: "install and start the listener as a launchd user agent instead of running here"},
 			listenPortFlag(),
 			listenAddrFlag(),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			st, err := settings.Load()
+			st, _, err := listenerPreflight(c)
 			if err != nil {
 				return err
 			}
-			if !st.Webhook.Enabled {
-				return errors.New(
-					"the webhook daemon is disabled; run `agent-utils config webhook --enable` first")
-			}
-
-			// --listen-port/--listen-addr validate through the exact same
-			// settings.FieldFor(...).Set path `config set` and `config
-			// webhook` use (setField, in config.go), and are applied to an
-			// in-memory copy only -- they are never saved to config.yaml.
-			// An override that reached service.Install's plist unvalidated
-			// would be rendered into a file launchd executes at every
-			// login; going through the shared validator is what keeps
-			// `--listen-port 0` rejected here exactly as it is in `config
-			// set webhook.listen_port` and in listener.New itself.
-			var overrideArgs []string
-			if c.IsSet("listen-addr") {
-				v := c.String("listen-addr")
-				if err := setField(st, "webhook.listen_addr", v); err != nil {
-					return err
-				}
-				overrideArgs = append(overrideArgs, "--listen-addr", v)
-			}
-			if c.IsSet("listen-port") {
-				v := c.Int("listen-port")
-				if err := setField(st, "webhook.listen_port", strconv.Itoa(v)); err != nil {
-					return err
-				}
-				overrideArgs = append(overrideArgs, "--listen-port", strconv.Itoa(v))
-			}
-
-			// Refuse to run an unauthenticated listener. listener.New
-			// refuses an empty secret too, but that check happens only
-			// after a database is opened and a pidfile written below; this
-			// one fails before any of that, with a message that names what
-			// is actually wrong rather than New's generic one.
-			if st.Webhook.Secret == "" {
-				return errors.New(
-					"webhook.secret is empty; refusing to start an unauthenticated listener")
-			}
-
-			// Checked up front, once, before opening the database or
-			// binding a socket: without this a daemon started against a
-			// 0644 (or missing) env file comes up looking healthy and then
-			// fails every single tick, since Worker reads the token fresh
-			// on every delivery (see internal/listener/env.go's Token).
-			if err := ensureToken(os.Stdin, os.Stderr, isInteractive()); err != nil {
-				return err
-			}
-
-			if c.Bool("daemon") {
-				return installDaemon(overrideArgs)
-			}
-
 			def := st.WithDefaults()
-			// os.Stdout, and only on this path: --daemon returned above
-			// without ever running a server, so it has no routing table to
-			// report and would be printing one for a process that is not
-			// the one serving.
 			return runListener(ctx, os.Stdout, def.Webhook.ListenAddr, def.Webhook.ListenPort, currentSecret)
 		},
 	}
 }
 
-// ensureToken proves the GitHub token is readable before the listener starts,
-// and offers to write the env file when it is simply not there yet.
+func listenerInstallCommand() *cli.Command {
+	return &cli.Command{
+		Name: "install",
+		Usage: "register the listener with the OS service manager " +
+			"(systemd on linux, launchd on macOS) and start it",
+		Flags: []cli.Flag{
+			listenPortFlag(),
+			listenAddrFlag(),
+		},
+		Action: func(_ context.Context, c *cli.Command) error {
+			_, overrideArgs, err := listenerPreflight(c)
+			if err != nil {
+				return err
+			}
+			return installService(overrideArgs)
+		},
+	}
+}
+
+func listenerUninstallCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "uninstall",
+		Usage: "remove the listener's registration from the OS service manager",
+		Action: func(_ context.Context, _ *cli.Command) error {
+			mgr := service.New()
+			status, err := mgr.Status()
+			switch {
+			case errors.Is(err, service.ErrUnsupported):
+				// This platform has no service manager, so there is nothing
+				// registered and never was.
+				fmt.Println("no listener service is installed")
+				return nil
+			case err != nil:
+				// Anything else means this machine's registration could not
+				// be READ -- a permission problem, an I/O error. A
+				// root-owned, boot-persistent unit may well still be
+				// installed, so reporting "nothing is installed" here would
+				// be a lie at the one moment it matters.
+				return fmt.Errorf("check whether a listener service is installed: %w", err)
+			case !status.Installed:
+				fmt.Println("no listener service is installed")
+				return nil
+			}
+			if err := mgr.Uninstall(); err != nil {
+				return fmt.Errorf("uninstall the listener service: %w", err)
+			}
+			fmt.Println("uninstalled the listener service")
+			return nil
+		},
+	}
+}
+
+// ensureToken proves the GitHub token is readable before starting the
+// listener, and offers to write the env file when it is simply not there yet.
 //
 // The prompt is offered for an ABSENT file only. A wrong mode, a symlink, or
 // a file owned by somebody else all still fail with the error Token
@@ -202,26 +270,25 @@ func ensureToken(in io.Reader, out io.Writer, interactive bool) error {
 	return nil
 }
 
-// installDaemon registers this program as a launchd user agent, invoked at
-// login and kept alive, running `listener start` (never `--daemon` again --
-// that would just reinstall itself in a loop) plus any validated listen
-// override.
-func installDaemon(overrideArgs []string) error {
+// installService registers this program with the OS service manager, to be
+// started without the operator present and kept alive, running `listener run`
+// (never `install` again -- that would reinstall itself in a loop) plus any
+// validated listen override.
+func installService(overrideArgs []string) error {
 	// self is passed to Install for its own sake (a caller that names a
 	// binary other than the one it is actually running as is confused about
 	// what this does, and failing loudly is cheaper than silently ignoring
 	// it), but Install resolves the SOURCE of the installed path itself, via
 	// os.Executable() plus filepath.EvalSymlinks; see resolveSelf in
-	// internal/service/service_darwin.go. That is what keeps a service
-	// definition with RunAtLoad+KeepAlive -- permanent login-time execution
-	// -- from ever being pointed at a path this process merely claims to be
-	// running from.
+	// internal/service/service.go. That is what keeps a service definition
+	// with Restart=always -- or launchd's RunAtLoad+KeepAlive -- from ever
+	// being pointed at a path this process merely claims to be running from.
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate this executable: %w", err)
 	}
 
-	args := append([]string{"listener", "start"}, overrideArgs...)
+	args := append([]string{"listener", "run"}, overrideArgs...)
 
 	mgr := service.New()
 	if err := mgr.Install(self, args); err != nil {
@@ -235,46 +302,50 @@ func installDaemon(overrideArgs []string) error {
 	return nil
 }
 
-// explainInstallErr adds operator-facing context to an Install failure
-// caused by a group- or world-writable install path (see
-// refuseIfWritableByOthers in internal/service/service_darwin.go). That
-// refusal is the correct security default -- a plist with RunAtLoad and
-// KeepAlive is permanent login-time execution of whatever path it names, and
-// a writable parent directory would let another local account replace the
-// binary launchd runs at every login -- but the bare error from
-// os.Lstat-driven mode checks reads like a bug report, not an explanation.
-// The common case it is guarding against, an Intel-Mac Homebrew install
-// under /usr/local (commonly drwxrwxr-x, group admin), is named explicitly
-// so the operator understands why and knows the fix.
+// explainInstallErr adds operator-facing context to an Install failure caused
+// by a group- or world-writable install path (see refuseIfWritableByOthers in
+// internal/service/service.go). That refusal is the correct security default
+// -- a service definition started without the operator present is permanent
+// execution of whatever path it names, and a writable parent directory would
+// let another local account replace the binary the machine runs at every boot
+// or login -- but the bare error from os.Lstat-driven mode checks reads like a
+// bug report, not an explanation. The common case it is guarding against, an
+// Intel-Mac Homebrew install under /usr/local (commonly drwxrwxr-x, group
+// admin), is named explicitly so the operator understands why and knows the
+// fix.
 func explainInstallErr(err error) error {
 	if err == nil {
 		return nil
 	}
 	if !containsWritableRefusal(err) {
-		return fmt.Errorf("install as a launchd agent: %w", err)
+		return fmt.Errorf("install the listener service: %w", err)
 	}
 	return fmt.Errorf(
-		"install as a launchd agent: %w\n\n"+
+		"install the listener service: %w\n\n"+
 			"agent-utils refuses to install itself from a group- or world-writable\n"+
-			"location. This is a common outcome for a Homebrew install under\n"+
+			"location. A service definition is permanent execution of whatever path\n"+
+			"it names, without the operator present, so a writable parent directory\n"+
+			"would let another local account replace the binary the machine runs at\n"+
+			"every boot or login. On Linux that binary is started by root, which\n"+
+			"makes it worse. This is a common outcome for a Homebrew install under\n"+
 			"/usr/local on an Intel Mac, where the directory is typically\n"+
-			"drwxrwxr-x owned by group \"admin\". A launchd agent with\n"+
-			"RunAtLoad+KeepAlive is permanent login-time execution of whatever path\n"+
-			"it names, so a writable parent directory would let another local\n"+
-			"account replace the binary launchd runs at every login. Move the\n"+
-			"binary to a location only you can write to (for example ~/bin) and\n"+
-			"run `listener start --daemon` again", err)
+			"drwxrwxr-x owned by group \"admin\". Move the binary to a location only\n"+
+			"you can write to (for example ~/bin) and run `listener install` again",
+		err)
 }
 
 // containsWritableRefusal reports whether err is (or wraps) the specific
-// refusal refuseIfWritableByOthers produces. It matches on text rather than
-// a sentinel because that function returns a plain fmt.Errorf with no
-// exported error value to compare against; see the cross-reference comment
-// left next to that error in internal/service/service_darwin.go, which
-// exists so a wording change there cannot silently break this match without
-// a reader noticing.
+// refusal refuseIfWritableByOthers produces. It matches on the exported
+// constant rather than a repeated literal because that function returns a
+// plain fmt.Errorf with no exported error value to compare against; see the
+// cross-reference comment left next to that error in
+// internal/service/service.go, which exists so a wording change there cannot
+// silently break this match without a reader noticing. Matching on the
+// constant itself, rather than each side keeping its own copy of the phrase,
+// is what makes a drift between the two impossible to express rather than
+// merely detectable.
 func containsWritableRefusal(err error) bool {
-	return strings.Contains(err.Error(), "writable by group or other")
+	return strings.Contains(err.Error(), service.WritableRefusalPhrase)
 }
 
 // currentSecret reads the webhook secret from the settings file, fresh.
@@ -300,7 +371,7 @@ func currentSecret() (string, error) {
 //
 // ctx is accepted for symmetry with the rest of this program's Actions, but
 // shutdown itself is driven by the OS signal, not by ctx: a foreground
-// `listener start` must keep serving after its own CLI Action would
+// `listener run` must keep serving after its own CLI Action would
 // otherwise be considered "done", which is exactly what a long-running
 // daemon is.
 func runListener(_ context.Context, out io.Writer, addr string, port int, secret func() (string, error)) error {
@@ -310,14 +381,17 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 	}
 
 	// Acquired first, before anything else opens or writes: see
-	// lockFileName. A second `listener start` must fail HERE, before it can
+	// lockFileName. A second `listener run` must fail HERE, before it can
 	// touch the pidfile or the database a live listener already owns.
 	lockPath := filepath.Join(dir, lockFileName)
 	lk, err := lock.Acquire(lockPath)
 	if errors.Is(err, lock.ErrHeld) {
 		return errors.New(
 			"a listener is already running (its lock is held); " +
-				"run `agent-utils listener status` to check, or `listener stop` to stop it first")
+				"run `agent-utils listener status` to check, stop a foreground one with Ctrl-C " +
+				"in its own terminal, or stop an installed one with " +
+				"`systemctl stop agent-utils-listener` (linux) or " +
+				"`launchctl bootout gui/$(id -u)/com.seanmcgary.agent-utils.listener` (macOS)")
 	}
 	if err != nil {
 		return fmt.Errorf("acquire listener lock: %w", err)
@@ -455,15 +529,15 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 	// as the machine-readable record of the same event.
 	//
 	// Printed here, after ListenAndServe has been started and at the same
-	// moment "listener started" is recorded, so a daemon that cannot bind
-	// still reports that failure as its outcome rather than this table
-	// becoming the last thing an operator reads.
+	// moment the "started listener" line below is recorded, so a daemon that
+	// cannot bind still reports that failure as its outcome rather than this
+	// table becoming the last thing an operator reads.
 	printRoutingTable(out)
 	// tend_interval is in the banner line because it is the one thing about
 	// this daemon an operator cannot see from the routing table: whether the
 	// loops it just listed will have their stale pull requests noticed without
 	// a delivery. Zero means the periodic check is off.
-	slog.Info("listener started", "addr", addr, "port", port, "pid", os.Getpid(),
+	slog.Info("started listener", "addr", addr, "port", port, "pid", os.Getpid(),
 		"tend_interval", tendEvery)
 
 	// Whichever happens first -- an operator or launchd sending a signal, or
@@ -627,7 +701,7 @@ func routingTable(routes listener.Routes) string {
 //     internal/loopcmd/tick.go's orphan sweep) rather than simply finishing.
 //
 //  5. Remove the pidfile, but only if it still names THIS process. A second
-//     `listener start` cannot get far enough to overwrite it now that the
+//     `listener run` cannot get far enough to overwrite it now that the
 //     lock (step 6) serializes starts, but re-checking here costs nothing
 //     and means this function is never the one that deletes a pidfile some
 //     other process is relying on.
@@ -745,7 +819,7 @@ func wrapTick(
 // incremented with no matching Done, which hangs drainAndClose's
 // tickWG.Wait() forever: the database is never closed, the pidfile is never
 // removed, and the listener lock (see lockFileName) is never released, so
-// the hung process keeps holding it and every later `listener start`
+// the hung process keeps holding it and every later `listener run`
 // refuses with "already running" until something SIGKILLs the hung
 // process. Moving Add/Done to fire time closes that: a stopped timer's
 // callback never runs, so it never touches tickWG at all, and there is
@@ -868,21 +942,21 @@ func readPidfile(path string) (pidfileContent, error) {
 // Two caveats, both accepted rather than silently ignored:
 //
 // It skips lock.Acquire entirely, and returns "not live" straight away,
-// when lockPath has never existed. Without this, a read-only `status` or
-// `stop` on a machine that has never started a listener would still create
-// <home> and an empty lock file as a side effect (lock.Acquire's
-// os.MkdirAll and os.OpenFile with O_CREATE) -- the common case for a fresh
-// checkout or a CI box, hit every time those commands run.
+// when lockPath has never existed. Without this, a read-only `status` on a
+// machine that has never started a listener would still create <home> and an
+// empty lock file as a side effect (lock.Acquire's os.MkdirAll and
+// os.OpenFile with O_CREATE) -- the common case for a fresh checkout or a CI
+// box, hit every time that command runs.
 //
 // Once the lock file does exist, this still takes a real, briefly-held
 // LOCK_EX to answer the question, and internal/lock exposes no
 // non-exclusive "would this succeed" query. That means this probe can race
-// a concurrent `listener start`: if this probe's Acquire lands in the
-// narrow window before start's own, start's Acquire observes ErrHeld and
+// a concurrent `listener run`: if this probe's Acquire lands in the
+// narrow window before run's own, run's Acquire observes ErrHeld and
 // fails with "already running" even though nothing was actually running --
 // only this probe, for a moment. Adding a non-exclusive query to
 // internal/lock is out of this task's scope for what is a narrow,
-// self-correcting race (a retried `listener start` succeeds immediately
+// self-correcting race (a retried `listener run` succeeds immediately
 // after), so it is documented here rather than fixed.
 func listenerLive(lockPath string) (bool, error) {
 	if _, err := os.Stat(lockPath); errors.Is(err, os.ErrNotExist) {
@@ -902,98 +976,20 @@ func listenerLive(lockPath string) (bool, error) {
 	return false, nil
 }
 
-func listenerStopCommand() *cli.Command {
-	return &cli.Command{
-		Name:  "stop",
-		Usage: "stop the listener, whether it runs as a launchd agent, in the foreground, or both",
-		Action: func(_ context.Context, _ *cli.Command) error {
-			acted := false
-
-			mgr := service.New()
-			if status, err := mgr.Status(); err == nil && status.Installed {
-				if err := mgr.Uninstall(); err != nil {
-					return fmt.Errorf("uninstall the launchd agent: %w", err)
-				}
-				fmt.Println("uninstalled the launchd agent")
-				acted = true
-			}
-			// A Status error here means either an unsupported platform
-			// (internal/service's non-darwin stub) or a launchd this
-			// process cannot query. Either way there is nothing installed
-			// for this branch to remove, and stop must still work for a
-			// foreground listener -- see the lock/pidfile handling below,
-			// which is the only way to stop a listener off macOS.
-
-			dir, err := home.Dir()
-			if err != nil {
-				return err
-			}
-			pidPath := filepath.Join(dir, pidFileName)
-			lockPath := filepath.Join(dir, lockFileName)
-
-			live, err := listenerLive(lockPath)
-			if err != nil {
-				return fmt.Errorf("check whether a listener is running: %w", err)
-			}
-			if live {
-				pf, err := readPidfile(pidPath)
-				if err != nil {
-					return fmt.Errorf(
-						"a listener is running (its lock is held) but its pidfile is unreadable: %w", err)
-				}
-				// The pid comes out of a JSON file on disk, and it is
-				// handed straight to kill(2), which reads non-positive
-				// values as broadcasts: 0 signals the CALLER's whole
-				// process group, -1 every process this user owns, and any
-				// other negative value a process group of its own. Nothing
-				// upstream guarantees the number is a pid at all -- a
-				// truncated write, a hand-edited file, or another local
-				// account that got write access to it (the file is 0600 for
-				// this reason, see writePidfile) is enough.
-				if pf.PID <= 0 {
-					return fmt.Errorf(
-						"the listener pidfile at %s records pid %d, which is not a process; "+
-							"delete it and stop the listener by hand", pidPath, pf.PID)
-				}
-				if err := syscall.Kill(pf.PID, syscall.SIGTERM); err != nil {
-					return fmt.Errorf("signal listener pid %d: %w", pf.PID, err)
-				}
-				fmt.Printf("sent SIGTERM to listener pid %d\n", pf.PID)
-				acted = true
-			} else if _, statErr := os.Stat(pidPath); statErr == nil {
-				// The lock is free, so whatever the pidfile says is stale:
-				// left by a process that died without running its own
-				// shutdown (a kill -9, a crash). Clean it up so `status`
-				// does not keep reporting a dead pid forever; a listener's
-				// own drainAndClose already removes this on an ordinary
-				// shutdown, so this only ever fires on the unclean path.
-				if rmErr := os.Remove(pidPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-					slog.Warn("remove stale pidfile", "path", pidPath, "err", rmErr)
-				}
-			}
-
-			if !acted {
-				fmt.Println("no listener is installed or running")
-			}
-			return nil
-		},
-	}
-}
-
 func listenerStatusCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "status",
-		Usage: "report whether the listener is installed as a launchd agent and whether it is running",
+		Usage: "report whether the listener is installed as a service and whether it is running",
 		Action: func(_ context.Context, _ *cli.Command) error {
 			mgr := service.New()
 			status, statusErr := mgr.Status()
 			if statusErr != nil {
-				// Unsupported platform or an unreadable launchd state; not
-				// fatal to this command, since the lock/pidfile below may
-				// still have something to report -- see listenerStopCommand.
-				fmt.Printf("launchd: unavailable (%v)\n", statusErr)
+				// Unsupported platform, or a service manager this process
+				// cannot query; not fatal to this command, since the
+				// lock/pidfile below may still have something to report.
+				fmt.Printf("service: unavailable (%v)\n", statusErr)
 			} else {
-				fmt.Printf("launchd: installed=%t running=%t", status.Installed, status.Running)
+				fmt.Printf("service: installed=%t running=%t", status.Installed, status.Running)
 				if status.Running {
 					fmt.Printf(" pid=%d", status.PID)
 				}
@@ -1019,9 +1015,23 @@ func listenerStatusCommand() *cli.Command {
 				fmt.Println("pidfile: none")
 			case err != nil:
 				fmt.Printf("pidfile: unreadable (%v)\n", err)
+			case !live:
+				// The lock is free, so whatever the pidfile says is stale:
+				// left by a process that died without running its own
+				// shutdown (a kill -9, a crash). Clean it up here so status
+				// does not keep reporting a dead pid forever. A listener's own
+				// drainAndClose removes this on an ordinary shutdown, so this
+				// only ever fires on the unclean path. The listener's old
+				// `stop` subcommand used to own this cleanup; it no longer
+				// exists.
+				fmt.Printf("pidfile: pid=%d alive=false addr=%s:%d (stale, removed)\n",
+					pf.PID, pf.Addr, pf.Port)
+				if rmErr := os.Remove(pidPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+					slog.Warn("remove stale pidfile", "path", pidPath, "err", rmErr)
+				}
 			default:
-				fmt.Printf("pidfile: pid=%d alive=%t addr=%s:%d\n",
-					pf.PID, live, pf.Addr, pf.Port)
+				fmt.Printf("pidfile: pid=%d alive=true addr=%s:%d\n",
+					pf.PID, pf.Addr, pf.Port)
 			}
 			return nil
 		},

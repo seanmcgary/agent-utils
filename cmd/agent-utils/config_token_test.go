@@ -127,10 +127,10 @@ func TestConfigTokenIsRegistered(t *testing.T) {
 	t.Fatal("no `token` subcommand under `config`")
 }
 
-// The three tests below cover `listener start`'s token check. It calls
-// listener.Token() up front so a bad file fails fast, rather than on every
-// tick; the only change is that an ABSENT file, at a terminal, becomes a
-// question instead of an error.
+// The three tests below cover listenerPreflight's token check, shared by
+// `listener run` and `listener install`. It calls listener.Token() up front
+// so a bad file fails fast, rather than on every tick; the only change is
+// that an ABSENT file, at a terminal, becomes a question instead of an error.
 
 func TestEnsureTokenPromptsAndContinuesWhenTheFileIsAbsent(t *testing.T) {
 	withHome(t)
@@ -199,8 +199,8 @@ func TestEnsureTokenDoesNotPromptForAWrongMode(t *testing.T) {
 
 // The tests below cover token DISCOVERY: the step in front of the prompt that
 // looks for a credential the operator already has, so `config token` and
-// `listener start`'s inline offer stop asking for something the machine can
-// already answer.
+// listenerPreflight's inline offer (shared by `listener run` and `listener
+// install`) stop asking for something the machine can already answer.
 //
 // Two things are stubbed, and only two. isTerminalInput/readSecret stand in
 // for the tty (term.ReadPassword fails with ENOTTY on anything else, so the
@@ -421,9 +421,10 @@ func TestReadTokenPromptsPlainlyWhenGhHasNoToken(t *testing.T) {
 	}
 }
 
-// `listener start`'s inline offer keeps the sentence explaining why the file
-// matters, and its first sentence now reports what discovery found rather
-// than always claiming there is nothing.
+// listenerPreflight's inline offer (shared by `listener run` and `listener
+// install`) keeps the sentence explaining why the file matters, and its
+// first sentence now reports what discovery found rather than always
+// claiming there is nothing.
 func TestEnsureTokenReportsAnEnvironmentTokenInItsOffer(t *testing.T) {
 	withHome(t)
 	t.Setenv("GITHUB_TOKEN", "ghp_fromtheenvironmentAB12")

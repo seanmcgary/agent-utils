@@ -3,11 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -31,22 +32,73 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// isolateLaunchd points service.New at a scratch LaunchAgents directory
-// instead of the operator's real ~/Library/LaunchAgents.
+// isolateService points service.New at scratch directories instead of the
+// operator's real ~/Library/LaunchAgents (darwin) and /etc/systemd/system
+// (linux).
 //
-// Without this, any test that runs `listener stop` or `listener status` on
-// darwin calls service.New().Status() (and stop calls Uninstall()), which
-// internal/service/service_darwin.go resolves through launchAgentsDir --
-// and that function falls back to the REAL LaunchAgents directory whenever
-// LaunchAgentsDirEnvVar is unset. A developer who has ever run `listener
-// start --daemon` on their own machine would have `go test ./cmd/...`
-// silently run `launchctl bootout` against their real daemon and delete its
-// real plist. service.LaunchAgentsDirEnvVar exists precisely so a test can
-// opt out of that; see internal/service/service_darwin_test.go for the same
-// pattern one layer down.
-func isolateLaunchd(t *testing.T) {
+// Without this, any test that reaches internal/service falls back to the REAL
+// directory whenever the override is unset. A developer who has ever run
+// `listener install` on their own machine would have `go test ./cmd/...`
+// silently tear down their real service. Both override variables exist
+// precisely so a test can opt out; see internal/service/selfinstall_test.go
+// and service_linux_test.go for the same pattern one layer down.
+//
+// Note this isolates the DIRECTORY, not the command. A real `launchctl print`
+// or `systemctl show` still runs for a `status` query -- both are read-only
+// and neither can find anything under a scratch directory. Use fakeService
+// below wherever a test needs the Manager itself under control.
+func isolateService(t *testing.T) {
 	t.Helper()
 	t.Setenv(service.LaunchAgentsDirEnvVar, t.TempDir())
+	t.Setenv(service.SystemdUnitDirEnvVar, t.TempDir())
+}
+
+// fakeManager records what the CLI asks of a Manager and answers with what
+// the test tells it to.
+type fakeManager struct {
+	status        service.Status
+	statusErr     error
+	installBinary string
+	installArgs   []string
+	installErr    error
+	uninstalled   bool
+	uninstallErr  error
+}
+
+func (f *fakeManager) Install(binary string, args []string) error {
+	f.installBinary = binary
+	f.installArgs = args
+	return f.installErr
+}
+func (f *fakeManager) Uninstall() error                 { f.uninstalled = true; return f.uninstallErr }
+func (f *fakeManager) Status() (service.Status, error)  { return f.status, f.statusErr }
+func (f *fakeManager) ServiceFilePath() (string, error) { return "/scratch/" + service.UnitName, nil }
+
+// fakeService substitutes m for the real platform Manager, so a cmd-level
+// test can assert what the CLI asked for without running launchctl,
+// systemctl, or sudo.
+func fakeService(t *testing.T, m *fakeManager) {
+	t.Helper()
+	prev := service.New
+	service.New = func() service.Manager { return m }
+	t.Cleanup(func() { service.New = prev })
+}
+
+// runListenerCLINoExit runs the listener command tree with cli.OsExiter
+// replaced, and reports the exit code the library asked for.
+//
+// urfave/cli v3.11.0 does NOT return an error for an unknown subcommand: it
+// prints "No help topic for '<verb>'" and calls cli.OsExiter(3), which by
+// default is os.Exit. A test that asserts on a returned error therefore kills
+// the whole test binary mid-suite with no failure attribution. Measured
+// against this exact tree shape.
+func runListenerCLINoExit(t *testing.T, args ...string) (stdout string, exitCode int) {
+	t.Helper()
+	prev := cli.OsExiter
+	cli.OsExiter = func(code int) { exitCode = code }
+	t.Cleanup(func() { cli.OsExiter = prev })
+	out, _ := runListenerCLI(t, args...)
+	return out, exitCode
 }
 
 // runListenerCLI runs the listener command tree against args and returns
@@ -78,41 +130,91 @@ func runListenerCLI(t *testing.T, args ...string) (stdout string, err error) {
 	return buf.String(), runErr
 }
 
-// TestListenerHelpListsThreeSubcommands covers the acceptance bullet:
-// "listener --help lists three subcommands."
-func TestListenerHelpListsThreeSubcommands(t *testing.T) {
+// helpCommands returns the subcommand names listed in the COMMANDS: block of
+// a urfave/cli help screen. Each row is indented and starts with the name.
+func helpCommands(t *testing.T, out string) []string {
+	t.Helper()
+	var names []string
+	inBlock := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "COMMANDS:") {
+			inBlock = true
+			continue
+		}
+		if inBlock {
+			if strings.TrimSpace(line) == "" {
+				break
+			}
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			names = append(names, strings.TrimSuffix(fields[0], ","))
+		}
+	}
+	return names
+}
+
+// TestListenerHelpListsExactlyTheFourSubcommands pins the command surface.
+// `start` and `stop` are gone: a registered service is started and stopped
+// with systemctl or launchctl, and a foreground `listener run` is stopped
+// with Ctrl-C. This test fails if either verb comes back, and -- unlike the
+// substring check it replaces -- it fails if the subcommands disappear.
+func TestListenerHelpListsExactlyTheFourSubcommands(t *testing.T) {
 	out, err := runListenerCLI(t, "listener", "--help")
 	if err != nil {
 		t.Fatalf("listener --help: %v", err)
 	}
-	for _, name := range []string{"start", "stop", "status"} {
-		if !strings.Contains(out, name) {
-			t.Errorf("listener --help output = %q, want it to list subcommand %q", out, name)
+	got := helpCommands(t, out)
+	want := []string{"run", "install", "uninstall", "status"}
+	if len(got) != len(want) {
+		t.Fatalf("listener --help lists %v, want exactly %v\n%s", got, want, out)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("subcommand %d = %q, want %q", i, got[i], w)
 		}
 	}
 }
 
-// TestListenerStartDisabledWebhookFailsAndNamesEnableCommand covers: "listener
-// start with webhook.enabled false exits non-zero and names the config
+// TestListenerRejectsTheRemovedVerbs proves the removal is real rather than
+// a rename that left an alias behind. It goes through runListenerCLINoExit
+// because the library exits the process rather than returning an error; see
+// that helper's comment.
+func TestListenerRejectsTheRemovedVerbs(t *testing.T) {
+	for _, verb := range []string{"start", "stop"} {
+		t.Run(verb, func(t *testing.T) {
+			withHome(t)
+			isolateService(t)
+			out, code := runListenerCLINoExit(t, "listener", verb)
+			if code == 0 {
+				t.Fatalf("listener %s exited 0; it should be an unknown command\n%s", verb, out)
+			}
+		})
+	}
+}
+
+// TestListenerRunDisabledWebhookFailsAndNamesEnableCommand covers: "listener
+// run with webhook.enabled false exits non-zero and names the config
 // webhook command."
-func TestListenerStartDisabledWebhookFailsAndNamesEnableCommand(t *testing.T) {
+func TestListenerRunDisabledWebhookFailsAndNamesEnableCommand(t *testing.T) {
 	withHome(t)
 
 	// No settings file at all: settings.Load returns the zero value, whose
 	// Webhook.Enabled is false. That is the common case this guards
 	// against -- a machine that has never run `config webhook --enable`.
-	_, err := runListenerCLI(t, "listener", "start")
+	_, err := runListenerCLI(t, "listener", "run")
 	if err == nil {
-		t.Fatal("listener start with webhook disabled: want an error, got nil")
+		t.Fatal("listener run with webhook disabled: want an error, got nil")
 	}
 	if !strings.Contains(err.Error(), "config webhook --enable") {
 		t.Errorf("error = %q, want it to name `agent-utils config webhook --enable`", err.Error())
 	}
 }
 
-// TestListenerStartEmptySecretFails covers: "listener start with an empty
+// TestListenerRunEmptySecretFails covers: "listener run with an empty
 // secret exits non-zero."
-func TestListenerStartEmptySecretFails(t *testing.T) {
+func TestListenerRunEmptySecretFails(t *testing.T) {
 	withHome(t)
 
 	if err := settings.Save(&settings.Settings{
@@ -121,17 +223,17 @@ func TestListenerStartEmptySecretFails(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	_, err := runListenerCLI(t, "listener", "start")
+	_, err := runListenerCLI(t, "listener", "run")
 	if err == nil {
-		t.Fatal("listener start with an empty secret: want an error, got nil")
+		t.Fatal("listener run with an empty secret: want an error, got nil")
 	}
 }
 
-// TestListenerStartInvalidPortOverrideFails proves the CLI override keeps
+// TestListenerRunInvalidPortOverrideFails proves the CLI override keeps
 // the same 1..65535 rule `config set webhook.listen_port` enforces, with no
 // exception for the listener command: --listen-port 0 must stay rejected
 // here even though a positive Port is otherwise accepted.
-func TestListenerStartInvalidPortOverrideFails(t *testing.T) {
+func TestListenerRunInvalidPortOverrideFails(t *testing.T) {
 	withHome(t)
 
 	if err := settings.Save(&settings.Settings{
@@ -140,9 +242,9 @@ func TestListenerStartInvalidPortOverrideFails(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	_, err := runListenerCLI(t, "listener", "start", "--listen-port", "0")
+	_, err := runListenerCLI(t, "listener", "run", "--listen-port", "0")
 	if err == nil {
-		t.Fatal("listener start --listen-port 0: want an error, got nil")
+		t.Fatal("listener run --listen-port 0: want an error, got nil")
 	}
 	if !strings.Contains(err.Error(), "between 1 and 65535") {
 		t.Errorf("error = %q, want the same range message settings.Fields uses", err.Error())
@@ -161,7 +263,7 @@ func TestListenerStartInvalidPortOverrideFails(t *testing.T) {
 }
 
 // TestRunListenerRefusesWhenAlreadyRunning covers the CRITICAL fix: a second
-// `listener start` must fail fast at the lock, before it can write a
+// `listener run` must fail fast at the lock, before it can write a
 // pidfile a live listener already owns. Simulating "already running" by
 // holding lockFileName directly -- rather than actually starting a second
 // listener -- keeps this test fast and deterministic: runListener returns
@@ -197,7 +299,7 @@ func TestRunListenerRefusesWhenAlreadyRunning(t *testing.T) {
 // from the lock, not from probing the pid.
 func TestListenerStatusReportsLiveForegroundListenerThroughPidfile(t *testing.T) {
 	withHome(t)
-	isolateLaunchd(t)
+	isolateService(t)
 
 	homeDir := os.Getenv("AGENT_UTILS_HOME")
 	if homeDir == "" {
@@ -227,14 +329,19 @@ func TestListenerStatusReportsLiveForegroundListenerThroughPidfile(t *testing.T)
 	}
 }
 
-// TestListenerStatusReportsStaleePidfileAsNotAlive proves status's liveness
-// comes from the lock, not from kill(pid, 0): it writes a pidfile naming
-// this TEST process's own pid (genuinely alive) but does NOT hold the lock,
-// simulating a listener that was killed -9 and left its pidfile behind. A
-// pid-based check would wrongly report this alive.
-func TestListenerStatusReportsStaleePidfileAsNotAlive(t *testing.T) {
+// TestListenerStatusReportsAndRemovesAStalePidfile proves two things about
+// the same fixture. First, status's liveness comes from the lock, not from
+// kill(pid, 0): it writes a pidfile naming this TEST process's own pid
+// (genuinely alive) but does NOT hold the lock, simulating a listener that
+// was killed -9 and left its pidfile behind. A pid-based check would wrongly
+// report this alive.
+//
+// Second, status now REMOVES that pidfile. The listener's old `stop`
+// subcommand used to own the cleanup and no longer exists, so without this,
+// status would report the same dead pid forever.
+func TestListenerStatusReportsAndRemovesAStalePidfile(t *testing.T) {
 	withHome(t)
-	isolateLaunchd(t)
+	isolateService(t)
 
 	homeDir := os.Getenv("AGENT_UTILS_HOME")
 	pidPath := filepath.Join(homeDir, pidFileName)
@@ -250,89 +357,219 @@ func TestListenerStatusReportsStaleePidfileAsNotAlive(t *testing.T) {
 		t.Errorf("status output = %q, want alive=false: the lock is not held, "+
 			"so this pidfile is stale regardless of whether its pid happens to be alive", out)
 	}
-}
-
-// TestListenerStopSignalsLiveForegroundPid covers stop's pidfile path: "stop
-// ... signal the pidfile's process when one is live." It spawns this test
-// binary as a child (a real process, not this test's own pid) and holds the
-// lock itself, matching what a real runListener does, so stop's liveness
-// check has something genuine to key on.
-func TestListenerStopSignalsLiveForegroundPid(t *testing.T) {
-	withHome(t)
-	isolateLaunchd(t)
-
-	homeDir := os.Getenv("AGENT_UTILS_HOME")
-
-	held, err := lock.Acquire(filepath.Join(homeDir, lockFileName))
-	if err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	defer held.Release()
-
-	// A short-lived real process this test can wait on: `sleep 30`, killed
-	// early by `listener stop` sending SIGTERM to its pid. Using a real
-	// child, not this test's own pid, means the test also proves stop does
-	// not just report success without truly signaling anything.
-	cmd := testSleepCmd(t)
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start sleep: %v", err)
-	}
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
-
-	pidPath := filepath.Join(homeDir, pidFileName)
-	if err := writePidfile(pidPath, cmd.Process.Pid, "127.0.0.1", 8787); err != nil {
-		t.Fatalf("writePidfile: %v", err)
-	}
-
-	out, err := runListenerCLI(t, "listener", "stop")
-	if err != nil {
-		t.Fatalf("listener stop: %v", err)
-	}
-	if !strings.Contains(out, "sent SIGTERM") {
-		t.Errorf("stop output = %q, want it to report signaling the pid", out)
-	}
-
-	waitErrCh := make(chan error, 1)
-	go func() { waitErrCh <- cmd.Wait() }()
-	select {
-	case <-waitErrCh:
-		// The child exited, killed by the SIGTERM `stop` sent it.
-	case <-time.After(5 * time.Second):
-		t.Fatal("child process did not exit after `listener stop`")
-	}
-}
-
-// TestListenerStopRemovesStalePidfileWithoutSignalingAnyone covers the other
-// half of CRITICAL 1's fix: with the lock free, a pidfile naming this TEST
-// process's own (genuinely alive) pid must NOT be signaled -- liveness comes
-// from the lock, and the lock says no listener is running.
-func TestListenerStopRemovesStalePidfileWithoutSignalingAnyone(t *testing.T) {
-	withHome(t)
-	isolateLaunchd(t)
-
-	homeDir := os.Getenv("AGENT_UTILS_HOME")
-	pidPath := filepath.Join(homeDir, pidFileName)
-	if err := writePidfile(pidPath, os.Getpid(), "127.0.0.1", 8787); err != nil {
-		t.Fatalf("writePidfile: %v", err)
-	}
-
-	out, err := runListenerCLI(t, "listener", "stop")
-	if err != nil {
-		t.Fatalf("listener stop: %v", err)
-	}
-	if strings.Contains(out, "SIGTERM") {
-		t.Errorf("stop output = %q, must not claim to signal anything: the lock was free", out)
+	if !strings.Contains(out, "stale") {
+		t.Errorf("status output = %q, want it to say the pidfile was stale", out)
 	}
 	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
-		t.Errorf("stale pidfile still exists after stop (stat err = %v)", statErr)
+		t.Errorf("listener status left the stale pidfile at %s", pidPath)
 	}
 }
 
-// testSleepCmd returns an unstarted long-sleep command, real enough that
-// SIGTERM has a genuine process to end.
-func testSleepCmd(t *testing.T) *exec.Cmd {
-	t.Helper()
-	return exec.Command("sleep", "30")
+// TestListenerStatusLabelsTheBackendNeutrally pins the rename from
+// "launchd:" to "service:". The backend is launchd on darwin and systemd on
+// linux, and the label must not name one of them.
+func TestListenerStatusLabelsTheBackendNeutrally(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fakeService(t, &fakeManager{status: service.Status{Installed: true, Running: true, PID: 7}})
+
+	out, err := runListenerCLI(t, "listener", "status")
+	if err != nil {
+		t.Fatalf("listener status: %v", err)
+	}
+	if !strings.Contains(out, "service: installed=true running=true pid=7") {
+		t.Errorf("listener status does not report the Manager's answer:\n%s", out)
+	}
+	if strings.Contains(out, "launchd:") {
+		t.Errorf("listener status still names launchd:\n%s", out)
+	}
+}
+
+// TestListenerUninstallWithNothingInstalledSaysSo covers the idempotent path
+// an operator hits on a machine that never ran `listener install`.
+func TestListenerUninstallWithNothingInstalledSaysSo(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fake := &fakeManager{status: service.Status{Installed: false}}
+	fakeService(t, fake)
+
+	out, err := runListenerCLI(t, "listener", "uninstall")
+	if err != nil {
+		t.Fatalf("listener uninstall: %v", err)
+	}
+	if !strings.Contains(out, "no listener service is installed") {
+		t.Errorf("listener uninstall did not report an empty machine:\n%s", out)
+	}
+	if fake.uninstalled {
+		t.Error("listener uninstall called Uninstall with nothing installed")
+	}
+}
+
+// TestListenerUninstallOnAnUnsupportedPlatformSaysSo covers the other reason
+// there is nothing to remove.
+func TestListenerUninstallOnAnUnsupportedPlatformSaysSo(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fakeService(t, &fakeManager{statusErr: service.ErrUnsupported})
+
+	out, err := runListenerCLI(t, "listener", "uninstall")
+	if err != nil {
+		t.Fatalf("listener uninstall: %v", err)
+	}
+	if !strings.Contains(out, "no listener service is installed") {
+		t.Errorf("listener uninstall did not report an unsupported platform:\n%s", out)
+	}
+}
+
+// TestListenerUninstallSurfacesARealStatusFailure is the fail-closed case.
+// A Status error that is NOT ErrUnsupported means this machine's
+// registration could not be READ -- a permission problem, an I/O error --
+// and a root-owned, boot-persistent unit may well still be installed.
+// Telling the operator "nothing is installed" and exiting 0 would be a lie
+// at the one moment it matters.
+func TestListenerUninstallSurfacesARealStatusFailure(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fakeService(t, &fakeManager{statusErr: errors.New("permission denied")})
+
+	if _, err := runListenerCLI(t, "listener", "uninstall"); err == nil {
+		t.Fatal("listener uninstall reported success for an unreadable registration")
+	}
+}
+
+// TestListenerUninstallRemovesAnInstalledService covers the ordinary path.
+func TestListenerUninstallRemovesAnInstalledService(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fake := &fakeManager{status: service.Status{Installed: true}}
+	fakeService(t, fake)
+
+	out, err := runListenerCLI(t, "listener", "uninstall")
+	if err != nil {
+		t.Fatalf("listener uninstall: %v", err)
+	}
+	if !fake.uninstalled {
+		t.Error("listener uninstall did not call Uninstall")
+	}
+	if !strings.Contains(out, "uninstalled") {
+		t.Errorf("listener uninstall said nothing about what it did:\n%s", out)
+	}
+}
+
+// TestListenerInstallRegistersListenerRunNeverInstall is the test for the
+// one hazard installService's own comment names: the registered command must
+// be `listener run`. Registering `listener install` would make the service
+// reinstall itself at every start.
+func TestListenerInstallRegistersListenerRunNeverInstall(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	if err := settings.Save(&settings.Settings{
+		Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: "a-secret"},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv("GITHUB_TOKEN", "")
+	if _, err := listener.SetToken("ghp_testtoken"); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+
+	fake := &fakeManager{}
+	fakeService(t, fake)
+
+	if _, err := runListenerCLI(t, "listener", "install", "--listen-port", "8788"); err != nil {
+		t.Fatalf("listener install: %v", err)
+	}
+	want := []string{"listener", "run", "--listen-port", "8788"}
+	if strings.Join(fake.installArgs, " ") != strings.Join(want, " ") {
+		t.Errorf("installed args = %v, want %v", fake.installArgs, want)
+	}
+	// removedDaemonFlag is split rather than a literal so this line does not
+	// itself match the repo-wide grep for the BoolFlag task 4 deleted.
+	removedDaemonFlag := "--" + "daemon"
+	for _, a := range fake.installArgs {
+		if a == "install" || a == removedDaemonFlag {
+			t.Errorf("installed args name a service-management verb: %v", fake.installArgs)
+		}
+	}
+}
+
+// TestListenerInstallDisabledWebhookFailsBeforeTouchingTheServiceManager
+// pins the check order. `install` must make exactly the checks `run` makes,
+// and make them first: a service registered against a disabled webhook, an
+// empty secret, or an unreadable token comes up looking healthy and then
+// fails every single delivery, with nothing at a terminal to say why.
+func TestListenerInstallDisabledWebhookFailsBeforeTouchingTheServiceManager(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fake := &fakeManager{}
+	fakeService(t, fake)
+
+	// No settings file at all: settings.Load returns the zero value, whose
+	// Webhook.Enabled is false.
+	_, err := runListenerCLI(t, "listener", "install")
+	if err == nil {
+		t.Fatal("listener install with the webhook disabled: want an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "config webhook --enable") {
+		t.Errorf("error %q does not name the command that fixes it", err)
+	}
+	if fake.installArgs != nil {
+		t.Error("listener install reached the service manager before its checks")
+	}
+}
+
+// TestListenerInstallEmptySecretFails is the second of the four checks.
+func TestListenerInstallEmptySecretFails(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	fake := &fakeManager{}
+	fakeService(t, fake)
+
+	if err := settings.Save(&settings.Settings{
+		Webhook: settings.Webhook{Enabled: true, URL: "https://x/y", Secret: ""},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	_, err := runListenerCLI(t, "listener", "install")
+	if err == nil {
+		t.Fatal("listener install with an empty secret: want an error, got nil")
+	}
+	if fake.installArgs != nil {
+		t.Error("listener install reached the service manager before its checks")
+	}
+}
+
+// TestContainsWritableRefusalMatchesOnlyTheSharedConstant pins ruling 1 from
+// task-4: containsWritableRefusal matches on service.WritableRefusalPhrase,
+// the exported constant refuseIfWritableByOthers (internal/service/service.go)
+// builds its refusal from, rather than on a literal copy of the phrase kept
+// on this side. That is what makes a wording drift between the two
+// impossible to express rather than merely detectable, so this test builds a
+// synthetic error containing the constant instead of driving a real Install
+// against a writable path -- doing that for real would write a genuine
+// launchd plist or systemd unit and run a real launchctl/systemctl, which
+// global test policy forbids.
+func TestContainsWritableRefusalMatchesOnlyTheSharedConstant(t *testing.T) {
+	writable := fmt.Errorf("refusing to install: /some/path is %s", service.WritableRefusalPhrase)
+	if !containsWritableRefusal(writable) {
+		t.Errorf("containsWritableRefusal(%v) = false, want true", writable)
+	}
+	unrelated := errors.New("permission denied")
+	if containsWritableRefusal(unrelated) {
+		t.Errorf("containsWritableRefusal(%v) = true, want false", unrelated)
+	}
+
+	explainedWritable := explainInstallErr(writable)
+	if !strings.Contains(explainedWritable.Error(), "~/bin") {
+		t.Errorf("explainInstallErr(%v) = %v, want it to add the ~/bin operator guidance",
+			writable, explainedWritable)
+	}
+	explainedUnrelated := explainInstallErr(unrelated)
+	if strings.Contains(explainedUnrelated.Error(), "~/bin") {
+		t.Errorf("explainInstallErr(%v) = %v, want no operator guidance for an unrelated error",
+			unrelated, explainedUnrelated)
+	}
 }
 
 // TestDrainAndCloseWaitsForInFlightTickBeforeClosingDB covers: "a test
@@ -618,7 +855,7 @@ func TestInstrumentRetriesRecoversPanicAndTracksWaitGroup(t *testing.T) {
 // drainAndClose's tickWG.Wait() with a timeout, that hangs the whole
 // shutdown forever: the database is never closed, the pidfile is never
 // removed, and the listener lock is never released, so every later
-// `listener start` refuses with "already running" until the process is
+// `listener run` refuses with "already running" until the process is
 // SIGKILLed. This test stops an armed timer and asserts the drain still
 // completes -- the case the previous round's suite did not cover.
 func TestInstrumentRetriesDrainCompletesAfterAStoppedTimer(t *testing.T) {
