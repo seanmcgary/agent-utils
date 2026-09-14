@@ -102,10 +102,18 @@ func runListenerCLINoExit(t *testing.T, args ...string) (stdout string, exitCode
 }
 
 // runListenerCLI runs the listener command tree against args and returns
-// what it printed to stdout, mirroring project_init_test.go's
-// TestProjectInitCLIPositionalNameNotFlag: a bare root built from just
-// listenerCommand() so a test cannot accidentally exercise `project` or
-// `config` and touch state this test does not control.
+// what it printed to stdout and stderr combined, mirroring
+// project_init_test.go's TestProjectInitCLIPositionalNameNotFlag: a bare
+// root built from just listenerCommand() so a test cannot accidentally
+// exercise `project` or `config` and touch state this test does not
+// control.
+//
+// Both streams are captured (and concatenated into the single returned
+// string) because CommandNotFound's guidance goes to os.Stderr -- matching
+// this repo's convention of stderr for an error report -- while every valid
+// command's own output still lands on stdout. Concatenating keeps every
+// existing strings.Contains assertion working regardless of which stream a
+// given command writes to.
 func runListenerCLI(t *testing.T, args ...string) (stdout string, err error) {
 	t.Helper()
 	root := &cli.Command{
@@ -113,19 +121,29 @@ func runListenerCLI(t *testing.T, args ...string) (stdout string, err error) {
 		Commands: []*cli.Command{listenerCommand()},
 	}
 
-	outR, outW, pipeErr := os.Pipe()
-	if pipeErr != nil {
-		t.Fatalf("stdout pipe: %v", pipeErr)
+	outR, outW, outPipeErr := os.Pipe()
+	if outPipeErr != nil {
+		t.Fatalf("stdout pipe: %v", outPipeErr)
 	}
-	old := os.Stdout
+	errR, errW, errPipeErr := os.Pipe()
+	if errPipeErr != nil {
+		t.Fatalf("stderr pipe: %v", errPipeErr)
+	}
+	oldOut, oldErr := os.Stdout, os.Stderr
 	os.Stdout = outW
+	os.Stderr = errW
 	runErr := root.Run(context.Background(), append([]string{"agent-utils"}, args...))
-	os.Stdout = old
+	os.Stdout = oldOut
+	os.Stderr = oldErr
 	outW.Close()
+	errW.Close()
 
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, outR); err != nil {
 		t.Fatalf("read captured stdout: %v", err)
+	}
+	if _, err := io.Copy(&buf, errR); err != nil {
+		t.Fatalf("read captured stderr: %v", err)
 	}
 	return buf.String(), runErr
 }
@@ -196,6 +214,29 @@ func TestListenerRejectsTheRemovedVerbs(t *testing.T) {
 				t.Errorf("listener %s output = %q, want it to name `run` and `install`", verb, out)
 			}
 		})
+	}
+}
+
+// TestListenerUnknownVerbGetsTheShortForm proves an unrelated typo (not
+// `start` or `stop`) gets the short four-verb list rather than the
+// start/stop replacement essay, which would otherwise name two commands the
+// operator never typed.
+func TestListenerUnknownVerbGetsTheShortForm(t *testing.T) {
+	withHome(t)
+	isolateService(t)
+	out, code := runListenerCLINoExit(t, "listener", "sttatus")
+	if code == 0 {
+		t.Fatalf("listener sttatus exited 0; it should be an unknown command\n%s", out)
+	}
+	// The start/stop essay is the only place "removed" and "foreground"
+	// appear; their absence here proves the short form ran instead.
+	if strings.Contains(out, "removed") || strings.Contains(out, "foreground") {
+		t.Errorf("listener sttatus output = %q, want the short form, not the start/stop guidance", out)
+	}
+	for _, verb := range []string{"run", "install", "uninstall", "status"} {
+		if !strings.Contains(out, verb) {
+			t.Errorf("listener sttatus output = %q, want it to list %q", out, verb)
+		}
 	}
 }
 

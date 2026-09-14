@@ -81,6 +81,15 @@ func listenerCommand() *cli.Command {
 		// removed by this rewrite. Losing two published verbs is a breaking
 		// change, and the moment an operator types the one that is gone is
 		// the one moment a pointer to its replacement is worth something.
+		// Any other unknown verb (a typo, say) gets the short form: just the
+		// four verbs that exist, not an essay about two the operator never
+		// typed.
+		//
+		// This is an error report, not a completed action's output, so it
+		// goes to os.Stderr -- matching this repo's convention of stdout for
+		// a completed action (uninstall's confirmation, status's report) and
+		// stderr for every error or warning (see main.go's top-level error
+		// print and project.go's warnings).
 		//
 		// It still exits non-zero, via cli.OsExiter rather than os.Exit: this
 		// only fires for a genuinely unknown subcommand, so reporting success
@@ -90,11 +99,17 @@ func listenerCommand() *cli.Command {
 		// without the library's default path killing the test binary; see
 		// that helper's own comment.
 		CommandNotFound: func(_ context.Context, _ *cli.Command, name string) {
-			fmt.Printf("agent-utils listener %s: no such command\n\n"+
-				"`start` and `stop` were removed. `start` is now `run` (foreground) or\n"+
-				"`install` (as a service); `stop` is now `uninstall`, Ctrl-C for a\n"+
-				"foreground run, or your platform's own service tool (systemctl/launchctl).\n",
-				name)
+			if name == "start" || name == "stop" {
+				fmt.Fprintf(os.Stderr, "agent-utils listener %s: no such command\n\n"+
+					"`start` and `stop` were removed. `start` is now `run` (foreground) or\n"+
+					"`install` (as a service); `stop` is now `uninstall`, Ctrl-C for a\n"+
+					"foreground run, or your platform's own service tool (systemctl/launchctl).\n",
+					name)
+			} else {
+				fmt.Fprintf(os.Stderr, "agent-utils listener %s: no such command\n\n"+
+					"available commands: run, install, uninstall, status\n",
+					name)
+			}
 			cli.OsExiter(1)
 		},
 	}
