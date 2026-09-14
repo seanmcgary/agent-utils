@@ -60,7 +60,7 @@ func (t Target) Ref() loopcmd.ProjectRef {
 // throws it away. A per-delivery log line is the wrong place for a
 // misconfiguration that is permanent: it scrolls past, and the loop it names
 // never routes again until somebody fixes it. Returning the skips lets
-// `listener start` show them at the moment an operator is watching -- see
+// `listener run` show them at the moment an operator is watching -- see
 // routingTable in cmd/agent-utils/listener.go.
 type Skip struct {
 	// Project is the registered project's name.
@@ -136,7 +136,7 @@ func (r Routes) ByRepo() []RepoRoute {
 // This is the whole of Targets' walk apart from the repo filter, and Targets
 // is written in terms of it rather than beside it. A second copy of the skip
 // rules would drift: a project this one showed and Targets dropped would make
-// `listener start`'s routing table promise deliveries that never happen, and
+// `listener run`'s routing table promise deliveries that never happen, and
 // the divergence would only ever surface as "the webhook does nothing".
 //
 // Nothing here is cached, for the reason Targets documents.
@@ -244,7 +244,7 @@ func Scan() (Routes, error) {
 //   - a target, for a project that enables tending and can build a dispatcher;
 //   - NOTHING, silently, for a project with no descriptor or with tending
 //     switched off. That is the normal state of most projects, on every scan,
-//     and a skip entry for it would fill `listener start`'s routing table with
+//     and a skip entry for it would fill `listener run`'s routing table with
 //     lines saying a project chose not to do something;
 //   - a skip reason, for a project that enables tending and cannot build one --
 //     no loop that loads, loops that disagree about the repository, a tend

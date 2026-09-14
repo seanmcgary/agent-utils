@@ -374,7 +374,7 @@ func TestTargetForIsGoneWhenTheProjectHasNoConfigsAtAll(t *testing.T) {
 }
 
 // Everything below is about Scan: the same walk Targets does, minus the repo
-// filter, so `listener start` can print the routing table it will actually
+// filter, so `listener run` can print the routing table it will actually
 // use. The two must share the walk -- a project Targets skips but Scan shows
 // would make the startup banner promise routing that a delivery then does
 // not do.

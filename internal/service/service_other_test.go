@@ -1,41 +1,38 @@
-//go:build !darwin
+//go:build !darwin && !linux
 
 package service
 
 import (
-	"strings"
+	"errors"
 	"testing"
 )
 
 // TestOtherManagerReportsUnsupported pins the fail-closed behavior of every
-// Manager method on a non-darwin platform: --daemon is launchd-only for now,
-// and each method must say so with a macOS-specific error rather than
-// silently doing nothing or panicking. This is the test that keeps that
-// contract honest now that CI (ubuntu-latest) actually compiles this file.
+// Manager method on a platform with no service-manager backend: each must
+// return ErrUnsupported rather than silently doing nothing or panicking.
+//
+// Nothing in CI RUNS this test. CI is ubuntu-latest, and the Makefile's vet
+// target type-checks this file under GOOS=freebsd -- vet analyzes test files,
+// so a compile error here fails `make check`, but no assertion below is ever
+// executed. That is the honest state of a stub for platforms this project
+// ships no binary for (see the Makefile's release targets: linux and darwin
+// only). Keep the assertions cheap and the file compiling.
 func TestOtherManagerReportsUnsupported(t *testing.T) {
 	m := New()
 
-	if err := m.Install("agent-utils", []string{"listener", "start"}); err == nil {
-		t.Error("Install did not report unsupported")
-	} else if !strings.Contains(err.Error(), "macOS") {
-		t.Errorf("Install error %q does not name macOS", err)
+	if err := m.Install("agent-utils", []string{"listener", "start"}); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("Install error = %v, want ErrUnsupported", err)
 	}
 
-	if err := m.Uninstall(); err == nil {
-		t.Error("Uninstall did not report unsupported")
-	} else if !strings.Contains(err.Error(), "macOS") {
-		t.Errorf("Uninstall error %q does not name macOS", err)
+	if err := m.Uninstall(); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("Uninstall error = %v, want ErrUnsupported", err)
 	}
 
-	if _, err := m.Status(); err == nil {
-		t.Error("Status did not report unsupported")
-	} else if !strings.Contains(err.Error(), "macOS") {
-		t.Errorf("Status error %q does not name macOS", err)
+	if _, err := m.Status(); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("Status error = %v, want ErrUnsupported", err)
 	}
 
-	if _, err := m.ServiceFilePath(); err == nil {
-		t.Error("ServiceFilePath did not report unsupported")
-	} else if !strings.Contains(err.Error(), "macOS") {
-		t.Errorf("ServiceFilePath error %q does not name macOS", err)
+	if _, err := m.ServiceFilePath(); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("ServiceFilePath error = %v, want ErrUnsupported", err)
 	}
 }

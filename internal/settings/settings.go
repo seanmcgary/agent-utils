@@ -549,8 +549,9 @@ func Fields() []Field {
 // is told plainly instead of being stopped.
 //
 // Stderr, not slog: the only callers of Set are the `config` command and
-// `listener start`'s flag validation, both of which talk to a person at a
-// terminal, and stdout is reserved for the value those commands print.
+// listenerPreflight's flag validation (shared by `listener run` and
+// `listener install`), both of which talk to a person at a terminal, and
+// stdout is reserved for the value those commands print.
 func warnIfNotLoopback(addr string) {
 	if isLoopbackHost(addr) {
 		return

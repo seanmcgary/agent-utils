@@ -279,9 +279,10 @@ func TestSetTokenTrimsSurroundingWhitespace(t *testing.T) {
 	}
 }
 
-// `listener start` prompts only when the file is ABSENT; a wrong mode, a
-// symlink or a bad owner must still fail. That distinction is made with
-// errors.Is against this sentinel, so the wrapping has to survive.
+// listenerPreflight (shared by `listener run` and `listener install`)
+// prompts only when the file is ABSENT; a wrong mode, a symlink or a bad
+// owner must still fail. That distinction is made with errors.Is against
+// this sentinel, so the wrapping has to survive.
 func TestTokenReportsAMissingFileAsErrEnvFileMissing(t *testing.T) {
 	envHome(t)
 

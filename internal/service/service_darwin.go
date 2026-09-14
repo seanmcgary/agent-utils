@@ -38,14 +38,6 @@ func launchAgentsDir() (string, error) {
 	return filepath.Join(userHome, "Library", "LaunchAgents"), nil
 }
 
-// executablePath resolves the path of the running process's own binary. It
-// is a variable, not a direct os.Executable() call at each use site, so a
-// test can point Install at a path inside a scratch directory without the
-// test binary itself needing to live there -- see resolveSelf for why this,
-// not Install's binary argument, is the SOURCE of the path that gets
-// installed.
-var executablePath = os.Executable
-
 // launchctl runs `launchctl <args...>` and returns its combined output. It
 // is a variable, not a direct exec.Command call at each use site, so a test
 // can prove Install and Uninstall write and remove the right files without
@@ -69,84 +61,6 @@ func (darwinManager) ServiceFilePath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, Label+".plist"), nil
-}
-
-// resolveSelf returns the absolute, symlink-resolved path to the running
-// binary and refuses one that a user other than its owner could overwrite.
-//
-// It resolves via os.Executable() (through the executablePath variable),
-// not via Install's binary argument: RunAtLoad and KeepAlive are both true
-// in the plist this produces, so whatever path ends up in
-// ProgramArguments[0] is permanent login-time execution. Treating an
-// arbitrary caller-supplied string as the SOURCE of that path -- rather than
-// merely checking it -- would let exactly the kind of injection this
-// package's plist rendering guards against back in through a different
-// door. The only binary this method should ever install is the one
-// currently running it, and os.Executable() is the one source that actually
-// answers that question rather than asserting it. Install still verifies
-// its binary argument against this result and fails loudly on a mismatch,
-// rather than silently ignoring what the caller asked for.
-//
-// The writability check matters for the same reason: this program dispatches
-// agents that run with permission prompts disabled on untrusted text (see
-// README, "Security") and can write anything the user can. A plist that
-// pointed into a checkout's ./bin -- or any other path with a writable
-// parent -- would hand a prompt-injected agent a way to overwrite the binary
-// launchd runs at every login, i.e. persistence across reboots.
-func resolveSelf() (string, error) {
-	self, err := executablePath()
-	if err != nil {
-		return "", fmt.Errorf("locate this executable: %w", err)
-	}
-	real, err := filepath.EvalSymlinks(self)
-	if err != nil {
-		return "", fmt.Errorf("resolve executable path: %w", err)
-	}
-	if err := refuseIfWritableByOthers(real); err != nil {
-		return "", err
-	}
-	return real, nil
-}
-
-// refuseIfWritableByOthers walks real and every parent directory up to the
-// filesystem root, refusing if any is group- or world-writable. A writable
-// parent is as dangerous as a writable file: an attacker who cannot modify
-// the binary in place can still rename a replacement over it, or remove and
-// recreate the path, because that only requires write access to the
-// directory entry, not the file itself.
-func refuseIfWritableByOthers(real string) error {
-	path := real
-	for {
-		info, err := os.Lstat(path)
-		if err != nil {
-			return fmt.Errorf("stat %s: %w", path, err)
-		}
-		// 0o022 is the group-write and other-write bits. Masking to just
-		// those and ignoring the rest of the mode (owner permissions,
-		// setuid/setgid) is deliberate, not an oversight about the sticky
-		// bit: on a directory, sticky (mode 1000) is exactly what stops
-		// another user renaming or unlinking an entry they don't own, but
-		// it only protects entries that already exist. It does nothing to
-		// stop another user CREATING a new entry at a path this plist will
-		// later name -- e.g. a binary that does not exist yet at install
-		// time, in a writable directory that is later populated. So a
-		// sticky, world-writable directory (mode 1777, like /tmp) is still
-		// refused here, correctly.
-		// cmd/agent-utils/listener.go's explainInstallErr matches this exact
-		// phrase ("writable by group or other") to decide whether to append
-		// operator-facing context (the Intel-Mac Homebrew /usr/local case)
-		// to this error. Changing the wording here without updating that
-		// match would silently turn a would-be explained refusal back into
-		// a bare one.
-		if info.Mode().Perm()&0o022 != 0 {
-			return fmt.Errorf("refusing to install: %s is writable by group or other", path)
-		}
-		parent := filepath.Dir(path)
-		if parent == path {
-			return nil
-		}
-		path = parent
-	}
 }
 
 // Install writes the plist and registers it with launchd.
@@ -222,6 +136,29 @@ func (m darwinManager) Install(binary string, args []string) error {
 
 	slog.Info("installing launch agent", "label", Label, "path", path, "binary", self)
 
+	// bootout first, tolerating failure, is what makes Manager.Install's
+	// documented idempotence true on darwin. `launchctl bootstrap` against a
+	// label already bootstrapped in the gui/<uid> domain does not replace
+	// the registration -- it fails outright, exit 5, "Bootstrap failed: 5:
+	// Input/output error". And an old agent is essentially always loaded:
+	// RunAtLoad brings it back at every login, so the ordinary case for a
+	// reinstall is a currently-running one, not a fresh machine. Without
+	// this bootout, `listener install` run a second time -- exactly the
+	// upgrade path the README documents -- would fail. bootout returning
+	// non-zero here means the agent was not loaded, the normal first-install
+	// case, so that failure is logged and swallowed the same way Uninstall
+	// treats it below, not surfaced as an error.
+	//
+	// This runs after the plist write, not before: bootout only needs the
+	// label, not the file, so ordering against the write doesn't affect
+	// whether it can run. Putting it after keeps both launchctl calls
+	// adjacent at the bottom of this method, so the bootstrap they set up
+	// reads as one uninterrupted sequence rather than being split around the
+	// file write in between.
+	if out, err := launchctl("bootout", gui()+"/"+Label); err != nil {
+		slog.Info("launchctl bootout reported non-zero, continuing", "label", Label, "output", strings.TrimSpace(string(out)))
+	}
+
 	out, err := launchctl("bootstrap", gui(), path)
 	if err != nil {
 		return fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
@@ -233,7 +170,7 @@ func (m darwinManager) Install(binary string, args []string) error {
 func (m darwinManager) Uninstall() error {
 	// bootout returns a non-zero status when the service is not currently
 	// loaded. Treat that as success, not failure: Uninstall must be
-	// idempotent, since `listener stop` may run against a plist a user
+	// idempotent, since `listener uninstall` may run against a plist a user
 	// already removed by hand, or against a machine that rebooted without
 	// the agent ever having bootstrapped successfully.
 	out, err := launchctl("bootout", gui()+"/"+Label)
