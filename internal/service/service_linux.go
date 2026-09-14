@@ -145,8 +145,9 @@ func (m linuxManager) Install(binary string, args []string) error {
 	// most ordinary operator mistake in this whole command.
 	//
 	// There is no case in which running the whole program as root is
-	// correct: it calls sudo itself for exactly the three steps that need
-	// it, and every directory it resolves must be the operator's.
+	// correct: it calls sudo itself for exactly the four steps that need
+	// it (tee, chmod, daemon-reload, enable --now), and every directory it
+	// resolves must be the operator's.
 	if geteuid() == 0 {
 		return errors.New(
 			"run `agent-utils listener install` as yourself, not as root: " +
