@@ -704,8 +704,8 @@ agent-utils listener install
 ```
 
 On Linux, that last command asks for your `sudo` password and registers a root-owned unit that
-starts at boot; see the [Linux walkthrough](#recovering-from-a-crash) below for what it does and
-why it needs root.
+starts at boot; see [Recovering from a crash](#recovering-from-a-crash) below for what it does
+and why it needs root.
 
 `agent-utils listener run` speaks plain HTTP and never terminates TLS itself — it expects
 nginx, cloudflared, or ngrok in front of it to do that. `webhook.url` is therefore the proxy's
