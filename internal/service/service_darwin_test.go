@@ -104,6 +104,83 @@ func TestInstallWritesPlistToOverrideDirOnly(t *testing.T) {
 	}
 }
 
+// TestInstallBootsOutBeforeBootstrap proves Install calls bootout before
+// bootstrap, in that order -- the sequence that makes reinstalling over a
+// loaded agent (RunAtLoad means that is the ordinary case) replace it
+// instead of failing with launchctl's exit 5.
+func TestInstallBootsOutBeforeBootstrap(t *testing.T) {
+	self := writableSelf(t)
+	stubExecutable(t, self)
+	t.Setenv(LaunchAgentsDirEnvVar, t.TempDir())
+	t.Setenv("AGENT_UTILS_HOME", t.TempDir())
+
+	var calls [][]string
+	stubLaunchctl(t, func(args ...string) ([]byte, error) {
+		calls = append(calls, args)
+		return nil, nil
+	})
+
+	if err := New().Install(self, []string{"listener", "start"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("launchctl called %d times, want 2: %v", len(calls), calls)
+	}
+	if calls[0][0] != "bootout" {
+		t.Errorf("first launchctl call = %v, want bootout first", calls[0])
+	}
+	if calls[1][0] != "bootstrap" {
+		t.Errorf("second launchctl call = %v, want bootstrap second", calls[1])
+	}
+}
+
+// TestInstallToleratesFailingBootout proves a non-zero bootout -- the
+// ordinary case for a first install, where nothing is loaded yet -- does not
+// fail Install, the same tolerance Uninstall already has for the same
+// command.
+func TestInstallToleratesFailingBootout(t *testing.T) {
+	self := writableSelf(t)
+	stubExecutable(t, self)
+	t.Setenv(LaunchAgentsDirEnvVar, t.TempDir())
+	t.Setenv("AGENT_UTILS_HOME", t.TempDir())
+
+	stubLaunchctl(t, func(args ...string) ([]byte, error) {
+		if args[0] == "bootout" {
+			return []byte("Boot-out failed: 3: No such process"), errStub
+		}
+		return nil, nil
+	})
+
+	if err := New().Install(self, []string{"listener", "start"}); err != nil {
+		t.Fatalf("Install returned an error for a non-zero bootout: %v", err)
+	}
+}
+
+// TestInstallFailsOnFailingBootstrap proves the tolerance above is scoped to
+// bootout alone: a failing bootstrap must still fail Install loudly.
+func TestInstallFailsOnFailingBootstrap(t *testing.T) {
+	self := writableSelf(t)
+	stubExecutable(t, self)
+	t.Setenv(LaunchAgentsDirEnvVar, t.TempDir())
+	t.Setenv("AGENT_UTILS_HOME", t.TempDir())
+
+	stubLaunchctl(t, func(args ...string) ([]byte, error) {
+		if args[0] == "bootstrap" {
+			return []byte("Bootstrap failed: 5: Input/output error"), errStub
+		}
+		return nil, nil
+	})
+
+	err := New().Install(self, []string{"listener", "start"})
+	if err == nil {
+		t.Fatal("Install did not fail on a non-zero bootstrap")
+	}
+	if !strings.Contains(err.Error(), "bootstrap") {
+		t.Errorf("error %q should name bootstrap as the failing command", err)
+	}
+}
+
 func TestInstallRefusesWorldWritableParentDirectory(t *testing.T) {
 	dir := t.TempDir()
 	// A checkout's ./bin, or any directory another local user can write

@@ -136,6 +136,29 @@ func (m darwinManager) Install(binary string, args []string) error {
 
 	slog.Info("installing launch agent", "label", Label, "path", path, "binary", self)
 
+	// bootout first, tolerating failure, is what makes Manager.Install's
+	// documented idempotence true on darwin. `launchctl bootstrap` against a
+	// label already bootstrapped in the gui/<uid> domain does not replace
+	// the registration -- it fails outright, exit 5, "Bootstrap failed: 5:
+	// Input/output error". And an old agent is essentially always loaded:
+	// RunAtLoad brings it back at every login, so the ordinary case for a
+	// reinstall is a currently-running one, not a fresh machine. Without
+	// this bootout, `listener install` run a second time -- exactly the
+	// upgrade path the README documents -- would fail. bootout returning
+	// non-zero here means the agent was not loaded, the normal first-install
+	// case, so that failure is logged and swallowed the same way Uninstall
+	// treats it below, not surfaced as an error.
+	//
+	// This runs after the plist write, not before: bootout only needs the
+	// label, not the file, so ordering against the write doesn't affect
+	// whether it can run. Putting it after keeps both launchctl calls
+	// adjacent at the bottom of this method, so the bootstrap they set up
+	// reads as one uninterrupted sequence rather than being split around the
+	// file write in between.
+	if out, err := launchctl("bootout", gui()+"/"+Label); err != nil {
+		slog.Info("launchctl bootout reported non-zero, continuing", "label", Label, "output", strings.TrimSpace(string(out)))
+	}
+
 	out, err := launchctl("bootstrap", gui(), path)
 	if err != nil {
 		return fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
