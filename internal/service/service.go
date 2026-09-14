@@ -189,12 +189,13 @@ func refuseIfWritableByOthers(real string) error {
 		// time, in a writable directory that is later populated. So a
 		// sticky, world-writable directory (mode 1777, like /tmp) is still
 		// refused here, correctly.
-		// cmd/agent-utils/listener.go's explainInstallErr matches this exact
-		// phrase, now exported as WritableRefusalPhrase, to decide whether
-		// to append operator-facing context (the Intel-Mac Homebrew
-		// /usr/local case) to this error. Changing the wording of
-		// WritableRefusalPhrase without updating that match would silently
-		// turn a would-be explained refusal back into a bare one.
+		// cmd/agent-utils/listener.go's explainInstallErr matches
+		// WritableRefusalPhrase, not a literal it carries its own copy of,
+		// to decide whether to append operator-facing context (the
+		// Intel-Mac Homebrew /usr/local case) to this error. The wording
+		// lives on the constant and travels with it, so rewording the
+		// phrase here cannot desync the two sides the way two independent
+		// literals could.
 		if info.Mode().Perm()&0o022 != 0 {
 			return fmt.Errorf("refusing to install: %s is %s", path, WritableRefusalPhrase)
 		}

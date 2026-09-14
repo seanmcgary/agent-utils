@@ -92,8 +92,10 @@ func TestRefuseIfWritableByOthersRejectsAWritableParent(t *testing.T) {
 	if err == nil {
 		t.Fatal("refuseIfWritableByOthers accepted a world-writable parent directory")
 	}
-	// cmd/agent-utils/listener.go's containsWritableRefusal matches this
-	// exact phrase. A wording change here breaks that match silently.
+	// This literal, not WritableRefusalPhrase, is what pins the actual
+	// English a human reads in the refusal; cmd/agent-utils/listener.go's
+	// containsWritableRefusal matches the constant itself, so a wording
+	// change here cannot desync that match, only this assertion.
 	if !strings.Contains(err.Error(), "writable by group or other") {
 		t.Errorf("refusal %q does not carry the phrase containsWritableRefusal matches", err)
 	}
