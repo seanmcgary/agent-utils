@@ -1073,9 +1073,10 @@ pause a registration in place.
 to hand-edit or hand-remove. The launchd label is unchanged
 (`com.seanmcgary.agent-utils.listener`, see `Label` in `internal/service/service.go`), so the new
 `listener status` reports on that same agent and `listener uninstall` removes it exactly as if
-you had installed it with the new command. Re-running `listener install` on macOS overwrites
-that same registration in place — same label, same plist path — so it is the supported way to
-move an old install onto the new form, not a second, competing one.
+you had installed it with the new command. Re-running `listener install` on macOS replaces that
+same registration — same label, same plist path, booting the old one out before bootstrapping
+the new plist in — so it is the supported way to move an old install onto the new form, not a
+second, competing one.
 
 ## Versioning and releases
 
