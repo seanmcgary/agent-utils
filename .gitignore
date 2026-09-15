@@ -16,3 +16,6 @@ release/
 /agent-utils
 
 .idea
+
+# Worktrees created for agent-driven work
+/.claude/worktrees/

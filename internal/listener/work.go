@@ -208,7 +208,26 @@ type Worker struct {
 	// the calls a delivery makes, which is the only place the saving is
 	// visible.
 	NewClient func(token string) ghub.Client
-	Open      func(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error)
+	// PollInterval is how often pollPass runs, and zero means never. `listener
+	// run` leaves it zero and `listener poll` sets it: the two commands differ
+	// in which SOURCE they start, and in nothing else.
+	PollInterval time.Duration
+	// NewPollSource builds the GitHub client one poll pass shares across every
+	// repository it reads. It is a seam for the same reason NewClient is, and
+	// it is a SEPARATE seam because its interface is narrower: widening
+	// ghub.Client to carry two methods only the poller calls would force them
+	// onto every fake in this tree that implements it.
+	NewPollSource func(token string) PollSource
+	// PollDeliver is the function a POLLED delivery goes through. NewWorker
+	// wires it to Deliver, and it is a seam for two callers: a test records
+	// what a pass produced without wiring a whole runtime behind it, and the
+	// process owner (cmd/agent-utils) wraps it in the same panic recovery it
+	// gives an HTTP-delivered tick. That wrapping is not optional -- pollPass
+	// calls this inline on Serve's own goroutine, so an unrecovered panic in
+	// one polled delivery kills the whole daemon, and the snapshot and cursor
+	// are already written by then, which loses the rest of the pass for good.
+	PollDeliver func(ctx context.Context, d Delivery)
+	Open        func(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error)
 	// RunIssue acts on ONE issue, taking the loop's lock first. It is
 	// loopcmd.TickIssue, never loopcmd.RunTick: the daemon answers events, and
 	// an event names an issue. The full reconcile is the cron sweep's job --
@@ -371,6 +390,7 @@ func NewWorker(db *store.DB) *Worker {
 		TargetFor:       TargetFor,
 		Token:           Token,
 		NewClient:       func(token string) ghub.Client { return ghub.New(token) },
+		NewPollSource:   func(token string) PollSource { return ghub.New(token) },
 		Open:            loopcmd.Open,
 		RunIssue:        loopcmd.TickIssue,
 		RunTend:         loopcmd.TendSweep,
@@ -406,6 +426,8 @@ func NewWorker(db *store.DB) *Worker {
 	// replaces Now after NewWorker returns, and a value captured here would
 	// leave it waiting a real ten minutes.
 	w.unroutable.now = func() time.Time { return w.Now() }
+	// Assigned after the literal because it refers to w itself.
+	w.PollDeliver = w.Deliver
 	return w
 }
 
@@ -807,8 +829,15 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 	// sweep issue 0.
 	//
 	// It is a separate branch, not an `||` with the condition above, because
-	// the two enter the sweep at different issues. A press and a close cannot
-	// arrive in one delivery, so at most one of them runs.
+	// the two enter the sweep at different issues -- and it must STAY separate
+	// even though both can now run for one delivery. A webhook sends one event
+	// per label and per state change, so it could never set both flags at
+	// once; a poll sees the edit whole, and an issue that was closed and
+	// labelled ready between two passes arrives as a single delivery carrying
+	// ClosedIssue AND EpicReady. Both sweeps must then run, which is exactly
+	// what the webhook's two deliveries would have produced. Folding these
+	// into an `else if` would silently drop one of them, for polled events
+	// only.
 	if d.Number > 0 && d.EpicReady {
 		w.epicReadyPass(ctx, t, d, cfg, deps)
 	}
@@ -1927,6 +1956,13 @@ func (w *Worker) Serve(ctx context.Context) {
 	tendC, stopTend := w.tendTicker()
 	defer stopTend()
 
+	// The second event source, on its own interval. It is built here rather
+	// than folded into the wake timer for the reason the tend ticker is: the
+	// wake serves deadlines this daemon wrote, and a poll asks GitHub a
+	// question nobody wrote a deadline for.
+	pollC, stopPoll := w.pollTicker()
+	defer stopPoll()
+
 	// Swept BEFORE the first wake, because a daemon starting is the moment a
 	// crash is discovered. The rows a machine leaves behind carry no retry
 	// deadline -- only a reap writes one -- so Wake cannot see them, and
@@ -1971,6 +2007,10 @@ func (w *Worker) Serve(ctx context.Context) {
 			// nil when the check is disabled, and a nil channel blocks
 			// forever, so this case simply never fires then.
 			w.tendCheckPass(ctx)
+		case <-pollC:
+			// nil when polling is off, and a nil channel blocks forever, so
+			// this case simply never fires for `listener run`.
+			w.pollPass(ctx)
 		case <-sweep.C:
 			// Falls through to the top of the loop, which calls Wake. That is
 			// deliberate: the sweep has just stamped deadlines that are due

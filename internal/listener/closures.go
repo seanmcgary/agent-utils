@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -159,8 +158,8 @@ func groupByRepo(refs []store.IssueRef) []repoGroup {
 // that cannot see one project's repository must not stop the others from being
 // reconciled, and this runs during startup.
 func (w *Worker) reconcileRepo(ctx context.Context, acc *access, g repoGroup) {
-	owner, name, ok := strings.Cut(g.Repo, "/")
-	if !ok || owner == "" || name == "" {
+	owner, name, ok := splitRepo(g.Repo)
+	if !ok {
 		// A dispatch row whose repo is not owner/name cannot be asked about.
 		// It is data this daemon did not write in that shape, so it is worth
 		// one line rather than a silent skip.

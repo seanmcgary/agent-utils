@@ -136,6 +136,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils version` | Version and commit |
 | `agent-utils config show [--reveal] \| get <key> \| set <key> <value> \| unset <key> \| webhook ...` | Read and write the machine-wide `~/.agent-utils/config.yaml`: the webhook daemon's URL, bind address and secret |
 | `agent-utils listener run [--listen-addr <a>] [--listen-port <p>]` | Run the webhook listener in this terminal until Ctrl-C |
+| `agent-utils listener poll [interval]` | Run the loops from a GitHub poll instead of webhook deliveries, for a repository you cannot add a hook to |
 | `agent-utils listener install [--listen-addr <a>] [--listen-port <p>] \| uninstall \| status` | Register the listener as an OS service, remove that registration, or inspect it |
 
 ### Project
@@ -952,6 +953,78 @@ restart of the installed service, and
 the endpoint it widens is the one that starts agents. Treat it the way you would treat any
 other change that opens a port to the LAN — deliberately, and behind your own firewall rule if
 this machine is not already trusted network-wide.
+
+## Polling
+
+Creating a webhook needs ADMIN on the repository. On a repository you do not
+have it on, `agent-utils listener poll` derives the same events by asking
+GitHub what changed, on an interval:
+
+```bash
+agent-utils listener poll 1m
+```
+
+The interval is a Go duration and defaults to one minute; below thirty seconds
+it is refused. It binds no port, and it needs no `webhook.url` and no secret --
+only the same `~/.agent-utils/env` with `GITHUB_TOKEN` in it that the [Cron](#cron)
+section has you create.
+
+It is the same daemon `listener run` is, with a different event source. The
+runtime does not know which source produced an event: the retry wake, the
+periodic tend check, the orphan sweep and the startup reconcile of what closed
+while it was down all run here exactly as they do there, and a polled change
+reaches a loop through the same path a delivery does.
+
+Each pass asks each watched repository for the issues and pull requests updated
+since the last pass, and for the tip of the default branch. What it finds is
+compared against what the last pass saw, and each difference becomes the
+delivery a webhook would have sent -- a label edit or a comment becomes a tick,
+a close arms the epic sweep or worktree cleanup, a merge or a direct push to
+the default branch arms a tend sweep. Roughly two API calls per repository per
+pass.
+
+**The first pass for a repository delivers nothing.** It records what is
+currently true and stops; otherwise starting the poller on an established
+repository would dispatch an agent for every issue in its history. Changes after
+that point are delivered however old they are, so a poller that was off for a
+day catches up on its next pass.
+
+Each pass writes its snapshot and its cursor before it sends a single delivery
+from that pass. That ordering buys **at-most-once** delivery: a crash between
+the write and the loop that follows drops whatever in that window had not yet
+gone out, because the next pass diffs new-against-new and sees no change where
+the undelivered remainder used to be. A webhook does not have this failure
+mode -- GitHub redelivers what a listener fails to acknowledge. The recovery
+path here is the cron `loop tick`, a full reconcile that re-derives the work
+from scratch rather than trusting any window of deliveries, which is the
+strongest reason to keep cron running beside the poller rather than treating
+the poller as a replacement for it. The alternative ordering, sending before
+writing, would trade this loss for the opposite failure -- redelivering a
+window already acted on -- and that is the worse of the two to risk.
+
+The poll cursor also keeps only one default-branch head per repository, so a
+poll watches ONE default branch per repository: the first non-empty
+`default_branch` among the loops watching it. Two loops watching the same
+repository under different default branches means pushes to the second branch
+are never detected as pushes -- the tend sweep a push would arm never fires
+for it there, though the periodic tend check still catches the resulting
+staleness later, just not promptly. A webhook subscribes per repository, not
+per branch, so it does not have this limitation.
+
+Poll mode is **foreground-only**. `agent-utils listener install` registers
+`listener run` with the service manager and has no way to register `listener
+poll`, so a poller is something you start in a terminal (or under your own
+supervisor) and stop with Ctrl-C — on exactly the machine this feature exists
+for. `agent-utils listener status` reports "not running" while a poller is up,
+too: it looks for the listener's pidfile and lock, and a poller writes no
+pidfile and holds a lock of its own, `listener.poll.lock`.
+
+One thing a poll cannot see at all: a review submitted with no comment body
+moves nothing the poll reads. The periodic tend check already covers the
+staleness that would signal.
+
+Cron remains worth keeping beside it, for the same reason it is worth keeping
+beside the listener.
 
 ## Epics
 

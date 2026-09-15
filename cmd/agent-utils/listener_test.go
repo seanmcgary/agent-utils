@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -187,18 +188,20 @@ func helpCommands(t *testing.T, out string) []string {
 	return names
 }
 
-// TestListenerHelpListsExactlyTheFourSubcommands pins the command surface.
+// TestListenerHelpListsExactlyTheFiveSubcommands pins the command surface.
 // `start` and `stop` are gone: a registered service is started and stopped
 // with systemctl or launchctl, and a foreground `listener run` is stopped
-// with Ctrl-C. This test fails if either verb comes back, and -- unlike the
-// substring check it replaces -- it fails if the subcommands disappear.
-func TestListenerHelpListsExactlyTheFourSubcommands(t *testing.T) {
+// with Ctrl-C. `poll` is the event source for a repository nobody has ADMIN
+// on (see listenerPollCommand). This test fails if either removed verb comes
+// back, and -- unlike the substring check it replaces -- it fails if any
+// subcommand disappears.
+func TestListenerHelpListsExactlyTheFiveSubcommands(t *testing.T) {
 	out, err := runListenerCLI(t, "listener", "--help")
 	if err != nil {
 		t.Fatalf("listener --help: %v", err)
 	}
 	got := helpCommands(t, out)
-	want := []string{"run", "install", "uninstall", "status"}
+	want := []string{"run", "poll", "install", "uninstall", "status"}
 	if len(got) != len(want) {
 		t.Fatalf("listener --help lists %v, want exactly %v\n%s", got, want, out)
 	}
@@ -850,7 +853,7 @@ func TestWrapTickUsesTickCtxNotHandlerCtx(t *testing.T) {
 	defer cancelTickCtx()
 
 	seen := make(chan context.Context, 1)
-	tick := wrapTick(tickCtx, func(ctx context.Context, _ listener.Delivery) {
+	tick := wrapTick("webhook", tickCtx, func(ctx context.Context, _ listener.Delivery) {
 		seen <- ctx
 	})
 
@@ -875,7 +878,7 @@ func TestWrapTickUsesTickCtxNotHandlerCtx(t *testing.T) {
 // TestWrapTickRecoversPanic covers the recover decision: a panic inside
 // deliver must not escape wrapTick.
 func TestWrapTickRecoversPanic(t *testing.T) {
-	tick := wrapTick(context.Background(), func(context.Context, listener.Delivery) {
+	tick := wrapTick("webhook", context.Background(), func(context.Context, listener.Delivery) {
 		panic("boom")
 	})
 
@@ -1189,5 +1192,268 @@ func TestRoutingTableKeepsEachSkipOnOneLine(t *testing.T) {
 	}
 	if !strings.Contains(skipLines[0], "line 2: field this_key_does_not_exist not found") {
 		t.Errorf("flattening the skip lost the detail of the error: %q", skipLines[0])
+	}
+}
+
+func TestParsePollInterval(t *testing.T) {
+	cases := []struct {
+		arg  string
+		want time.Duration
+		bad  bool
+	}{
+		{arg: "", want: defaultPollInterval},
+		{arg: "1m", want: time.Minute},
+		{arg: "5m", want: 5 * time.Minute},
+		{arg: "30s", want: 30 * time.Second},
+		{arg: "10s", bad: true},
+		{arg: "0", bad: true},
+		{arg: "-1m", bad: true},
+		{arg: "soon", bad: true},
+	}
+	for _, c := range cases {
+		got, err := parsePollInterval(c.arg)
+		if c.bad {
+			if err == nil {
+				t.Errorf("parsePollInterval(%q) = %v, want an error", c.arg, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parsePollInterval(%q): %v", c.arg, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parsePollInterval(%q) = %v, want %v", c.arg, got, c.want)
+		}
+	}
+}
+
+// The floor is REJECTED, not clamped. tend_interval clamps because it is a
+// stored setting whose owner may be nowhere near the machine when it loads; an
+// argument typed at a prompt has somebody reading the reply.
+func TestPollIntervalBelowTheFloorNamesTheFloor(t *testing.T) {
+	_, err := parsePollInterval("5s")
+	if err == nil {
+		t.Fatal("5s was accepted")
+	}
+	if !strings.Contains(err.Error(), minPollInterval.String()) {
+		t.Errorf("error %q does not name the floor %s", err, minPollInterval)
+	}
+}
+
+// pollHome prepares a home directory `listener poll` can actually start in:
+// a readable env file, since the command refuses to come up without a token
+// for the same reason `run` does.
+func pollHome(t *testing.T) string {
+	t.Helper()
+	withHome(t)
+	dir := os.Getenv("AGENT_UTILS_HOME")
+	if err := os.WriteFile(filepath.Join(dir, "env"), []byte("GITHUB_TOKEN=x\n"), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+	return dir
+}
+
+// runPollCommand runs the real `listener poll` Action under ctx, through the
+// command tree, and returns its error on a channel.
+//
+// ctx is what stops it: the Action derives its signal context from the one it
+// is given, so cancelling this one unblocks Worker.Serve exactly as SIGINT
+// does on an operator's terminal. Stdout is redirected to /dev/null because
+// the command prints its routing table; the assertions here are about what it
+// did, not what it said.
+func runPollCommand(t *testing.T, ctx context.Context, args ...string) <-chan error {
+	t.Helper()
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	old := os.Stdout
+	os.Stdout = devNull
+
+	done := make(chan error, 1)
+	go func() {
+		root := &cli.Command{
+			Name:     "agent-utils",
+			Commands: []*cli.Command{listenerCommand()},
+		}
+		runErr := root.Run(ctx, append([]string{"agent-utils", "listener", "poll"}, args...))
+		os.Stdout = old
+		devNull.Close()
+		done <- runErr
+	}()
+	return done
+}
+
+// TestPollCommandRefusesWhenAPollerAlreadyHoldsTheLock covers: a second
+// poller on one machine would double every dispatch, so it must fail fast the
+// way a second `listener run` does.
+//
+// It drives the COMMAND, not internal/lock: the version of this test that
+// acquired the lock itself and never called the command passed just as well
+// with the command taking no lock at all, which is the one regression it was
+// supposed to catch.
+func TestPollCommandRefusesWhenAPollerAlreadyHoldsTheLock(t *testing.T) {
+	dir := pollHome(t)
+
+	held, err := lock.Acquire(filepath.Join(dir, pollLockFileName))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer held.Release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	select {
+	case err := <-runPollCommand(t, ctx, "30s"):
+		if err == nil {
+			t.Fatal("a second poller started while the poll lock was held")
+		}
+		if !strings.Contains(err.Error(), "already running") {
+			t.Errorf("error = %q, want it to say a poller is already running", err.Error())
+		}
+	case <-ctx.Done():
+		t.Fatal("the poll command never returned; it did not fail at the lock")
+	}
+}
+
+// TestPollCommandReleasesItsLockOnShutdown runs the command for real and
+// stops it the way a signal does. It is the one test that exercises the poll
+// Action end to end -- the gap that let the missing process-owner protections
+// (instrumentPoller) go unnoticed -- and it pins the two halves of the
+// lifecycle a poller owns: it takes the lock while running, and gives it back
+// on the way out, after the drain.
+func TestPollCommandReleasesItsLockOnShutdown(t *testing.T) {
+	dir := pollHome(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runPollCommand(t, ctx, "30s")
+
+	// The poller is up once it holds the lock; until then there is nothing to
+	// shut down and cancelling would only race the start.
+	deadline := time.After(10 * time.Second)
+	for {
+		lk, err := lock.Acquire(filepath.Join(dir, pollLockFileName))
+		if err != nil {
+			break // the command holds it: it is running
+		}
+		lk.Release()
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("the poll command never took its lock")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("poll command returned %v, want a clean shutdown", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the poll command never returned after its context was cancelled")
+	}
+
+	lk, err := lock.Acquire(filepath.Join(dir, pollLockFileName))
+	if err != nil {
+		t.Fatalf("the poll lock was still held after shutdown: %v", err)
+	}
+	lk.Release()
+}
+
+// TestInstrumentPollerRecoversAPolledDeliveryPanic covers half of the parity
+// fix: pollPass calls Worker.PollDeliver inline on Serve's own goroutine, so
+// without a recover a panic in ANY polled delivery kills the whole daemon --
+// and the snapshot and cursor are already written by then, so the rest of
+// that pass is lost for good rather than re-derived next time. This test
+// fails (by crashing the test binary) if instrumentPoller stops wrapping the
+// seam.
+func TestInstrumentPollerRecoversAPolledDeliveryPanic(t *testing.T) {
+	withHome(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	w := listener.NewWorker(db)
+	// Installed BEFORE instrumentPoller, so the wrapper wraps it: this stands
+	// in for a Deliver that panics somewhere down in a tick.
+	w.PollDeliver = func(context.Context, listener.Delivery) { panic("boom") }
+
+	drain := instrumentPoller(w, context.Background())
+	defer drain()
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		w.PollDeliver(context.Background(), listener.Delivery{Repo: "owner/repo", Number: 7})
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the polled delivery never returned; the panic escaped instrumentPoller's recover")
+	}
+}
+
+// TestInstrumentPollerDrainWaitsForARetryFiredTick covers the other half: a
+// retry timer that has already fired and begun a tick must hold the poll
+// command's shutdown open, so the database is not closed underneath it. A
+// tick cut off that way leaves a dispatches row `running` with no pid, which
+// internal/loopcmd/tick.go does not treat as an orphan and so never reaps.
+//
+// It fails if instrumentPoller stops calling instrumentRetries, or stops
+// waiting on the WaitGroup before returning.
+func TestInstrumentPollerDrainWaitsForARetryFiredTick(t *testing.T) {
+	withHome(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	w := listener.NewWorker(db)
+	drain := instrumentPoller(w, context.Background())
+
+	running := make(chan struct{})
+	release := make(chan struct{})
+	var finished atomic.Bool
+	timer := w.After(time.Millisecond, func() {
+		close(running)
+		<-release
+		finished.Store(true)
+	})
+	defer timer.Stop()
+
+	select {
+	case <-running:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the retry callback never ran")
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		drain()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		t.Fatal("drain returned while a retry-fired tick was still running; " +
+			"the database would be closed underneath it")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-drained:
+		if !finished.Load() {
+			t.Fatal("drain returned before the retry-fired tick finished")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain never returned after the retry-fired tick finished")
 	}
 }
