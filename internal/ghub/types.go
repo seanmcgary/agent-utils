@@ -95,11 +95,12 @@ type PullRequest struct {
 	// linked to an issue and tended, because tending checks the head branch out
 	// and runs an agent inside it.
 	Trusted bool
-	// State is "open" or "closed", as GitHub spells it, and Merged says which
-	// kind of close. Both are here for the poller: a delivery TELLS this
-	// daemon a pull request merged, and a poll has to ask. Compare State with
-	// EqualFold rather than ==, as Issue.IsOpen does.
-	State  string
+	// Merged says which kind of close this was. It is here for the poller: a
+	// delivery TELLS this daemon a pull request merged, and a poll has to ask.
+	// There is deliberately no State beside it -- the poller compares the
+	// STATE OF THE LISTING (ghub.Subject.State) and never the fetched pull
+	// request's, so a second spelling of the same fact would only be one
+	// nothing reads.
 	Merged bool
 }
 

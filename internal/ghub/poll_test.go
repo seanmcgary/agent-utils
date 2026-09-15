@@ -76,7 +76,7 @@ func TestListSubjectsUpdatedSinceKeepsPullRequests(t *testing.T) {
 
 // A merge arms the tend sweep. Without this field the poller cannot tell a
 // merged pull request from an abandoned one, and a merge would arm nothing.
-func TestPullRequestCarriesMergedAndState(t *testing.T) {
+func TestPullRequestCarriesMerged(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/o/r/pulls/108", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -94,9 +94,6 @@ func TestPullRequestCarriesMergedAndState(t *testing.T) {
 	}
 	if !got.Merged {
 		t.Error("Merged = false, want true")
-	}
-	if got.State != "closed" {
-		t.Errorf("State = %q, want closed", got.State)
 	}
 	if got.BaseRef != "master" {
 		t.Errorf("BaseRef = %q, want master", got.BaseRef)

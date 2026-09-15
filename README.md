@@ -1011,6 +1011,14 @@ for it there, though the periodic tend check still catches the resulting
 staleness later, just not promptly. A webhook subscribes per repository, not
 per branch, so it does not have this limitation.
 
+Poll mode is **foreground-only**. `agent-utils listener install` registers
+`listener run` with the service manager and has no way to register `listener
+poll`, so a poller is something you start in a terminal (or under your own
+supervisor) and stop with Ctrl-C — on exactly the machine this feature exists
+for. `agent-utils listener status` reports "not running" while a poller is up,
+too: it looks for the listener's pidfile and lock, and a poller writes no
+pidfile and holds a lock of its own, `listener.poll.lock`.
+
 One thing a poll cannot see at all: a review submitted with no comment body
 moves nothing the poll reads. The periodic tend check already covers the
 staleness that would signal.

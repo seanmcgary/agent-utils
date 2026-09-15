@@ -146,7 +146,6 @@ func convertPR(owner, repo string, pr *github.PullRequest) PullRequest {
 		HeadRepo:          headRepo,
 		AuthorAssociation: assoc,
 		Trusted:           trusted,
-		State:             pr.GetState(),
 		Merged:            pr.GetMerged(),
 	}
 }

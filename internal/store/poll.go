@@ -15,10 +15,17 @@ import (
 // time", and the poller writes it already lowercased, sorted and joined, so a
 // reordered label list is not a change.
 type PollSubject struct {
-	Repo      string
-	Number    int
-	IsPR      bool
-	State     string
+	Repo   string
+	Number int
+	// IsPR is recorded for an operator reading this table, not consumed by the
+	// diff: the poller decides whether to fetch a closed pull request from the
+	// CURRENT listing's flag, never from the row it stored last pass.
+	IsPR  bool
+	State string
+	// Merged is recorded for the same reason IsPR is -- it says how a pull
+	// request this snapshot already shows as closed ended, which is worth
+	// having in the table when something has to be explained after the fact.
+	// The diff reads only State, Labels and UpdatedAt.
 	Merged    bool
 	Labels    string
 	UpdatedAt time.Time
