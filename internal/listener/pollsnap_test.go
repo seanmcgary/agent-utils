@@ -33,6 +33,26 @@ func TestPollDelivery(t *testing.T) {
 			want:  Delivery{Repo: "o/r", Number: 51},
 		},
 		{
+			// known is the sole authority for "never seen before", not
+			// whether prev happens to be the zero value. This prev is
+			// non-zero (open, updated at 10) yet known is false: a number
+			// first seen already closed says nothing about WHEN it closed,
+			// so the correct implementation must still yield a plain tick,
+			// not arm ClosedIssue off a transition it cannot have observed.
+			// Arming an epic sweep here would sweep on the poller's own
+			// schedule rather than the issue's.
+			//
+			// This state is not reachable through pollRepo today, where a
+			// map miss always yields a zero prev -- this test pins the
+			// function's contract so a future caller cannot violate it
+			// silently.
+			name:  "known false with a non-zero prev is still a plain tick",
+			prev:  store.PollSubject{Repo: "o/r", Number: 51, State: "open", UpdatedAt: at(10)},
+			known: false,
+			cur:   pollSubject{Number: 51, State: "closed", UpdatedAt: at(11)},
+			want:  Delivery{Repo: "o/r", Number: 51},
+		},
+		{
 			name: "an unchanged subject re-read at the inclusive boundary delivers nothing",
 			prev: openIssue, known: true,
 			cur:  pollSubject{Number: 51, State: "open", Labels: []string{"status:ready"}, UpdatedAt: at(10)},
