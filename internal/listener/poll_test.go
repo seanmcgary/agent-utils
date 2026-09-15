@@ -224,16 +224,70 @@ func TestAFailingRepositoryDoesNotAdvanceItsCursorOrStopTheNext(t *testing.T) {
 	h := newPollHarness(t, src, []Target{repoTarget(), second})
 	h.w.pollPass(context.Background()) // seed both
 
+	before, ok, err := h.db.PollCursor("o/r")
+	if err != nil || !ok {
+		t.Fatalf("PollCursor after seeding: %+v ok=%v err=%v", before, ok, err)
+	}
+
 	src.err = errors.New("github is down")
 	h.w.pollPass(context.Background())
 	src.err = nil
 
-	if _, ok, _ := h.db.PollCursor("o/r"); !ok {
-		t.Fatal("the seeded cursor vanished")
+	after, ok, err := h.db.PollCursor("o/r")
+	if err != nil || !ok {
+		t.Fatalf("the seeded cursor vanished: %+v ok=%v err=%v", after, ok, err)
+	}
+	// The whole cursor, not merely its presence: a failing pass that zeroed
+	// Since, wiped HeadSHA, or moved SeededAt would still pass an existence
+	// check while losing exactly the window this test exists to protect.
+	if !after.Since.Equal(before.Since) || after.HeadSHA != before.HeadSHA || !after.SeededAt.Equal(before.SeededAt) {
+		t.Errorf("cursor after the failing pass = %+v, want unchanged from %+v", after, before)
 	}
 	// Both repositories were attempted: two listings on the failing pass.
 	if src.listed != 4 {
 		t.Errorf("listings = %d, want 4 (two repositories, two passes)", src.listed)
+	}
+}
+
+// A pull request merged into a branch OTHER than the default must not
+// suppress a genuine push to the default branch: the two events are
+// unrelated, and swallowing the push silently drops a tend sweep a human
+// push into the default branch is owed. This pins the bug where `merged`
+// was set for ANY merge regardless of which branch it landed on.
+func TestAMergeIntoAnotherBranchDoesNotSuppressTheDefaultBranchPush(t *testing.T) {
+	src := &fakeSource{
+		subjects: map[string][]ghub.Subject{
+			"o/r": {{Number: 52, IsPullRequest: true, State: "open", UpdatedAt: at(10)}},
+		},
+		heads: map[string]string{"o/r@master": "sha1"},
+		prs:   map[int]ghub.PullRequest{52: {Number: 52, State: "closed", Merged: true, BaseRef: "release/1.x"}},
+	}
+	h := newPollHarness(t, src, []Target{repoTarget()})
+	h.w.pollPass(context.Background())
+
+	src.subjects["o/r"] = []ghub.Subject{{Number: 52, IsPullRequest: true, State: "closed", UpdatedAt: at(11)}}
+	src.heads["o/r@master"] = "sha2" // an unrelated, genuine push to master
+	h.w.pollPass(context.Background())
+
+	if len(h.got) != 2 {
+		t.Fatalf("deliveries = %+v, want two: the merge into release/1.x AND the push to master", h.got)
+	}
+	var sawMerge, sawPush bool
+	for _, d := range h.got {
+		if d.MergedInto == "release/1.x" {
+			sawMerge = true
+		}
+		if d.PushedTo == "master" {
+			sawPush = true
+		}
+	}
+	if !sawMerge || !sawPush {
+		t.Errorf("deliveries = %+v, want both the merge and the push", h.got)
+	}
+	// BranchHead is asked once per pass: the fake's counts are the point of
+	// its comment, and nothing before this test asserted this one.
+	if src.headed != 2 {
+		t.Errorf("BranchHead calls = %d, want 2 (one per pass)", src.headed)
 	}
 }
 
@@ -253,5 +307,41 @@ func TestPollTickerIsNilWhenDisabled(t *testing.T) {
 	defer stop2()
 	if c2 == nil {
 		t.Error("a positive PollInterval must produce a ticker")
+	}
+}
+
+// Every poll test above overrides Worker.deliver, so none of them would
+// notice the seam being left unwired in NewWorker -- which would make the
+// poller a silent no-op in production, dispatching nothing while logging
+// success. This is the one test that looks at the constructor's own wiring.
+func TestNewWorkerWiresDeliver(t *testing.T) {
+	w := NewWorker(nil)
+	if w.deliver == nil {
+		t.Fatal("NewWorker left deliver unwired; pollRepo would call a nil func")
+	}
+}
+
+// A pass given an already-cancelled context must do no work at all: no
+// listing, no snapshot write, no cursor write. pollPass and pollRepo both
+// check ctx.Err(), but only mid-loop -- this pins the case a caller hands in
+// a context that is dead before the first repository is even reached.
+func TestACancelledContextPassDeliversAndWritesNothing(t *testing.T) {
+	src := &fakeSource{
+		subjects: map[string][]ghub.Subject{
+			"o/r": {issueSubject(51, "open", nil, 10)},
+		},
+		heads: map[string]string{"o/r@master": "sha1"},
+	}
+	h := newPollHarness(t, src, []Target{repoTarget()})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.w.pollPass(ctx)
+
+	if len(h.got) != 0 {
+		t.Fatalf("a cancelled pass delivered %+v, want nothing", h.got)
+	}
+	if _, ok, _ := h.db.PollCursor("o/r"); ok {
+		t.Fatal("a cancelled pass wrote a cursor; want no write at all")
 	}
 }

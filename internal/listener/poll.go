@@ -119,6 +119,11 @@ func (w *Worker) pollRepo(ctx context.Context, src PollSource, r RepoRoute) erro
 		return err
 	}
 
+	// The default branch, hoisted above the subject loop: the merge
+	// suppression below must compare against THIS branch specifically, not
+	// merely "some merge happened somewhere in this pass".
+	branch := defaultBranchOf(r)
+
 	var (
 		rows       []store.PollSubject
 		deliveries []Delivery
@@ -133,9 +138,13 @@ func (w *Worker) pollRepo(ctx context.Context, src PollSource, r RepoRoute) erro
 
 		prev, known := snap[s.Number]
 		// The one extra fetch a pass can make, and only for a pull request
-		// that JUST closed: the listing carries no merged flag and no base
-		// ref, and without them a merge arms no tend sweep.
-		if known && cur.IsPR && isOpen(prev.State) && !isOpen(cur.State) {
+		// that JUST closed on an ALREADY-seeded pass: the listing carries no
+		// merged flag and no base ref, and without them a merge arms no tend
+		// sweep. Gated on seeded too, not only known -- a seeding pass can
+		// already have a snapshot row (a repeat seed after a wipe, or a
+		// number an earlier pass already recorded) but must deliver, and
+		// therefore fetch, nothing.
+		if seeded && known && cur.IsPR && isOpen(prev.State) && !isOpen(cur.State) {
 			pr, err := src.PullRequest(ctx, owner, name, s.Number)
 			if err != nil {
 				return err
@@ -153,33 +162,42 @@ func (w *Worker) pollRepo(ctx context.Context, src PollSource, r RepoRoute) erro
 		}
 		if d, ok := pollDelivery(r.Repo, prev, known, cur); ok {
 			deliveries = append(deliveries, d)
-			if d.MergedInto != "" {
+			// Scoped to the branch actually being compared below: a merge
+			// into release/1.x must not suppress a genuine push to master.
+			// branch != "" follows IsMergeInto's rule (see work.go) -- a
+			// repository whose targets name no default branch names no
+			// branch to compare against, so an empty MergedInto must not
+			// match an empty branch.
+			if d.MergedInto == branch && branch != "" {
 				merged = true
 			}
 		}
 	}
 
-	// The default branch, for the event nothing else can report. The first
-	// non-empty branch among this repository's targets: they are loops of
-	// possibly different projects, and a loop that names none has nothing to
-	// compare against.
-	head, branch := "", defaultBranchOf(r)
+	// The default branch, for the event nothing else can report.
+	head := ""
 	if branch != "" {
 		if head, err = src.BranchHead(ctx, owner, name, branch); err != nil {
 			return err
 		}
-		// Suppressed when a merge in this same pass explains the move: both
-		// arm the same sweep, and arming it twice dispatches two tend agents
-		// for one merge.
+		// Suppressed when a merge INTO THIS BRANCH in this same pass explains
+		// the move: both arm the same sweep, and arming it twice dispatches
+		// two tend agents for one merge. A merge into a different branch must
+		// not suppress this: the default branch moving is then unexplained
+		// and still needs its own push delivery.
 		if seeded && head != "" && head != cursor.HeadSHA && !merged {
 			deliveries = append(deliveries, Delivery{Repo: r.Repo, PushedTo: branch})
 		}
 	}
 
-	// Written BEFORE the deliveries go out. A delivery can take a long time --
-	// it opens loops and may dispatch agents -- and a crash in the middle of
-	// that must not leave a snapshot claiming the old state, which would
-	// deliver everything again on the next pass.
+	// Written BEFORE the deliveries go out. At-most-once: a crash between
+	// this write and the loop below could otherwise redeliver a window
+	// already acted on. The cost is the mirror image, not a comfort -- a
+	// crash or shutdown in that same gap DROPS whatever had not yet gone
+	// out, because the next pass diffs new-against-new and sees no change
+	// where this pass's undelivered remainder used to be. Cron's full
+	// reconcile tick is what recovers from that loss; this ordering only
+	// trades which failure mode a crash produces.
 	if err := w.DB.SavePollSubjects(r.Repo, rows); err != nil {
 		return err
 	}
@@ -217,6 +235,15 @@ func seededAt(c store.PollCursor, seeded bool, now time.Time) time.Time {
 
 // defaultBranchOf returns the first default branch this repository's targets
 // name, or "" when none does.
+//
+// KNOWN LIMITATION: when two loops watch the same repository with different
+// default branches, only the first one's pushes are ever detected -- there is
+// one head SHA per repository in poll_cursors, not one per branch, so the
+// second branch's moves are silently absorbed into "no change" against the
+// first branch's cursor. Fixing that needs a per-branch head store, which is
+// a schema change this task does not take. The periodic tend check still
+// catches the resulting staleness later by asking git directly, so a push to
+// the second branch is delayed rather than lost, only late.
 func defaultBranchOf(r RepoRoute) string {
 	for _, t := range r.Targets {
 		if t.DefaultBranch != "" {
