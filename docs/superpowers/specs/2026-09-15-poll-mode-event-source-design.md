@@ -241,9 +241,13 @@ A repository whose listing fails is logged and skipped, and its cursor is NOT
 advanced; the next pass re-reads the same window. One unreachable repository
 must not stop the others, and must not silently lose the interval it covered.
 
-Within a repository, subjects are processed in ascending `updated_at` and the
-cursor is advanced to the last one fully delivered, so a failure part way
-through a page resumes rather than restarts.
+Within a repository, subjects are processed in ascending `updated_at`, and
+neither the snapshot nor the cursor is written until the whole repository has
+been read. A failure part way through therefore RESTARTS that repository's
+window on the next pass rather than resuming inside it -- which costs one
+re-read and is correct, because re-reading is free by construction: a subject
+whose snapshot row is unchanged produces no delivery. Ascending order is what
+makes the cursor a single high-water mark rather than a set.
 
 A `Deliver` that fails is not the poller's problem: the retry schedule inside
 the runtime owns it, identically to a webhook delivery.
