@@ -187,18 +187,20 @@ func helpCommands(t *testing.T, out string) []string {
 	return names
 }
 
-// TestListenerHelpListsExactlyTheFourSubcommands pins the command surface.
+// TestListenerHelpListsExactlyTheFiveSubcommands pins the command surface.
 // `start` and `stop` are gone: a registered service is started and stopped
 // with systemctl or launchctl, and a foreground `listener run` is stopped
-// with Ctrl-C. This test fails if either verb comes back, and -- unlike the
-// substring check it replaces -- it fails if the subcommands disappear.
-func TestListenerHelpListsExactlyTheFourSubcommands(t *testing.T) {
+// with Ctrl-C. `poll` is the event source for a repository nobody has ADMIN
+// on (see listenerPollCommand). This test fails if either removed verb comes
+// back, and -- unlike the substring check it replaces -- it fails if any
+// subcommand disappears.
+func TestListenerHelpListsExactlyTheFiveSubcommands(t *testing.T) {
 	out, err := runListenerCLI(t, "listener", "--help")
 	if err != nil {
 		t.Fatalf("listener --help: %v", err)
 	}
 	got := helpCommands(t, out)
-	want := []string{"run", "install", "uninstall", "status"}
+	want := []string{"run", "poll", "install", "uninstall", "status"}
 	if len(got) != len(want) {
 		t.Fatalf("listener --help lists %v, want exactly %v\n%s", got, want, out)
 	}
@@ -1189,5 +1191,68 @@ func TestRoutingTableKeepsEachSkipOnOneLine(t *testing.T) {
 	}
 	if !strings.Contains(skipLines[0], "line 2: field this_key_does_not_exist not found") {
 		t.Errorf("flattening the skip lost the detail of the error: %q", skipLines[0])
+	}
+}
+
+func TestParsePollInterval(t *testing.T) {
+	cases := []struct {
+		arg  string
+		want time.Duration
+		bad  bool
+	}{
+		{arg: "", want: defaultPollInterval},
+		{arg: "1m", want: time.Minute},
+		{arg: "5m", want: 5 * time.Minute},
+		{arg: "30s", want: 30 * time.Second},
+		{arg: "10s", bad: true},
+		{arg: "0", bad: true},
+		{arg: "-1m", bad: true},
+		{arg: "soon", bad: true},
+	}
+	for _, c := range cases {
+		got, err := parsePollInterval(c.arg)
+		if c.bad {
+			if err == nil {
+				t.Errorf("parsePollInterval(%q) = %v, want an error", c.arg, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parsePollInterval(%q): %v", c.arg, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parsePollInterval(%q) = %v, want %v", c.arg, got, c.want)
+		}
+	}
+}
+
+// The floor is REJECTED, not clamped. tend_interval clamps because it is a
+// stored setting whose owner may be nowhere near the machine when it loads; an
+// argument typed at a prompt has somebody reading the reply.
+func TestPollIntervalBelowTheFloorNamesTheFloor(t *testing.T) {
+	_, err := parsePollInterval("5s")
+	if err == nil {
+		t.Fatal("5s was accepted")
+	}
+	if !strings.Contains(err.Error(), minPollInterval.String()) {
+		t.Errorf("error %q does not name the floor %s", err, minPollInterval)
+	}
+}
+
+// A second poller on one machine would double every dispatch. It must fail
+// fast, the way a second `listener run` does.
+func TestPollLockIsExclusive(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENT_UTILS_HOME", home)
+
+	first, err := lock.Acquire(filepath.Join(home, pollLockFileName))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer first.Release()
+
+	if _, err := lock.Acquire(filepath.Join(home, pollLockFileName)); err == nil {
+		t.Fatal("a second poller acquired the lock")
 	}
 }

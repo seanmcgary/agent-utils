@@ -55,6 +55,24 @@ const pidFileName = "listener.pid"
 // listener's pidfile out from under it.
 const lockFileName = "listener.lock"
 
+// pollLockFileName is the poller's single-instance lock, at
+// <home>/listener.poll.lock.
+//
+// It is a SEPARATE lock from lockFileName on purpose. Running a poller beside
+// an HTTP listener is redundant but supported -- the per-loop lock already
+// makes an overlapping tick harmless -- and contending for one lock would turn
+// "a daemon is up" into "the poller refuses to start".
+const pollLockFileName = "listener.poll.lock"
+
+// defaultPollInterval is how often `listener poll` asks GitHub what changed
+// when the operator names no interval.
+const defaultPollInterval = time.Minute
+
+// minPollInterval is the floor under the interval argument. Below it, a poll
+// spends its rate limit re-reading a repository faster than an agent can act
+// on what the last one found.
+const minPollInterval = 30 * time.Second
+
 // listenerCommand groups the webhook listener's lifecycle: run it here,
 // register it with the OS service manager, remove that registration, and ask
 // what it is doing. It is top level, not project-scoped, because one listener
@@ -71,6 +89,7 @@ func listenerCommand() *cli.Command {
 		Usage: "run the webhook listener that dispatches loops on GitHub deliveries",
 		Commands: []*cli.Command{
 			listenerRunCommand(),
+			listenerPollCommand(),
 			listenerInstallCommand(),
 			listenerUninstallCommand(),
 			listenerStatusCommand(),
@@ -107,7 +126,7 @@ func listenerCommand() *cli.Command {
 					name)
 			} else {
 				fmt.Fprintf(os.Stderr, "agent-utils listener %s: no such command\n\n"+
-					"available commands: run, install, uninstall, status\n",
+					"available commands: run, poll, install, uninstall, status\n",
 					name)
 			}
 			cli.OsExiter(1)
@@ -198,6 +217,128 @@ func listenerRunCommand() *cli.Command {
 			}
 			def := st.WithDefaults()
 			return runListener(ctx, os.Stdout, def.Webhook.ListenAddr, def.Webhook.ListenPort, currentSecret)
+		},
+	}
+}
+
+// parsePollInterval turns the command's optional positional argument into an
+// interval.
+//
+// An out-of-range value is REJECTED rather than clamped, unlike
+// settings.TendEvery: that one reads a stored file whose author may be nowhere
+// near the machine when it loads, and this one reads an argument somebody just
+// typed, with the reply in front of them.
+func parsePollInterval(arg string) (time.Duration, error) {
+	if strings.TrimSpace(arg) == "" {
+		return defaultPollInterval, nil
+	}
+	d, err := time.ParseDuration(arg)
+	if err != nil {
+		return 0, fmt.Errorf("interval must be a duration such as %q: %w", "1m", err)
+	}
+	if d < minPollInterval {
+		return 0, fmt.Errorf(
+			"interval must be at least %s; got %s", minPollInterval, d)
+	}
+	return d, nil
+}
+
+// listenerPollCommand runs this machine's loops from a POLL instead of from
+// webhook deliveries.
+//
+// It exists for a repository nobody has ADMIN on: a hook cannot be created
+// there, and without one none of the events a loop reacts to ever reach this
+// machine. Polling derives the same events by asking.
+//
+// It binds no port. `listener run` and this command start DIFFERENT SOURCES
+// for the same runtime and differ in nothing else -- the retry wake, the
+// periodic tend check, the orphan sweep and the startup closure reconcile all
+// run here exactly as they do there.
+func listenerPollCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "poll",
+		Usage:     "run the loops from a github poll instead of webhook deliveries",
+		ArgsUsage: "[interval]",
+		Description: "The interval is a Go duration such as 1m or 5m, and defaults to " +
+			defaultPollInterval.String() + ". It binds no port and needs no webhook.",
+		Action: func(ctx context.Context, c *cli.Command) error {
+			interval, err := parsePollInterval(c.Args().First())
+			if err != nil {
+				return err
+			}
+
+			// The token half of listenerPreflight, and deliberately not
+			// the whole of it: that function also requires webhook.enabled
+			// and a non-empty webhook.secret, and a poller has neither a
+			// delivery to verify nor a port to serve it on. Refusing to start
+			// on a missing or world-readable env file is the half that
+			// applies, for the reason it applies to `run` -- Worker reads the
+			// token fresh on every pass, so without this the daemon comes up
+			// looking healthy and then fails every one of them.
+			if err := ensureToken(os.Stdin, os.Stderr, isInteractive()); err != nil {
+				return err
+			}
+
+			dir, err := home.Dir()
+			if err != nil {
+				return err
+			}
+			lockPath := filepath.Join(dir, pollLockFileName)
+			lk, err := lock.Acquire(lockPath)
+			if errors.Is(err, lock.ErrHeld) {
+				return errors.New(
+					"another `agent-utils listener poll` is already running (its lock is held); " +
+						"stop it with Ctrl-C in its own terminal")
+			}
+			if err != nil {
+				return fmt.Errorf("acquire poll lock: %w", err)
+			}
+			defer func() {
+				if err := lk.Release(); err != nil {
+					slog.Warn("release poll lock", "path", lockPath, "err", err)
+				}
+			}()
+
+			dbPath, err := home.StateDBPath()
+			if err != nil {
+				return err
+			}
+			db, err := store.Open(dbPath)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := db.Close(); err != nil {
+					slog.Warn("close state database", "err", err)
+				}
+			}()
+
+			w := listener.NewWorker(db)
+			w.PollInterval = interval
+			// Read once at startup, exactly as runListener reads it, and for
+			// the same reason: a Worker's delays are set before it is shared
+			// with the wake loop and never written afterwards. The runtime is
+			// the runtime -- a poller that skipped this would tend on a
+			// different schedule from a listener, which is precisely the
+			// difference this command exists to avoid.
+			w.TendInterval = settings.DefaultTendInterval
+			if st, err := settings.Load(); err == nil {
+				w.TendInterval = st.TendEvery()
+			} else {
+				slog.Warn("cannot read settings; using the default tend interval", "err", err)
+			}
+
+			routes, err := listener.Scan()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("polling every %s; no port is bound\n", interval)
+			fmt.Print(routingTable(routes))
+
+			ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			w.Serve(ctx)
+			return nil
 		},
 	}
 }
