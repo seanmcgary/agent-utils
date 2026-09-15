@@ -179,16 +179,36 @@ this listed OPEN issues and OPEN pull requests only:
 
 - `PullRequest` gains `Merged bool` and `State string`, set in `convertPR`.
   Without `Merged` there is no `MergedInto`, and a merge arms no tend sweep.
-- `Issue` gains `IsPullRequest bool`, set in `ConvertIssues` from the
-  `pull_request` stub GitHub attaches. The listing returns both kinds mixed,
-  and three rows of the flag table turn on which one a subject is.
-- `ListIssuesUpdatedSince(ctx, owner, repo, since) ([]Issue, error)`:
-  `state=all`, `sort=updated`, `direction=asc`, paginated. `ListOpenIssues`
-  cannot be reused -- it is open-only and unordered, and a close is exactly
-  what this must see.
+- A new `Subject` type -- `{Number, IsPullRequest, State, Labels, UpdatedAt}`
+  -- and `ListSubjectsUpdatedSince(ctx, owner, repo, since) ([]Subject, error)`:
+  `state=all`, `sort=updated`, `direction=asc`, paginated.
+
+  `Issue` is deliberately NOT reused and `ConvertIssues` is NOT touched.
+  `ConvertIssues` DROPS pull requests (`gi.IsPullRequest()`), and every caller
+  it has depends on that; teaching it to keep them, behind a new flag, would
+  put a pull request into the epic sweep's issue lists. `ListOpenIssues` is
+  unusable here for a second reason besides: it is open-only and unordered, and
+  a close is exactly what a poll must see.
 - `BranchHead(ctx, owner, repo, branch) (string, error)`, returning the head
   commit SHA. `BehindBy` compares two refs and answers a count, which is a
   different question.
+
+None of this reaches the `ghub.Client` INTERFACE. The two new methods are on
+`*GitHubClient` only, and the poller reaches them through its own narrow
+interface:
+
+```go
+type PollSource interface {
+    ListSubjectsUpdatedSince(ctx context.Context, owner, repo string, since time.Time) ([]ghub.Subject, error)
+    BranchHead(ctx context.Context, owner, repo, branch string) (string, error)
+    PullRequest(ctx context.Context, owner, repo string, number int) (ghub.PullRequest, error)
+}
+```
+
+`Worker` gains `NewPollSource func(token string) PollSource`, wired to
+`ghub.New` in `NewWorker`, exactly as the existing `NewClient` seam is. Widening
+`ghub.Client` instead would force two methods onto every fake in `loopcmd` and
+`listener` that implements it, for the benefit of one caller.
 
 ## Command surface
 
