@@ -253,7 +253,18 @@ func parsePollInterval(arg string) (time.Duration, error) {
 // It binds no port. `listener run` and this command start DIFFERENT SOURCES
 // for the same runtime and differ in nothing else -- the retry wake, the
 // periodic tend check, the orphan sweep and the startup closure reconcile all
-// run here exactly as they do there.
+// run here exactly as they do there, and so do the process-owner protections
+// around a tick: the retry instrumentation, the panic recovery, and the drain
+// that holds shutdown open until an already-fired tick has finished. Those
+// three live in this command, not in internal/listener, so they have to be
+// installed here explicitly; instrumentPoller is where, and its comment says
+// what each of them is for.
+//
+// It is FOREGROUND-ONLY, deliberately and for now: `listener install`
+// registers `listener run`, so there is no way to register a poller with the
+// service manager, and `listener status` reports "not running" while one is up
+// -- a poller writes no pidfile and holds a lock of its own. Both are
+// documented in the README's Polling section.
 func listenerPollCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "poll",
@@ -279,7 +290,11 @@ func listenerPollCommand() *cli.Command {
 				return err
 			}
 
-			dir, err := home.Dir()
+			// EnsureDir, not Dir, exactly as runListener does: everything
+			// below writes into this directory, and relying on lock.Acquire's
+			// MkdirAll of the lock file's parent to create it first makes
+			// correctness depend on the order these calls happen to be in.
+			dir, err := home.EnsureDir()
 			if err != nil {
 				return err
 			}
@@ -325,7 +340,12 @@ func listenerPollCommand() *cli.Command {
 			if st, err := settings.Load(); err == nil {
 				w.TendInterval = st.TendEvery()
 			} else {
-				slog.Warn("cannot read settings; using the default tend interval", "err", err)
+				// "tend_interval", the same key runListener's warning carries
+				// and for the reason its comment gives: an operator greps the
+				// setting's name, and a second spelling of one value hides the
+				// warning from exactly the search that would find it.
+				slog.Warn("cannot read the settings; using the default tend check interval",
+					"tend_interval", w.TendInterval, "err", err)
 			}
 
 			routes, err := listener.Scan()
@@ -337,7 +357,18 @@ func listenerPollCommand() *cli.Command {
 
 			ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 			defer stop()
+
+			// The process-owner protections `listener run` installs, on the
+			// same Worker seams; see instrumentPoller. The signal context is
+			// the shutdown gate, because for a poller it is the only thing
+			// that ever starts a shutdown.
+			drain := instrumentPoller(w, ctx)
+
 			w.Serve(ctx)
+			// Before the deferred db.Close() and lock release above: that is
+			// drainAndClose's step 3 ahead of its steps 4 and 6, for the
+			// reason it documents there.
+			drain()
 			return nil
 		},
 	}
@@ -663,7 +694,7 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 		Addr:   addr,
 		Port:   port,
 		Secret: secret,
-		Tick:   wrapTick(tickCtx, w.Deliver),
+		Tick:   wrapTick("webhook", tickCtx, w.Deliver),
 	})
 	if err != nil {
 		closeDB()
@@ -952,19 +983,79 @@ func drainAndClose(
 // unrecovered panic in ANY Go goroutine kills the whole process -- there is
 // no per-goroutine isolation. This command is the process owner, so the
 // decision belongs here.
+//
+// source names the event source in the recovered-panic line, because both
+// commands wrap with this one function: `listener run` passes "webhook" and
+// `listener poll` passes "poll" (see instrumentPoller). It is the only
+// difference between the two wrappings, and the log line is the one place an
+// operator can see which source a crash came out of.
 func wrapTick(
+	source string,
 	tickCtx context.Context,
 	deliver func(ctx context.Context, d listener.Delivery),
 ) func(context.Context, listener.Delivery) {
 	return func(_ context.Context, d listener.Delivery) {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("webhook tick panicked; recovered to keep the listener alive",
+				slog.Error(source+" tick panicked; recovered to keep the listener alive",
 					"repo", d.Repo, "number", d.Number,
 					"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
 			}
 		}()
 		deliver(tickCtx, d)
+	}
+}
+
+// instrumentPoller gives `listener poll`'s Worker the three process-owner
+// protections runListener gives its own, and returns the drain the poll
+// command must run once Serve has returned.
+//
+// It exists because those protections are NOT inside internal/listener and
+// never were: they belong to the process owner, and until this function the
+// poll command simply did not install them -- which made the claim that the
+// two commands differ only in which source they start false in the three ways
+// that matter most.
+//
+//  1. instrumentRetries, on the same terms as runListener: a retry-fired tick
+//     is accounted for, panic-safe, and stopped from starting a fresh coding
+//     agent once shutdown has begun. shuttingDown here is the SIGNAL context
+//     the command already builds, rather than a context of its own as in
+//     runListener -- a poller has no HTTP server that can exit underneath it,
+//     so the signal is the only thing that ever starts a shutdown, and using
+//     it directly cancels the gate at the earliest possible moment rather
+//     than after Serve has finished unwinding.
+//
+//  2. wrapTick around the delivery seam. pollPass calls Worker.PollDeliver
+//     INLINE on Serve's own goroutine, so an unrecovered panic in one polled
+//     delivery takes the whole daemon down -- and the snapshot and cursor for
+//     that repository are already written by then, so the rest of that pass's
+//     deliveries are lost permanently rather than re-derived by the next one.
+//     The tickCtx substitution carries over unchanged from `listener run`: a
+//     delivery already running when the signal arrives is allowed to finish
+//     rather than being cut off mid-tick, and pollRepo's own ctx.Err() check
+//     between deliveries is what stops the pass.
+//
+//  3. The returned drain waits on tickWG before the command's deferred
+//     db.Close() and lock release run, which is drainAndClose's step 3 before
+//     its steps 4 and 6, for the reason documented there: a tickOne in flight
+//     when the database closes underneath it leaves a dispatches row stuck
+//     `running` with no pid, which internal/loopcmd/tick.go does not treat as
+//     an orphan and so never reaps. drainAndClose itself is not reused
+//     wholesale because its other steps -- stopping the HTTP server, removing
+//     the pidfile -- have no counterpart here: a poller binds no socket and
+//     writes no pidfile.
+func instrumentPoller(w *listener.Worker, shuttingDown context.Context) (drain func()) {
+	var tickWG sync.WaitGroup
+	instrumentRetries(w, &tickWG, shuttingDown)
+
+	// Not cancelled until after the drain, for the reason runListener's own
+	// tickCtx is not: it is what lets an in-flight delivery finish.
+	tickCtx, cancelTickCtx := context.WithCancel(context.Background())
+	w.PollDeliver = wrapTick("poll", tickCtx, w.PollDeliver)
+
+	return func() {
+		tickWG.Wait()
+		cancelTickCtx()
 	}
 }
 

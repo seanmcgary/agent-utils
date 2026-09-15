@@ -13,11 +13,18 @@ import (
 // fakeSource is a PollSource that answers from tables and counts what it was
 // asked. The counts are the point of two of the tests below: a pass that reads
 // more than it must is the failure this whole design is shaped to avoid.
+//
+// Each method has its OWN error hook. One shared error could only ever fail
+// the listing, which is why a failing BranchHead discarding a whole pass went
+// unnoticed until a review found it: the fake could not express that failure
+// at all.
 type fakeSource struct {
 	subjects map[string][]ghub.Subject // keyed "owner/repo"
 	heads    map[string]string
 	prs      map[int]ghub.PullRequest
-	err      error
+	listErr  error
+	headErr  error
+	prErr    error
 
 	listed  int
 	headed  int
@@ -30,14 +37,17 @@ func (f *fakeSource) ListSubjectsUpdatedSince(
 ) ([]ghub.Subject, error) {
 	f.listed++
 	f.since = since
-	if f.err != nil {
-		return nil, f.err
+	if f.listErr != nil {
+		return nil, f.listErr
 	}
 	return f.subjects[owner+"/"+repo], nil
 }
 
 func (f *fakeSource) BranchHead(_ context.Context, owner, repo, branch string) (string, error) {
 	f.headed++
+	if f.headErr != nil {
+		return "", f.headErr
+	}
 	return f.heads[owner+"/"+repo+"@"+branch], nil
 }
 
@@ -45,6 +55,9 @@ func (f *fakeSource) PullRequest(
 	_ context.Context, _, _ string, number int,
 ) (ghub.PullRequest, error) {
 	f.fetched = append(f.fetched, number)
+	if f.prErr != nil {
+		return ghub.PullRequest{}, f.prErr
+	}
 	return f.prs[number], nil
 }
 
@@ -70,7 +83,7 @@ func newPollHarness(t *testing.T, src *fakeSource, targets []Target) *pollHarnes
 	h.w.Token = func() (string, error) { return "t", nil }
 	h.w.NewPollSource = func(string) PollSource { return src }
 	h.w.ScanTargets = func() (Routes, error) { return Routes{Targets: targets}, nil }
-	h.w.deliver = func(_ context.Context, d Delivery) { h.got = append(h.got, d) }
+	h.w.PollDeliver = func(_ context.Context, d Delivery) { h.got = append(h.got, d) }
 	return h
 }
 
@@ -168,7 +181,7 @@ func TestAMergeAndItsPushArmOneTend(t *testing.T) {
 			"o/r": {{Number: 52, IsPullRequest: true, State: "open", UpdatedAt: at(10)}},
 		},
 		heads: map[string]string{"o/r@master": "sha1"},
-		prs:   map[int]ghub.PullRequest{52: {Number: 52, State: "closed", Merged: true, BaseRef: "master"}},
+		prs:   map[int]ghub.PullRequest{52: {Number: 52, Merged: true, BaseRef: "master"}},
 	}
 	h := newPollHarness(t, src, []Target{repoTarget()})
 	h.w.pollPass(context.Background())
@@ -229,9 +242,9 @@ func TestAFailingRepositoryDoesNotAdvanceItsCursorOrStopTheNext(t *testing.T) {
 		t.Fatalf("PollCursor after seeding: %+v ok=%v err=%v", before, ok, err)
 	}
 
-	src.err = errors.New("github is down")
+	src.listErr = errors.New("github is down")
 	h.w.pollPass(context.Background())
-	src.err = nil
+	src.listErr = nil
 
 	after, ok, err := h.db.PollCursor("o/r")
 	if err != nil || !ok {
@@ -260,7 +273,7 @@ func TestAMergeIntoAnotherBranchDoesNotSuppressTheDefaultBranchPush(t *testing.T
 			"o/r": {{Number: 52, IsPullRequest: true, State: "open", UpdatedAt: at(10)}},
 		},
 		heads: map[string]string{"o/r@master": "sha1"},
-		prs:   map[int]ghub.PullRequest{52: {Number: 52, State: "closed", Merged: true, BaseRef: "release/1.x"}},
+		prs:   map[int]ghub.PullRequest{52: {Number: 52, Merged: true, BaseRef: "release/1.x"}},
 	}
 	h := newPollHarness(t, src, []Target{repoTarget()})
 	h.w.pollPass(context.Background())
@@ -291,6 +304,59 @@ func TestAMergeIntoAnotherBranchDoesNotSuppressTheDefaultBranchPush(t *testing.T
 	}
 }
 
+// A failing BranchHead must cost the pass its PUSH detection and nothing
+// else. Returning there discarded the subject stream with it, and for a
+// PERMANENT failure -- a default_branch typo, a repository renamed
+// master->main with stale config, both 404s -- that wedged the repository
+// forever: no issue ever delivered again, and the cursor never advancing, so
+// every pass re-listed the whole paginated history against the rate limit.
+func TestAFailingBranchHeadStillDeliversAndStillAdvancesTheCursor(t *testing.T) {
+	src := &fakeSource{
+		subjects: map[string][]ghub.Subject{
+			"o/r": {issueSubject(51, "open", nil, 10)},
+		},
+		heads: map[string]string{"o/r@master": "sha1"},
+	}
+	h := newPollHarness(t, src, []Target{repoTarget()})
+	h.w.pollPass(context.Background()) // seed, with a working BranchHead
+
+	src.headErr = errors.New("404 no such branch")
+	src.subjects["o/r"] = []ghub.Subject{issueSubject(51, "closed", nil, 11)}
+	h.w.pollPass(context.Background())
+
+	if len(h.got) != 1 {
+		t.Fatalf("deliveries = %+v, want the close of 51 despite the branch read failing", h.got)
+	}
+	if !h.got[0].ClosedIssue || h.got[0].Number != 51 {
+		t.Errorf("delivery = %+v, want the close of issue 51", h.got[0])
+	}
+
+	after, ok, err := h.db.PollCursor("o/r")
+	if err != nil || !ok {
+		t.Fatalf("PollCursor: %+v ok=%v err=%v", after, ok, err)
+	}
+	if !after.Since.Equal(at(11)) {
+		t.Errorf("cursor Since = %v, want %v: a wedged cursor re-lists the whole history every pass",
+			after.Since, at(11))
+	}
+	// Preserved, not zeroed: the head is the one thing this pass could not
+	// learn, and forgetting it would make the NEXT successful pass see a
+	// move from "" to sha1 and deliver a push nobody made.
+	if after.HeadSHA != "sha1" {
+		t.Errorf("cursor HeadSHA = %q, want the previous head %q carried forward", after.HeadSHA, "sha1")
+	}
+
+	// And the next pass, with the branch read working again, sees no push:
+	// the head it reads equals the one carried forward.
+	src.headErr = nil
+	src.subjects["o/r"] = nil
+	h.got = nil
+	h.w.pollPass(context.Background())
+	if len(h.got) != 0 {
+		t.Fatalf("the recovered pass delivered %+v, want nothing", h.got)
+	}
+}
+
 // PollInterval <= 0 must produce a nil channel: a nil channel blocks forever,
 // which is how Serve's select case simply never fires for a worker that does
 // not poll. It is the same shape tendTicker uses.
@@ -310,14 +376,14 @@ func TestPollTickerIsNilWhenDisabled(t *testing.T) {
 	}
 }
 
-// Every poll test above overrides Worker.deliver, so none of them would
+// Every poll test above overrides Worker.PollDeliver, so none of them would
 // notice the seam being left unwired in NewWorker -- which would make the
 // poller a silent no-op in production, dispatching nothing while logging
 // success. This is the one test that looks at the constructor's own wiring.
 func TestNewWorkerWiresDeliver(t *testing.T) {
 	w := NewWorker(nil)
-	if w.deliver == nil {
-		t.Fatal("NewWorker left deliver unwired; pollRepo would call a nil func")
+	if w.PollDeliver == nil {
+		t.Fatal("NewWorker left PollDeliver unwired; pollRepo would call a nil func")
 	}
 }
 

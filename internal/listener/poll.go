@@ -177,8 +177,26 @@ func (w *Worker) pollRepo(ctx context.Context, src PollSource, r RepoRoute) erro
 	// The default branch, for the event nothing else can report.
 	head := ""
 	if branch != "" {
-		if head, err = src.BranchHead(ctx, owner, name, branch); err != nil {
-			return err
+		// Carried forward from the cursor, so a FAILING read costs this pass
+		// its push detection and nothing else. Returning the error here
+		// instead would discard the subject stream with it, and a permanent
+		// failure -- a default_branch typo in a loop's yaml, a repository
+		// renamed master->main with stale config, both 404s -- would then wedge
+		// the repository forever: no issue, close or merge ever delivered
+		// again, and a cursor that never advances, so every pass re-lists the
+		// whole paginated history against the rate limit. defaultBranchOf
+		// takes the FIRST target's branch, so one misconfigured project would
+		// take every other project watching the repository down with it. The
+		// carried-forward head arms no spurious push: it compares equal below.
+		// (src.PullRequest above does still abort the repository, deliberately:
+		// skipping it loses a merge, and there is one high-water mark to
+		// resume from.)
+		head = cursor.HeadSHA
+		if got, headErr := src.BranchHead(ctx, owner, name, branch); headErr != nil {
+			slog.Error("cannot read the default branch head; this pass reports no push for it",
+				"repo", r.Repo, "branch", branch, "err", headErr)
+		} else {
+			head = got
 		}
 		// Suppressed when a merge INTO THIS BRANCH in this same pass explains
 		// the move: both arm the same sweep, and arming it twice dispatches
@@ -220,7 +238,7 @@ func (w *Worker) pollRepo(ctx context.Context, src PollSource, r RepoRoute) erro
 			"closed_issue", d.ClosedIssue, "closed_pr", d.ClosedPR,
 			"reopened", d.Reopened, "merged_into", d.MergedInto,
 			"pushed_to", d.PushedTo, "epic_ready", d.EpicReady)
-		w.deliver(ctx, d)
+		w.PollDeliver(ctx, d)
 	}
 	return nil
 }
