@@ -68,6 +68,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -79,7 +80,7 @@ import (
 // poller derives turn on which kind a subject is. ConvertIssues drops them,
 // which is why this path does not use it.
 func TestListSubjectsUpdatedSinceKeepsPullRequests(t *testing.T) {
-	var gotQuery map[string][]string
+	var gotQuery url.Values
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/o/r/issues", func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.Query()
