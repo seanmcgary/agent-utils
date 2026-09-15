@@ -95,6 +95,12 @@ type PullRequest struct {
 	// linked to an issue and tended, because tending checks the head branch out
 	// and runs an agent inside it.
 	Trusted bool
+	// State is "open" or "closed", as GitHub spells it, and Merged says which
+	// kind of close. Both are here for the poller: a delivery TELLS this
+	// daemon a pull request merged, and a poll has to ask. Compare State with
+	// EqualFold rather than ==, as Issue.IsOpen does.
+	State  string
+	Merged bool
 }
 
 // Hook is the subset of a GitHub repository webhook that register-webhook
@@ -141,6 +147,24 @@ func IsHookEvent(name string) bool {
 		}
 	}
 	return false
+}
+
+// Subject is one issue OR pull request as a poll sees it: the fields that say
+// whether something happened to it, and nothing else.
+//
+// It is not Issue. Issue is built by ConvertIssues, which DROPS pull requests,
+// and every caller of that function depends on it -- a pull request carried
+// into the epic sweep's lists would be swept as the issue that shares its
+// number. The poll listing returns both kinds mixed on purpose, because both
+// kinds are things a loop reacts to, so it gets a type that can say which is
+// which.
+type Subject struct {
+	Number        int
+	IsPullRequest bool
+	// State is "open" or "closed", as GitHub spells it.
+	State     string
+	Labels    []string
+	UpdatedAt time.Time
 }
 
 // safeRef matches a git branch name this program is willing to pass to git.

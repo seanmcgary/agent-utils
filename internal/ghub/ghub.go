@@ -146,6 +146,8 @@ func convertPR(owner, repo string, pr *github.PullRequest) PullRequest {
 		HeadRepo:          headRepo,
 		AuthorAssociation: assoc,
 		Trusted:           trusted,
+		State:             pr.GetState(),
+		Merged:            pr.GetMerged(),
 	}
 }
 
@@ -248,6 +250,79 @@ func (g *GitHubClient) ListOpenPullRequests(ctx context.Context, owner, repo str
 		// PullRequestListOptions embeds only ListOptions, so this one is fine.
 		opts.Page = resp.NextPage
 	}
+}
+
+// ListSubjectsUpdatedSince returns every issue AND pull request in the
+// repository whose updated_at is at or after since, oldest first.
+//
+// state=all is the point of it: ListOpenIssues cannot answer this, because a
+// close is exactly the change a poll must see and an open-only listing reports
+// a closed issue by omitting it, which is indistinguishable from "unchanged".
+//
+// direction=asc is load-bearing too. The caller advances a cursor to the last
+// subject it fully processed, so a failure part way through a page resumes
+// rather than restarts; descending order would make every partial pass lose
+// its oldest work.
+//
+// since is INCLUSIVE at the API, and the caller relies on that -- see the
+// poller's cursor, which deliberately re-reads its own boundary.
+func (g *GitHubClient) ListSubjectsUpdatedSince(
+	ctx context.Context, owner, repo string, since time.Time,
+) ([]Subject, error) {
+	opts := &github.IssueListByRepoOptions{
+		State:       "all",
+		Sort:        "updated",
+		Direction:   "asc",
+		Since:       since.UTC(),
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	var all []Subject
+	for {
+		page, resp, err := g.c.Issues.ListByRepo(ctx, owner, repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list subjects %s/%s: %w", owner, repo, err)
+		}
+		for _, gi := range page {
+			if gi == nil {
+				continue
+			}
+			labels := make([]string, 0, len(gi.Labels))
+			for _, l := range gi.Labels {
+				if l.GetName() != "" {
+					labels = append(labels, l.GetName())
+				}
+			}
+			all = append(all, Subject{
+				Number:        gi.GetNumber(),
+				IsPullRequest: gi.IsPullRequest(),
+				State:         gi.GetState(),
+				Labels:        labels,
+				UpdatedAt:     gi.GetUpdatedAt().Time,
+			})
+		}
+		if resp.NextPage == 0 {
+			return all, nil
+		}
+		// IssueListByRepoOptions embeds BOTH ListCursorOptions (Page string)
+		// and ListOptions (Page int) at the same depth, so a bare opts.Page is
+		// an ambiguous selector and does not compile. Qualify it.
+		opts.ListOptions.Page = resp.NextPage
+	}
+}
+
+// BranchHead returns the SHA at the tip of branch.
+//
+// It exists for the one event a poll cannot see any other way: a direct push
+// to the default branch produces no pull request and no issue update, and it
+// makes every open pull request of that repository stale exactly as a merge
+// does. BehindBy is not a substitute -- it answers how far one ref trails
+// another, which cannot report that a ref moved.
+func (g *GitHubClient) BranchHead(ctx context.Context, owner, repo, branch string) (string, error) {
+	c, _, err := g.c.Repositories.GetCommit(ctx, owner, repo, branch, nil)
+	if err != nil {
+		return "", fmt.Errorf("head of %s/%s@%s: %w", owner, repo, branch, err)
+	}
+	return c.GetSHA(), nil
 }
 
 // BehindBy returns how many commits head lacks from base.
