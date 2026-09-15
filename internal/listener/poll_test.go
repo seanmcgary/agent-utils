@@ -345,3 +345,39 @@ func TestACancelledContextPassDeliversAndWritesNothing(t *testing.T) {
 		t.Fatal("a cancelled pass wrote a cursor; want no write at all")
 	}
 }
+
+// The runtime must not care which source produced an event. Serve is what
+// makes that true in practice: a worker with a poll interval runs the retry
+// wake, the tend check and the orphan sweep exactly as a worker serving HTTP
+// does, and polls in addition.
+func TestServeRunsThePollSource(t *testing.T) {
+	src := &fakeSource{
+		subjects: map[string][]ghub.Subject{"o/r": {issueSubject(51, "open", nil, 10)}},
+		heads:    map[string]string{"o/r@master": "sha1"},
+	}
+	h := newPollHarness(t, src, []Target{repoTarget()})
+	h.w.PollInterval = time.Millisecond
+	// Keep the rest of the loop quiet: this test is about the poll case
+	// firing, and a real wake would try to open loops that do not exist here.
+	h.w.MinWakeInterval = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { h.w.Serve(ctx); close(done) }()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if _, ok, _ := h.db.PollCursor("o/r"); ok {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("Serve never ran a poll pass")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}

@@ -1943,6 +1943,13 @@ func (w *Worker) Serve(ctx context.Context) {
 	tendC, stopTend := w.tendTicker()
 	defer stopTend()
 
+	// The second event source, on its own interval. It is built here rather
+	// than folded into the wake timer for the reason the tend ticker is: the
+	// wake serves deadlines this daemon wrote, and a poll asks GitHub a
+	// question nobody wrote a deadline for.
+	pollC, stopPoll := w.pollTicker()
+	defer stopPoll()
+
 	// Swept BEFORE the first wake, because a daemon starting is the moment a
 	// crash is discovered. The rows a machine leaves behind carry no retry
 	// deadline -- only a reap writes one -- so Wake cannot see them, and
@@ -1987,6 +1994,10 @@ func (w *Worker) Serve(ctx context.Context) {
 			// nil when the check is disabled, and a nil channel blocks
 			// forever, so this case simply never fires then.
 			w.tendCheckPass(ctx)
+		case <-pollC:
+			// nil when polling is off, and a nil channel blocks forever, so
+			// this case simply never fires for `listener run`.
+			w.pollPass(ctx)
 		case <-sweep.C:
 			// Falls through to the top of the loop, which calls Wake. That is
 			// deliberate: the sweep has just stamped deadlines that are due
