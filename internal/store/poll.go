@@ -86,7 +86,7 @@ func (d *DB) SavePollSubjects(repo string, subjects []PollSubject) error {
 	if err != nil {
 		return fmt.Errorf("save poll subjects: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	for _, s := range subjects {
 		if _, err := tx.Exec(`

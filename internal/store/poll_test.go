@@ -95,3 +95,47 @@ func TestPollCursorReportsAbsence(t *testing.T) {
 		t.Errorf("cursor = %+v, want %+v", got, want)
 	}
 }
+
+// SavePollCursor's ON CONFLICT clause deliberately omits seeded_at, so a
+// repository's ORIGINAL seeding time survives every later write. seeded_at is
+// the durable half of the absence-vs-zero-time distinction that keeps a fresh
+// poll from dispatching an agent for every issue in a repository's history:
+// an operator needs to be able to tell when a repository entered the poll,
+// and that answer must not drift every time the cursor advances.
+func TestSavePollCursorKeepsTheOriginalSeededAt(t *testing.T) {
+	db, _ := openTempDB(t)
+
+	original := PollCursor{
+		Repo:     "o/r",
+		Since:    time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC),
+		HeadSHA:  "deadbeef",
+		SeededAt: time.Date(2026, 9, 15, 9, 0, 0, 0, time.UTC),
+	}
+	if err := db.SavePollCursor(original); err != nil {
+		t.Fatalf("SavePollCursor (initial): %v", err)
+	}
+
+	later := PollCursor{
+		Repo:     "o/r",
+		Since:    original.Since.Add(24 * time.Hour),
+		HeadSHA:  "cafef00d",
+		SeededAt: original.SeededAt.Add(24 * time.Hour),
+	}
+	if err := db.SavePollCursor(later); err != nil {
+		t.Fatalf("SavePollCursor (later): %v", err)
+	}
+
+	got, ok, err := db.PollCursor("o/r")
+	if err != nil {
+		t.Fatalf("PollCursor: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false after SavePollCursor")
+	}
+	if !got.Since.Equal(later.Since) || got.HeadSHA != later.HeadSHA {
+		t.Errorf("cursor = %+v, want Since/HeadSHA updated to %+v", got, later)
+	}
+	if !got.SeededAt.Equal(original.SeededAt) {
+		t.Errorf("SeededAt = %v, want the ORIGINAL %v to survive", got.SeededAt, original.SeededAt)
+	}
+}
