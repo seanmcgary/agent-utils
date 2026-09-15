@@ -230,6 +230,34 @@ CREATE TABLE IF NOT EXISTS tend_conflicts (
   PRIMARY KEY (project_id, loop, repo, pr_number)
 );
 
+-- poll_subjects is what the poller last saw of one issue or pull request, and
+-- exists so a poll can answer "what CHANGED" from a listing that only reports
+-- what IS. It is keyed by repository and NOT by project: a poll observes
+-- GitHub, which is a machine-wide fact, and the fan-out to the projects
+-- watching that repository happens after, in Worker.Deliver, exactly as it
+-- does for a webhook delivery. Contrast closures, which is keyed by project
+-- because its rows are joined against dispatch rows.
+CREATE TABLE IF NOT EXISTS poll_subjects (
+  repo       TEXT    NOT NULL,
+  number     INTEGER NOT NULL,
+  is_pr      INTEGER NOT NULL,
+  state      TEXT    NOT NULL,
+  merged     INTEGER NOT NULL,
+  labels     TEXT    NOT NULL,
+  updated_at TIMESTAMP NOT NULL,
+  PRIMARY KEY (repo, number)
+);
+
+-- poll_cursors is where each repository's poll resumes. The ABSENCE of a row
+-- is meaningful: it is what makes the first pass seed the snapshot silently
+-- instead of dispatching an agent for every issue in the repository's history.
+CREATE TABLE IF NOT EXISTS poll_cursors (
+  repo      TEXT PRIMARY KEY,
+  since     TIMESTAMP NOT NULL,
+  head_sha  TEXT NOT NULL,
+  seeded_at TIMESTAMP NOT NULL
+);
+
 -- One row per legacy per-loop database this canonical file has imported.
 --
 -- The key is a triple, not a path. Two loops may share one state_dir, so one
