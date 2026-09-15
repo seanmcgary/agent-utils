@@ -208,7 +208,20 @@ type Worker struct {
 	// the calls a delivery makes, which is the only place the saving is
 	// visible.
 	NewClient func(token string) ghub.Client
-	Open      func(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error)
+	// PollInterval is how often pollPass runs, and zero means never. `listener
+	// run` leaves it zero and `listener poll` sets it: the two commands differ
+	// in which SOURCE they start, and in nothing else.
+	PollInterval time.Duration
+	// NewPollSource builds the GitHub client one poll pass shares across every
+	// repository it reads. It is a seam for the same reason NewClient is, and
+	// it is a SEPARATE seam because its interface is narrower: widening
+	// ghub.Client to carry two methods only the poller calls would force them
+	// onto every fake in this tree that implements it.
+	NewPollSource func(token string) PollSource
+	// deliver is Deliver, indirected so a test can record what a pass produced
+	// without wiring a whole runtime behind it. Production never replaces it.
+	deliver func(ctx context.Context, d Delivery)
+	Open    func(ref loopcmd.ProjectRef, path string, o loopcmd.Options) (*config.Config, loopcmd.Deps, func(), error)
 	// RunIssue acts on ONE issue, taking the loop's lock first. It is
 	// loopcmd.TickIssue, never loopcmd.RunTick: the daemon answers events, and
 	// an event names an issue. The full reconcile is the cron sweep's job --
@@ -371,6 +384,7 @@ func NewWorker(db *store.DB) *Worker {
 		TargetFor:       TargetFor,
 		Token:           Token,
 		NewClient:       func(token string) ghub.Client { return ghub.New(token) },
+		NewPollSource:   func(token string) PollSource { return ghub.New(token) },
 		Open:            loopcmd.Open,
 		RunIssue:        loopcmd.TickIssue,
 		RunTend:         loopcmd.TendSweep,
@@ -406,6 +420,8 @@ func NewWorker(db *store.DB) *Worker {
 	// replaces Now after NewWorker returns, and a value captured here would
 	// leave it waiting a real ten minutes.
 	w.unroutable.now = func() time.Time { return w.Now() }
+	// Assigned after the literal because it refers to w itself.
+	w.deliver = w.Deliver
 	return w
 }
 
