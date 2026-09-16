@@ -48,7 +48,46 @@ make install     # into GOBIN, with the VERSION file's value stamped in
 
 ## Quick start
 
-`agent-utils project init` is the first step. A hand-made `.agent-utils/configs/` directory is
+`agent-utils project init --all-loops` is the fast path, and it is the one to reach for when
+you want the standard pipeline: it skips every question and writes all four templates' loop
+configurations exactly as the templates have them.
+
+```bash
+cd ~/Code/my-repo
+agent-utils project init --all-loops
+```
+
+```
+Created project "my-repo" (/Users/you/Code/my-repo/.agent-utils)
+Wrote loop configuration /Users/you/Code/my-repo/.agent-utils/configs/planning.yaml                 (opus/high)
+Wrote loop configuration /Users/you/Code/my-repo/.agent-utils/configs/execution.yaml                (sonnet/medium)
+Wrote loop configuration /Users/you/Code/my-repo/.agent-utils/configs/pr-review.yaml                (opus/medium)
+Wrote loop configuration /Users/you/Code/my-repo/.agent-utils/configs/exec-pr-review-findings.yaml  (sonnet/medium)
+
+WARNING: a loop above runs with permission_mode: bypassPermissions, which disables
+every permission prompt on third-party issue text; an instruction hidden in an issue
+comment executes. Review these files before the first tick.
+Next: agent-utils project --name my-repo loop tick --name planning
+```
+
+Everything but four fields comes from the templates verbatim: the labels, both prompt bodies,
+the models and efforts above, `permission_mode: bypassPermissions` with its acknowledgement,
+no cost ceiling, a 24h timeout, and the retry policy. `master` is the base branch because that
+is what every template names — the detected `origin/HEAD` is deliberately ignored, so a
+repository whose default branch is `main` needs that one field edited. The four fields that are
+not verbatim describe this machine rather than the loop: `repo` comes from the origin remote,
+`checkout_base_dir` is `.`, `worktree_dir` is `.agent-utils/worktrees`, and `state_dir` is left
+to its derived default. There is no prompt anywhere in this path, including the confirmation
+the wizard puts in front of `bypassPermissions` — the warning above is what is left of it, so
+read the files before the first tick.
+
+Because it asks nothing, `--all-loops` works where the wizard cannot: a provisioning script, a
+cron job, a fresh checkout over ssh. It needs an origin remote, since there is no way to ask
+for the repository, and it refuses to run alongside `--no-loop`. On a project that already has
+a loop configuration it does nothing at all, for the same reason the wizard is skipped there.
+
+To choose your own values instead, run `project init` with no flag and answer the wizard. A
+hand-made `.agent-utils/configs/` directory is
 no longer enough to make something a project — the machine-wide directory
 (`~/.agent-utils`) looks like an ordinary directory too, and without an explicit init step a
 stray `cd ~ && agent-utils project status` would happily register it as one. `project init`
@@ -109,7 +148,7 @@ the clone's `.agent-utils/config.yaml` and run init again. (An already-duplicate
 caught on the other side too: selecting by an ambiguous name is an error listing both
 candidates, and you can select by id or path instead.)
 
-Unless you pass `--no-loop`, and unless the project already has at least one loop
+Unless you pass `--no-loop` or `--all-loops`, and unless the project already has at least one loop
 configuration, `project init` then walks an interactive wizard that asks for every field the first loop needs — labels, repository, agent model, retry policy — and takes
 the three prompt bodies from the template, which you edit in the written file. It writes
 `.agent-utils/configs/<name>.yaml`. Run from a script or a cron job (any
@@ -143,7 +182,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 
 | Command | Does |
 |---|---|
-| `agent-utils project init [<name>] [--dir <path>] [--no-loop]` | Create or re-register a project explicitly and, unless `--no-loop` or it already has a loop, walk the loop-configuration wizard for its first loop |
+| `agent-utils project init [<name>] [--dir <path>] [--no-loop] [--all-loops]` | Create or re-register a project explicitly and, unless `--no-loop` or it already has a loop, walk the loop-configuration wizard for its first loop. `--all-loops` skips the wizard and writes every template's loop configuration verbatim |
 | `agent-utils project loop new` | Add another loop configuration to this project, via the same wizard |
 | `agent-utils project status` | Identity, file locations, and every loop's state |
 | `agent-utils project list` | This project's loop configurations |
