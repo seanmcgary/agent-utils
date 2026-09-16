@@ -40,6 +40,7 @@ func projectInitCommand() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "dir", Usage: "project directory; omit to use the working directory"},
 			&cli.BoolFlag{Name: "no-loop", Usage: "create the project only; skip the loop configuration wizard"},
+			&cli.BoolFlag{Name: "all-loops", Usage: "skip the wizard and write every template's loop configuration as-is"},
 		},
 		Action: func(_ context.Context, c *cli.Command) error {
 			dir := c.String("dir")
@@ -51,12 +52,14 @@ func projectInitCommand() *cli.Command {
 				dir = wd
 			}
 			return projectInitRun(projectInitDeps{
-				Dir:         dir,
-				Name:        c.StringArg("name"),
-				NoLoop:      c.Bool("no-loop"),
-				Interactive: isInteractive(),
-				RunWizard:   runLoopWizard,
-				Out:         os.Stdout,
+				Dir:           dir,
+				Name:          c.StringArg("name"),
+				NoLoop:        c.Bool("no-loop"),
+				AllLoops:      c.Bool("all-loops"),
+				Interactive:   isInteractive(),
+				RunWizard:     runLoopWizard,
+				ScaffoldLoops: scaffoldLoops,
+				Out:           os.Stdout,
 			})
 		},
 	}
@@ -73,15 +76,36 @@ type projectInitDeps struct {
 	Dir string
 	// Name is the positional project name. Empty lets mintProjectDescriptor
 	// (via project.EnsureNamed) name the project after Dir's base name instead.
-	Name        string
-	NoLoop      bool
+	Name   string
+	NoLoop bool
+	// AllLoops writes every template's loop configuration verbatim instead of
+	// asking anything. It is mutually exclusive with NoLoop.
+	AllLoops    bool
 	Interactive bool
 	// RunWizard runs the loop-configuration wizard and writes the result. It
-	// is called only when NoLoop is false and Interactive is true, and takes
-	// (agentUtilsDir, rootDir): Write needs the former, Detect needs the
-	// latter.
+	// is called only when NoLoop and AllLoops are false and Interactive is
+	// true, and takes (agentUtilsDir, rootDir): Write needs the former,
+	// Detect needs the latter.
 	RunWizard func(agentUtilsDir, rootDir string) (string, error)
-	Out       io.Writer
+	// ScaffoldLoops writes every template's loop configuration and reports
+	// what it wrote. It is called only when AllLoops is true, and takes the
+	// same two directories for the same two reasons RunWizard does. It
+	// returns whatever it managed to write EVEN when it errors, so a
+	// part-way failure can still name the files that landed.
+	ScaffoldLoops func(agentUtilsDir, rootDir string) ([]scaffoldedLoop, error)
+	Out           io.Writer
+}
+
+// scaffoldedLoop is one loop --all-loops wrote. The agent fields are carried
+// back so projectInitRun can report the model and effort each loop ended up
+// with -- the values that made the shortcut worth having -- and so the
+// bypassPermissions warning is driven by what was actually written rather
+// than by an assumption about what the templates say.
+type scaffoldedLoop struct {
+	Path           string
+	Model          string
+	Effort         string
+	PermissionMode string
 }
 
 // projectInitRun resolves the target directory, mints or loads the project's
@@ -94,6 +118,14 @@ type projectInitDeps struct {
 // finishing a half-set-up project someone forgot already existed, while a
 // repository cloned with its loops already committed just gets registered.
 func projectInitRun(deps projectInitDeps) error {
+	// Checked before anything is resolved or created: the two flags ask for
+	// opposite things, and picking a winner would mean an operator who typed
+	// both got a project set up the way they did not ask for. Refusing here
+	// leaves no directory, no descriptor and no registry entry behind.
+	if deps.AllLoops && deps.NoLoop {
+		return errors.New("--all-loops and --no-loop ask for opposite things; pass one or neither")
+	}
+
 	rootDir, err := filepath.Abs(deps.Dir)
 	if err != nil {
 		return err
@@ -230,6 +262,14 @@ func projectInitRun(deps projectInitDeps) error {
 			cfg.Name, cfg.ID, agentUtilsDir, loops, plural(loops))
 	}
 
+	// Before the Interactive gate below, deliberately: --all-loops asks
+	// nothing, and being usable where the wizard is not -- a provisioning
+	// script, a fresh checkout over ssh -- is most of the point of having it.
+	if deps.AllLoops {
+		loops, scaffoldErr := deps.ScaffoldLoops(agentUtilsDir, rootDir)
+		return reportScaffold(deps.Out, cfg.Name, loops, scaffoldErr)
+	}
+
 	if deps.NoLoop {
 		return reportf(deps.Out,
 			"Skipped the loop configuration wizard (--no-loop). "+
@@ -352,6 +392,99 @@ func runLoopWizard(agentUtilsDir, rootDir string) (string, error) {
 		return "", err
 	}
 	return wizard.Write(agentUtilsDir, cfg)
+}
+
+// scaffoldLoops writes every template's loop configuration, taking each
+// template's own agent and retry settings verbatim and asking nothing.
+//
+// It is the shortcut past the wizard for the case the wizard serves worst: a
+// project that wants the standard four loops with the standard settings, where
+// every one of the two dozen questions per loop is answered with the value the
+// template already held. wizard.Scaffold is where that substitution lives;
+// this function is only the write loop and the reporting shape around it.
+//
+// A failure part way returns BOTH the loops already written and the error.
+// wizard.Write reloads each file through config.Load before returning it, so
+// the paths reported as written are known good, and leaving them in place is
+// what makes the failure diagnosable — the operator can see how far it got,
+// fix the cause, and finish the rest with `project loop new`.
+func scaffoldLoops(agentUtilsDir, rootDir string) ([]scaffoldedLoop, error) {
+	cfgs, err := wizard.Scaffold(wizard.Detect(rootDir))
+	if err != nil {
+		return nil, err
+	}
+
+	written := make([]scaffoldedLoop, 0, len(cfgs))
+	for _, cfg := range cfgs {
+		path, err := wizard.Write(agentUtilsDir, cfg)
+		if err != nil {
+			return written, fmt.Errorf("scaffold loop %s: %w", cfg.Name, err)
+		}
+		written = append(written, scaffoldedLoop{
+			Path:           path,
+			Model:          cfg.Agent.Model,
+			Effort:         cfg.Agent.Effort,
+			PermissionMode: cfg.Agent.PermissionMode,
+		})
+	}
+	return written, nil
+}
+
+// reportScaffold prints what --all-loops wrote and then returns scaffoldErr,
+// so a part-way failure still names the files that landed. It takes the
+// scaffold's two return values directly for exactly that reason: reporting
+// has to happen on the error path too, and a caller that returned early on
+// err would have printed nothing.
+func reportScaffold(out io.Writer, projectName string, loops []scaffoldedLoop, scaffoldErr error) error {
+	// Width of the longest path, so the agent settings line up in a column an
+	// operator can read down. exec-pr-review-findings.yaml is a good deal
+	// longer than planning.yaml, and the whole reason for printing the
+	// settings at all is to be checked at a glance.
+	width := 0
+	for _, l := range loops {
+		if n := len(l.Path); n > width {
+			width = n
+		}
+	}
+
+	bypass := false
+	for _, l := range loops {
+		if l.PermissionMode == "bypassPermissions" {
+			bypass = true
+		}
+		if err := reportf(out, "Wrote loop configuration %-*s  (%s/%s)\n",
+			width, l.Path, l.Model, l.Effort); err != nil {
+			return err
+		}
+	}
+
+	if bypass {
+		// The wizard asks for this one by hand (Run's question 16 gates it
+		// behind a separate confirmation, defaulting to No) because it
+		// disables every permission prompt on text third parties wrote into
+		// an issue. --all-loops asks nothing, so the acknowledgement the
+		// templates already carry stands — and saying so plainly is what is
+		// left of that gate.
+		if err := reportf(out,
+			"\nWARNING: a loop above runs with permission_mode: bypassPermissions, which disables\n"+
+				"every permission prompt on third-party issue text; an instruction hidden in an issue\n"+
+				"comment executes. Review these files before the first tick.\n"); err != nil {
+			return err
+		}
+	}
+
+	if scaffoldErr != nil {
+		return scaffoldErr
+	}
+	if len(loops) == 0 {
+		// Not reachable through wizard.Scaffold, which either errors or
+		// returns every template; guarded so the "Next:" line below cannot
+		// name a loop that does not exist.
+		return errors.New("scaffolded no loop configurations")
+	}
+
+	first := strings.TrimSuffix(filepath.Base(loops[0].Path), filepath.Ext(loops[0].Path))
+	return reportf(out, "Next: agent-utils project --name %s loop tick --name %s\n", projectName, first)
 }
 
 // projectLoopNewCommand adds another loop configuration to an already
