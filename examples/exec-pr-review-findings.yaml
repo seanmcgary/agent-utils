@@ -171,10 +171,13 @@ prompt: |
   A FRESH WORKTREE HAS NO node_modules. Run `pnpm install` before any Node gate.
 
   YOU DO NOT RE-REVIEW. The artifact is the whole of your input. Do not re-read
-  the diff hunting for what the reviewers missed, do not overturn a Reject, and
-  do not promote a Defer. A finding you believe is WRONG -- the code does not say
-  what it says the code says -- you leave unapplied and report by number with
-  your reasoning. Everything else in the Fix section, you apply.
+  the diff hunting for what the reviewers missed, and do not overturn a Reject.
+  A finding you believe is WRONG -- the code does not say what it says the code
+  says -- you leave unapplied and report by number with your reasoning.
+  Everything else in both Fix sections, you apply. That is not a limit on
+  fixing: a subagent that sees a real defect in a file it holds fixes it and
+  reports it. Nobody writes TODO comments; Defer rows already carry their
+  GitHub issues.
 
   ONE SUBAGENT PER FILE GROUP, DISPATCHED IN ONE MESSAGE. The artifact is
   already grouped by file. Send every Agent call in a SINGLE message: background
@@ -193,6 +196,12 @@ prompt: |
   to no single group, so there is nobody to send it back to. Then re-run format
   and lint and commit their output.
 
+  CROSS-CUTTING FIXES. After every file group has returned, apply each
+  "Fix — cross-cutting" finding with a senior-tier subagent that may edit every
+  file the finding names. A group that could not finish a finding without a
+  file another group held is handled here too. This is work to do, not a
+  reason to park.
+
   COMMITTING. The subagents do not commit; you do, once per group as it returns.
   Concurrent subagents sharing one git index is the same lost-write hazard as
   sharing a file.
@@ -210,8 +219,10 @@ prompt: |
 
   ON COMPLETION. Post ONE pull request comment covering the round: every Fix
   finding by number, applied or not applied with the reason; every finding a
-  subagent reported wrong, with your decision; the deferred TODOs you placed;
-  and the full suite's result. Do not restate the review's Reject and Defer
+  subagent reported wrong, with your decision; every cross-cutting finding and
+  how its acceptance criteria were met; the additional defects subagents fixed;
+  the Defer rows' issue links; and the full suite's result. Copy the artifact's
+  "Decisions needed" and "Pre-merge checks" rows into the pull request body. Do not restate the review's Reject and Defer
   reasoning -- the findings comment already carries it and the human has read
   it. Link to that comment instead. @-mention @seanmcgary. Then remove
   {{.Labels.InFlight}} and add {{.Labels.Terminal}} as your LAST action. That
@@ -219,8 +230,7 @@ prompt: |
   it.
 
   PARKING. Park only when you cannot proceed: no findings comment, a full suite
-  still red after your fixes, a group that cannot be fixed without editing a
-  file another group holds, a rejected lease, or a pull request that cannot be
+  still red after your fixes, a rejected lease, or a pull request that cannot be
   resolved from Pipeline State. PARK means: commit and push what is safe to
   push, post a comment stating exactly what you need, remove
   {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment
