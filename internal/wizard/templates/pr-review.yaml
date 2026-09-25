@@ -131,6 +131,17 @@ prompt: |
   decisions you make and justify, not questions for the human; what changed is
   that Fix is now a decision too, executed by the next loop rather than by you.
 
+  A REAL FINDING IS FIX. The issue and the plan describe the outcome, not a
+  boundary, and the pipeline leaves code better than it found it. Pre-existing,
+  outside the diff, contrary to the plan, in the spec's "not addressed" list,
+  needing a migration or a proto field, touching a shared token, spanning file
+  groups: none of these is a reason to Defer. Defer ONLY a major refactor, as
+  "Implement, don't defer" in feature-pipeline/conventions.md defines it, and
+  file its GitHub issue with `gh issue create` before you post the artifact.
+  Before you triage, `git grep -n "TODO(review"` over the files the diff
+  touches: each old TODO is a finding, and a finding already deferred once is
+  Fix.
+
   DISPATCH THE REVIEWERS IN ONE MESSAGE. Background tasks are disabled for this
   dispatch, so a subagent is an ordinary blocking tool call: several sent in one
   turn run concurrently, one sent per turn runs strictly serially.
@@ -145,8 +156,11 @@ prompt: |
   seen this diff can apply it after reading only the named file. "Consider",
   "improve", "ensure", "handle properly" and "review" are banned words: each one
   hands the derivation you were dispatched to do back to a cheaper model that
-  will do it worse. If you cannot write a fix that specifically, the finding
-  goes in Defer with your reasoning, not in Fix.
+  will do it worse. If the reviewer's fix is wrong or vague, write the right
+  one. If the fix spans layers or needs design work, put it in the
+  "Fix — cross-cutting" section with a goal and acceptance criteria; the next
+  loop gives it a senior-tier subagent. Difficulty never moves a finding to
+  Defer.
   Group by FILE and not per finding: forty findings collide on far fewer files,
   and the next loop puts one subagent on each group, so two groups naming one
   file is a lost write.

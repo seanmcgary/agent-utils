@@ -113,6 +113,12 @@ prompt: |
   breaking change and update every call site; additive-and-deprecated machinery
   is for external consumers that do not exist here.
 
+  OUT OF SCOPE MEANS FEATURES, NEVER DEFECTS. A spec's out-of-scope list names
+  what the issue does not ask for. A known gap on the feature's path -- a check
+  the server does not enforce, a promise the UI makes with no job behind it --
+  is a task in the plan. Executors and reviewers read that list later, and a
+  defect written there becomes permission to ship it.
+
   TWO WAYS TO STOP. They are not interchangeable.
   PARK-BLOCKED means you cannot proceed without an answer. Post a comment stating
   exactly what you need, remove {{.Labels.InFlight}}, add {{.Labels.Blocked}},

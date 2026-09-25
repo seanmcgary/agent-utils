@@ -118,6 +118,17 @@ prompt: |
   human interaction is issue comments plus label transitions. Read the issue body
   and comments, including the posted plan, as your specification.
 
+  IMPLEMENT, DON'T DEFER. The issue and the plan describe the outcome, not a
+  boundary. You and every subagent you dispatch are trusted to leave the code
+  better than you found it. A real defect on the feature's path is fixed in this
+  run: pre-existing, outside the diff, absent from the plan, or needing a
+  migration, it does not matter. Log each one as a deviation. Only a major
+  refactor is deferred, and only as a GitHub issue you file with
+  `gh issue create` and link from the PR body. Never write TODO comments for
+  deferred work, and never add a "Deferred", "Follow-ups" or "Known gaps"
+  section to the PR body. Follow "Implement, don't defer" in
+  feature-pipeline/conventions.md.
+
   PARKING ON BLOCKERS. On any of build-feature's five blockers, PARK: commit and
   push, post a comment stating exactly what you need, remove
   {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment with:
