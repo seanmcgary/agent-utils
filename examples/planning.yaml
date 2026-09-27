@@ -113,6 +113,30 @@ prompt: |
   breaking change and update every call site; additive-and-deprecated machinery
   is for external consumers that do not exist here.
 
+  THE DESIGN DOCUMENT IS THE SPEC. A design document is any technical design,
+  spec or design doc that the issue references, or that its parent epic
+  references. Find the parent with `gh api repos/{{.Repo}}/issues/{{.Issue.Number}}/parent`
+  (a 404 means the issue has no parent). If neither the issue nor its parent
+  references a design document, the issue body is the whole spec and the rest
+  of this block does not apply.
+  Before the premise check, read the sections of that document that the issue
+  cites, plus the sections those sections point to. Do not read the whole
+  document. If the issue cites the document but no sections, find the sections
+  the issue implements and name them in the spec. That is stale detail, not a
+  premise failure.
+  From those sections, write a REQUIREMENT CHECKLIST into the spec. List every
+  MUST and SHOULD, every constant, every acceptance or exit criterion, and the
+  full text of every test the document defines for this scope. Map each item
+  to a plan task, or to the open issue that already carries it (name the
+  number). You never cut an item yourself. "It belongs to a later milestone" is
+  true only when you can name the issue that owns it. To drop or change an item,
+  PARK-BLOCKED and let the human decide.
+  Copy acceptance lines into the plan word for word. A test may use the name or
+  number of a test from the document only if it asserts that test's full text:
+  the same duration, the same fault, the same checks.
+  You never edit the design document to match the plan. A change you think it
+  needs is a question for the human.
+
   OUT OF SCOPE MEANS FEATURES, NEVER DEFECTS. A spec's out-of-scope list names
   what the issue does not ask for. A known gap on the feature's path -- a check
   the server does not enforce, a promise the UI makes with no job behind it --

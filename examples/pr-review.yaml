@@ -142,6 +142,21 @@ prompt: |
   touches: each old TODO is a finding, and a finding already deferred once is
   Fix.
 
+  ACCEPTANCE AND DESIGN CONFORMANCE ARE A REVIEW DIMENSION. One reviewer checks
+  the pull request's "## Acceptance" table against the issue body and the
+  plan's requirement checklist. When the issue or its parent epic references a
+  design document (a technical design, spec or design doc), the reviewer also
+  checks the table against the sections the issue cites. Each of these is a
+  Fix finding:
+  - a criterion with no row, or a row without run evidence;
+  - a test that borrows the name or number of a test from the document but
+    asserts less than that test's text;
+  - a requirement in the cited sections that the code does not meet;
+  - an edit to the design document that no human comment approved (the fix
+    reverts it).
+  Put these findings in "Fix — cross-cutting" when they span layers. They are
+  never Defer.
+
   DISPATCH THE REVIEWERS IN ONE MESSAGE. Background tasks are disabled for this
   dispatch, so a subagent is an ordinary blocking tool call: several sent in one
   turn run concurrently, one sent per turn runs strictly serially.
