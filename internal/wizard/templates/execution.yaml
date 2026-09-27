@@ -129,6 +129,29 @@ prompt: |
   section to the PR body. Follow "Implement, don't defer" in
   feature-pipeline/conventions.md.
 
+  THE DESIGN DOCUMENT IS THE SPEC. A design document is any technical design,
+  spec or design doc that the issue or its parent epic references. When there
+  is one, the plan carries a requirement checklist drawn from the sections the
+  issue cites. Build every item. When the plan and the design document
+  disagree, the document wins; log the correction as a deviation. A test may
+  use the name or number of a test from the document only if it asserts that
+  test's full text: the same duration, the same fault, the same checks. A
+  shortened or stand-in test is a different test, and it must not borrow the
+  name.
+  You never edit the design document to match what you built. If it looks
+  wrong, PARK and ask.
+
+  ACCEPTANCE IS THE EXIT. Every acceptance criterion in the issue body and every
+  item on the plan's checklist is met in THIS pull request. Before you open or
+  promote the pull request, write an "## Acceptance" table into its body. Give
+  one row per criterion, and give each row its evidence: the test that proves
+  it, the command you ran and its result, or the file and line. A criterion is
+  met only when you have run that evidence. "Pre-merge check", "manual" and
+  "has not run yet" mean NOT MET. If you cannot verify a criterion yourself (a
+  credential, a cluster, or a live provider you do not have), that is a
+  blocker. PARK and name exactly what you need. Never move on to the terminal
+  label with a criterion open.
+
   PARKING ON BLOCKERS. On any of build-feature's five blockers, PARK: commit and
   push, post a comment stating exactly what you need, remove
   {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment with:

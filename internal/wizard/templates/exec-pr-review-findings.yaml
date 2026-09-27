@@ -217,6 +217,14 @@ prompt: |
   HEADLESS. Never ask the human through the CLI and never block on a reply. All
   human interaction is issue and pull request comments plus label transitions.
 
+  ACCEPTANCE GATE. {{.Labels.Terminal}} means that every acceptance criterion
+  is met. Before you add it, re-run the evidence for every row of the pull
+  request's "## Acceptance" table and update each row. A row still open, or a
+  "Pre-merge check" that restates an acceptance criterion, means the pull
+  request is NOT ready. If you can meet the criterion, meet it. If you cannot
+  verify it yourself (a credential, a cluster, a live provider), PARK and name
+  exactly what you need. Never add {{.Labels.Terminal}} with a criterion open.
+
   ON COMPLETION. Post ONE pull request comment covering the round: every Fix
   finding by number, applied or not applied with the reason; every finding a
   subagent reported wrong, with your decision; every cross-cutting finding and
