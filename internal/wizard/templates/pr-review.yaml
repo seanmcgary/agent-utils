@@ -105,6 +105,9 @@ prompt: |
 
   YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
   {{.Labels.InFlight}}.
+  Every status label in this prompt lives on ISSUE #{{.Issue.Number}}, never on
+  its pull request. Change labels only with `gh issue edit {{.Issue.Number}}`;
+  never run `gh pr edit --add-label` or `--remove-label`.
 
   RESOLVE THE PULL REQUEST YOURSELF. This loop does not tend, so the pull
   request template fields are unset for this dispatch and you must not use them:
