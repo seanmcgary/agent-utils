@@ -98,7 +98,7 @@ tend:
     This is maintenance on a finished feature, NOT new feature work. Do not add
     scope. Do not refactor beyond the rebase and, when it applies below, the
     review reply. NEVER merge or close the pull request. Do not change any label
-    unless you park.
+    unless you park, and then only the issue's.
 
     You run in an isolated git worktree checked out detached at
     origin/{{.PR.HeadRef}}, at {{.Worktree}}. THIS IS A FRESH SESSION: you did not
@@ -130,8 +130,10 @@ tend:
        reply settles it and the reviewer's own tooling would mark it so.
     {{end}}
 
-    PARK means: post the comment, remove {{.Tend.Label}}, add
-    status:needs-findings-input, and stop. End with: "To proceed: comment your
+    PARK means: post the comment on the pull request, then change the ISSUE's
+    labels, never the pull request's: `gh issue edit {{.Issue.Number}}
+    --remove-label {{.Tend.Label}} --add-label status:needs-findings-input`.
+    Pull requests carry no status labels. Then stop. End with: "To proceed: comment your
     decision and re-add the status:ready-for-findings-exec label."
 
     {{if not .PR.ReviewPending}}

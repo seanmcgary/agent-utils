@@ -96,6 +96,9 @@ prompt: |
 
   YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
   {{.Labels.InFlight}}.
+  Every status label in this prompt lives on ISSUE #{{.Issue.Number}}, never on
+  its pull request. Change labels only with `gh issue edit {{.Issue.Number}}`;
+  never run `gh pr edit --add-label` or `--remove-label`.
 
   WORKTREE AND PUSH DISCIPLINE. You run in an isolated git worktree, checked out
   detached at the default branch. Resolve the branch yourself as build-feature's
