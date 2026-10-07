@@ -196,8 +196,7 @@ prompt: |
   `Tests:` command its group carries -- and fixes until they pass. Its group is
   its blast radius. After every group has returned, YOU run the full suite
   ONCE, and you fix what that surfaces yourself: a cross-group failure belongs
-  to no single group, so there is nobody to send it back to. Then re-run format
-  and lint and commit their output.
+  to no single group, so there is nobody to send it back to.
 
   CROSS-CUTTING FIXES. After every file group has returned, apply each
   "Fix — cross-cutting" finding with a senior-tier subagent that may edit every
@@ -228,6 +227,25 @@ prompt: |
   verify it yourself (a credential, a cluster, a live provider), PARK and name
   exactly what you need. Never add {{.Labels.Terminal}} with a criterion open.
 
+  CI PARITY GATE. This is the last thing you do before the final push, AFTER
+  the acceptance gate and after your last commit. The pull request's checks run
+  on the commit you push, so that commit is what you verify, whole, locally.
+    1. Build the list of checks from the repository, never from memory: every
+       job in `.github/workflows/` that runs on `pull_request`, cross-checked
+       against the names `gh pr checks <n>` reports. Format, lint, typecheck,
+       build, generated-code drift and every test job are all on it if CI runs
+       them.
+    2. Run each job's commands locally, the way its `run:` steps spell them,
+       against your final HEAD.
+    3. If one fails, or a formatter or generator changes a file, fix it, commit,
+       and re-run the WHOLE list. A fix for one check can break another, and a
+       list you only partly re-ran verifies a commit you are not pushing.
+    4. A check you cannot run locally (it needs a secret, a cluster, a live
+       provider) you name in your completion comment as NOT VERIFIED LOCALLY,
+       with the reason. Do not wait on CI for it.
+  Never add {{.Labels.Terminal}} with a local check red. A check still red after
+  your fixes is a reason to PARK, naming the check and its output.
+
   ON COMPLETION. Post ONE pull request comment covering the round: every Fix
   finding by number, applied or not applied with the reason; every finding a
   subagent reported wrong, with your decision; every cross-cutting finding and
@@ -241,10 +259,10 @@ prompt: |
   it.
 
   PARKING. Park only when you cannot proceed: no findings comment, a full suite
-  still red after your fixes, a rejected lease, or a pull request that cannot be
-  resolved from Pipeline State. PARK means: commit and push what is safe to
-  push, post a comment stating exactly what you need, remove
-  {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment
+  or a CI parity check still red after your fixes, a rejected lease, or a pull
+  request that cannot be resolved from Pipeline State. PARK means: commit and
+  push what is safe to push, post a comment stating exactly what you need,
+  remove {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment
   with: "To proceed: comment your decision and re-add the {{.Labels.Trigger}}
   label." Parking never turns into a re-review.
 
