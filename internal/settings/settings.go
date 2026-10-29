@@ -106,7 +106,7 @@ type Settings struct {
 	// It is machine-wide rather than per loop because it describes how
 	// attentive the daemon is, not anything about a loop. It applies to every
 	// tending loop of every registered project.
-	TendInterval string `yaml:"tend_interval,omitempty"`
+	TendInterval string    `yaml:"tend_interval,omitempty"`
 	GitHubApp    GitHubApp `yaml:"github_app,omitempty"`
 	Commit       Commit    `yaml:"commit,omitempty"`
 }
@@ -370,10 +370,11 @@ func Save(s *Settings) error {
 	header := "# Machine-wide agent-utils settings.\n" +
 		"# This is NOT a project descriptor, even though it shares config.yaml's\n" +
 		"# name; see internal/settings. It holds the webhook daemon's listen\n" +
-		"# address, the HMAC secret GitHub deliveries are signed with, and\n" +
+		"# address and the HMAC secret GitHub deliveries are signed with.\n" +
 		"# tend_interval: how often the daemon looks for a pull request that has\n" +
-		"# fallen behind its base (\"0\" disables that check), github_app: the GitHub App this machine acts as, and commit: how agent\n" +
-		"# commits are attributed.\n"
+		"# fallen behind its base (\"0\" disables that check).\n" +
+		"# github_app: the GitHub App this machine acts as.\n" +
+		"# commit: how agent commits are attributed.\n"
 	body := append([]byte(header), raw...)
 
 	if err := writeSecretFile(dir, path, body); err != nil {
