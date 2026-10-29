@@ -3,11 +3,13 @@
 package lock
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // ErrHeld reports that another process holds the lock.
@@ -36,6 +38,31 @@ func Acquire(path string) (*Lock, error) {
 		return nil, fmt.Errorf("flock: %w", err)
 	}
 	return &Lock{f: f}, nil
+}
+
+// lockPoll is how often AcquireWait retries a held lock. The token cache is
+// the one caller, and its holder makes a single HTTPS round trip, so a short
+// poll costs nothing and keeps a waiting gh call from noticeably stalling.
+const lockPoll = 25 * time.Millisecond
+
+// AcquireWait takes the lock at path, waiting while another process holds it,
+// until ctx ends.
+//
+// It polls Acquire rather than calling flock without LOCK_NB, because a
+// blocking flock cannot be interrupted by a context: a caller whose deadline
+// passed would sit in the syscall until the holder let go.
+func AcquireWait(ctx context.Context, path string) (*Lock, error) {
+	for {
+		l, err := Acquire(path)
+		if !errors.Is(err, ErrHeld) {
+			return l, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(lockPoll):
+		}
+	}
 }
 
 // Release unlocks and closes the lock file.
