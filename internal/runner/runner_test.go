@@ -861,3 +861,94 @@ func TestPatternWriterFindsAMatchSplitAcrossWrites(t *testing.T) {
 		t.Errorf("stderr was not passed through intact: %q", got)
 	}
 }
+
+// stubEnvClaude writes a fake claude onto PATH that dumps its environment to
+// envFile and then prints a successful result line.
+func stubEnvClaude(t *testing.T, envFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\nenv > '" + envFile + "'\ncat <<'EOF'\n" +
+		`{"type":"result","subtype":"success","session_id":"env","is_error":false,"result":"ok"}` +
+		"\nEOF\n"
+	p := filepath.Join(dir, "claude")
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// superviseEnv runs Supervise against stubEnvClaude and returns the
+// environment the child saw, without the variables /bin/sh itself exports
+// (PWD, SHLVL, _, OLDPWD): those are the stub's, not Supervise's.
+func superviseEnv(t *testing.T, cfg *config.Config, inv Invocation) []string {
+	t.Helper()
+	envFile := filepath.Join(t.TempDir(), "env")
+	stubEnvClaude(t, envFile)
+
+	s := newStore(t)
+	id, err := s.CreateDispatch(store.Dispatch{
+		Loop: "planning", Repo: "o/r", Number: 3, Kind: store.KindStart, SessionID: "env",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := s.GetDispatch(id)
+	if err := Supervise(context.Background(), cfg, s, d, inv, t.TempDir(),
+		filepath.Join(t.TempDir(), "run.jsonl")); err != nil {
+		t.Fatalf("Supervise: %v", err)
+	}
+
+	raw, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("the stub never wrote its environment: %v", err)
+	}
+	var out []string
+	for _, kv := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+		k, _, _ := strings.Cut(kv, "=")
+		switch k {
+		case "PWD", "SHLVL", "_", "OLDPWD":
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+func TestSuperviseAppendsInvocationEnv(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_secret_value")
+	cfg := &config.Config{Agent: config.Agent{Model: "opus", Timeout: config.Duration(60e9)}}
+
+	env := superviseEnv(t, cfg, Invocation{
+		SessionID: "env", Prompt: "go",
+		Env: []string{"GIT_CONFIG_COUNT=0", "AGENT_UTILS_DISPATCH_REPO=acme/widgets"},
+	})
+
+	for _, want := range []string{"GIT_CONFIG_COUNT=0", "AGENT_UTILS_DISPATCH_REPO=acme/widgets"} {
+		if !slices.Contains(env, want) {
+			t.Errorf("child environment lacks %q: %v", want, env)
+		}
+	}
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GITHUB_TOKEN=") {
+			t.Error("GITHUB_TOKEN must not reach the agent, identity or not")
+		}
+	}
+}
+
+// The default-mode regression pin: with no identity environment the agent
+// sees exactly agentEnv() and claudeEnv(cfg), nothing more and nothing less.
+func TestSuperviseEnvUnchangedWithoutIdentity(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_secret_value")
+	cfg := &config.Config{Agent: config.Agent{Model: "opus", Timeout: config.Duration(60e9)}}
+
+	env := superviseEnv(t, cfg, Invocation{SessionID: "env", Prompt: "go"})
+
+	// agentEnv reads PATH, which stubEnvClaude changed, so build the
+	// expectation after the stub is in place.
+	want := append(agentEnv(), claudeEnv(cfg)...)
+	slices.Sort(env)
+	slices.Sort(want)
+	if !slices.Equal(env, want) {
+		t.Errorf("child environment changed in default mode:\n got  %v\n want %v", env, want)
+	}
+}

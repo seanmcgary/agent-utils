@@ -21,6 +21,10 @@ type Invocation struct {
 	// row. The detached runner never sees the tick's GitHub snapshot, so this
 	// is the only way an override reaches it.
 	Overrides config.Overrides
+	// Env is added to the agent's environment after agentEnv and the
+	// harness's own, so it wins any repeated key. It carries the dispatch's
+	// git and gh identity; see internal/identity.
+	Env []string
 }
 
 // Settings is the resolved agent configuration for one invocation, after an

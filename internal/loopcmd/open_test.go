@@ -62,8 +62,8 @@ func TestOpen_RequireGitHubMissingTokenFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open with RequireGitHub true and no token: want error, got nil")
 	}
-	if !strings.Contains(err.Error(), "GITHUB_TOKEN is not set") {
-		t.Fatalf("err = %v, want it to mention GITHUB_TOKEN is not set", err)
+	if !strings.Contains(err.Error(), "GITHUB_TOKEN is not set and no github_app is configured") {
+		t.Fatalf("err = %v, want it to name both GITHUB_TOKEN and github_app", err)
 	}
 }
 

@@ -8,14 +8,19 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
+	"github.com/seanmcgary/agent-utils/internal/ghapp"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/home"
+	"github.com/seanmcgary/agent-utils/internal/identity"
 	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
@@ -116,6 +121,34 @@ type Deps struct {
 	// the override is an operator standing at a terminal, and a gate a
 	// delivery could clear on its own would not be a gate.
 	Force bool
+	// App is the GitHub App this machine acts as, or nil in token mode.
+	App *ghapp.App
+	// Authors and CoAuthor drive commit.co_author_issue_author: the tick
+	// resolves the issue author through Authors when CoAuthor is set.
+	Authors  ghub.AuthorReader
+	CoAuthor bool
+}
+
+// resolveCoAuthor returns the co-author for issue number's commits, or "".
+//
+// It runs in the tick because the detached runner has no GitHub client; the
+// value reaches the runner on the dispatch row. A lookup failure is a
+// warning, never a failed dispatch: the commit is still correct without the
+// trailer, and a flaky profile read must not stall an issue.
+func resolveCoAuthor(ctx context.Context, cfg *config.Config, deps Deps, number int) string {
+	if !deps.CoAuthor || deps.Authors == nil {
+		return ""
+	}
+	owner, repo, ok := strings.Cut(cfg.Repo, "/")
+	if !ok {
+		return ""
+	}
+	v, err := deps.Authors.CoAuthor(ctx, owner, repo, number)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %s#%d: no co-author: %v\n", cfg.Repo, number, err)
+		return ""
+	}
+	return v
 }
 
 // count increments n only when the action succeeded, so the recorded summary
@@ -707,6 +740,9 @@ func dispatch(
 		// ReviewPending travels here, not on pr_links: see
 		// store.Dispatch.ReviewPending for why.
 		ReviewPending: d.ReviewPending,
+		// The issue's author for the commit hook. A tend's Number is its
+		// issue too, so a fix pushed during a tend credits the same person.
+		CoAuthor: resolveCoAuthor(ctx, cfg, deps, d.Issue),
 	})
 	if err != nil {
 		return err
@@ -1028,6 +1064,17 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		return err
 	}
 
+	idEnv, idDir, err := prepareIdentity(ctx, cfg, deps, d, workDir)
+	if err != nil {
+		_ = runner.Finish(cfg, deps.Store, d, store.DispatchResult{
+			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
+		}, deps.Now())
+		return err
+	}
+	if idDir != "" {
+		defer func() { _ = os.RemoveAll(idDir) }()
+	}
+
 	// Overrides come from THE ROW, not from a snapshot the tick took: this
 	// detached process never saw the tick's decision, and the labels it was
 	// parsed from may since have changed on GitHub.
@@ -1035,8 +1082,46 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		runner.Invocation{
 			SessionID: d.SessionID, Prompt: prompt, Resume: resume,
 			Overrides: config.Overrides{Model: d.Model, Harness: d.Harness, Effort: d.Effort},
+			Env:       idEnv,
 		},
 		workDir, d.LogPath)
+}
+
+// prepareIdentity builds the dispatch's identity directory and environment.
+// It returns no directory, and no environment, when neither the app nor the
+// co-author setting applies.
+func prepareIdentity(ctx context.Context, cfg *config.Config, deps Deps, d store.Dispatch, workDir string) ([]string, string, error) {
+	if deps.App == nil && d.CoAuthor == "" {
+		return nil, "", nil
+	}
+	dir, err := home.Dir()
+	if err != nil {
+		return nil, "", err
+	}
+	p := identity.Plan{
+		Dir:      filepath.Join(dir, "run", strconv.FormatInt(d.ID, 10)),
+		WorkDir:  workDir,
+		Repo:     cfg.Repo,
+		SelfPath: deps.SelfPath,
+		Home:     os.Getenv(home.EnvVar),
+		CoAuthor: d.CoAuthor,
+	}
+	// A leftover directory from a runner that died is this dispatch id's
+	// own, and stale; start clean.
+	_ = os.RemoveAll(p.Dir)
+	if deps.App != nil {
+		bot, err := deps.App.Bot(ctx, cfg.Repo)
+		if err != nil {
+			return nil, "", fmt.Errorf("resolve the GitHub App's bot identity: %w", err)
+		}
+		p.Bot = &bot
+	}
+	env, err := identity.Prepare(ctx, p)
+	if err != nil {
+		_ = os.RemoveAll(p.Dir)
+		return nil, "", fmt.Errorf("prepare dispatch identity: %w", err)
+	}
+	return env, p.Dir, nil
 }
 
 // Reset drops the stored session and worktree for one issue, so the next tick

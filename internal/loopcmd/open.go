@@ -8,12 +8,15 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/ghapp"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/home"
+	"github.com/seanmcgary/agent-utils/internal/identity"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/migrate"
 	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/runner"
+	"github.com/seanmcgary/agent-utils/internal/settings"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
 )
@@ -77,6 +80,10 @@ type Options struct {
 	// the feature would be dead exactly where it matters and nowhere a test
 	// injecting its own reader would notice.
 	Epic ghub.EpicReader
+	// Authors resolves co-authors. Nil falls back to GH when GH implements
+	// it; the daemon passes it explicitly, as it does Epic, because the
+	// DeliveryCache wrapper does not.
+	Authors ghub.AuthorReader
 }
 
 // Open resolves a project's loop configuration and builds everything one tick
@@ -141,14 +148,25 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		return nil, Deps{}, nil, fmt.Errorf("create state directory: %w", err)
 	}
 
+	s, err := settings.Load()
+	if err != nil {
+		return nil, Deps{}, nil, err
+	}
+	// A configured app is used wherever a token would have been, and it is
+	// an error -- never a fallback to GITHUB_TOKEN -- for it to be unusable.
+	app, err := ghapp.FromSettings(s)
+	if err != nil {
+		return nil, Deps{}, nil, err
+	}
+
 	// The token must come from the environment, never a flag. A flag value
 	// shows up in `ps` output and in the shell history of anyone who typed it.
 	// The detached runner never calls the GitHub API, so it must neither require
 	// nor carry the token. Requiring it there would put a repository-write
 	// credential in the environment of a process whose child is the agent.
 	token := opts.Token
-	if token == "" && opts.RequireGitHub && opts.GH == nil {
-		return nil, Deps{}, nil, fmt.Errorf("GITHUB_TOKEN is not set")
+	if token == "" && app == nil && opts.RequireGitHub && opts.GH == nil {
+		return nil, Deps{}, nil, fmt.Errorf("GITHUB_TOKEN is not set and no github_app is configured")
 	}
 
 	// A caller-supplied client is used as it is. Building a second one here
@@ -156,7 +174,17 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 	// fetches back.
 	gh := opts.GH
 	if gh == nil {
-		gh = ghub.New(token)
+		if app != nil {
+			gh = ghub.NewApp(app)
+		} else {
+			gh = ghub.New(token)
+		}
+	}
+	authors := opts.Authors
+	if authors == nil {
+		if ar, ok := gh.(ghub.AuthorReader); ok {
+			authors = ar
+		}
 	}
 
 	// Falls back to the same client when the caller supplied none. The
@@ -218,6 +246,14 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 	}
 
 	wt := worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch)
+	if app != nil {
+		bot, err := app.Bot(context.Background(), cfg.Repo)
+		if err != nil {
+			db.Close()
+			return nil, Deps{}, nil, fmt.Errorf("resolve the GitHub App's bot identity for %s: %w", cfg.Repo, err)
+		}
+		wt.Env = identity.GitEnv(self, os.Getenv(home.EnvVar), cfg.Repo, bot)
+	}
 
 	deps := Deps{
 		Store:      db.Project(ref.ID),
@@ -237,6 +273,10 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		// tend, silently -- which is correct for a test and dead on arrival
 		// here.
 		Git: wt,
+
+		App:      app,
+		Authors:  authors,
+		CoAuthor: s.Commit.CoAuthorIssueAuthor,
 	}
 	return cfg, deps, func() { db.Close() }, nil
 }
