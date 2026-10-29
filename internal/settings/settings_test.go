@@ -536,3 +536,55 @@ func TestTendEveryRefusesAHandWrittenValueBelowTheFloor(t *testing.T) {
 		t.Errorf("TendEvery(\"1m\") = %v, want 1m: the floor itself is allowed", got)
 	}
 }
+
+func TestGitHubAppAndCommitRoundTrip(t *testing.T) {
+	withHome(t)
+	in := &Settings{
+		GitHubApp: GitHubApp{AppID: 123456, PrivateKeyPath: "/keys/app.pem"},
+		Commit:    Commit{CoAuthorIssueAuthor: true},
+	}
+	if err := Save(in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.GitHubApp != in.GitHubApp || out.Commit != in.Commit {
+		t.Errorf("round trip = %+v, want %+v", *out, *in)
+	}
+}
+
+func TestGitHubAppFields(t *testing.T) {
+	var s Settings
+	for _, kv := range [][2]string{
+		{"github_app.app_id", "42"},
+		{"github_app.private_key_path", "/abs/app.pem"},
+		{"commit.co_author_issue_author", "true"},
+	} {
+		f, ok := FieldFor(kv[0])
+		if !ok {
+			t.Fatalf("no field %s", kv[0])
+		}
+		if err := f.Set(&s, kv[1]); err != nil {
+			t.Fatalf("set %s: %v", kv[0], err)
+		}
+		if got := f.Get(&s); got != kv[1] {
+			t.Errorf("%s = %q, want %q", kv[0], got, kv[1])
+		}
+	}
+	bad := map[string]string{
+		"github_app.app_id":             "abc",
+		"github_app.private_key_path":   "relative/app.pem",
+		"commit.co_author_issue_author": "maybe",
+	}
+	for k, v := range bad {
+		f, _ := FieldFor(k)
+		if err := f.Set(&s, v); err == nil {
+			t.Errorf("%s=%q: want an error", k, v)
+		}
+	}
+	if f, _ := FieldFor("github_app.app_id"); f.Set(&s, "0") == nil {
+		t.Error("app_id 0 must be rejected; unset it instead")
+	}
+}
