@@ -63,7 +63,7 @@ func writeHooks(ctx context.Context, p Plan) (string, error) {
 	// path because --no-verify skips commit-msg but not it; but it runs before
 	// the editor, so a message written in the editor has no trailer yet and
 	// commit-msg adds it. addIfDifferent keeps it to one copy when both run,
-	// and across --amend, rebase rewords and squashes.
+	// and across --amend. A rebase is left alone; see trailerHook.
 	for _, name := range []string{"prepare-commit-msg", "commit-msg"} {
 		script := trailerHook(filepath.Join(orig, name), valueFile)
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {
@@ -79,10 +79,20 @@ func writeHooks(ctx context.Context, p Plan) (string, error) {
 // A message with nothing but comments is left alone: adding the trailer to it
 // would make it non-empty and defeat git's "Aborting commit due to empty
 // commit message". stripspace reads core.commentChar itself.
+//
+// Nothing is added while a rebase, cherry-pick or revert is replaying
+// commits. The sequencer runs the message hooks for every pick, so a rebase
+// the agent runs on a PR branch would otherwise credit the issue author on a
+// human's commits too. The agent's own commits already carry the trailer from
+// when they were made. --git-path answers for this worktree, not the main one.
 func trailerHook(repoHook, valueFile string) string {
 	return "#!/bin/sh\n" +
 		"h=" + shellQuote(repoHook) + "\n" +
 		"if [ -x \"$h\" ]; then \"$h\" \"$@\" || exit $?; fi\n" +
+		"[ -d \"$(git rev-parse --git-path rebase-merge)\" ] && exit 0\n" +
+		"[ -d \"$(git rev-parse --git-path rebase-apply)\" ] && exit 0\n" +
+		"[ -f \"$(git rev-parse --git-path CHERRY_PICK_HEAD)\" ] && exit 0\n" +
+		"[ -f \"$(git rev-parse --git-path REVERT_HEAD)\" ] && exit 0\n" +
 		"git stripspace --strip-comments <\"$1\" | grep -q . || exit 0\n" +
 		"v=$(cat " + shellQuote(valueFile) + ") || exit 1\n" +
 		"exec git interpret-trailers --in-place --if-exists addIfDifferent --trailer \"Co-authored-by: $v\" \"$1\"\n"

@@ -203,3 +203,49 @@ func TestConcurrentDispatchesInSiblingWorktrees(t *testing.T) {
 		}
 	}
 }
+
+// A rebase the agent runs replays every commit on the branch through the
+// message hooks, a human's included. Only the agent's own commits may carry
+// the trailer, and they already do from when they were made.
+func TestRebaseDoesNotCreditReplayedCommits(t *testing.T) {
+	base := isolatedGit(t)
+	repo := newRepo(t, base)
+	env := prepare(t, base, repo, sean)
+
+	run(t, repo, base, "git", "checkout", "-q", "-b", "pr")
+	commit(t, repo, base, "human", "fix: by a human")
+	commit(t, repo, env, "agent", "feat: by the agent")
+	run(t, repo, base, "git", "checkout", "-q", "main")
+	commit(t, repo, base, "upstream", "chore: upstream moved")
+	run(t, repo, base, "git", "checkout", "-q", "pr")
+
+	run(t, repo, env, "git", "rebase", "-q", "main")
+
+	if got := trailers(run(t, repo, env, "git", "log", "-1", "--format=%B", "HEAD~1")); len(got) != 0 {
+		t.Errorf("human commit trailers = %q, want none", got)
+	}
+	if got := trailers(run(t, repo, env, "git", "log", "-1", "--format=%B", "HEAD")); len(got) != 1 {
+		t.Errorf("agent commit trailers = %q, want exactly one", got)
+	}
+	if subj := run(t, repo, env, "git", "log", "-1", "--format=%s", "HEAD~2"); subj != "chore: upstream moved" {
+		t.Errorf("rebase did not replay onto main: HEAD~2 is %q", subj)
+	}
+}
+
+func TestRewordRebaseKeepsOneTrailer(t *testing.T) {
+	base := isolatedGit(t)
+	repo := newRepo(t, base)
+	commit(t, repo, prepare(t, base, repo, sean), "b", "feat: b")
+	editor := filepath.Join(t.TempDir(), "editor")
+	// Rewrites the subject and keeps the rest, as a person rewording does.
+	os.WriteFile(editor, []byte("#!/bin/sh\nsed -i.bak '1s/.*/feat: reworded/' \"$1\"\n"), 0o755)
+	env := append(prepare(t, base, repo, sean),
+		"GIT_SEQUENCE_EDITOR=sed -i.bak 's/^pick/reword/'", "GIT_EDITOR="+editor)
+
+	run(t, repo, env, "git", "rebase", "-q", "-i", "HEAD~1")
+
+	msg := run(t, repo, env, "git", "log", "-1", "--format=%B")
+	if got := trailers(msg); len(got) != 1 || !strings.HasPrefix(msg, "feat: reworded") {
+		t.Errorf("message = %q; want the reworded subject and one trailer", msg)
+	}
+}
