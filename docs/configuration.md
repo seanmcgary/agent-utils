@@ -204,8 +204,10 @@ person who asked for the change is credited on the commits the agent makes. The 
 `Co-authored-by: <name> <email>`. The name is the author's profile name, or their login if
 the profile has none. The email is their public email if they have one, and otherwise
 `<id>+<login>@users.noreply.github.com`, which GitHub attributes to their account. Authors
-that are bots (`type: Bot`, or a login ending in `[bot]`) are skipped. A failed lookup of the
-author never fails a dispatch; the commit just has no trailer.
+that are bots (`type: Bot`, or a login ending in `[bot]`) are skipped. A failed lookup never
+fails a dispatch. If the issue cannot be read, the commits get no trailer. If only the
+author's profile cannot be read, the trailer still goes on, with their login as the name and
+the `<id>+<login>@users.noreply.github.com` address.
 
 This works with a personal token as well as with an app. It is implemented as a git hook that
 the dispatch installs through environment configuration, not as an instruction in the prompt,
@@ -215,7 +217,10 @@ whose message is otherwise empty still aborts, as git does.
 
 Known gaps: a message written in an editor and committed with `--no-verify` gets no trailer.
 A tool that runs git with a scrubbed environment does not see the per-dispatch configuration,
-so its commits get the host's git identity and no trailer.
+so its commits get the host's git identity and no trailer. Commits replayed by a rebase,
+cherry-pick or revert the agent runs are not given the trailer; they keep whatever trailers
+they had, so the agent's own commits keep theirs and a human's commits on the branch are not
+credited to the issue author.
 
 ### Two different `config.yaml` files
 
