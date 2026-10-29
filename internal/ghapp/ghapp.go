@@ -40,6 +40,9 @@ import (
 // a token never expires mid-command.
 const RefreshBefore = 10 * time.Minute
 
+// httpTimeout bounds each request New's client makes; see New.
+const httpTimeout = 30 * time.Second
+
 // ErrNotInstalled reports that the app has no installation covering a
 // repository.
 var ErrNotInstalled = errors.New("the GitHub App is not installed on this repository")
@@ -73,7 +76,11 @@ func New(id int64, keyPath, cacheDir string) (*App, error) {
 		return nil, err
 	}
 	return &App{
-		ID: id, BaseURL: "https://api.github.com", HTTP: http.DefaultClient, Now: time.Now,
+		// A mint runs under the repository's token-cache lock, and every gh
+		// shim and credential helper call for that repository queues on it.
+		// http.DefaultClient never times out, so one hung GitHub response
+		// would stall all of them for good.
+		ID: id, BaseURL: "https://api.github.com", HTTP: &http.Client{Timeout: httpTimeout}, Now: time.Now,
 		key: k, keyPath: keyPath, dir: cacheDir,
 	}, nil
 }

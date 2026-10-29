@@ -281,3 +281,34 @@ func TestVerifyFailsWhenGitHubRejectsTheJWT(t *testing.T) {
 		t.Error("a rejected JWT must fail Verify even with a cached slug")
 	}
 }
+
+func TestTokenTimesOutAndReleasesTheLock(t *testing.T) {
+	a, f := newTestApp(t)
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer hung.Close()
+	good := a.BaseURL
+	a.BaseURL = hung.URL
+	a.HTTP = &http.Client{Timeout: 100 * time.Millisecond}
+	if _, err := a.Token(context.Background(), "acme/widgets"); err == nil {
+		t.Fatal("a hung response must fail Token")
+	}
+	// The lock the hung call held must be free again.
+	a.BaseURL = good
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := a.Token(ctx, "acme/widgets"); err != nil || f.mints.Load() != 1 {
+		t.Errorf("second Token: err %v, mints %d", err, f.mints.Load())
+	}
+}
+
+func TestNewSetsAnHTTPTimeout(t *testing.T) {
+	a, _ := newTestApp(t)
+	if a.HTTP == nil || a.HTTP.Timeout <= 0 {
+		t.Errorf("New's HTTP client has no timeout: %+v", a.HTTP)
+	}
+}
