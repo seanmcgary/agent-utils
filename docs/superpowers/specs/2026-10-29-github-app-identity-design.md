@@ -70,19 +70,22 @@ module dependency).
 
 - `JWT(now)` signs `{iat: now-60s, exp: now+9m, iss: app_id}`. The 60s
   backdate absorbs clock skew, as GitHub's docs recommend.
-- `Installation(ctx, repo)` calls `GET /repos/{owner}/{repo}/installation`
-  with the JWT and returns the installation id. Cached in memory per process
-  and on disk alongside the tokens.
-- `Token(ctx, repo)` returns a valid installation token for the repository's
-  installation:
-  1. Read `~/.agent-utils/tokens/<installation_id>.json` (0600, directory
+- The installation for a repository comes from `GET
+  /repos/{owner}/{repo}/installation` with the JWT, and is cached in the
+  repository's token file.
+- `Token(ctx, repo)` returns a valid installation token scoped to that one
+  repository (`"repositories": [name]` on the mint), so a dispatch's token
+  cannot reach the app's other repositories:
+  1. Read `~/.agent-utils/tokens/<owner>/<name>.json` (0600, directories
      0700). If the cached token expires more than 10 minutes from now, return
-     it.
-  2. Otherwise take an exclusive lock on `<installation_id>.lock`
+     it. A cache hit costs no API call.
+  2. Otherwise take an exclusive lock on `<name>.json.lock`
      (`internal/lock`), re-read the file (another process may have minted
      while this one waited), and if it is still stale call `POST
      /app/installations/{id}/access_tokens`, write the result atomically
-     (temp file + rename), release the lock, and return it.
+     (temp file + rename), release the lock, and return it. A cached
+     installation id that the mint rejects is looked up once more, for an
+     app that was reinstalled.
 - `Bot(ctx)` returns the bot identity: `GET /app` (JWT) for the slug, then
   `GET /users/{slug}[bot]` (installation token; the JWT is only accepted on
   `/app` endpoints) for the bot user id. Name is `<slug>[bot]`; email is
@@ -94,18 +97,18 @@ minutes, longer than any single `gh` or `git` invocation.
 
 ### Daemon clients
 
-`ghub.New(token string)` stays for token mode. A new
-`ghub.NewForRepo(src TokenSource, repo string)` builds the go-github client on
-an `http.RoundTripper` that calls `src.Token(ctx, repo)` per request and sets
-`Authorization: Bearer`. Long-lived clients (the listener's per-repo access,
-the poll source) therefore never hold an expired token.
+`ghub.New(token string)` stays for token mode. A new `ghub.NewApp(app)`
+builds the go-github client on an `http.RoundTripper` that reads the
+repository from each request's `/repos/{owner}/{name}/` path and sets that
+repository's installation token. Every call the daemon makes is under such a
+path except the co-author profile read (`GET /users/{login}`), which names
+its repository with `ghapp.WithRepo(ctx, repo)`; a request with neither is
+refused rather than sent unauthenticated. One client therefore serves every
+repository, and a long-lived one never holds an expired token.
 
-The scattered `os.Getenv("GITHUB_TOKEN")` reads (`cmd/agent-utils/main.go`,
-`project.go`, `loopcmd/open.go`, `listener/work.go`) are replaced by one
-`auth.Resolve(settings) (auth.Source, error)`, which returns either a static
-token source or a `ghapp` source. Each call site asks it for a client for its
-repository. `listener.Worker`'s `NewClient`/`NewPollSource` seams take the
-repo instead of a token.
+`loopcmd.Open` loads the settings and builds the app client when one is
+configured; the listener's worker and the webhook registration in `project`
+do the same. `GITHUB_TOKEN` is read only when no app is configured.
 
 ### Self-identity
 
@@ -156,17 +159,24 @@ fetch a current one:
     `ssh://git@github.com/`, so a repository cloned over SSH pushes over HTTPS
     as the app.
   - `user.name`, `user.email` = the bot identity.
-- `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`,
-  `GIT_COMMITTER_EMAIL` = the bot identity, which outrank `user.*` from any
-  source.
+
+The identity is `user.name`/`user.email` only, not `GIT_AUTHOR_*` in the
+environment: those would override the author of an existing commit on
+`--amend` and during a rebase, rewriting a human's authorship as the bot's.
+`GIT_CONFIG_*` outranks every config file, and `agentEnv` passes no host
+`GIT_AUTHOR_*` through, so the bot is the default for every new commit.
 
 `internal gh-token` prints `ghapp.Token` for the repository.
-`internal git-credential` implements the git credential protocol's `get`
-(username `x-access-token`, password the token) and ignores `store`/`erase`.
-Both refuse a `--repo` that is not the dispatch's own repository, read from an
-`AGENT_UTILS_DISPATCH_REPO` variable the runner sets, so an agent cannot ask
-for a token for another repository the app is installed on by changing the
-flag. (It can still read the key file; see [Security](#security).)
+`internal git-credential` implements the git credential protocol's `get` for
+`https://github.com` (username `x-access-token`, password the token) and
+ignores `store`/`erase`. Neither takes a repository argument: both read it
+from `AGENT_UTILS_DISPATCH_REPO`, which the runner sets, so a command line the
+agent writes cannot point them at another repository. (The agent can still
+read the key file; see [Security](#security).)
+
+`AGENT_UTILS_HOME` is withheld from the agent's environment on purpose, so
+when it is set the runner writes it into the shim and the helper command
+line rather than the environment.
 
 ### Go-side git
 
@@ -215,8 +225,10 @@ the same `GIT_CONFIG_*` mechanism (in either auth mode).
   2. `git interpret-trailers --in-place --if-exists addIfDifferent --trailer
      "Co-authored-by: <value>" "$1"`.
 
-  The value is written into the script by the runner, single-quoted, after
-  rejecting any value containing a quote, newline or control character.
+  The value is read from `run/<id>/co-author`, a file the runner writes, so
+  a name with a quote in it is data and never shell. Control characters are
+  dropped when the value is formatted, and a name or email containing `<` or
+  `>` falls back to the login or the noreply address.
 - Every other client-side hook name git defines (`pre-commit`, `commit-msg`,
   `post-commit`, `pre-push`, `pre-rebase`, `post-checkout`, `post-merge`,
   `post-rewrite`, `pre-merge-commit`, `reference-transaction`, ...) gets a stub
@@ -311,8 +323,9 @@ daemon as a dedicated user for a real boundary.
   identity.
 - `ghub.AuthenticatedLogin` in app mode returns `<slug>[bot]` without calling
   `/user`.
-- `internal git-credential` and `internal gh-token` refuse a `--repo` that is
-  not `AGENT_UTILS_DISPATCH_REPO`.
+- `internal git-credential` and `internal gh-token` fail without
+  `AGENT_UTILS_DISPATCH_REPO`, and the credential helper answers only
+  `https://github.com`.
 
 ## Docs
 
