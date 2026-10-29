@@ -95,7 +95,7 @@ func TestTokenIsCachedAndRepoScoped(t *testing.T) {
 	if t3, _ := b.Token(ctx, "acme/widgets"); t3 != t1 || f.mints.Load() != 1 {
 		t.Errorf("second App re-minted: %q, mints %d", t3, f.mints.Load())
 	}
-	info, err := os.Stat(filepath.Join(a.dir, "tokens", "acme", "widgets.json"))
+	info, err := os.Stat(filepath.Join(a.dir, "tokens", "7", "acme", "widgets.json"))
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Errorf("cache file: %v, mode %v", err, info.Mode().Perm())
 	}
@@ -310,5 +310,26 @@ func TestNewSetsAnHTTPTimeout(t *testing.T) {
 	a, _ := newTestApp(t)
 	if a.HTTP == nil || a.HTTP.Timeout <= 0 {
 		t.Errorf("New's HTTP client has no timeout: %+v", a.HTTP)
+	}
+}
+
+func TestTokenCacheIsPerApp(t *testing.T) {
+	a, f := newTestApp(t)
+	b, err := New(8, a.keyPath, a.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.BaseURL = a.BaseURL
+	ctx := context.Background()
+	ta, err := a.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, err := b.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ta == tb || f.mints.Load() != 2 {
+		t.Errorf("apps 7 and 8 got %q and %q with %d mints; want two tokens", ta, tb, f.mints.Load())
 	}
 }

@@ -185,7 +185,7 @@ longer falls back to defaults.
   is used and `GITHUB_TOKEN` is ignored.
 
 **Token mechanics.** Installation tokens are minted for a single repository and kept in
-`~/.agent-utils/tokens/` (directory `0700`, files `0600`). A token is refreshed when fewer
+`~/.agent-utils/tokens/<app_id>/` (directory `0700`, files `0600`). A token is refreshed when fewer
 than 10 minutes of its lifetime remain. The agent's environment never holds a token: `gh` and
 git reach it through the `agent-utils internal gh-token` and `agent-utils internal
 git-credential` helpers, which are configured per dispatch through environment variables and

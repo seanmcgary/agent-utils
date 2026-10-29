@@ -3,9 +3,10 @@
 // An installation token expires an hour after it is minted and cannot be
 // refreshed; a new one is minted by signing a JWT with the app's private key.
 // A dispatch can run for a day, and the agent's gh and git each run as fresh
-// processes, so tokens are cached ON DISK, per repository, and every process
-// that needs one -- the daemon, a tick, the gh shim, the git credential helper
-// -- reads the same file and mints only when it is close to expiry.
+// processes, so tokens are cached ON DISK, per app and repository, and every
+// process that needs one -- the daemon, a tick, the gh shim, the git
+// credential helper -- reads the same file and mints only when it is close to
+// expiry.
 package ghapp
 
 import (
@@ -26,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -146,8 +148,11 @@ type cachedToken struct {
 	ExpiresAt      time.Time `json:"expires_at"`
 }
 
+// tokenPath is keyed by app id as well as repository: after the operator
+// switches apps, a token the old app minted must not be handed out as the
+// new app's for the rest of its hour.
 func (a *App) tokenPath(owner, name string) string {
-	return filepath.Join(a.dir, "tokens", owner, name+".json")
+	return filepath.Join(a.dir, "tokens", strconv.FormatInt(a.ID, 10), owner, name+".json")
 }
 
 func (a *App) fresh(c cachedToken) bool {
