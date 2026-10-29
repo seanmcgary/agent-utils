@@ -5,10 +5,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -192,5 +194,40 @@ func TestTransportAuthenticatesPerRepo(t *testing.T) {
 	req, _ := http.NewRequestWithContext(WithRepo(context.Background(), "acme/widgets"), "GET", a.BaseURL+"/users/acme-agent[bot]", nil)
 	if resp, err := a.Client().Do(req); err != nil || resp.StatusCode != 200 {
 		t.Errorf("WithRepo request: %v %v", resp, err)
+	}
+}
+
+func TestTransportNeverSendsTheTokenOffHost(t *testing.T) {
+	a, f := newTestApp(t)
+	var got atomic.Pointer[string]
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		got.Store(&h)
+	}))
+	defer other.Close()
+
+	// A request GitHub redirects off-host re-enters the transport with the
+	// same WithRepo context; it must not arrive carrying the token.
+	f.redirect = other.URL + "/blob"
+	req, _ := http.NewRequestWithContext(WithRepo(context.Background(), "acme/widgets"), "GET", a.BaseURL+"/repos/acme/widgets/redirect", nil)
+	if resp, err := a.Client().Do(req); err == nil {
+		resp.Body.Close()
+	}
+	if h := got.Load(); h != nil && *h != "" {
+		t.Errorf("redirect target received Authorization %q", *h)
+	}
+
+	// A request addressed to another host is refused and mints nothing.
+	before := f.mints.Load()
+	req, _ = http.NewRequestWithContext(context.Background(), "GET", other.URL+"/repos/acme/widgets/issues/1", nil)
+	if resp, err := a.Client().Do(req); err == nil {
+		resp.Body.Close()
+		t.Error("request to a non-BaseURL host was sent")
+	}
+	if f.mints.Load() != before {
+		t.Errorf("a refused request minted a token")
+	}
+	if h := got.Load(); h != nil && *h != "" {
+		t.Errorf("other host received Authorization %q", *h)
 	}
 }

@@ -30,6 +30,7 @@ type fakeGitHub struct {
 	expiry    time.Duration
 	mu        sync.Mutex
 	scopes    [][]string // repositories requested per mint
+	redirect  string     // target of GET /repos/{owner}/{name}/redirect
 }
 
 func writeKey(t *testing.T, dir string) (string, *rsa.PrivateKey) {
@@ -123,6 +124,9 @@ func newFakeGitHub(t *testing.T, pub *rsa.PublicKey) *fakeGitHub {
 	})
 	mux.HandleFunc("GET /repos/{owner}/{name}/issues/{n}", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"number":1,"auth":%q}`, r.Header.Get("Authorization"))
+	})
+	mux.HandleFunc("GET /repos/{owner}/{name}/redirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, f.redirect, http.StatusFound)
 	})
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
