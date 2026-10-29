@@ -154,7 +154,9 @@ limit on what a leaked key can reach.
 agent-utils config github-app --app-id 123456 --private-key /abs/path/app.pem
 ```
 
-The key path must be absolute. The key file must be mode `0600` and owned by the user the
+`config github-app` resolves a relative `--private-key` against the current directory and stores
+the absolute path; `agent-utils config set github_app.private_key_path` rejects a relative path
+instead. The key file must be mode `0600` and owned by the user the
 daemon runs as. Before saving anything the command signs a JWT with the key and calls
 `GET /app`; if GitHub rejects the app id or the key, nothing is saved. On success it prints the
 app's slug. The settings are stored as `github_app.app_id` and `github_app.private_key_path` in
