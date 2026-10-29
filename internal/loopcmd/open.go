@@ -44,6 +44,13 @@ type ProjectRef struct {
 	Dir string
 }
 
+// appFromSettings is ghapp.FromSettings; a test replaces it to point the app
+// at its own server.
+var appFromSettings = ghapp.FromSettings
+
+// botLookupTimeout bounds Open's bot identity lookup, which may mint a token.
+const botLookupTimeout = 30 * time.Second
+
 // Options configures Open.
 type Options struct {
 	// Token authenticates the GitHub client.
@@ -154,7 +161,7 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 	}
 	// A configured app is used wherever a token would have been, and it is
 	// an error -- never a fallback to GITHUB_TOKEN -- for it to be unusable.
-	app, err := ghapp.FromSettings(s)
+	app, err := appFromSettings(s)
 	if err != nil {
 		return nil, Deps{}, nil, err
 	}
@@ -246,8 +253,15 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 	}
 
 	wt := worktree.New(cfg.CheckoutBaseDir, cfg.WorktreeDir, cfg.Name, cfg.DefaultBranch)
-	if app != nil {
-		bot, err := app.Bot(context.Background(), cfg.Repo)
+	// Only a caller that talks to GitHub runs Go-side git that reaches it
+	// (the tick's fetch, the automatic rebase's push). logs, reset, the
+	// detached runner and the orphan sweep pass RequireGitHub false and must
+	// work with GitHub down, so they skip the bot lookup, which can mint a
+	// token. The runner resolves the bot itself, in prepareIdentity.
+	if app != nil && opts.RequireGitHub {
+		ctx, cancel := context.WithTimeout(context.Background(), botLookupTimeout)
+		bot, err := app.Bot(ctx, cfg.Repo)
+		cancel()
 		if err != nil {
 			db.Close()
 			return nil, Deps{}, nil, fmt.Errorf("resolve the GitHub App's bot identity for %s: %w", cfg.Repo, err)
