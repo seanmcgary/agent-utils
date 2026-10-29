@@ -41,6 +41,12 @@ func configCommand() *cli.Command {
 						return err
 					}
 					fmt.Print(out)
+					if s.GitHubApp.AppID != 0 {
+						fmt.Printf("The daemon acts as the GitHub App %d.\n", s.GitHubApp.AppID)
+						if os.Getenv(githubTokenEnv) != "" {
+							fmt.Printf("%s is set but ignored: the GitHub App wins.\n", githubTokenEnv)
+						}
+					}
 					return nil
 				},
 			},
@@ -104,6 +110,7 @@ func configCommand() *cli.Command {
 				},
 			},
 			configWebhookCommand(),
+			githubAppCommand(),
 			configTokenCommand(),
 		},
 	}
