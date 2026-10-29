@@ -57,12 +57,17 @@ func (w *Worker) pollPass(ctx context.Context) {
 		return
 	}
 
-	token, err := w.Token()
-	if err != nil {
-		slog.Error("cannot read the github token to poll", "err", err)
-		return
+	var src PollSource
+	if w.App != nil {
+		src = ghub.NewApp(w.App)
+	} else {
+		token, err := w.Token()
+		if err != nil {
+			slog.Error("cannot read the github token to poll", "err", err)
+			return
+		}
+		src = w.NewPollSource(token)
 	}
-	src := w.NewPollSource(token)
 
 	for _, r := range byRepo {
 		// Checked per repository, not only on entry: a shutdown must not wait

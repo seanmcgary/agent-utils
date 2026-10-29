@@ -3,6 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -1455,5 +1459,26 @@ func TestInstrumentPollerDrainWaitsForARetryFiredTick(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("drain never returned after the retry-fired tick finished")
+	}
+}
+
+func TestEnsureTokenAppModeNeedsNoToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENT_UTILS_HOME", dir)
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, "app.pem")
+	b := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
+	if err := os.WriteFile(keyPath, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &settings.Settings{GitHubApp: settings.GitHubApp{AppID: 7, PrivateKeyPath: keyPath}}
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureToken(nil, io.Discard, false); err != nil {
+		t.Fatalf("app mode must not need a token: %v", err)
 	}
 }

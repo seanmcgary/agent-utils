@@ -2,8 +2,13 @@ package listener
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,6 +16,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/ghapp"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
@@ -3113,5 +3119,39 @@ func TestTheLabelledIssuesOwnPassStillRuns(t *testing.T) {
 	}
 	if n := h.timers.len(); n != 0 {
 		t.Errorf("armed %d retry timers for a failed sweep, want 0", n)
+	}
+}
+
+// testApp builds a ghapp.App over a throwaway key. access makes no request, so
+// no server is needed.
+func testApp(t *testing.T) *ghapp.App {
+	t.Helper()
+	dir := t.TempDir()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, "app.pem")
+	b := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
+	if err := os.WriteFile(keyPath, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, err := ghapp.New(7, keyPath, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return app
+}
+
+func TestAccessUsesAppWithoutToken(t *testing.T) {
+	w := NewWorker(nil)
+	w.Token = func() (string, error) { return "", errors.New("no env file") }
+	w.App = testApp(t)
+	acc, err := w.access()
+	if err != nil {
+		t.Fatalf("app mode must not need a token: %v", err)
+	}
+	if acc.gh == nil || acc.epic == nil || acc.authors == nil {
+		t.Errorf("access = %+v; want gh, epic and authors set", acc)
 	}
 }
