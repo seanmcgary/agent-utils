@@ -231,3 +231,53 @@ func TestTransportNeverSendsTheTokenOffHost(t *testing.T) {
 		t.Errorf("other host received Authorization %q", *h)
 	}
 }
+
+func writeBotCache(t *testing.T, a *App, content string) string {
+	t.Helper()
+	dir := filepath.Join(a.dir, "tokens")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "bot-7.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestVerifyIgnoresTheSlugCache(t *testing.T) {
+	a, f := newTestApp(t)
+	path := writeBotCache(t, a, `{"slug":"old-slug","user_id":55}`)
+	slug, err := a.Verify(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slug != "acme-agent" || f.appHits.Load() != 1 {
+		t.Errorf("slug %q, /app hits %d; want acme-agent and 1", slug, f.appHits.Load())
+	}
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "acme-agent") || strings.Contains(string(raw), "55") {
+		t.Errorf("changed slug must refresh the cache and drop the stale user id: %s", raw)
+	}
+}
+
+func TestVerifyKeepsUserIDWhenSlugUnchanged(t *testing.T) {
+	a, _ := newTestApp(t)
+	path := writeBotCache(t, a, `{"slug":"acme-agent","user_id":55}`)
+	if _, err := a.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(path); !strings.Contains(string(raw), "55") {
+		t.Errorf("user id lost: %s", raw)
+	}
+}
+
+func TestVerifyFailsWhenGitHubRejectsTheJWT(t *testing.T) {
+	a, _ := newTestApp(t)
+	writeBotCache(t, a, `{"slug":"acme-agent","user_id":55}`)
+	other, _ := newTestApp(t) // different key than a's server trusts
+	other.BaseURL, other.dir = a.BaseURL, a.dir
+	if _, err := other.Verify(context.Background()); err == nil {
+		t.Error("a rejected JWT must fail Verify even with a cached slug")
+	}
+}

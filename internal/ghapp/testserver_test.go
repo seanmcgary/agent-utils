@@ -26,6 +26,7 @@ type fakeGitHub struct {
 	pub       *rsa.PublicKey
 	mints     atomic.Int32
 	lookups   atomic.Int32
+	appHits   atomic.Int32
 	installed map[string]int64 // "owner/name" -> installation id
 	expiry    time.Duration
 	mu        sync.Mutex
@@ -104,6 +105,7 @@ func newFakeGitHub(t *testing.T, pub *rsa.PublicKey) *fakeGitHub {
 			time.Now().Add(f.expiry).UTC().Format(time.RFC3339))
 	})
 	mux.HandleFunc("GET /app", func(w http.ResponseWriter, r *http.Request) {
+		f.appHits.Add(1)
 		if _, ok := f.verifyJWT(r); !ok {
 			http.Error(w, "bad jwt", http.StatusUnauthorized)
 			return

@@ -238,6 +238,32 @@ func (a *App) Slug(ctx context.Context) (string, error) {
 	return strings.TrimSuffix(id.Login, "[bot]"), err
 }
 
+// Verify asks GitHub for the app with a freshly signed JWT and returns its
+// slug. Unlike Slug it never answers from the cache: a cached slug says
+// nothing about whether the key in hand is still accepted, and checking a
+// new or rotated key is the whole point. On success the cached slug is
+// refreshed; the cached bot user id is kept only if the slug is unchanged.
+func (a *App) Verify(ctx context.Context) (string, error) {
+	var out struct {
+		Slug string `json:"slug"`
+	}
+	if _, err := a.jwtCall(ctx, "GET", "/app", nil, &out); err != nil {
+		return "", fmt.Errorf("read the GitHub App: %w", err)
+	}
+	if out.Slug == "" {
+		return "", errors.New("read the GitHub App: GitHub returned no slug")
+	}
+	path := filepath.Join(a.dir, "tokens", fmt.Sprintf("bot-%d.json", a.ID))
+	b, _ := readJSON[botFile](path)
+	if b.Slug != out.Slug {
+		b = botFile{Slug: out.Slug}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err == nil {
+		_ = writeJSON(path, b)
+	}
+	return out.Slug, nil
+}
+
 // Bot returns the app's bot identity. The bot's user id is read with an
 // installation token for repo, because /users accepts no app JWT.
 func (a *App) Bot(ctx context.Context, repo string) (Identity, error) {

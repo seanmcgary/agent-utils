@@ -8,6 +8,9 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,5 +87,33 @@ func TestConfigShowSaysTheAppWinsOverGitHubToken(t *testing.T) {
 	out, _, _ = runConfigCLI(t, "config", "show")
 	if strings.Contains(out, "acts as the GitHub App") || strings.Contains(out, "ignored") {
 		t.Errorf("no app configured, yet show output = %q", out)
+	}
+}
+
+func TestConfigureGitHubAppDoesNotSaveWhenVerifyIsRejectedDespiteCache(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENT_UTILS_HOME", dir)
+	keyPath := writeTestKey(t, dir)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "bad jwt", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	// A slug cached by an earlier successful run must not stand in for GitHub.
+	tokens := filepath.Join(dir, "tokens")
+	if err := os.MkdirAll(tokens, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tokens, "bot-7.json"), []byte(`{"slug":"acme-agent"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verify := func(a *ghapp.App) (string, error) {
+		a.BaseURL = srv.URL
+		return a.Verify(context.Background())
+	}
+	if err := configureGitHubApp(context.Background(), io.Discard, 7, keyPath, verify); err == nil {
+		t.Fatal("a key GitHub rejects must not be saved")
+	}
+	if s, _ := settings.Load(); s.GitHubApp.AppID != 0 {
+		t.Errorf("saved %+v", s.GitHubApp)
 	}
 }

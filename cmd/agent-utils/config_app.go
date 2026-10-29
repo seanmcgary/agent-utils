@@ -45,8 +45,10 @@ func githubAppCommand() *cli.Command {
 			if err != nil {
 				return err
 			}
+			// Verify, not Slug: Slug answers from the cache after one success,
+			// so a rotated or wrong key would be saved without GitHub seeing it.
 			return configureGitHubApp(ctx, out, c.Int64("app-id"), keyPath,
-				func(a *ghapp.App) (string, error) { return a.Slug(ctx) })
+				func(a *ghapp.App) (string, error) { return a.Verify(ctx) })
 		},
 	}
 }
