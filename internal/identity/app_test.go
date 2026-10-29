@@ -53,6 +53,9 @@ func TestAppEnvSetsBotIdentity(t *testing.T) {
 	if got != want+"|"+want {
 		t.Errorf("author|committer = %q, want bot for both", got)
 	}
+	if !strings.Contains(strings.Join(env, "\n"), "\nGIT_TERMINAL_PROMPT=0\n") {
+		t.Error("app-mode env must disable git's terminal prompt")
+	}
 }
 
 func TestAppEnvAndCoAuthorTogether(t *testing.T) {
@@ -152,7 +155,7 @@ func TestHelperCommandCarriesHome(t *testing.T) {
 func TestGitEnvForDaemon(t *testing.T) {
 	env := GitEnv("/usr/local/bin/agent-utils", "", "acme/widgets", bot)
 	joined := strings.Join(env, "\n")
-	for _, want := range []string{RepoEnv + "=acme/widgets", "=user.email", "=" + bot.Email, "insteadOf"} {
+	for _, want := range []string{RepoEnv + "=acme/widgets", "=user.email", "=" + bot.Email, "insteadOf", "GIT_TERMINAL_PROMPT=0"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("GitEnv missing %q:\n%s", want, joined)
 		}

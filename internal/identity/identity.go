@@ -63,6 +63,9 @@ func Prepare(ctx context.Context, p Plan) ([]string, error) {
 			// finds no stored login rather than the host user's.
 			"GH_CONFIG_DIR="+ghConfig,
 			"GH_PROMPT_DISABLED=1",
+			// A credential helper that fails must fail the git command, not
+			// fall through to a username prompt on a terminal nobody watches.
+			"GIT_TERMINAL_PROMPT=0",
 		)
 		if binDir != "" {
 			// Appended after agentEnv's PATH; exec keeps the last value of a
@@ -155,9 +158,9 @@ func appGitConfig(selfPath, home, repo string, bot ghapp.Identity) []gitKV {
 
 // GitEnv is the environment Go-side git runs with in app mode: fetches and
 // the automatic rebase's push. It carries no hooks; those commands make no
-// new commits.
+// new commits. GIT_TERMINAL_PROMPT=0 is there for the reason Prepare sets it.
 func GitEnv(selfPath, home, repo string, bot ghapp.Identity) []string {
-	return append([]string{RepoEnv + "=" + repo},
+	return append([]string{RepoEnv + "=" + repo, "GIT_TERMINAL_PROMPT=0"},
 		renderGitConfig(appGitConfig(selfPath, home, repo, bot))...)
 }
 
