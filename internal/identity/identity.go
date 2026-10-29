@@ -48,7 +48,7 @@ func Prepare(ctx context.Context, p Plan) ([]string, error) {
 	var kvs []gitKV
 	var env []string
 	if p.Bot != nil {
-		kvs = append(kvs, appGitConfig(p.SelfPath, p.Home, *p.Bot)...)
+		kvs = append(kvs, appGitConfig(p.SelfPath, p.Home, p.Repo, *p.Bot)...)
 		ghConfig := filepath.Join(p.Dir, "gh")
 		if err := os.MkdirAll(ghConfig, 0o700); err != nil {
 			return nil, err
@@ -124,8 +124,8 @@ func helperCommand(selfPath, home string) string {
 // The identity is user.name/user.email, deliberately not GIT_AUTHOR_* in the
 // environment: those would override the author of an existing commit on
 // --amend and during a rebase, rewriting a human's authorship as the bot's.
-func appGitConfig(selfPath, home string, bot ghapp.Identity) []gitKV {
-	return []gitKV{
+func appGitConfig(selfPath, home, repo string, bot ghapp.Identity) []gitKV {
+	kvs := []gitKV{
 		{"credential.https://github.com.helper", ""},
 		{"credential.https://github.com.helper", "!" + helperCommand(selfPath, home) + " internal git-credential"},
 		{"url.https://github.com/.insteadOf", "git@github.com:"},
@@ -133,6 +133,24 @@ func appGitConfig(selfPath, home string, bot ghapp.Identity) []gitKV {
 		{"user.name", bot.Name},
 		{"user.email", bot.Email},
 	}
+	// git picks the longest matching insteadOf/pushInsteadOf prefix, and on a
+	// tie the entry read first, which is the host's file (GIT_CONFIG_* is read
+	// last). A host rule such as `git@github.com: insteadOf https://github.com/`
+	// would otherwise send the push over SSH with the human's key. A
+	// repo-scoped prefix is longer than any host-wide GitHub rule, so ours win.
+	if repo != "" {
+		key := "url.https://github.com/" + repo
+		for _, from := range []string{
+			"https://github.com/" + repo,
+			"git@github.com:" + repo,
+			"ssh://git@github.com/" + repo,
+		} {
+			kvs = append(kvs,
+				gitKV{key + ".insteadOf", from},
+				gitKV{key + ".pushInsteadOf", from})
+		}
+	}
+	return kvs
 }
 
 // GitEnv is the environment Go-side git runs with in app mode: fetches and
@@ -140,7 +158,7 @@ func appGitConfig(selfPath, home string, bot ghapp.Identity) []gitKV {
 // new commits.
 func GitEnv(selfPath, home, repo string, bot ghapp.Identity) []string {
 	return append([]string{RepoEnv + "=" + repo},
-		renderGitConfig(appGitConfig(selfPath, home, bot))...)
+		renderGitConfig(appGitConfig(selfPath, home, repo, bot))...)
 }
 
 // writeGhShim writes <Dir>/bin/gh. It fetches a token on EVERY invocation:

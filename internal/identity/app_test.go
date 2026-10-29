@@ -161,3 +161,48 @@ func TestGitEnvForDaemon(t *testing.T) {
 		t.Error("the daemon's git must not get the co-author hook")
 	}
 }
+
+// hostRule appends a rewrite to the isolated host gitconfig.
+func hostRule(t *testing.T, base []string, rule string) {
+	t.Helper()
+	cfgPath := strings.TrimPrefix(base[2], "GIT_CONFIG_GLOBAL=")
+	f, err := os.OpenFile(cfgPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(rule); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertHTTPSRemote(t *testing.T, repo string, env []string) {
+	t.Helper()
+	const want = "https://github.com/acme/widgets.git"
+	if got := run(t, repo, env, "git", "remote", "get-url", "origin"); got != want {
+		t.Errorf("fetch url = %q, want %q", got, want)
+	}
+	if got := run(t, repo, env, "git", "remote", "get-url", "--push", "origin"); got != want {
+		t.Errorf("push url = %q, want %q", got, want)
+	}
+}
+
+func TestAppEnvBeatsHostInsteadOf(t *testing.T) {
+	base := isolatedGit(t)
+	hostRule(t, base, "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n")
+	repo := newRepo(t, base)
+	run(t, repo, base, "git", "remote", "add", "origin", "https://github.com/acme/widgets.git")
+	self, _ := fakeSelf(t)
+	assertHTTPSRemote(t, repo, appEnv(t, base, repo, self, "", ""))
+	assertHTTPSRemote(t, repo, append(append([]string{}, base...), GitEnv(self, "", "acme/widgets", bot)...))
+}
+
+func TestAppEnvBeatsHostPushInsteadOf(t *testing.T) {
+	base := isolatedGit(t)
+	hostRule(t, base, "[url \"git@github.com:\"]\n\tpushInsteadOf = https://github.com/\n")
+	repo := newRepo(t, base)
+	run(t, repo, base, "git", "remote", "add", "origin", "https://github.com/acme/widgets.git")
+	self, _ := fakeSelf(t)
+	assertHTTPSRemote(t, repo, appEnv(t, base, repo, self, "", ""))
+	assertHTTPSRemote(t, repo, append(append([]string{}, base...), GitEnv(self, "", "acme/widgets", bot)...))
+}
