@@ -333,3 +333,17 @@ func TestTokenCacheIsPerApp(t *testing.T) {
 		t.Errorf("apps 7 and 8 got %q and %q with %d mints; want two tokens", ta, tb, f.mints.Load())
 	}
 }
+
+func TestBotRejectsAMissingUserID(t *testing.T) {
+	a, f := newTestApp(t)
+	f.noUserID = true
+	if id, err := a.Bot(context.Background(), "acme/widgets"); err == nil {
+		t.Fatalf("Bot = %+v; a user with no id must be an error", id)
+	}
+	// Nothing wrong was cached: once GitHub answers properly, so does Bot.
+	f.noUserID = false
+	id, err := a.Bot(context.Background(), "acme/widgets")
+	if err != nil || id.Email != "9001+acme-agent[bot]@users.noreply.github.com" {
+		t.Errorf("Bot after recovery = %+v, %v", id, err)
+	}
+}

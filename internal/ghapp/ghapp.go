@@ -324,6 +324,11 @@ func (a *App) botCache(ctx context.Context, repo string) (Identity, error) {
 		if _, err := a.call(ctx, "GET", "/users/"+url.PathEscape(login), "token "+tok, nil, &out); err != nil {
 			return Identity{}, fmt.Errorf("read the app's bot user: %w", err)
 		}
+		if out.ID == 0 {
+			// Without the id the noreply email is wrong, and every commit
+			// made with it is attributed to no one.
+			return Identity{}, errors.New("read the app's bot user: GitHub returned no id")
+		}
 		b.UserID = out.ID
 		_ = writeJSON(path, b)
 	}

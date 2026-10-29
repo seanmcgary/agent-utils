@@ -32,6 +32,7 @@ type fakeGitHub struct {
 	mu        sync.Mutex
 	scopes    [][]string // repositories requested per mint
 	redirect  string     // target of GET /repos/{owner}/{name}/redirect
+	noUserID  bool       // GET /users/{login} answers {}
 }
 
 func writeKey(t *testing.T, dir string) (string, *rsa.PrivateKey) {
@@ -120,6 +121,10 @@ func newFakeGitHub(t *testing.T, pub *rsa.PublicKey) *fakeGitHub {
 		}
 		if r.PathValue("login") != "acme-agent[bot]" {
 			http.Error(w, "not found", 404)
+			return
+		}
+		if f.noUserID {
+			fmt.Fprint(w, `{}`)
 			return
 		}
 		fmt.Fprint(w, `{"login":"acme-agent[bot]","id":9001,"type":"Bot"}`)
