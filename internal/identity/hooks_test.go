@@ -104,6 +104,43 @@ func TestHooksHonourRepositoryHooksPath(t *testing.T) {
 	}
 }
 
+func gitCommit(dir string, env []string, args ...string) error {
+	cmd := exec.Command("git", append([]string{"commit", "-q"}, args...)...)
+	cmd.Dir, cmd.Env = dir, env
+	return cmd.Run()
+}
+
+func TestEmptyMessageStillAborts(t *testing.T) {
+	base := isolatedGit(t)
+	repo := newRepo(t, base)
+	env := append(prepare(t, base, repo, sean), "GIT_EDITOR=true")
+	os.WriteFile(filepath.Join(repo, "b"), []byte("b"), 0o644)
+	run(t, repo, env, "git", "add", "b")
+	if err := gitCommit(repo, env); err == nil {
+		t.Error("an empty message must still abort the commit")
+	}
+	if n := run(t, repo, env, "git", "rev-list", "--count", "HEAD"); n != "1" {
+		t.Errorf("commit count = %s, want 1", n)
+	}
+}
+
+func TestEditorWrittenMessageGetsOneTrailer(t *testing.T) {
+	base := isolatedGit(t)
+	repo := newRepo(t, base)
+	editor := filepath.Join(t.TempDir(), "editor")
+	os.WriteFile(editor, []byte("#!/bin/sh\nprintf 'feat: from editor\\n' > \"$1\"\n"), 0o755)
+	env := append(prepare(t, base, repo, sean), "GIT_EDITOR="+editor)
+	os.WriteFile(filepath.Join(repo, "b"), []byte("b"), 0o644)
+	run(t, repo, env, "git", "add", "b")
+	if err := gitCommit(repo, env); err != nil {
+		t.Fatal(err)
+	}
+	msg := run(t, repo, env, "git", "log", "-1", "--format=%B")
+	if got := trailers(msg); len(got) != 1 || !strings.HasPrefix(msg, "feat: from editor") {
+		t.Errorf("message = %q", msg)
+	}
+}
+
 func TestNoCoAuthorMeansNoHooks(t *testing.T) {
 	base := isolatedGit(t)
 	repo := newRepo(t, base)

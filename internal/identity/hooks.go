@@ -9,13 +9,14 @@ import (
 	"strings"
 )
 
-// clientHooks is every client-side hook git runs from core.hooksPath. Setting
+// stubHooks is every client-side hook git runs from core.hooksPath, except the
+// two commit-message hooks writeHooks generates itself. Setting
 // core.hooksPath replaces the repository's hook directory outright, so each
 // one gets a stub that runs the repository's own; without them husky,
 // lefthook and plain .git/hooks checks would silently stop running.
-var clientHooks = []string{
+var stubHooks = []string{
 	"applypatch-msg", "pre-applypatch", "post-applypatch",
-	"pre-commit", "pre-merge-commit", "commit-msg", "post-commit",
+	"pre-commit", "pre-merge-commit", "post-commit",
 	"pre-rebase", "post-checkout", "post-merge", "pre-push",
 	"pre-auto-gc", "post-rewrite", "reference-transaction",
 	"post-index-change", "sendemail-validate",
@@ -48,7 +49,7 @@ func writeHooks(ctx context.Context, p Plan) (string, error) {
 		return "", fmt.Errorf("write co-author: %w", err)
 	}
 
-	for _, name := range clientHooks {
+	for _, name := range stubHooks {
 		stub := "#!/bin/sh\n" +
 			"h=" + shellQuote(filepath.Join(orig, name)) + "\n" +
 			"[ -x \"$h\" ] && exec \"$h\" \"$@\"\n" +
@@ -58,16 +59,31 @@ func writeHooks(ctx context.Context, p Plan) (string, error) {
 		}
 	}
 
-	// The repository's prepare-commit-msg runs first and can refuse the
-	// commit. addIfDifferent keeps the trailer to one copy across --amend,
-	// rebase rewords and squashes.
-	pcm := "#!/bin/sh\n" +
-		"h=" + shellQuote(filepath.Join(orig, "prepare-commit-msg")) + "\n" +
-		"if [ -x \"$h\" ]; then \"$h\" \"$@\" || exit $?; fi\n" +
-		"v=$(cat " + shellQuote(valueFile) + ") || exit 1\n" +
-		"exec git interpret-trailers --in-place --if-exists addIfDifferent --trailer \"Co-authored-by: $v\" \"$1\"\n"
-	if err := os.WriteFile(filepath.Join(dir, "prepare-commit-msg"), []byte(pcm), 0o700); err != nil {
-		return "", fmt.Errorf("write prepare-commit-msg hook: %w", err)
+	// Both message hooks add the trailer. prepare-commit-msg is the primary
+	// path because --no-verify skips commit-msg but not it; but it runs before
+	// the editor, so a message written in the editor has no trailer yet and
+	// commit-msg adds it. addIfDifferent keeps it to one copy when both run,
+	// and across --amend, rebase rewords and squashes.
+	for _, name := range []string{"prepare-commit-msg", "commit-msg"} {
+		script := trailerHook(filepath.Join(orig, name), valueFile)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {
+			return "", fmt.Errorf("write %s hook: %w", name, err)
+		}
 	}
 	return dir, nil
+}
+
+// trailerHook renders a message hook that runs the repository's hook of the
+// same name (which can refuse the commit), then adds the co-author trailer.
+//
+// A message with nothing but comments is left alone: adding the trailer to it
+// would make it non-empty and defeat git's "Aborting commit due to empty
+// commit message". stripspace reads core.commentChar itself.
+func trailerHook(repoHook, valueFile string) string {
+	return "#!/bin/sh\n" +
+		"h=" + shellQuote(repoHook) + "\n" +
+		"if [ -x \"$h\" ]; then \"$h\" \"$@\" || exit $?; fi\n" +
+		"git stripspace --strip-comments <\"$1\" | grep -q . || exit 0\n" +
+		"v=$(cat " + shellQuote(valueFile) + ") || exit 1\n" +
+		"exec git interpret-trailers --in-place --if-exists addIfDifferent --trailer \"Co-authored-by: $v\" \"$1\"\n"
 }
