@@ -64,6 +64,10 @@ type fakeWait struct {
 type fakeRun struct {
 	repo, workflow, branch string
 	run                    ghub.WorkflowRun
+	// lagging hides the run from status-filtered listings, as GitHub's index
+	// does for a few seconds after a run completes; a read by head SHA still
+	// returns it.
+	lagging bool
 }
 
 func newFakeWait() *fakeWait {
@@ -149,7 +153,7 @@ func (f *fakeWait) WorkflowRuns(_ context.Context, owner, repo string, q ghub.Ru
 		if q.HeadSHA != "" && r.run.HeadSHA != q.HeadSHA {
 			continue
 		}
-		if q.Status == "success" && r.run.Conclusion != "success" {
+		if q.Status == "success" && (r.run.Conclusion != "success" || r.lagging) {
 			continue
 		}
 		out = append(out, r.run)
@@ -411,6 +415,30 @@ func TestWaitForChecksReleasesOnAGreenRunOfTheMergeCommit(t *testing.T) {
 	}
 	if sum.Released != 1 || !f.released(cfg, 945) {
 		t.Fatalf("released = %d, writes = %+v", sum.Released, f.writes)
+	}
+}
+
+// GitHub's status-filtered run listing lags a just-completed run: the
+// workflow_run delivery for mirror.yml's success arrived, and was evaluated,
+// before the run showed up under status=success (exchange-infra#945, released
+// only by a restart's catch-up pass). The merge commit's own run, read by head
+// SHA, is green, and that alone releases the issue.
+func TestWaitForChecksReleasesOnTheCommitsOwnGreenRunBeforeTheListingCatchesUp(t *testing.T) {
+	cfg, deps, f := waitFixture(t, "mirror.yml")
+	f.blockedBy[945] = []ghub.Issue{closedCompleted(blockerRepo, 697)}
+	mergedBy(f, blockerRepo, 697, mergeSHA)
+	run(f, mergeSHA, "success", 1)
+	f.runs[len(f.runs)-1].lagging = true
+
+	sum, err := WaitSweep(context.Background(), cfg, deps, []int{945})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Released != 1 || !f.released(cfg, 945) {
+		t.Fatalf("released = %d, writes = %+v; the commit's own green run must release it", sum.Released, f.writes)
+	}
+	if c := f.commentWrites(); len(c) != 0 {
+		t.Errorf("comments = %+v, want none", c)
 	}
 }
 
