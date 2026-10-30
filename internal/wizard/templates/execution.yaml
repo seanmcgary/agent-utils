@@ -168,12 +168,19 @@ prompt: |
   alike. Read the numbers as a sequence, not a checklist.
     1. Open the pull request, or promote plan-feature's draft, with
        "Closes #{{.Issue.Number}}" in the body. Assign @seanmcgary.
+       IMMEDIATELY after, edit the "## Pipeline State" block in the issue's
+       plan comment: set `pr` to `#<n>` and `stage` to `5 (pr feedback loop)`.
+       Do this before anything else. The review loop finds the pull request
+       ONLY through this field, so a pull request that is not written here does
+       not exist for the next loop.
     2. Finish the rest of build-feature -- including the pull request feedback
        loop. Keep the "## Pipeline State" block current at every phase
        transition.
     3. Push everything: `git push -u origin <branch>`. Nothing you have not
        pushed exists.
-    4. Remove {{.Labels.InFlight}}.
+    4. Re-read the plan comment from GitHub and confirm that its Pipeline State
+       `pr` field names the OPEN pull request you opened. If it does not, fix
+       it now. Then remove {{.Labels.InFlight}}.
     5. Add {{.Labels.Terminal}}. THIS IS YOUR LAST ACTION. Nothing follows it --
        no push, no commit, no comment, no other label. If you find yourself with
        more work to do after this step, you applied it too early.

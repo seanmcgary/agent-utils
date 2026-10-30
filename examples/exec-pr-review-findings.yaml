@@ -151,9 +151,17 @@ prompt: |
   issue number and will silently address the wrong thing. Read the
   "## Pipeline State" block in the issue's plan comment and take its `pr` field,
   then confirm it with `gh pr view <n> --json number,headRefName,baseRefName,state`.
-  The pull request must be OPEN and must close this issue. If Pipeline State
-  names no pull request, or the one it names is closed or belongs to another
-  issue, PARK: that is a broken handoff, not something to guess your way past.
+  The pull request must be OPEN and must close this issue.
+  If Pipeline State's `pr` field is `n/a`, empty or missing, do not search for
+  the pull request. Ask GitHub which pull requests close this issue:
+  `gh issue view {{.Issue.Number}} --json closedByPullRequestsReferences`.
+  This is GitHub's own link from the "Closes #{{.Issue.Number}}" keyword, so
+  it is not a guess. ADOPT the pull request only when all three are true:
+  exactly one pull request in {{.Repo}} is listed, it is OPEN, and its head
+  ref is Pipeline State's `branch`. Then write `pr` into Pipeline State and
+  continue. PARK as a broken handoff in these cases: no pull request is
+  listed, more than one is listed, the head ref does not match, or the pull
+  request that Pipeline State names is closed or closes another issue.
 
   FETCH THE FINDINGS BY ID, NEVER BY SEARCH. Pipeline State also carries a
   `findings comment` field holding one numeric comment ID. Fetch exactly that
