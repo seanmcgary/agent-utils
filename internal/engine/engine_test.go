@@ -1191,3 +1191,27 @@ func TestSameHarnessStillParksAtTheCap(t *testing.T) {
 		t.Fatalf("kinds = %v, want [%v]", got, KindParkRetryExhausted)
 	}
 }
+
+// The waiting label stops a dispatch without being listed under veto. An issue
+// that waits on a blocker must not start just because someone also applied the
+// trigger -- that is exactly the half-released state the waiting pass leaves
+// behind when its second label write fails.
+func TestWaitingLabelSkipsEvenWithTrigger(t *testing.T) {
+	cfg := testConfig()
+	cfg.Labels.Waiting = "status:awaiting-mirror"
+	snap := Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger, "status:awaiting-mirror")}}
+	p := Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 0 {
+		t.Fatalf("decisions = %v, want none while the waiting label is present", kinds(p))
+	}
+	if got := p.Skips[1]; !strings.Contains(got, "waiting label") {
+		t.Errorf("skip reason = %q, want it to name the waiting label", got)
+	}
+
+	// The same issue without the waiting label starts.
+	snap = Snapshot{Issues: []ghub.Issue{issue(1, cfg.Labels.Trigger)}}
+	p = Decide(cfg, snap, State{Issues: map[int]store.IssueState{}}, time.Now())
+	if len(p.Decisions) != 1 {
+		t.Fatalf("decisions = %v, want one start once the waiting label is gone", kinds(p))
+	}
+}

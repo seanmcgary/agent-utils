@@ -87,6 +87,10 @@ type Options struct {
 	// the feature would be dead exactly where it matters and nowhere a test
 	// injecting its own reader would notice.
 	Epic ghub.EpicReader
+	// Wait serves the waiting-label pass. Nil falls back to GH when GH
+	// implements it, exactly as Epic does, and for the same reason the daemon
+	// passes it explicitly: its GH is a DeliveryCache.
+	Wait ghub.WaitReader
 	// Authors resolves co-authors. Nil falls back to GH when GH implements
 	// it; the daemon passes it explicitly, as it does Epic, because the
 	// DeliveryCache wrapper does not.
@@ -204,6 +208,13 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		}
 	}
 
+	waitReader := opts.Wait
+	if waitReader == nil {
+		if wr, ok := gh.(ghub.WaitReader); ok {
+			waitReader = wr
+		}
+	}
+
 	if _, err := home.EnsureDir(); err != nil {
 		return nil, Deps{}, nil, err
 	}
@@ -274,6 +285,7 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		ProjectID:  ref.ID,
 		GH:         gh,
 		Epic:       epicReader,
+		Wait:       waitReader,
 		WT:         wt,
 		SelfPath:   self,
 		ConfigPath: abs,

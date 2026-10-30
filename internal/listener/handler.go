@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -43,6 +44,11 @@ var repoFullName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,1
 // UUID. It exists only to bound what safeDeliveryID will pass through to a
 // log line; the dedup cache itself (deliveryCache) accepts any non-empty
 // string as its key.
+// workflowFile matches a GitHub Actions workflow file's base name, the shape
+// config.validateWaiting accepts for wait_for_checks. A workflow_run whose path
+// does not end in one is dropped before it is logged or routed.
+var workflowFile = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}\.ya?ml$`)
+
 var deliveryIDShape = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 
 // webhookAction matches the "action" field an issue, pull request or comment
@@ -450,11 +456,12 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			Label struct {
 				Name string `json:"name"`
 			} `json:"label"`
-			// The subject of the delivery. Of the six subscribed events, five
+			// The subject of the delivery. Of the seven subscribed events, five
 			// carry a number: issues and issue_comment in issue.number, and
 			// pull_request, pull_request_review and pull_request_review_comment
-			// in pull_request.number. The sixth, push, carries neither -- its
-			// subject is a branch, decoded separately as Ref below. Both
+			// in pull_request.number. push and workflow_run carry neither --
+			// their subjects are a branch and a workflow, decoded separately
+			// as Ref and WorkflowRun below. Both
 			// fields here are decoded because issue_comment fires on pull
 			// requests too, and because a delivery this daemon cannot
 			// attribute to one number is one it cannot act on.
@@ -467,6 +474,10 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				Number int        `json:"number"`
 				Title  string     `json:"title"`
 				Labels []nameOnly `json:"labels"`
+				// StateReason says how a closed issue closed. It filters the
+				// waiting pass: a blocker closed as not planned releases
+				// nothing, so its close need not cost the calls.
+				StateReason string `json:"state_reason"`
 			} `json:"issue"`
 			// Merged and Base carry the one fact that arms a tend sweep: this
 			// delivery merged a pull request, and into which branch. Both are
@@ -489,6 +500,15 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// Ref is the branch a push delivery moved. It is the only subject
 			// a push has: the payload carries no issue and no pull request.
 			Ref string `json:"ref"`
+			// WorkflowRun is the subject of a workflow_run delivery. Only the
+			// workflow's path is read: its base name is the workflow FILE a
+			// loop's wait_for_checks names. Which commit ran and how it
+			// concluded are re-read from GitHub by the waiting pass, never
+			// taken from here, so this delivery can only choose WHEN the pass
+			// runs, not what it decides.
+			WorkflowRun struct {
+				Path string `json:"path"`
+			} `json:"workflow_run"`
 		}
 		if err := json.Unmarshal(payload, &body); err != nil || !repoFullName.MatchString(body.Repository.FullName) {
 			s.rejected(w, deliveryID, "repository", http.StatusBadRequest)
@@ -508,9 +528,10 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// it names nothing this daemon can act on, and answering 202 would
 		// hide a malformed delivery, or a subscription to an event that
 		// carries no number, behind a success the operator never sees. push
-		// is the single exception: its subject is a branch, not an issue, so
-		// a numberless push is the expected shape rather than a malformed one.
-		if number <= 0 && event != "push" {
+		// and workflow_run are the exceptions: their subjects are a branch and
+		// a workflow, not an issue, so a numberless one is the expected shape
+		// rather than a malformed one.
+		if number <= 0 && event != "push" && event != "workflow_run" {
 			s.rejected(w, deliveryID, "issue number", http.StatusBadRequest)
 			return
 		}
@@ -519,9 +540,34 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// produce a body that passes the HMAC, so this is not
 		// attacker-reachable, but forcing the number to 0 for push is one
 		// line and strictly tighter than trusting a field this event does
-		// not define.
-		if event == "push" {
+		// not define. A workflow_run is treated the same way, for the same
+		// reason: its payload carries pull_requests, never an issue.
+		if event == "push" || event == "workflow_run" {
 			number = 0
+		}
+
+		// A workflow_run arrives three times per run -- requested, in_progress,
+		// completed -- for every workflow of every watched repository, and
+		// only a completion can change what the waiting pass decides. The
+		// other two are answered here, before the pool, the dedup cache or
+		// the log, exactly as an event this daemon does not subscribe to is.
+		//
+		// The file name is shape-checked as a branch is: it is matched
+		// against configuration and logged. A path whose base name is not a
+		// workflow file (a dynamic workflow, for one) is dropped the same way,
+		// because no wait_for_checks entry could name it.
+		var completedWorkflow string
+		if event == "workflow_run" {
+			if body.Action != "completed" {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			base := path.Base(body.WorkflowRun.Path)
+			if !strings.HasPrefix(body.WorkflowRun.Path, ".github/workflows/") || !workflowFile.MatchString(base) {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			completedWorkflow = base
 		}
 
 		// A merged pull request is the only delivery that arms a sweep. The
@@ -597,6 +643,14 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// issues and pull requests share that. See Delivery.Reopened.
 		reopened := (event == "issues" || event == "pull_request") &&
 			body.Action == "reopened"
+
+		// The close reason, carried only for an issue close and only in the
+		// shape GitHub spells it. Anything else is dropped to empty, which the
+		// waiting pass reads as "unknown" and evaluates rather than skips.
+		var stateReason string
+		if closedIssue && webhookAction.MatchString(body.Issue.StateReason) {
+			stateReason = body.Issue.StateReason
+		}
 
 		// 9. GitHub redelivers on timeout and on manual "Redeliver," and the
 		// plaintext hop behind a reverse proxy makes a captured delivery
@@ -713,6 +767,12 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if reopened {
 				attrs = append(attrs, "reopened", true)
 			}
+			if stateReason != "" {
+				attrs = append(attrs, "state_reason", stateReason)
+			}
+			if completedWorkflow != "" {
+				attrs = append(attrs, "workflow", completedWorkflow)
+			}
 			slog.Info("accepted delivery", attrs...)
 
 			s.wg.Add(1)
@@ -722,7 +782,8 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 				s.Tick(ctx, Delivery{
 					Repo: repo, Number: number, MergedInto: mergedInto, PushedTo: pushedTo,
 					ClosedPR: closedPR, ClosedIssue: closedIssue, Reopened: reopened,
-					EpicReady: epicReady,
+					EpicReady: epicReady, StateReason: stateReason,
+					CompletedWorkflow: completedWorkflow,
 				})
 			}()
 		default:

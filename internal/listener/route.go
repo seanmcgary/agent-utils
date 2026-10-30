@@ -33,6 +33,12 @@ type Target struct {
 	// migration check; a busy feature branch would pay all three on every push,
 	// once per target, for a delivery nothing can act on.
 	DefaultBranch string
+	// Waiting and WaitForChecks are the loop's labels.waiting and
+	// wait_for_checks, copied off the scan so the waiting pass can pick its
+	// loops -- and drop a workflow_run delivery no loop waits on -- without
+	// opening a database. Both are empty for the tend dispatcher.
+	Waiting       string
+	WaitForChecks []string
 	// Tends marks the project's tend dispatcher. It is true for exactly one
 	// target per tending project and false for every loop -- a loop no longer
 	// tends at all, so this is an identity rather than a capability. The
@@ -207,6 +213,8 @@ func Scan() (Routes, error) {
 				LoopName:      e.Name,
 				Repo:          e.Repo,
 				DefaultBranch: e.DefaultBranch,
+				Waiting:       e.Waiting,
+				WaitForChecks: e.WaitForChecks,
 			})
 		}
 

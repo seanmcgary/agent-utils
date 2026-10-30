@@ -58,6 +58,13 @@ type Entry struct {
 	// property of any loop, so it is read once from the project descriptor --
 	// see LoadTend and listener.Scan -- rather than resolved per file here.
 	DefaultBranch string
+	// Waiting and WaitForChecks are copied off the same Load, for the reason
+	// DefaultBranch is: the listener filters a workflow_run delivery -- one for
+	// every CI run in every watched repository -- down to the loops that wait
+	// on that workflow without opening anything. Both are empty when Err is
+	// set.
+	Waiting       string
+	WaitForChecks []string
 	// Err records why the file could not be loaded. Listing reports a broken
 	// configuration rather than hiding it, because a file that silently does
 	// not appear is harder to debug than one that appears with its error.
@@ -184,6 +191,8 @@ func List(agentUtilsDir string) ([]Entry, error) {
 			entry.Name = cfg.Name
 			entry.Repo = cfg.Repo
 			entry.DefaultBranch = cfg.DefaultBranch
+			entry.Waiting = cfg.Labels.Waiting
+			entry.WaitForChecks = cfg.WaitForChecks
 		}
 		out = append(out, entry)
 	}

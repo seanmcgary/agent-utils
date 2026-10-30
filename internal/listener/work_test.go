@@ -211,6 +211,14 @@ func newHarness(db *store.DB) *harness {
 	w.ReapOrphans = h.reap
 	w.IssueBusy = h.issueBusy
 	w.Targets = h.targetsSeam
+	// The scan of the whole machine answers from the same targets. Without
+	// this, every test reaching Serve would run the waiting catch-up against
+	// the REAL registry of whoever runs the tests.
+	w.ScanTargets = func() (Routes, error) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return Routes{Targets: append([]Target(nil), h.targets...)}, nil
+	}
 	w.TargetFor = func(projectID, loop string) (Target, Routing, error) {
 		if h.targetFor != nil {
 			return h.targetFor(projectID, loop)

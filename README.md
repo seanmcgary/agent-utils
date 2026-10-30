@@ -7,8 +7,9 @@ the loop sets `agent.harness: pi`, so a loop can drive a model that claude does 
 It replaces the LLM orchestrator in an issue-driven planning loop and execution loop. Go owns
 the deterministic decisions — selecting issues by label, session and worktree bookkeeping,
 retries, backoff, the circuit breaker. The agent owns every judgement and every GitHub write but
-two: the retry-cap park, and the epic sweep's promotion (see [Epics](#epics)). Cron does the
-scheduling; the engine has no timer.
+three: the retry-cap park, the epic sweep's promotion (see [Epics](#epics)), and the release of
+an issue that was waiting on another (see [Waiting on another issue](#waiting-on-another-issue)).
+Cron does the scheduling; the engine has no timer.
 
 The load-bearing property is session continuity: an issue keeps one agent session across a
 park and its answer, so a resumed run continues the conversation instead of re-deriving its
@@ -665,7 +666,7 @@ Passing `--config` with an absolute path works too and skips discovery entirely.
 
 The webhook listener turns a GitHub delivery — an issue labeled, a comment posted, a pull
 request updated — directly into a `loop tick`, instead of waiting for the next cron interval.
-A delivery acts on the issue it names. There are four exceptions.
+A delivery acts on the issue it names. There are five exceptions.
 
 Two are on a `pull_request` delivery. A pull request that **closes**, merged or not, has its
 `pr-<N>` worktree removed, along with the `issue-<M>` worktree of the issue it closes, once
@@ -705,7 +706,16 @@ changes. It is capped either way.
 
 The fourth exception is on an `issues` delivery reporting a **close**: when the closed issue
 is a sub-issue of an epic, the delivery also sweeps that epic, promoting sibling sub-issues the
-delivery never names — see [Epics](#epics).
+delivery never names — see [Epics](#epics). A close as completed also re-decides every issue
+that declared the closed one a blocker and carries some loop's waiting label, in whichever
+repository it lives — see [Waiting on another issue](#waiting-on-another-issue).
+
+The fifth is a `workflow_run` delivery, which names no issue at all. Only a **completed** run is
+acted on, and only when some loop's [`wait_for_checks`](docs/configuration.md#wait_for_checks)
+names that workflow: it re-decides that loop's waiting issues blocked by an issue in the run's
+repository, which usually means issues in another repository. A completed run nothing waits on
+does nothing past the accepted-delivery line, and the `requested` and `in_progress` actions are
+answered 204 before they are logged at all.
 
 Every close and every reopen — of an issue or of a pull request — is also recorded locally,
 which is what lets `sessions list` leave finished work out of its table. It is written before
@@ -874,6 +884,15 @@ missing scope does, which is easy to mistake for "no webhook registered" rather 
 scope." The token in `~/.agent-utils/env` needs upgrading to `admin` before re-running the
 command. Until that is done, the merge trigger and the periodic tend check still work
 unchanged; only the push trigger waits on it.
+
+**And again for `workflow_run`.** It is the newest event in the list, for loops that set
+[`wait_for_checks`](docs/configuration.md#wait_for_checks): a waiting issue is released the
+moment the named workflow goes green on its blocker's merge commit only if the BLOCKER's
+repository delivers `workflow_run`. Re-run `register-webhook` in the project that watches that
+repository (exchange-service, in the example below); until then the release still happens, but
+only at the next `loop tick` under cron or the next daemon start. A loop with a waiting label and
+no `wait_for_checks` needs nothing new: it is released on the `issues` close every hook already
+carries.
 
 Each registration is recorded in the canonical state database, keyed by project and
 repository, with the hook id GitHub assigned and the URL it was registered with.
@@ -1104,7 +1123,9 @@ so is an epic whose parent lives in another repository: the promotion is a label
 by issue number, and a foreign number names a different issue here. A *blocker* in another
 repository is **ignored** — it cannot hold a sub-issue back. That last one is a deliberate
 trade: a sub-issue whose only remaining blocker is out-of-repo gets promoted while that blocker
-is still open. Keep a dependency inside the repository if you want the sweep to wait for it.
+is still open. Keep a dependency inside the repository if you want the sweep to wait for it, or
+use a waiting label instead — see [Waiting on another issue](#waiting-on-another-issue), which does
+follow blockers across repositories.
 
 **Who this trusts.** The sweep acts on relations a person with `triage` on the repository built:
 the `epic` label, the sub-issue links, and the `blocked_by` edges. Anyone who can create those can
@@ -1170,6 +1191,49 @@ The sweep never comments, never closes an issue, and never writes a dependency. 
 removes is `status:epic-ready`, from the epic it was asked to sweep; it removes nothing from a
 sub-issue. Entering an epic's graph is a human's job, or an agent's, and both use the GitHub UI or
 its API.
+
+## Waiting on another issue
+
+An issue can wait for another one — **in the same repository or a different one** — to be done,
+and start on its own when it is. A loop declares a waiting label; whatever opens the issue applies
+it and records the dependency with GitHub's own `blocked_by` relation:
+
+```yaml
+labels:
+  trigger: status:ready-for-cve-bump
+  waiting: status:awaiting-mirror
+wait_for_checks: [mirror.yml]     # optional
+```
+
+The case it was built for: a daily job opens a *mirror* issue in one repository
+(`exchange-service#697`) and a *pin* issue in another (`exchange-infra#945`) that GitHub records
+as blocked by it. The pin carries `status:awaiting-mirror`. When the pull request closing the
+mirror merges into `main`, a push-triggered `mirror.yml` runs on the merge commit, and only once
+that run succeeds should the pin get its loop's trigger. With the configuration above, that is
+exactly what happens: the loop removes `status:awaiting-mirror` and adds
+`status:ready-for-cve-bump`, and the next tick dispatches it.
+
+- **The waiting label is a veto.** The loop never starts an issue carrying it.
+- **Release needs every blocker closed as completed.** Not planned, duplicate, or still open:
+  it waits. An issue with no blocker recorded yet also waits.
+- **With `wait_for_checks`**, each blocker's closing pull request's merge commit must also have a
+  green run of every named workflow — on that commit or on a later one containing it. No run yet
+  is a wait; a failed run posts one comment on the waiting issue and it keeps waiting. A blocker
+  closed by hand, with no merged pull request, counts as done.
+- **Writes go only to the waiting issue, in its own repository**, through the loop that owns the
+  label. The blocker's repository is only read. A closure in another repository decides *when*
+  the issue starts; *which* issue was decided by whoever labelled it and recorded the edge.
+
+Four things re-decide a waiting issue: an `issues` delivery closing any issue (the daemon follows
+its `blocking` edges, across repositories), a completed `workflow_run` of a named workflow, the
+daemon starting, and `loop tick` under cron. The first two need the BLOCKER's repository to have
+a webhook — and `workflow_run` is new, so [re-run `register-webhook`](#webhooks) there.
+
+How it differs from [Epics](#epics): the epic sweep promotes an epic's sub-issues into one loop's
+trigger and stays inside one repository; this works per loop, for any issue that carries the
+label, and follows blockers across repositories. The full rules are under
+[`labels.waiting`](docs/configuration.md#labelswaiting--optional) and
+[`wait_for_checks`](docs/configuration.md#wait_for_checks).
 
 ## Upgrading
 

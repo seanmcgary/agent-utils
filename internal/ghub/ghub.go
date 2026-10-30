@@ -102,12 +102,13 @@ func ConvertIssues(in []*github.Issue) []Issue {
 			}
 		}
 		out = append(out, Issue{
-			Number:    gi.GetNumber(),
-			Title:     gi.GetTitle(),
-			Labels:    labels,
-			UpdatedAt: gi.GetUpdatedAt().Time,
-			State:     gi.GetState(),
-			Repo:      issueRepo(gi),
+			Number:      gi.GetNumber(),
+			Title:       gi.GetTitle(),
+			Labels:      labels,
+			UpdatedAt:   gi.GetUpdatedAt().Time,
+			State:       gi.GetState(),
+			StateReason: gi.GetStateReason(),
+			Repo:        issueRepo(gi),
 		})
 	}
 	return out

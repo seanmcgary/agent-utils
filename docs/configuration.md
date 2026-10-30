@@ -265,6 +265,7 @@ absolute path** — it depends on no working directory and can never prompt.
 - [`labels`](#labels)
 - [Agent overrides from labels](#agent-overrides-from-labels)
 - [`agent`](#agent)
+- [`wait_for_checks`](#wait_for_checks)
 - [Project settings: `tend` and `epic`](#project-settings-tend-and-epic)
 - [`retry`](#retry)
 - [Prompts](#prompts)
@@ -286,6 +287,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `labels.blocked` | string | yes | — |
 | `labels.terminal` | string | no | empty |
 | `labels.veto` | list of string | no | empty |
+| `labels.waiting` | string | no; required by `wait_for_checks` | empty |
 | `agent.harness` | enum | no | `claude` |
 | `agent.model` | string | yes | — |
 | `agent.effort` | enum | no | claude's own default |
@@ -296,6 +298,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.timeout` | duration | no | `24h` |
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
 | `cleanup_closed_pr` | bool | no | `true` |
+| `wait_for_checks` | list of workflow file names | no | empty |
 | `retry.max` | int | no | `0`, meaning never retry |
 | `retry.backoff` | list of duration | yes if `retry.max > 0` | empty |
 | `retry.backoff_ticks` (removed) | — | — | — |
@@ -512,11 +515,13 @@ quietly relying on it: tend eligibility (now `tend.label`) and the epic sweep's 
 machine: it applies its terminal and stops. What makes a terminal a human gate is that no loop
 triggers on it.
 
-**The loop writes a label in three situations**, and never in any other. It applies `blocked` when
+**The loop writes a label in four situations**, and never in any other. It applies `blocked` when
 an issue exhausts its retry budget — see `retry.max`. It applies `trigger` to an unblocked
-sub-issue of an epic. And it removes `status:epic-ready` from an epic it has just swept on
-request. The last two are the epic sweep — see [Epics](../README.md#epics), which also explains
-why only one loop of a project ever does that. Everything else is the agent's to apply.
+sub-issue of an epic. It removes `status:epic-ready` from an epic it has just swept on
+request. And it swaps `waiting` for `trigger` on an issue whose blockers are all done — see
+[`labels.waiting`](#labelswaiting--optional). The middle two are the epic sweep — see
+[Epics](../README.md#epics), which also explains why only one loop of a project ever does that.
+Everything else is the agent's to apply.
 
 ### `labels.trigger` — required
 
@@ -617,6 +622,70 @@ veto:
 ```
 
 Quote any value containing `*`, or YAML may complain.
+
+The [`waiting`](#labelswaiting--optional) label, when set, is a veto too, without being listed
+here.
+
+### `labels.waiting` — optional
+
+The issue is **waiting for its blockers** — which may live in another repository — and the loop
+must not start it yet. Something other than the loop applies it: a person, or a job that opens an
+issue and records what it depends on with GitHub's own `blocked_by` relation.
+
+```yaml
+labels:
+  trigger: status:ready-for-cve-bump
+  waiting: status:awaiting-mirror
+wait_for_checks: [mirror.yml]   # optional; see wait_for_checks
+```
+
+**It acts as a veto.** An issue carrying it is never dispatched, even beside `trigger`, and you
+do not list it under `veto` as well. `project loop status` shows such an issue as `waiting`.
+
+**The loop releases it**: it adds `trigger` and then removes `waiting`, on the issue itself, once
+every issue in its `blocked_by` list is **closed as completed**. That is a GitHub write no agent
+makes, alongside the retry-cap park and the epic sweep. In detail:
+
+- **Every blocker must be closed with the reason `completed`.** A blocker closed as *not planned*
+  or as a *duplicate* did not deliver what the issue waits on, and neither did one closed before
+  GitHub recorded reasons; all of those keep it waiting. Reopen and re-close the blocker, or
+  release the issue by hand, if that is wrong.
+- **An issue with no blocker at all keeps waiting.** That is the moment between a job applying
+  the label and recording the dependency, and releasing it then would start the work early. To
+  start it without a blocker, apply `trigger` and remove `waiting` yourself.
+- **A blocker may live in another repository**, unlike the epic sweep's. The blocker's
+  repository is only ever *read*; both writes go to the waiting issue, addressed to the
+  repository of the loop that declares the label. So a closure in another repository chooses
+  *when* an issue is released, never *which*: that was decided by whoever applied `waiting` and
+  recorded the `blocked_by` edge here.
+- **The add comes first.** If the removal then fails, the issue carries both labels, `waiting`
+  still vetoes it, and the next pass finishes the job; the opposite order could leave it with
+  neither.
+- **At most 25 releases per pass**, as for the epic sweep; the rest wait for the next pass and
+  the log says so.
+
+Four things decide it:
+
+1. **An `issues` delivery closing any issue** in a watched repository. The daemon reads the
+   issues that closed one was blocking — across repositories — and re-decides each that is open
+   and carries the `waiting` label of a loop watching its repository, through that loop: its
+   project, its lock, its repository. A close as *not planned* costs no call.
+2. **A `workflow_run` delivery completing** one of the workflows a loop names in
+   `wait_for_checks`: that loop's waiting issues blocked by an issue in the run's repository are
+   re-decided. This needs the hook to carry `workflow_run`; see
+   [Webhooks](../README.md#webhooks) — **re-run `project register-webhook`** on every
+   repository whose closures or runs a waiting issue depends on.
+3. **The daemon starting**, beside its closure reconcile: every waiting issue is re-decided, for
+   whatever closed or went green while it was down.
+4. **`project loop tick`** under cron, which walks the loop's waiting issues — the backstop for a
+   delivery that never arrived.
+
+The pass takes the loop's lock around its writes, so a release and a dispatch decision are
+serial. A delivery that finds the lock held is tried again a minute later, up to three times.
+
+Rules: it must differ from `trigger`, `in_flight`, `blocked` and `terminal` (the release
+removes it, so sharing a role would strip that role from the issue), and it must be one literal
+label, not a `*` prefix rule. Matching ignores case.
 
 ## Agent overrides from labels
 
@@ -972,6 +1041,58 @@ Two limits apply, and neither is configurable:
 cleanup_closed_pr: false   # keep the worktrees
 ```
 
+## `wait_for_checks`
+
+GitHub Actions workflows, by **file name**, that must have succeeded on a blocker's merge commit
+before a [waiting](#labelswaiting--optional) issue is released. Optional; requires
+`labels.waiting`. Without it, a blocker closing as completed is enough.
+
+```yaml
+wait_for_checks: [mirror.yml]
+```
+
+It exists for the case where closing the blocker is not the moment its work is usable: the pull
+request that closes it merges, and a push-triggered workflow on the merge commit then has to
+finish — publishing an image, mirroring an artifact — before the dependent issue can start. The
+closure arrives first, so the closure alone cannot release it.
+
+For each blocker the loop finds the **merged pull request that closed it** (GitHub's own
+closing-reference link), and for that pull request's merge commit, every named workflow must have
+a **successful, completed run on the repository's default branch** whose head is either:
+
+- the merge commit itself, or
+- **a later commit that contains it.** A workflow under a concurrency group cancels the merge's own
+  run when the next merge lands, and only the newer run ever goes green; it counts.
+
+Everything else waits:
+
+- **No run yet** waits. The closure usually arrives before the push-triggered run exists, and
+  silence is not success.
+- **A run in progress, or cancelled,** waits for a later green run.
+- **A failed run** (`failure`, `timed_out`, `startup_failure`) on the merge commit, with no later
+  green run covering it, posts **one comment** on the waiting issue naming the workflow, the
+  commit and the run's URL, and keeps waiting — a later green run still releases it. The comment
+  carries a hidden marker keyed by run, so later passes, restarts and re-runs of that run do not
+  repeat it.
+- **A blocker closed as completed with no merged pull request** is a human's explicit close: there
+  is no commit to have run on, so it counts as done.
+
+The workflow runs are read in the repository the closing pull request lives in — the blocker's,
+in every ordinary case. Names are workflow file names (`mirror.yml`, `build.yaml`), not display
+names: the file name is what both the runs endpoint and a `workflow_run` delivery carry, while a
+display name is free text anyone editing the workflow can change. A dynamic workflow, which has
+no file, cannot be named.
+
+A completed `workflow_run` delivery for a named workflow is what re-decides the issue the moment
+the run goes green; cron's tick and the daemon's start-up catch-up are the backstops. The hook
+has to carry `workflow_run` for the first — see [Webhooks](../README.md#webhooks).
+
+Everything about the blocker is read with the daemon's credentials: its issue, its closing pull
+requests (one GraphQL query — REST has no endpoint for them) and, under `wait_for_checks`, its
+workflow runs, which need **Actions: read** there. A personal token with `repo` covers all of it;
+a [GitHub App](#running-as-a-github-app) must be installed on the blocker's repository and
+granted Actions: read. A read that fails holds the issue; it never releases it.
+
 ## Project settings: `tend` and `epic`
 
 **These live in `.agent-utils/config.yaml`, the PROJECT descriptor — not in a loop file.** A loop
@@ -1313,7 +1434,7 @@ outcome, or if `claude` exits non-zero, or if its stream reports an API error.
 
 How many times one issue may be retried before the loop gives up. `0` means never retry.
 
-**At the cap the loop makes one of its two non-agent GitHub writes.** It posts a comment saying
+**At the cap the loop makes one of its non-agent GitHub writes.** It posts a comment saying
 the retries are exhausted, then removes `in_flight` and `trigger` and applies `blocked`.
 
 It removes `trigger` deliberately: leaving it would let the next tick resume the issue
@@ -1509,6 +1630,10 @@ Beyond the required fields in the quick reference:
 | `retry.backoff_ticks` must be empty | `is no longer supported; ... replace it with retry.backoff` |
 | `retry.breaker.orphan_threshold` ≥ 1 | `must be at least 1` |
 | `retry.breaker.cooldown` > 0 | `must be greater than zero` |
+| `labels.waiting` differs from `trigger`, `in_flight`, `blocked`, `terminal` | `labels.waiting must differ from …` |
+| `labels.waiting` is not a `*` prefix rule | `… it must be one literal label` |
+| `wait_for_checks` needs `labels.waiting` | `wait_for_checks is set but labels.waiting is not` |
+| `wait_for_checks` entries are workflow file names, each once | `… is not a workflow file name` / `… lists … twice` |
 | `checkout_base_dir`/`worktree_dir` relative needs a project root | `… so there is no project root to resolve it against` |
 | All three prompts parse as templates | `prompt: template: …` |
 | No unknown keys anywhere | `field … not found in type config.Config` |
