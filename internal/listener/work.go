@@ -282,6 +282,16 @@ type Worker struct {
 	// them together would need a flag saying which, and a caller that got the
 	// flag wrong would sweep the wrong issue silently.
 	RunEpicReady func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, number int) (loopcmd.Summary, error)
+	// RunWait re-decides the named waiting issues of one loop, taking the
+	// loop's lock itself. Production wires it to loopcmd.WaitSweep. It runs
+	// for an issue CLOSING, in whichever loops wait on the issues that closure
+	// unblocked -- see waitClosePass.
+	RunWait func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, numbers []int) (loopcmd.Summary, error)
+	// RunWaitRepo re-decides every waiting issue of one loop that is blocked by
+	// an issue in blockerRepo ("" for every one), taking the loop's lock
+	// itself. Production wires it to loopcmd.WaitSweepRepo. A completed
+	// workflow run and the start-up catch-up use it.
+	RunWaitRepo func(ctx context.Context, cfg *config.Config, deps loopcmd.Deps, blockerRepo string) (loopcmd.Summary, error)
 	// RunTendCheck answers "is any pull request of this loop behind its base",
 	// as cheaply as it can. Production wires it to loopcmd.TendCheck. It is a
 	// seam because the real one shells out to git and reads a database, and
@@ -402,6 +412,8 @@ func NewWorker(db *store.DB) *Worker {
 		RunCleanup:      loopcmd.CleanupClosedPR,
 		RunEpic:         loopcmd.EpicSweep,
 		RunEpicReady:    loopcmd.EpicReady,
+		RunWait:         loopcmd.WaitSweep,
+		RunWaitRepo:     loopcmd.WaitSweepRepo,
 		RunTendCheck:    loopcmd.TendCheck,
 		ScanTargets:     Scan,
 		ReapOrphans:     loopcmd.ReapOrphans,
@@ -498,6 +510,18 @@ type Delivery struct {
 	// number}, which is GitHub's own number space, shared by issues and pull
 	// requests. Splitting it would give two flags one behaviour.
 	Reopened bool
+	// StateReason is the closed issue's state_reason when ClosedIssue is set
+	// and the payload carried one: "completed", "not_planned" or "duplicate".
+	// The waiting pass is armed by a close as completed; a polled close, which
+	// carries none, arms it too, and the pass re-reads every blocker's reason
+	// itself, so this is a filter that saves calls rather than the rule.
+	StateReason string
+	// CompletedWorkflow is the workflow FILE name ("mirror.yml") of a
+	// workflow_run delivery whose run COMPLETED, and is empty for every other
+	// delivery. A workflow_run names no issue -- Number is 0 -- and the only
+	// thing it can start is the waiting pass for issues blocked by issues in
+	// Repo. See Worker.waitRunPass.
+	CompletedWorkflow string
 }
 
 // IsMergeInto reports whether this delivery merged a pull request into branch.
@@ -531,17 +555,26 @@ func (d Delivery) IsPushTo(branch string) bool {
 // thing that changed.
 //
 // number may name a pull request rather than an issue; the two share a number
-// space, and five of the six subscribed events carry a pull request or issue
+// space, and five of the seven subscribed events carry a pull request or issue
 // number. Resolving that is loopcmd.TickIssue's job, because it is the layer
-// with a GitHub client. The sixth event, push, carries no number at all --
-// its subject is a branch, and the only thing it can start is the tend sweep
-// armed in tickOne.
+// with a GitHub client. push carries no number at all -- its subject is a
+// branch, and the only thing it can start is the tend sweep armed in tickOne.
+// workflow_run carries none either, and the only thing it can start is the
+// waiting pass; it is answered before the per-loop fan-out, by waitRunPass.
 //
 // The fan-out is still per loop: several projects may watch one repository, and
 // each keeps its own state and spends its own budget. The log lines here and in
 // handler.go are what makes the chain delivery -> repository -> issue -> loops
 // readable after the fact.
 func (w *Worker) Deliver(ctx context.Context, d Delivery) {
+	// A completed workflow run is answered before any routing by repository.
+	// Its only work is the waiting pass, whose loops are found by the workflow
+	// they wait on, not by the repository the run happened in -- the issue it
+	// releases usually lives elsewhere. See waitRunPass.
+	if d.CompletedWorkflow != "" {
+		w.waitRunPass(ctx, d)
+		return
+	}
 	targets, err := w.Targets(d.Repo)
 	if err != nil {
 		// Logged and dropped: the routing failure is machine-wide (the
@@ -650,6 +683,15 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 		// state, and one broken project must not strand the others.
 		w.tickOne(ctx, t, d, acc)
 	}
+
+	// After every target's own pass, and once per delivery rather than once
+	// per target: the issues a closure releases belong to whichever loops
+	// wait on them, which need not be any loop of this repository. d.Number
+	// > 0 for the epic pass's reason -- the number is read as the CLOSED
+	// ISSUE.
+	if d.Number > 0 && d.ClosedIssue {
+		w.waitClosePass(ctx, d, acc)
+	}
 }
 
 // access is the GitHub access ONE pass hands to the loops it ticks: the token
@@ -693,6 +735,10 @@ type access struct {
 	// authors is the same client again, for crediting the issue author. Nil
 	// where the client cannot answer, and loopcmd treats nil as "no credit".
 	authors ghub.AuthorReader
+	// wait is the same client again, for the waiting pass, which bypasses the
+	// cache for epic's reason. Nil where the client cannot answer, and the
+	// pass then declines rather than panicking.
+	wait ghub.WaitReader
 }
 
 // access reads the token and builds the pass's client and memo.
@@ -721,6 +767,9 @@ func (w *Worker) access() (*access, error) {
 	}
 	if ar, ok := c.(ghub.AuthorReader); ok {
 		acc.authors = ar
+	}
+	if wr, ok := c.(ghub.WaitReader); ok {
+		acc.wait = wr
 	}
 	return acc, nil
 }
@@ -1993,6 +2042,12 @@ func (w *Worker) Serve(ctx context.Context) {
 	// down is a fact no later delivery will ever carry. Unlike the reap it is
 	// not repeated on a timer -- see reconcileClosed.
 	w.reconcileClosed(ctx)
+
+	// Beside it, for the same reason: a blocker that closed, or a check that
+	// went green, while the daemon was down is a delivery nothing will send
+	// again, and the issue waiting on it would otherwise sit until the next
+	// cron tick -- or forever on a machine with none.
+	w.catchUpWaiting(ctx)
 
 	// A separate timer from the wake, on its own much longer interval. The two
 	// answer different questions: a wake serves deadlines this daemon wrote

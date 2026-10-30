@@ -56,7 +56,15 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	eligibleRetries := 0
 
 	for _, iss := range issues {
-		if iss.HasAnyLabel(cfg.Labels.Veto) {
+		// The waiting label is checked first and reported on its own, because
+		// it is not a veto anybody wrote: it is in Vetoes() so no operator has
+		// to repeat it under veto, and "a veto label is present" would send
+		// them looking through a list that does not contain it.
+		if w := cfg.Labels.Waiting; w != "" && iss.HasLabel(w) {
+			skips[iss.Number] = "the waiting label is present; this issue waits for its blockers"
+			continue
+		}
+		if iss.HasAnyLabel(cfg.Labels.Vetoes()) {
 			skips[iss.Number] = "a veto label is present"
 			continue
 		}

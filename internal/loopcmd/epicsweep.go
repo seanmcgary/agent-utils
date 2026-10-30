@@ -268,7 +268,11 @@ func sweepEpic(
 		return sum, fmt.Errorf("epic sweep: read sub-issues of #%d: %w", parent, err)
 	}
 
-	rule := epic.Rule{Veto: cfg.Labels.Veto, Owner: owner, Repo: repo, Trigger: cfg.Labels.Trigger}
+	// Vetoes, not Veto: a sub-issue carrying this loop's waiting label is
+	// waiting on something the epic graph may not show -- a blocker in another
+	// repository, which this sweep ignores -- so promoting it here would race
+	// the waiting pass that owns it.
+	rule := epic.Rule{Veto: cfg.Labels.Vetoes(), Owner: owner, Repo: repo, Trigger: cfg.Labels.Trigger}
 
 	children := make([]epic.Child, 0, len(kids))
 	for _, kid := range kids {

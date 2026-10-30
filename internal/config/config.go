@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"text/template"
 	"time"
@@ -56,6 +57,16 @@ type Config struct {
 
 	Retry Retry `yaml:"retry"`
 
+	// WaitForChecks names the GitHub Actions workflow FILES ("mirror.yml") that
+	// must have succeeded on a blocker's merge commit before an issue carrying
+	// labels.waiting is promoted. Empty means a blocker's closure alone is
+	// enough. It requires labels.waiting; see validate and loopcmd.WaitSweep.
+	//
+	// File names rather than display names, because the file name is what
+	// both the runs endpoint and a workflow_run delivery's path carry, and a
+	// display name is free text anyone editing the workflow can change.
+	WaitForChecks []string `yaml:"wait_for_checks"`
+
 	// AcknowledgeBypassPermissions must be true to select the
 	// bypassPermissions agent permission mode. See validate.
 	AcknowledgeBypassPermissions bool `yaml:"i_understand_bypass_permissions"`
@@ -71,13 +82,38 @@ type Config struct {
 	ResumePrompt string `yaml:"resume_prompt"`
 }
 
-// Labels holds the five label roles and the veto list.
+// Labels holds the label roles and the veto list.
 type Labels struct {
 	Trigger  string   `yaml:"trigger"`
 	InFlight string   `yaml:"in_flight"`
 	Blocked  string   `yaml:"blocked"`
 	Terminal string   `yaml:"terminal"`
 	Veto     []string `yaml:"veto"`
+	// Waiting marks an issue that waits for its blockers -- which may live in
+	// another repository -- before this loop may start it. The loop never
+	// dispatches an issue carrying it, and the waiting pass swaps it for
+	// Trigger once every blocker is closed as completed (and, with
+	// wait_for_checks, once the named workflows are green on each blocker's
+	// merge commit). Optional; empty switches the pass off for this loop.
+	Waiting string `yaml:"waiting"`
+}
+
+// Vetoes returns every label that stops this loop dispatching an issue: the
+// veto list, plus the waiting label when one is set.
+//
+// The waiting label is folded in here rather than left for an operator to
+// repeat under veto. An issue carrying it is by definition not ready, and an
+// operator who forgot the second entry would have the loop start an issue the
+// moment someone applied the trigger beside it -- before the blocker it is
+// waiting on had shipped. Every reader of the veto list reads it through this,
+// so none of them can forget it either.
+func (l Labels) Vetoes() []string {
+	if strings.TrimSpace(l.Waiting) == "" {
+		return l.Veto
+	}
+	out := make([]string, 0, len(l.Veto)+1)
+	out = append(out, l.Veto...)
+	return append(out, l.Waiting)
 }
 
 // Agent holds the agent invocation settings.
@@ -310,6 +346,8 @@ func (c *Config) validate() error {
 		}
 	}
 
+	errs = append(errs, c.validateWaiting()...)
+
 	switch c.Agent.Harness {
 	case "", HarnessClaude, HarnessPi:
 	default:
@@ -432,4 +470,59 @@ func (c *Config) validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// workflowFile matches a workflow file's base name. It is the same shape the
+// runs endpoint accepts in place of a workflow id, and it is checked here
+// because the value is placed in a request path.
+var workflowFile = regexp.MustCompile(`^[A-Za-z0-9._-]+\.ya?ml$`)
+
+// validateWaiting checks labels.waiting and wait_for_checks.
+//
+// The waiting label must be distinct from the loop's other roles because the
+// pass REMOVES it on promotion: a waiting label equal to trigger would be
+// added and removed in one write, and one equal to in_flight or blocked would
+// be stripped from an issue an agent or a park had put there. It must be a
+// literal label, not a veto-style prefix rule, because it is removed by name.
+func (c *Config) validateWaiting() []error {
+	var errs []error
+	waiting := strings.TrimSpace(c.Labels.Waiting)
+	if waiting == "" {
+		if len(c.WaitForChecks) > 0 {
+			errs = append(errs, errors.New(
+				"wait_for_checks is set but labels.waiting is not; the checks gate the "+
+					"promotion of a waiting issue, so a loop with no waiting label has nothing to gate"))
+		}
+		return errs
+	}
+	if strings.HasSuffix(waiting, "*") {
+		errs = append(errs, fmt.Errorf(
+			"labels.waiting %q ends in \"*\"; it is applied and removed by name, so it must be one literal label",
+			c.Labels.Waiting))
+	}
+	for _, other := range []struct{ field, value string }{
+		{"labels.trigger", c.Labels.Trigger},
+		{"labels.in_flight", c.Labels.InFlight},
+		{"labels.blocked", c.Labels.Blocked},
+		{"labels.terminal", c.Labels.Terminal},
+	} {
+		if strings.EqualFold(waiting, strings.TrimSpace(other.value)) {
+			errs = append(errs, fmt.Errorf(
+				"labels.waiting must differ from %s; both are %q", other.field, waiting))
+		}
+	}
+	seen := map[string]bool{}
+	for _, f := range c.WaitForChecks {
+		if !workflowFile.MatchString(f) {
+			errs = append(errs, fmt.Errorf(
+				"wait_for_checks entry %q is not a workflow file name such as \"mirror.yml\"", f))
+			continue
+		}
+		k := strings.ToLower(f)
+		if seen[k] {
+			errs = append(errs, fmt.Errorf("wait_for_checks lists %q twice", f))
+		}
+		seen[k] = true
+	}
+	return errs
 }

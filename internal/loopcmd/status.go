@@ -101,6 +101,8 @@ func Status(ctx context.Context, cfg *config.Config, deps Deps) (string, error) 
 	for _, iss := range issues {
 		var state string
 		switch {
+		case cfg.Labels.Waiting != "" && iss.HasLabel(cfg.Labels.Waiting):
+			state = "waiting"
 		case iss.HasAnyLabel(cfg.Labels.Veto):
 			state = "veto"
 		case iss.HasLabel(cfg.Labels.InFlight):

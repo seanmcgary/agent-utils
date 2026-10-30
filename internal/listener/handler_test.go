@@ -86,6 +86,8 @@ type tickCall struct {
 	closedIssue bool
 	reopened    bool
 	epicReady   bool
+	stateReason string
+	workflow    string
 }
 
 // newServer builds a Server wired to tickCh: the fake Tick sends the repo
@@ -99,7 +101,8 @@ func newServer(t *testing.T, tickCh chan<- tickCall) *Server {
 		Tick: func(_ context.Context, d Delivery) {
 			tickCh <- tickCall{repo: d.Repo, number: d.Number, mergedInto: d.MergedInto,
 				pushedTo: d.PushedTo, closedPR: d.ClosedPR, closedIssue: d.ClosedIssue,
-				reopened: d.Reopened, epicReady: d.EpicReady}
+				reopened: d.Reopened, epicReady: d.EpicReady,
+				stateReason: d.StateReason, workflow: d.CompletedWorkflow}
 		},
 	})
 	if err != nil {

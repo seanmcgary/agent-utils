@@ -20,6 +20,14 @@ type Issue struct {
 	// conversion. Compare it with IsOpen rather than by ==: GitHub's spelling
 	// is stable, but nothing here forces the case.
 	State string
+	// StateReason is why a CLOSED issue closed, as GitHub spells it:
+	// "completed", "not_planned" or "duplicate". It is empty for an open issue
+	// and for one closed before GitHub recorded reasons.
+	//
+	// The waiting-label pass is its only reader. A blocker closed as not
+	// planned did not deliver what its dependent was waiting for, so "closed"
+	// alone is not the unblock signal there -- see loopcmd.WaitSweep.
+	StateReason string
 	// Repo is the "owner/name" this issue lives in, or "" when the response did
 	// not say.
 	//
@@ -138,6 +146,11 @@ var HookEvents = []string{
 	// two overlap -- but a direct push produces no pull_request delivery at
 	// all, and that is the case no other event covers.
 	"push",
+	// A completed GitHub Actions run is what releases an issue waiting on a
+	// check (wait_for_checks): the blocker's closure usually arrives BEFORE the
+	// push-triggered run on its merge commit has finished, so the closure
+	// alone cannot release it. Only the "completed" action is acted on.
+	"workflow_run",
 }
 
 // IsHookEvent reports whether name is one this daemon acts on.

@@ -77,7 +77,11 @@ type Deps struct {
 	// Epic reads sub-issues and issue dependencies for the epic sweep. It is
 	// narrow on purpose -- see ghub.EpicReader -- so a test of any OTHER pass
 	// does not have to grow three methods it never calls.
-	Epic       ghub.EpicReader
+	Epic ghub.EpicReader
+	// Wait reads blockers, closing pull requests and workflow runs for the
+	// waiting-label pass, and makes its two writes on the waiting issue. Narrow
+	// for the reason Epic is; see ghub.WaitReader.
+	Wait       ghub.WaitReader
 	WT         *worktree.Manager
 	SelfPath   string
 	ConfigPath string
@@ -212,6 +216,10 @@ type Summary struct {
 	// summary can tell a declined repeat from a completed one.
 	Backoff  int `json:"backoff"`
 	Promoted int `json:"promoted"`
+	// Released counts issues the waiting pass moved from labels.waiting to
+	// labels.trigger. Separate from Promoted, which is the epic sweep's, so a
+	// tick's line says which mechanism moved an issue.
+	Released int `json:"released"`
 	Parked   int `json:"parked"`
 	// Stopped counts KindStop decisions applied this tick: an operator's
 	// `sessions kill`, or an invalid label override. Either way nothing was
@@ -382,6 +390,18 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 		slog.Warn("epic sweep failed", "loop", cfg.Name, "err", err)
 	} else {
 		sum.Promoted += epicSum.Promoted
+	}
+
+	// The waiting pass's backstop, on the same terms as the epic sweep's above:
+	// after dispatch, so a released issue dispatches on the NEXT tick; no lock
+	// of its own, because RunTick holds it; and a failure is logged rather than
+	// failing the tick. The daemon releases an issue the moment its blocker
+	// closes or its check goes green; this finds the ones whose delivery never
+	// arrived.
+	if waitSum, err := WaitSweepAll(ctx, cfg, deps); err != nil {
+		slog.Warn("waiting pass failed", "loop", cfg.Name, "err", err)
+	} else {
+		sum.Released += waitSum.Released
 	}
 
 	body, _ := json.Marshal(sum)
@@ -560,7 +580,7 @@ func clearUnreachableDeadlines(
 ) {
 	reachable := make(map[int]bool, len(snap.Issues))
 	for _, iss := range snap.Issues {
-		if iss.HasAnyLabel(cfg.Labels.Veto) {
+		if iss.HasAnyLabel(cfg.Labels.Vetoes()) {
 			continue
 		}
 		reachable[iss.Number] = true
