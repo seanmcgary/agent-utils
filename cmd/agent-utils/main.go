@@ -1100,6 +1100,8 @@ func internalCommand() *cli.Command {
 					return loopcmd.RunAgent(ctx, cfg, deps, int64(c.Int("dispatch")))
 				},
 			},
+			ghTokenCommand(),
+			gitCredentialCommand(),
 		},
 	}
 }

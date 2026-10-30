@@ -168,6 +168,11 @@ type Dispatch struct {
 	// the row. The dispatch row is written once, from the decision, by the
 	// code that made it, exactly like Model, Harness, and Effort above.
 	ReviewPending bool
+	// CoAuthor is the "Name <email>" the runner's commit hook credits, resolved
+	// by the tick from the issue's author. The detached runner holds no GitHub
+	// client, so this row is how the value reaches it. Empty means none: the
+	// setting is off, the author is a bot, or the lookup failed.
+	CoAuthor string
 }
 
 // RunnerID is the dispatch identifier the runner process actually carries.

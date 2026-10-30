@@ -347,6 +347,21 @@ func TestRegisterWebhookMissingTokenFailsBeforeGitHubCall(t *testing.T) {
 	}
 }
 
+// TestRegisterWebhookAppModeNeedsNoToken: a configured GitHub App stands in
+// for GITHUB_TOKEN, so the token check must not stop the run.
+func TestRegisterWebhookAppModeNeedsNoToken(t *testing.T) {
+	fake := newFakeHookAdmin()
+	s := &settings.Settings{Webhook: settings.Webhook{URL: "https://x/y", Secret: "sekrit"}}
+	deps := registerWebhookDeps{Records: newFakeWebhookRecords(), Hooks: fake, Settings: s, Token: "", App: true, Yes: true, Out: io.Discard}
+
+	if err := registerWebhookRun(context.Background(), []string{"acme/widgets"}, deps); err != nil {
+		t.Fatalf("app mode must pass the token check: %v", err)
+	}
+	if fake.listCalls == 0 {
+		t.Fatal("expected the hooks to be listed")
+	}
+}
+
 // TestRegisterWebhookWarnsWhenDisabled covers: "When webhook.enabled is
 // false, do the work and warn that the listener will refuse to start."
 func TestRegisterWebhookWarnsWhenDisabled(t *testing.T) {

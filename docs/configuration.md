@@ -127,6 +127,101 @@ install -m 600 /dev/null ~/.agent-utils/env
 echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
 ```
 
+### Running as a GitHub App
+
+Instead of a personal token, the daemon and the agent can act as a GitHub App. Comments, pull
+requests and commits then come from `<slug>[bot]` rather than from you, and no long-lived
+personal token has to sit on the machine.
+
+**Create the app** under your account or organisation settings (Developer settings, GitHub
+Apps), with these repository permissions and no user permissions:
+
+| Permission | Access |
+|---|---|
+| Contents | Read and write |
+| Issues | Read and write |
+| Pull requests | Read and write |
+| Metadata | Read |
+| Webhooks | Read and write, only if `project init` registers repository webhooks with this app |
+
+Generate a private key (a `.pem` file) and install the app on the loop repositories only. The
+app can mint a token for every repository it is installed on, so a narrow installation is the
+limit on what a leaked key can reach.
+
+**Point agent-utils at it:**
+
+```bash
+agent-utils config github-app --app-id 123456 --private-key /abs/path/app.pem
+```
+
+`config github-app` resolves a relative `--private-key` against the current directory and stores
+the absolute path; `agent-utils config set github_app.private_key_path` rejects a relative path
+instead. The key file must be mode `0600` and owned by the user the
+daemon runs as. Before saving anything the command signs a JWT with the key and calls
+`GET /app`; if GitHub rejects the app id or the key, nothing is saved. On success it prints the
+app's slug. The settings are stored as `github_app.app_id` and `github_app.private_key_path` in
+the machine-wide `config.yaml`, and `agent-utils config show` reports that the app is in use.
+To go back to a personal token:
+
+```bash
+agent-utils config github-app --unset
+```
+
+The listener daemon reads `github_app` once at startup. After changing or unsetting it,
+restart the daemon. `listener poll` refuses to start when the settings file is invalid; it no
+longer falls back to defaults.
+
+**What changes while an app is configured:**
+
+- The daemon's GitHub calls (issue reads, comments, labels, pull requests) are made with an
+  installation token.
+- `gh` inside the agent is authenticated as the app.
+- Pushes go over HTTPS as the app. Repository-scoped `insteadOf` and `pushInsteadOf` rules
+  make this hold even when your git configuration rewrites GitHub URLs to SSH, for the agent
+  and for the automatic rebase onto the base branch.
+- Commits are authored and committed by `<slug>[bot]`, with the email
+  `<bot_user_id>+<slug>[bot]@users.noreply.github.com`.
+- `GITHUB_TOKEN` is not required. When both an app and `GITHUB_TOKEN` are configured, the app
+  is used and `GITHUB_TOKEN` is ignored.
+
+**Token mechanics.** Installation tokens are minted for a single repository and kept in
+`~/.agent-utils/tokens/<app_id>/` (directory `0700`, files `0600`). A token is refreshed when fewer
+than 10 minutes of its lifetime remain. The agent's environment never holds a token: `gh` and
+git reach it through the `agent-utils internal gh-token` and `agent-utils internal
+git-credential` helpers, which are configured per dispatch through environment variables and
+write nothing to the repository's `.git/config` or `.git/hooks`. The agent can still call
+those helpers, and the key is readable by the same user, so it can mint a token for any
+repository the app is installed on. For a real boundary, run the daemon as a dedicated user.
+
+#### `commit.co_author_issue_author` — optional, default `false`
+
+```bash
+agent-utils config set commit.co_author_issue_author true
+```
+
+Adds a `Co-authored-by:` trailer for the author of the issue a dispatch is working on, so the
+person who asked for the change is credited on the commits the agent makes. The trailer is
+`Co-authored-by: <name> <email>`. The name is the author's profile name, or their login if
+the profile has none. The email is their public email if they have one, and otherwise
+`<id>+<login>@users.noreply.github.com`, which GitHub attributes to their account. Authors
+that are bots (`type: Bot`, or a login ending in `[bot]`) are skipped. A failed lookup never
+fails a dispatch. If the issue cannot be read, the commits get no trailer. If only the
+author's profile cannot be read, the trailer still goes on, with their login as the name and
+the `<id>+<login>@users.noreply.github.com` address.
+
+This works with a personal token as well as with an app. It is implemented as a git hook that
+the dispatch installs through environment configuration, not as an instruction in the prompt,
+so the agent cannot drop the trailer by ignoring or misreading its instructions. The hook adds
+the trailer in both `prepare-commit-msg` and `commit-msg`, and does not add it twice. A commit
+whose message is otherwise empty still aborts, as git does.
+
+Known gaps: a message written in an editor and committed with `--no-verify` gets no trailer.
+A tool that runs git with a scrubbed environment does not see the per-dispatch configuration,
+so its commits get the host's git identity and no trailer. Commits replayed by a rebase,
+cherry-pick or revert the agent runs are not given the trailer; they keep whatever trailers
+they had, so the agent's own commits keep theirs and a human's commits on the branch are not
+credited to the issue author.
+
 ### Two different `config.yaml` files
 
 `~/.agent-utils/config.yaml` (the machine-wide settings file, `AGENT_UTILS_HOME`) and
@@ -1462,5 +1557,5 @@ is reported as `INVALID` with its error rather than being skipped.
 
 `agent-utils project loop status --name <loop>` validates too, but it also lists the
 repository's open issues, so it needs `GITHUB_TOKEN` (see [The machine-wide
-directory](#the-machine-wide-directory), or `agent-utils config token`) and network access. A config error names
+directory](#the-machine-wide-directory), or `agent-utils config token`) or a GitHub App (see [Running as a GitHub App](#running-as-a-github-app)) and network access. A config error names
 the offending field, so it is easy to tell from an authentication error.

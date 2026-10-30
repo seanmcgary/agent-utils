@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/ghapp"
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/listener"
 	"github.com/seanmcgary/agent-utils/internal/lock"
@@ -329,6 +330,9 @@ func listenerPollCommand() *cli.Command {
 			}()
 
 			w := listener.NewWorker(db)
+			if w.App, err = configuredApp(); err != nil {
+				return err
+			}
 			w.PollInterval = interval
 			// Read once at startup, exactly as runListener reads it, and for
 			// the same reason: a Worker's delays are set before it is shared
@@ -426,6 +430,15 @@ func listenerUninstallCommand() *cli.Command {
 	}
 }
 
+// configuredApp returns the machine's GitHub App, or nil in token mode.
+func configuredApp() (*ghapp.App, error) {
+	s, err := settings.Load()
+	if err != nil {
+		return nil, err
+	}
+	return ghapp.FromSettings(s)
+}
+
 // ensureToken proves the GitHub token is readable before the listener starts,
 // and offers to write the env file when it is simply not there yet.
 //
@@ -441,6 +454,12 @@ func listenerUninstallCommand() *cli.Command {
 // there would hang the service forever on a question nobody will ever see --
 // the same rule resolveLoopConfig documents.
 func ensureToken(in io.Reader, out io.Writer, interactive bool) error {
+	// A GitHub App replaces the token entirely; nothing to ask for.
+	if app, err := configuredApp(); err != nil {
+		return err
+	} else if app != nil {
+		return nil
+	}
 	_, err := listener.Token()
 	if err == nil {
 		return nil
@@ -631,6 +650,11 @@ func runListener(_ context.Context, out io.Writer, addr string, port int, secret
 	pidPath := filepath.Join(dir, pidFileName)
 
 	w := listener.NewWorker(db)
+	if w.App, err = configuredApp(); err != nil {
+		releaseLock()
+		closeDB()
+		return err
+	}
 	// The periodic tend check's interval, read once at startup. It is not
 	// re-read per pass the way the webhook secret is: a Worker's seams and
 	// delays are set before it is shared with the HTTP handler and the wake

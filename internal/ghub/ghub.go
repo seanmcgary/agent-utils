@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/go-github/v77/github"
+	"github.com/seanmcgary/agent-utils/internal/ghapp"
 )
 
 // Client is the read surface the engine needs, plus the two writes reserved
@@ -52,11 +54,36 @@ type GitHubClient struct {
 	// degradation is not a failure mode worth keeping to save one retry.
 	loginMu sync.Mutex
 	login   string
+
+	// self, when set, answers AuthenticatedLogin instead of GET /user. An
+	// installation token cannot call /user (403), so an app-mode client is
+	// given the bot login here.
+	self func(context.Context) (string, error)
 }
 
 // New returns a client authenticated with token.
 func New(token string) *GitHubClient {
 	return &GitHubClient{c: github.NewClient(nil).WithAuthToken(token)}
+}
+
+// NewApp returns a client that authenticates each request as app's
+// installation on the repository it addresses. See ghapp.Client.
+//
+// In app mode the agent and this daemon act as the same bot, so the
+// self-filter in LatestReviewActivity finally filters the agent's own replies
+// by login. store.LastTendAt remains the guard that holds in token mode.
+func NewApp(app *ghapp.App) *GitHubClient {
+	c := github.NewClient(app.Client())
+	if u, err := url.Parse(strings.TrimSuffix(app.BaseURL, "/") + "/"); err == nil {
+		c.BaseURL = u
+	}
+	return &GitHubClient{c: c, self: func(ctx context.Context) (string, error) {
+		slug, err := app.Slug(ctx)
+		if err != nil {
+			return "", err
+		}
+		return slug + "[bot]", nil
+	}}
 }
 
 // ConvertIssues maps go-github issues onto the engine type. It drops pull
@@ -351,6 +378,17 @@ func (g *GitHubClient) AuthenticatedLogin(ctx context.Context) (string, error) {
 	defer g.loginMu.Unlock()
 	if g.login != "" {
 		return g.login, nil
+	}
+	if g.self != nil {
+		login, err := g.self(ctx)
+		if err != nil {
+			return "", fmt.Errorf("get app login: %w", err)
+		}
+		if login == "" {
+			return "", errors.New("the GitHub App has no login")
+		}
+		g.login = login
+		return login, nil
 	}
 	u, _, err := g.c.Users.Get(ctx, "")
 	if err != nil {

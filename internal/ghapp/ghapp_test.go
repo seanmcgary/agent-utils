@@ -1,0 +1,349 @@
+package ghapp
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/seanmcgary/agent-utils/internal/settings"
+)
+
+func TestNewRejectsBadKeys(t *testing.T) {
+	dir := t.TempDir()
+	good, _ := writeKey(t, dir)
+
+	if _, err := New(7, "relative.pem", dir); err == nil {
+		t.Error("relative path accepted")
+	}
+	if err := os.Chmod(good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(7, good, dir); err == nil || !strings.Contains(err.Error(), "0600") {
+		t.Errorf("0644 key: err = %v, want a mode error naming 0600", err)
+	}
+	junk := filepath.Join(dir, "junk.pem")
+	os.WriteFile(junk, []byte("not a key"), 0o600)
+	if _, err := New(7, junk, dir); err == nil {
+		t.Error("non-PEM key accepted")
+	}
+	link := filepath.Join(dir, "link.pem")
+	os.Chmod(good, 0o600)
+	os.Symlink(good, link)
+	if _, err := New(7, link, dir); err == nil {
+		t.Error("symlinked key accepted")
+	}
+}
+
+func TestFromSettings(t *testing.T) {
+	if a, err := FromSettings(&settings.Settings{}); a != nil || err != nil {
+		t.Errorf("unset: got %v, %v; want nil, nil", a, err)
+	}
+	_, err := FromSettings(&settings.Settings{GitHubApp: settings.GitHubApp{AppID: 7}})
+	if err == nil || !strings.Contains(err.Error(), "private_key_path") {
+		t.Errorf("missing key path: err = %v", err)
+	}
+}
+
+func TestJWTClaims(t *testing.T) {
+	a, f := newTestApp(t)
+	now := time.Unix(1_800_000_000, 0)
+	a.Now = func() time.Time { return now }
+	tok, err := a.JWT()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := http.NewRequest("GET", "/", nil)
+	r.Header.Set("Authorization", "Bearer "+tok)
+	claims, ok := f.verifyJWT(r)
+	if !ok {
+		t.Fatal("signature did not verify")
+	}
+	if claims["iss"] != float64(7) || claims["iat"] != float64(now.Unix()-60) || claims["exp"] != float64(now.Add(9*time.Minute).Unix()) {
+		t.Errorf("claims = %v", claims)
+	}
+}
+
+func TestTokenIsCachedAndRepoScoped(t *testing.T) {
+	a, f := newTestApp(t)
+	ctx := context.Background()
+	t1, err := a.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, err := a.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t1 != t2 || f.mints.Load() != 1 || f.lookups.Load() != 1 {
+		t.Errorf("tokens %q %q, mints %d, lookups %d; want one of each", t1, t2, f.mints.Load(), f.lookups.Load())
+	}
+	if got := f.scopes[0]; len(got) != 1 || got[0] != "widgets" {
+		t.Errorf("mint scoped to %v, want [widgets]", got)
+	}
+	// A second process reads the file, not memory.
+	b, _ := New(7, a.keyPath, a.dir)
+	b.BaseURL = a.BaseURL
+	if t3, _ := b.Token(ctx, "acme/widgets"); t3 != t1 || f.mints.Load() != 1 {
+		t.Errorf("second App re-minted: %q, mints %d", t3, f.mints.Load())
+	}
+	info, err := os.Stat(filepath.Join(a.dir, "tokens", "7", "acme", "widgets.json"))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("cache file: %v, mode %v", err, info.Mode().Perm())
+	}
+}
+
+func TestTokenRefreshesInsideThreshold(t *testing.T) {
+	a, f := newTestApp(t)
+	ctx := context.Background()
+	start := time.Now()
+	a.Now = func() time.Time { return start }
+	if _, err := a.Token(ctx, "acme/widgets"); err != nil {
+		t.Fatal(err)
+	}
+	a.Now = func() time.Time { return start.Add(time.Hour - RefreshBefore - time.Minute) }
+	a.Token(ctx, "acme/widgets")
+	if f.mints.Load() != 1 {
+		t.Fatalf("refreshed early: %d mints", f.mints.Load())
+	}
+	a.Now = func() time.Time { return start.Add(time.Hour - RefreshBefore + time.Minute) }
+	a.Token(ctx, "acme/widgets")
+	if f.mints.Load() != 2 {
+		t.Errorf("did not refresh inside threshold: %d mints", f.mints.Load())
+	}
+	if f.lookups.Load() != 1 {
+		t.Errorf("installation looked up %d times; the cached id should be reused", f.lookups.Load())
+	}
+}
+
+func TestConcurrentTokenMintsOnce(t *testing.T) {
+	a, f := newTestApp(t)
+	var wg sync.WaitGroup
+	toks := make([]string, 8)
+	for i := range toks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b, _ := New(7, a.keyPath, a.dir)
+			b.BaseURL = a.BaseURL
+			toks[i], _ = b.Token(context.Background(), "acme/widgets")
+		}()
+	}
+	wg.Wait()
+	if f.mints.Load() != 1 {
+		t.Errorf("%d mints, want 1", f.mints.Load())
+	}
+	for _, tok := range toks {
+		if tok != toks[0] || tok == "" {
+			t.Errorf("tokens differ: %v", toks)
+		}
+	}
+}
+
+func TestTokenNotInstalled(t *testing.T) {
+	a, _ := newTestApp(t)
+	_, err := a.Token(context.Background(), "acme/other")
+	if !errors.Is(err, ErrNotInstalled) || !strings.Contains(err.Error(), "acme/other") {
+		t.Errorf("err = %v, want ErrNotInstalled naming acme/other", err)
+	}
+}
+
+func TestTokenRejectsBadRepo(t *testing.T) {
+	a, _ := newTestApp(t)
+	for _, r := range []string{"", "acme", "acme/../x", "../acme/x", "a/b/c", "acme/."} {
+		if _, err := a.Token(context.Background(), r); err == nil {
+			t.Errorf("repo %q accepted", r)
+		}
+	}
+}
+
+func TestBotIdentity(t *testing.T) {
+	a, _ := newTestApp(t)
+	id, err := a.Bot(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Identity{Login: "acme-agent[bot]", Name: "acme-agent[bot]", Email: "9001+acme-agent[bot]@users.noreply.github.com"}
+	if id != want {
+		t.Errorf("Bot = %+v, want %+v", id, want)
+	}
+}
+
+func TestTransportAuthenticatesPerRepo(t *testing.T) {
+	a, _ := newTestApp(t)
+	resp, err := a.Client().Get(a.BaseURL + "/repos/acme/widgets/issues/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"auth":"token ghs_test1"`) {
+		t.Errorf("body = %s", body)
+	}
+	if _, err := a.Client().Get(a.BaseURL + "/users/someone"); err == nil {
+		t.Error("a non-repo path with no WithRepo context must fail, not go unauthenticated")
+	}
+	req, _ := http.NewRequestWithContext(WithRepo(context.Background(), "acme/widgets"), "GET", a.BaseURL+"/users/acme-agent[bot]", nil)
+	if resp, err := a.Client().Do(req); err != nil || resp.StatusCode != 200 {
+		t.Errorf("WithRepo request: %v %v", resp, err)
+	}
+}
+
+func TestTransportNeverSendsTheTokenOffHost(t *testing.T) {
+	a, f := newTestApp(t)
+	var got atomic.Pointer[string]
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		got.Store(&h)
+	}))
+	defer other.Close()
+
+	// A request GitHub redirects off-host re-enters the transport with the
+	// same WithRepo context; it must not arrive carrying the token.
+	f.redirect = other.URL + "/blob"
+	req, _ := http.NewRequestWithContext(WithRepo(context.Background(), "acme/widgets"), "GET", a.BaseURL+"/repos/acme/widgets/redirect", nil)
+	if resp, err := a.Client().Do(req); err == nil {
+		resp.Body.Close()
+	}
+	if h := got.Load(); h != nil && *h != "" {
+		t.Errorf("redirect target received Authorization %q", *h)
+	}
+
+	// A request addressed to another host is refused and mints nothing.
+	before := f.mints.Load()
+	req, _ = http.NewRequestWithContext(context.Background(), "GET", other.URL+"/repos/acme/widgets/issues/1", nil)
+	if resp, err := a.Client().Do(req); err == nil {
+		resp.Body.Close()
+		t.Error("request to a non-BaseURL host was sent")
+	}
+	if f.mints.Load() != before {
+		t.Errorf("a refused request minted a token")
+	}
+	if h := got.Load(); h != nil && *h != "" {
+		t.Errorf("other host received Authorization %q", *h)
+	}
+}
+
+func writeBotCache(t *testing.T, a *App, content string) string {
+	t.Helper()
+	dir := filepath.Join(a.dir, "tokens")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "bot-7.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestVerifyIgnoresTheSlugCache(t *testing.T) {
+	a, f := newTestApp(t)
+	path := writeBotCache(t, a, `{"slug":"old-slug","user_id":55}`)
+	slug, err := a.Verify(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slug != "acme-agent" || f.appHits.Load() != 1 {
+		t.Errorf("slug %q, /app hits %d; want acme-agent and 1", slug, f.appHits.Load())
+	}
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "acme-agent") || strings.Contains(string(raw), "55") {
+		t.Errorf("changed slug must refresh the cache and drop the stale user id: %s", raw)
+	}
+}
+
+func TestVerifyKeepsUserIDWhenSlugUnchanged(t *testing.T) {
+	a, _ := newTestApp(t)
+	path := writeBotCache(t, a, `{"slug":"acme-agent","user_id":55}`)
+	if _, err := a.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(path); !strings.Contains(string(raw), "55") {
+		t.Errorf("user id lost: %s", raw)
+	}
+}
+
+func TestVerifyFailsWhenGitHubRejectsTheJWT(t *testing.T) {
+	a, _ := newTestApp(t)
+	writeBotCache(t, a, `{"slug":"acme-agent","user_id":55}`)
+	other, _ := newTestApp(t) // different key than a's server trusts
+	other.BaseURL, other.dir = a.BaseURL, a.dir
+	if _, err := other.Verify(context.Background()); err == nil {
+		t.Error("a rejected JWT must fail Verify even with a cached slug")
+	}
+}
+
+func TestTokenTimesOutAndReleasesTheLock(t *testing.T) {
+	a, f := newTestApp(t)
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer hung.Close()
+	good := a.BaseURL
+	a.BaseURL = hung.URL
+	a.HTTP = &http.Client{Timeout: 100 * time.Millisecond}
+	if _, err := a.Token(context.Background(), "acme/widgets"); err == nil {
+		t.Fatal("a hung response must fail Token")
+	}
+	// The lock the hung call held must be free again.
+	a.BaseURL = good
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := a.Token(ctx, "acme/widgets"); err != nil || f.mints.Load() != 1 {
+		t.Errorf("second Token: err %v, mints %d", err, f.mints.Load())
+	}
+}
+
+func TestNewSetsAnHTTPTimeout(t *testing.T) {
+	a, _ := newTestApp(t)
+	if a.HTTP == nil || a.HTTP.Timeout <= 0 {
+		t.Errorf("New's HTTP client has no timeout: %+v", a.HTTP)
+	}
+}
+
+func TestTokenCacheIsPerApp(t *testing.T) {
+	a, f := newTestApp(t)
+	b, err := New(8, a.keyPath, a.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.BaseURL = a.BaseURL
+	ctx := context.Background()
+	ta, err := a.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, err := b.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ta == tb || f.mints.Load() != 2 {
+		t.Errorf("apps 7 and 8 got %q and %q with %d mints; want two tokens", ta, tb, f.mints.Load())
+	}
+}
+
+func TestBotRejectsAMissingUserID(t *testing.T) {
+	a, f := newTestApp(t)
+	f.noUserID = true
+	if id, err := a.Bot(context.Background(), "acme/widgets"); err == nil {
+		t.Fatalf("Bot = %+v; a user with no id must be an error", id)
+	}
+	// Nothing wrong was cached: once GitHub answers properly, so does Bot.
+	f.noUserID = false
+	id, err := a.Bot(context.Background(), "acme/widgets")
+	if err != nil || id.Email != "9001+acme-agent[bot]@users.noreply.github.com" {
+		t.Errorf("Bot after recovery = %+v, %v", id, err)
+	}
+}

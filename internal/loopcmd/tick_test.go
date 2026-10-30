@@ -510,6 +510,10 @@ func TestTickCarriesAModelOverrideToTheDispatchRow(t *testing.T) {
 	}}
 	spawned := 0
 	deps := newDeps(t, cfg, gh, &spawned)
+	// The co-author rides the same row to the runner, so it is pinned here
+	// beside the overrides.
+	deps.CoAuthor = true
+	deps.Authors = &fakeAuthors{v: "X <x@y.z>"}
 
 	sum, err := Tick(context.Background(), cfg, deps)
 	if err != nil {
@@ -539,6 +543,9 @@ func TestTickCarriesAModelOverrideToTheDispatchRow(t *testing.T) {
 	}
 	if got.Model != "claude-opus-5" {
 		t.Errorf("Model = %q, want %q", got.Model, "claude-opus-5")
+	}
+	if got.CoAuthor != "X <x@y.z>" {
+		t.Errorf("CoAuthor = %q, want %q", got.CoAuthor, "X <x@y.z>")
 	}
 }
 

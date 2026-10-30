@@ -174,6 +174,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
 | `agent-utils version` | Version and commit |
 | `agent-utils config show [--reveal] \| get <key> \| set <key> <value> \| unset <key> \| webhook ...` | Read and write the machine-wide `~/.agent-utils/config.yaml`: the webhook daemon's URL, bind address and secret |
+| `agent-utils config github-app --app-id <n> --private-key <path> \| --unset` | Act as a GitHub App instead of with `GITHUB_TOKEN`, after checking that GitHub accepts the key. See [docs/configuration.md](docs/configuration.md#running-as-a-github-app) |
 | `agent-utils listener run [--listen-addr <a>] [--listen-port <p>]` | Run the webhook listener in this terminal until Ctrl-C |
 | `agent-utils listener poll [interval]` | Run the loops from a GitHub poll instead of webhook deliveries, for a repository you cannot add a hook to |
 | `agent-utils listener install [--listen-addr <a>] [--listen-port <p>] \| uninstall \| status` | Register the listener as an OS service, remove that registration, or inspect it |
@@ -451,7 +452,8 @@ sessions. `state_dir` still holds each loop's tick lock and its log tree, under
 `<project>/.agent-utils/state/<loop>/` by default. Only the database moved. `~/.agent-utils`
 also holds `config.yaml` (the machine-wide settings `agent-utils config` edits — see
 [Webhooks](#webhooks)), `env` (the `GITHUB_TOKEN` file `agent-utils config token` writes, read by
-[Cron](#cron) and [Webhooks](#webhooks)), `listener.pid` and `listener.lock` (the lock is the
+[Cron](#cron) and [Webhooks](#webhooks); not needed when you run as a
+[GitHub App](docs/configuration.md#running-as-a-github-app)), `listener.pid` and `listener.lock` (the lock is the
 liveness source `listener status` trusts, and `status` removes a pidfile whose lock is free,
 because that pidfile was left by a process that died without shutting down), and the webhook
 listener's own logs.
@@ -548,8 +550,11 @@ UNTRUSTED input. An instruction hidden in a comment executes.
 Point a loop only at a repository whose issue and pull request population you trust. The
 engine reduces the blast radius in three ways, none of which is a substitute for that rule:
 
-- The agent process gets a filtered environment and `GITHUB_TOKEN` is removed from it, at both
-  hops (the detached runner and the agent itself).
+- The agent process gets a filtered environment, at both hops (the detached runner and the
+  agent itself). With `GITHUB_TOKEN`, the variable is removed from it. When a [GitHub App](docs/configuration.md#running-as-a-github-app)
+  is configured, the agent's environment never holds an installation token either; `gh` and
+  git fetch one through `agent-utils internal gh-token` and `agent-utils internal git-credential`,
+  scoped to the dispatch's repository.
 
   **This does not make the agent unprivileged.** It keeps `HOME` and `SSH_AUTH_SOCK`, because
   it has to push branches and use `gh`. Anything readable by your user is readable by the
@@ -557,14 +562,18 @@ engine reduces the blast radius in three ways, none of which is a substitute for
   file this README tells you to create, and `~/.agent-utils/config.yaml`, which holds the
   webhook HMAC secret. Treat the environment filter as
   defence in depth, not as a boundary. If you need a real boundary, run the loop as a separate
-  user with its own `HOME` and a narrowly scoped token.
+  user with its own `HOME` and a narrowly scoped token. In app mode the agent can run those
+  helpers to mint a token for its repository, and because the app's private key is readable by
+  the same user, it can mint one for any repository the app is installed on. Install the app
+  on the loop repositories only, and run the daemon as a dedicated user if you need a real
+  boundary.
 - Only a pull request opened by an OWNER, MEMBER, or COLLABORATOR, whose head branch lives in
   the target repository, is ever linked to an issue or tended.
 - `bypassPermissions` requires `i_understand_bypass_permissions: true` in the loop config.
 
 A loop with `agent.harness: pi` keeps the same posture. `pi -p` is non-interactive and runs
 tools with no gate, like claude with permission off, and the filtered environment still strips
-`GITHUB_TOKEN` at both hops. pi reads its own provider credentials from disk, not from the
+`GITHUB_TOKEN` at both hops, and in app mode no installation token reaches the environment. pi reads its own provider credentials from disk, not from the
 agent environment. For the worktree, trust of `AGENTS.md`/`CLAUDE.md` follows pi's
 `defaultProjectTrust`; keep an open trust default off for a loop whose worktree is fed with
 untrusted issue text. See [docs/configuration.md](docs/configuration.md#agent-harness-optional).
@@ -641,6 +650,9 @@ which is all the command is doing:
 install -m 600 /dev/null ~/.agent-utils/env
 echo 'export GITHUB_TOKEN=ghp_...' >> ~/.agent-utils/env
 ```
+
+To act as a GitHub App instead of with a personal token, see
+[docs/configuration.md](docs/configuration.md#running-as-a-github-app).
 
 ```cron
 */15 * * * * . $HOME/.agent-utils/env && /usr/local/bin/agent-utils project --name lawndominator loop tick --name planning >> $HOME/.agent-utils/planning.log 2>&1
@@ -827,7 +839,8 @@ nothing with them. Either:
 ```
 
 The listener needs the same `~/.agent-utils/env` file the [Cron](#cron) section has you
-create, with `GITHUB_TOKEN` in it: `listener run` refuses to start without it, and once
+create, with `GITHUB_TOKEN` in it (or a GitHub App, see
+[docs/configuration.md](docs/configuration.md#running-as-a-github-app)): `listener run` refuses to start without one, and once
 running, the daemon re-reads it on every delivery so a rotated token needs no restart. If you
 have not stored one yet:
 
@@ -1006,7 +1019,8 @@ agent-utils listener poll 1m
 The interval is a Go duration and defaults to one minute; below thirty seconds
 it is refused. It binds no port, and it needs no `webhook.url` and no secret --
 only the same `~/.agent-utils/env` with `GITHUB_TOKEN` in it that the [Cron](#cron)
-section has you create.
+section has you create (or a GitHub App, see
+[docs/configuration.md](docs/configuration.md#running-as-a-github-app)).
 
 It is the same daemon `listener run` is, with a different event source. The
 runtime does not know which source produced an event: the retry wake, the

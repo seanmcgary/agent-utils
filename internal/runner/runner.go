@@ -156,7 +156,7 @@ func Supervise(
 
 	cmd := exec.CommandContext(ctx, bin, build(inv)...)
 	cmd.Dir = workDir
-	cmd.Env = append(agentEnv(), extraEnv...)
+	cmd.Env = append(append(agentEnv(), extraEnv...), inv.Env...)
 	// Put the agent in its own process group so a timeout can kill the whole
 	// tree. A coding agent routinely leaves dev servers and watchers behind, and
 	// CommandContext kills only the direct child.

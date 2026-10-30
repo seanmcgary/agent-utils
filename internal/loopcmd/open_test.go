@@ -2,8 +2,14 @@ package loopcmd
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,9 +17,11 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/ghapp"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/lock"
+	"github.com/seanmcgary/agent-utils/internal/settings"
 )
 
 const openTestYAML = `
@@ -62,8 +70,8 @@ func TestOpen_RequireGitHubMissingTokenFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open with RequireGitHub true and no token: want error, got nil")
 	}
-	if !strings.Contains(err.Error(), "GITHUB_TOKEN is not set") {
-		t.Fatalf("err = %v, want it to mention GITHUB_TOKEN is not set", err)
+	if !strings.Contains(err.Error(), "GITHUB_TOKEN is not set and no github_app is configured") {
+		t.Fatalf("err = %v, want it to name both GITHUB_TOKEN and github_app", err)
 	}
 }
 
@@ -363,5 +371,55 @@ func TestOpenWiresTheFetch(t *testing.T) {
 
 	if deps.Fetch == nil {
 		t.Fatal("deps.Fetch is nil; every branch comparison reads refs nothing updated")
+	}
+}
+
+// failingApp makes Open build an app whose every GitHub request fails.
+func failingApp(t *testing.T) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, "app.pem")
+	b := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
+	if err := os.WriteFile(keyPath, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := appFromSettings
+	appFromSettings = func(*settings.Settings) (*ghapp.App, error) {
+		a, err := ghapp.New(7, keyPath, filepath.Join(dir, "cache"))
+		if err != nil {
+			return nil, err
+		}
+		a.BaseURL = srv.URL
+		return a, nil
+	}
+	t.Cleanup(func() { appFromSettings = orig })
+}
+
+func TestOpen_AppModeWithoutGitHubSkipsTheBotLookup(t *testing.T) {
+	t.Setenv(home.EnvVar, t.TempDir())
+	failingApp(t)
+	path := writeOpenConfig(t)
+
+	_, deps, cleanup, err := Open(ProjectRef{}, path, Options{RequireGitHub: false})
+	if err != nil {
+		t.Fatalf("Open with RequireGitHub false must not reach GitHub: %v", err)
+	}
+	defer cleanup()
+	if len(deps.WT.Env) != 0 {
+		t.Errorf("wt.Env = %v, want empty", deps.WT.Env)
+	}
+
+	// The same app does fail a caller that needs GitHub, so the case above
+	// passed by skipping the lookup and not by the lookup succeeding.
+	if _, _, _, err := Open(ProjectRef{}, path, Options{RequireGitHub: true}); err == nil {
+		t.Error("Open with RequireGitHub true and a failing app: want error, got nil")
 	}
 }

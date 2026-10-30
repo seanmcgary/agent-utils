@@ -589,15 +589,24 @@ func registerWebhookCommand() *cli.Command {
 			}
 			defer closeRecords()
 
+			app, err := configuredApp()
+			if err != nil {
+				return err
+			}
 			token := os.Getenv("GITHUB_TOKEN")
+			hooks := ghub.New(token)
+			if app != nil {
+				hooks = ghub.NewApp(app)
+			}
 			return registerWebhookRun(ctx, repos, registerWebhookDeps{
 				Records: records,
 				// ghub.New never talks to the network by itself; the token check
 				// inside registerWebhookRun runs before any of ListHooks,
 				// CreateHook or EditHook is ever called on this client.
-				Hooks:       ghub.New(token),
+				Hooks:       hooks,
 				Settings:    s,
 				Token:       token,
+				App:         app != nil,
 				Yes:         c.Bool("yes"),
 				Interactive: isInteractive(),
 				Confirm:     confirmRegisterWebhook,
@@ -657,9 +666,13 @@ type registerWebhookDeps struct {
 	// Records is where the registration is written once GitHub confirms it.
 	// Before it existed, registration left NOTHING on this machine naming the
 	// hook it had just created.
-	Records     webhookRecords
-	Settings    *settings.Settings
-	Token       string
+	Records  webhookRecords
+	Settings *settings.Settings
+	Token    string
+	// App is true when a GitHub App authenticates the hook calls, in which
+	// case Token may be empty. The App needs the "Webhooks: read and write"
+	// repository permission.
+	App         bool
 	Yes         bool
 	Interactive bool
 	// Confirm asks the operator to approve, and is called only when Yes is
@@ -709,8 +722,8 @@ func registerWebhookRun(ctx context.Context, repos []string, deps registerWebhoo
 	if missing := missingWebhookFields(deps.Settings); len(missing) > 0 {
 		return missingWebhookFieldsErr(missing)
 	}
-	if deps.Token == "" {
-		return errors.New("GITHUB_TOKEN is not set")
+	if deps.Token == "" && !deps.App {
+		return errors.New("GITHUB_TOKEN is not set and no github_app is configured")
 	}
 
 	if !deps.Yes {
@@ -994,15 +1007,24 @@ func deregisterWebhookCommand() *cli.Command {
 			}
 			defer closeRecords()
 
+			app, err := configuredApp()
+			if err != nil {
+				return err
+			}
 			token := os.Getenv("GITHUB_TOKEN")
+			hooks := ghub.New(token)
+			if app != nil {
+				hooks = ghub.NewApp(app)
+			}
 			return deregisterWebhookRun(ctx, repos, deregisterWebhookDeps{
 				Records: records,
 				// ghub.New never talks to the network by itself; the token
 				// check inside deregisterWebhookRun runs before any of
 				// ListHooks or DeleteHook is called on this client.
-				Hooks:       ghub.New(token),
+				Hooks:       hooks,
 				Settings:    s,
 				Token:       token,
+				App:         app != nil,
 				Yes:         c.Bool("yes"),
 				Force:       c.Bool("force"),
 				Interactive: isInteractive(),
@@ -1021,7 +1043,10 @@ type deregisterWebhookDeps struct {
 	Hooks    ghub.HookAdmin
 	Settings *settings.Settings
 	Token    string
-	Yes      bool
+	// App is true when a GitHub App authenticates the hook calls; see
+	// registerWebhookDeps.App.
+	App bool
+	Yes bool
 	// Force deletes a hook another project also records. Without it that case
 	// is a refusal, because the delete would silently stop their deliveries.
 	Force       bool
@@ -1040,8 +1065,8 @@ type deregisterWebhookDeps struct {
 // up after an operator who has already unset the webhook configuration, which
 // is precisely when an orphaned hook is left delivering to a dead endpoint.
 func deregisterWebhookRun(ctx context.Context, repos []string, deps deregisterWebhookDeps) error {
-	if deps.Token == "" {
-		return errors.New("GITHUB_TOKEN is not set")
+	if deps.Token == "" && !deps.App {
+		return errors.New("GITHUB_TOKEN is not set and no github_app is configured")
 	}
 
 	if !deps.Yes {

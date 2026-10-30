@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/ghapp"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
@@ -203,6 +204,9 @@ type Worker struct {
 	Targets   func(repo string) ([]Target, error)
 	TargetFor func(projectID, loop string) (Target, Routing, error)
 	Token     func() (string, error)
+	// App, when set, authenticates every client this worker builds as the
+	// GitHub App; Token is then never read.
+	App *ghapp.App
 	// NewClient builds the GitHub client ONE pass shares across the loops it
 	// ticks. Production wires it to ghub.New; it is a seam so a test can count
 	// the calls a delivery makes, which is the only place the saving is
@@ -686,6 +690,9 @@ type access struct {
 	// to collapse, so they bypass it rather than teaching it three more methods
 	// it would only ever pass through.
 	epic ghub.EpicReader
+	// authors is the same client again, for crediting the issue author. Nil
+	// where the client cannot answer, and loopcmd treats nil as "no credit".
+	authors ghub.AuthorReader
 }
 
 // access reads the token and builds the pass's client and memo.
@@ -695,16 +702,25 @@ type access struct {
 // the next attempt, and retrying would log the same error retry.max times. The
 // token itself is never in err: env.go keeps it out deliberately.
 func (w *Worker) access() (*access, error) {
-	tok, err := w.Token()
-	if err != nil {
-		return nil, err
+	var c ghub.Client
+	var tok string
+	if w.App != nil {
+		c = ghub.NewApp(w.App)
+	} else {
+		var err error
+		if tok, err = w.Token(); err != nil {
+			return nil, err
+		}
+		c = w.NewClient(tok)
 	}
-	c := w.NewClient(tok)
 	acc := &access{token: tok, gh: ghub.NewDeliveryCache(c)}
 	// A test's fake client may implement ghub.Client only. Leaving epic nil
 	// there is correct: EpicSweep refuses rather than panicking.
 	if er, ok := c.(ghub.EpicReader); ok {
 		acc.epic = er
+	}
+	if ar, ok := c.(ghub.AuthorReader); ok {
+		acc.authors = ar
 	}
 	return acc, nil
 }
@@ -748,6 +764,7 @@ func (w *Worker) tickOne(ctx context.Context, t Target, d Delivery, acc *access)
 		// delivered issue from one fetch. Open builds its own only when this
 		// is nil, which is what keeps `project loop tick` unchanged.
 		GH:            acc.gh,
+		Authors:       acc.authors,
 		Epic:          acc.epic,
 		RequireGitHub: true,
 		// The write path. A tick against a database missing this loop's rows
@@ -1158,7 +1175,7 @@ func (w *Worker) issueFresh(ctx context.Context, t Target, number int) {
 		return
 	}
 	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
-		Token: acc.token, GH: acc.gh, Epic: acc.epic, RequireGitHub: true,
+		Token: acc.token, GH: acc.gh, Authors: acc.authors, Epic: acc.epic, RequireGitHub: true,
 		MigrationPolicy: loopcmd.FailOnUnimported,
 	})
 	if cleanup != nil {
@@ -1247,7 +1264,7 @@ func (w *Worker) tendFresh(ctx context.Context, t Target, base string) {
 		return
 	}
 	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
-		Token: acc.token, GH: acc.gh, RequireGitHub: true,
+		Token: acc.token, GH: acc.gh, Authors: acc.authors, RequireGitHub: true,
 		MigrationPolicy: loopcmd.FailOnUnimported,
 	})
 	if cleanup != nil {
@@ -1390,7 +1407,7 @@ func (w *Worker) pruneConfirms(targets []Target) {
 // what armTend must be handed.
 func (w *Worker) tendCheckOne(ctx, checkCtx context.Context, t Target, acc *access) {
 	cfg, deps, cleanup, err := w.Open(t.Ref(), t.ConfigPath, loopcmd.Options{
-		Token: acc.token, GH: acc.gh, RequireGitHub: true,
+		Token: acc.token, GH: acc.gh, Authors: acc.authors, RequireGitHub: true,
 		MigrationPolicy: loopcmd.FailOnUnimported,
 	})
 	// Deferred before any branch below can return. Open holds a SQLite

@@ -20,6 +20,11 @@ type Manager struct {
 	worktreeDir     string
 	loop            string
 	defaultBranch   string
+
+	// Env is added to every git command this Manager runs. In app mode it is
+	// identity.GitEnv: the app's credential helper and bot identity, so
+	// fetches and the automatic rebase's push act as the app.
+	Env []string
 }
 
 // New returns a Manager.
@@ -457,6 +462,9 @@ func (m *Manager) runCtx(ctx context.Context, dir string, stdoutOnly bool, args 
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
+	if len(m.Env) > 0 {
+		cmd.Env = append(os.Environ(), m.Env...)
+	}
 	var (
 		out []byte
 		err error
@@ -489,6 +497,9 @@ func (m *Manager) git(dir string, args ...string) error {
 func (m *Manager) gitOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	if len(m.Env) > 0 {
+		cmd.Env = append(os.Environ(), m.Env...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s in %s: %w: %s",

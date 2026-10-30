@@ -78,6 +78,18 @@ const DefaultTendInterval = 15 * time.Minute
 // and it costs nothing at all.
 const MinTendInterval = time.Minute
 
+// GitHubApp holds the configuration for this machine's GitHub App identity.
+// It is machine-wide because one app serves every project on the host.
+type GitHubApp struct {
+	AppID          int64  `yaml:"app_id,omitempty"`
+	PrivateKeyPath string `yaml:"private_key_path,omitempty"`
+}
+
+// Commit holds configuration for how agent-utils attributes its commits.
+type Commit struct {
+	CoAuthorIssueAuthor bool `yaml:"co_author_issue_author,omitempty"`
+}
+
 // Settings is the machine-wide configuration.
 type Settings struct {
 	Webhook Webhook `yaml:"webhook"`
@@ -94,7 +106,9 @@ type Settings struct {
 	// It is machine-wide rather than per loop because it describes how
 	// attentive the daemon is, not anything about a loop. It applies to every
 	// tending loop of every registered project.
-	TendInterval string `yaml:"tend_interval,omitempty"`
+	TendInterval string    `yaml:"tend_interval,omitempty"`
+	GitHubApp    GitHubApp `yaml:"github_app,omitempty"`
+	Commit       Commit    `yaml:"commit,omitempty"`
 }
 
 // TendEvery returns the periodic tend check's interval.
@@ -356,9 +370,11 @@ func Save(s *Settings) error {
 	header := "# Machine-wide agent-utils settings.\n" +
 		"# This is NOT a project descriptor, even though it shares config.yaml's\n" +
 		"# name; see internal/settings. It holds the webhook daemon's listen\n" +
-		"# address, the HMAC secret GitHub deliveries are signed with, and\n" +
+		"# address and the HMAC secret GitHub deliveries are signed with.\n" +
 		"# tend_interval: how often the daemon looks for a pull request that has\n" +
-		"# fallen behind its base (\"0\" disables that check).\n"
+		"# fallen behind its base (\"0\" disables that check).\n" +
+		"# github_app: the GitHub App this machine acts as.\n" +
+		"# commit: how agent commits are attributed.\n"
 	body := append([]byte(header), raw...)
 
 	if err := writeSecretFile(dir, path, body); err != nil {
@@ -532,6 +548,49 @@ func Fields() []Field {
 				return nil
 			},
 			Unset: func(s *Settings) { s.TendInterval = "" },
+		},
+		{
+			Key: "github_app.app_id",
+			Get: func(s *Settings) string {
+				if s.GitHubApp.AppID == 0 {
+					return ""
+				}
+				return strconv.FormatInt(s.GitHubApp.AppID, 10)
+			},
+			Set: func(s *Settings, v string) error {
+				id, err := strconv.ParseInt(v, 10, 64)
+				if err != nil || id <= 0 {
+					return fmt.Errorf("github_app.app_id must be a positive number")
+				}
+				s.GitHubApp.AppID = id
+				return nil
+			},
+			Unset: func(s *Settings) { s.GitHubApp.AppID = 0 },
+		},
+		{
+			Key: "github_app.private_key_path",
+			Get: func(s *Settings) string { return s.GitHubApp.PrivateKeyPath },
+			Set: func(s *Settings, v string) error {
+				if !filepath.IsAbs(v) {
+					return fmt.Errorf("github_app.private_key_path must be absolute: the daemon's working directory is not yours")
+				}
+				s.GitHubApp.PrivateKeyPath = v
+				return nil
+			},
+			Unset: func(s *Settings) { s.GitHubApp.PrivateKeyPath = "" },
+		},
+		{
+			Key: "commit.co_author_issue_author",
+			Get: func(s *Settings) string { return strconv.FormatBool(s.Commit.CoAuthorIssueAuthor) },
+			Set: func(s *Settings, v string) error {
+				b, err := strconv.ParseBool(v)
+				if err != nil {
+					return fmt.Errorf("commit.co_author_issue_author must be true or false: %w", err)
+				}
+				s.Commit.CoAuthorIssueAuthor = b
+				return nil
+			},
+			Unset: func(s *Settings) { s.Commit.CoAuthorIssueAuthor = false },
 		},
 	}
 }
