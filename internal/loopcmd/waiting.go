@@ -556,6 +556,17 @@ scan:
 		v.kind, v.reason, v.run = verdictFailed, "the workflow's run on the merge commit concluded "+newest.Conclusion, newest
 		return v, nil
 	}
+	// The commit's own run succeeded, yet the green-run listing above did not
+	// show it. That listing is GitHub's status-filtered index, which lags the
+	// run itself: a workflow_run delivery for the completion can arrive, and be
+	// acted on, seconds before the run appears there. The run read by its head
+	// SHA is the authoritative answer, and it is green -- ready. Without this,
+	// the one delivery that announced the success was spent on a stale read and
+	// the issue waited for a pass nothing else would schedule.
+	if newest.Conclusion == "success" {
+		v.kind = verdictReady
+		return v, nil
+	}
 	v.kind, v.reason = verdictWait, "the workflow's run on the merge commit concluded "+newest.Conclusion+
 		"; waiting for a later green run that includes it"
 	return v, nil
