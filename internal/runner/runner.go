@@ -18,6 +18,7 @@ import (
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/home"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
@@ -65,6 +66,22 @@ func Spawn(selfPath string, dispatchID int64, projectID, configPath, runnerLog s
 	if h := os.Getenv(home.EnvVar); h != "" {
 		cmd.Env = append(cmd.Env, home.EnvVar+"="+h)
 	}
+
+	// The metrics configuration is added back for the same reason, and it has
+	// to be: the runner records the dispatch's outcome, so a runner spawned
+	// without it emits no dispatch.finished, no cost and no duration -- the
+	// metrics this feature is mostly for -- and nothing anywhere says they are
+	// missing. agentEnv filters the AGENT_UTILS_STATSD_* variables out like
+	// everything else.
+	//
+	// It is the configuration ACTIVE in this process, not this process's
+	// environment. A tick or a listener configured by a --statsd-* flag has
+	// nothing in its environment to inherit, and the runner's flags are fixed
+	// above. Rendering the resolved configuration covers both sources.
+	//
+	// Like AGENT_UTILS_HOME it is not in agentEnv's allowlist, so it reaches
+	// the runner and stops there: the agent child gets none of it.
+	cmd.Env = append(cmd.Env, metrics.Active().Env()...)
 
 	// The runner does the long work, so its structured logs must go somewhere.
 	// Discarding them would make every failure inside the detached process

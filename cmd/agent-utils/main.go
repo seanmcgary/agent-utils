@@ -17,6 +17,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/migrate"
 	"github.com/seanmcgary/agent-utils/internal/project"
 	"github.com/seanmcgary/agent-utils/internal/registry"
@@ -34,6 +35,12 @@ func main() {
 		Name:    "agent-utils",
 		Usage:   "utilities for agent workflows",
 		Version: version.GetVersion(),
+		Flags:   statsdFlags(),
+		Before:  configureMetrics,
+		After: func(_ context.Context, _ *cli.Command) error {
+			metrics.Shutdown()
+			return nil
+		},
 		Commands: []*cli.Command{
 			// Top level spans the machine.
 			listCommand(),
@@ -1083,6 +1090,11 @@ func internalCommand() *cli.Command {
 					configPath := c.String("config")
 					ref := loopcmd.ProjectRef{
 						ID: c.String("project"),
+						// Only the metrics project tag reads this. The runner
+						// owns no lookup it cannot do without, so a registry
+						// that is unreadable, or no longer lists the id,
+						// leaves it empty and the tag is dropped.
+						Name: projectNameByID(c.String("project")),
 						// Derived, not passed: the runner must not depend on a
 						// lookup it cannot perform. An empty result simply means
 						// the loop's own state directory is the only source.

@@ -22,6 +22,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/listener"
 	"github.com/seanmcgary/agent-utils/internal/lock"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/service"
 	"github.com/seanmcgary/agent-utils/internal/settings"
 	"github.com/seanmcgary/agent-utils/internal/store"
@@ -517,6 +518,24 @@ func installService(overrideArgs []string) error {
 	}
 
 	args := append([]string{"listener", "run"}, overrideArgs...)
+
+	// The metrics configuration travels the way the listen override does: as
+	// arguments in the service definition, not as an Environment= line or an
+	// EnvironmentVariables key. The plist renderer deliberately writes no
+	// environment at all (see launchdPlist), and one mechanism for both
+	// platforms is simpler to reason about than two.
+	//
+	// It is whatever configured THIS process -- a --statsd-* flag on the
+	// install command or an AGENT_UTILS_STATSD_* variable in the operator's
+	// shell -- because that is the one moment the operator's intent is
+	// visible. A service started at login inherits none of their shell, so an
+	// exported variable that was not captured here would silently stop at the
+	// install. Every value has passed metrics.Config.Validate by now, which
+	// limits it to a character set neither renderer has to escape.
+	//
+	// Running install again with no metrics configured drops them, exactly as
+	// it drops a listen override that is not repeated.
+	args = append(args, metrics.Active().Args()...)
 
 	mgr := service.New()
 	if err := mgr.Install(self, args); err != nil {
