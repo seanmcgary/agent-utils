@@ -48,6 +48,7 @@ func RunTendTick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, e
 // why putting that read there instead would break the thing that keeps a merge
 // from dispatching agents at pull requests that are perfectly current.
 func TendTick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
+	defer timeTick(cfg, deps, passTendSweep, time.Now())
 	var sum Summary
 	now := deps.Now()
 
@@ -180,6 +181,7 @@ func TendIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 }
 
 func tendIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (Summary, error) {
+	defer timeTick(cfg, deps, passTendIssue, time.Now())
 	var sum Summary
 	now := deps.Now()
 

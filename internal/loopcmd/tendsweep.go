@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
@@ -178,6 +179,7 @@ func tendDispatch(
 	ctx context.Context, cfg *config.Config, deps Deps,
 	snap engine.Snapshot, links []store.PRLink, base string,
 ) (Summary, error) {
+	defer timeTick(cfg, deps, passTendBase, time.Now())
 	var sum Summary
 	now := deps.Now()
 

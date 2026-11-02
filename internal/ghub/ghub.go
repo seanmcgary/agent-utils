@@ -63,7 +63,7 @@ type GitHubClient struct {
 
 // New returns a client authenticated with token.
 func New(token string) *GitHubClient {
-	return &GitHubClient{c: github.NewClient(nil).WithAuthToken(token)}
+	return &GitHubClient{c: github.NewClient(withRateMetrics(nil)).WithAuthToken(token)}
 }
 
 // NewApp returns a client that authenticates each request as app's
@@ -73,7 +73,7 @@ func New(token string) *GitHubClient {
 // self-filter in LatestReviewActivity finally filters the agent's own replies
 // by login. store.LastTendAt remains the guard that holds in token mode.
 func NewApp(app *ghapp.App) *GitHubClient {
-	c := github.NewClient(app.Client())
+	c := github.NewClient(withRateMetrics(app.Client()))
 	if u, err := url.Parse(strings.TrimSuffix(app.BaseURL, "/") + "/"); err == nil {
 		c.BaseURL = u
 	}

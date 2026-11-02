@@ -10,6 +10,7 @@ import (
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -229,6 +230,13 @@ func gitRebase(ctx context.Context, cfg *config.Config, deps Deps, d engine.Deci
 	}
 
 	if err := deps.Git.Rebase(ctx, path, d.BaseRef); err != nil {
+		// Counted on every failed replay, before the backoff decides what to
+		// do about it, so the rate reflects how often branches actually
+		// conflict rather than how often an agent was sent. A rebase that
+		// failed for some other reason -- the budget expiring mid-replay --
+		// lands here too; git does not distinguish them on the way out, and
+		// neither can this.
+		metrics.Default().Count(mRebaseConflict, 1, loopTags(cfg, deps)...)
 		// The cleanup runs on a context DETACHED from the one that may have
 		// just failed. The commonest way to reach this line is the rebase
 		// budget expiring or the daemon shutting down, and the worktree

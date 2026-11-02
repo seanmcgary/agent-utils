@@ -21,6 +21,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/identity"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/runner"
 	"github.com/seanmcgary/agent-utils/internal/store"
 	"github.com/seanmcgary/agent-utils/internal/worktree"
@@ -73,7 +74,13 @@ type Deps struct {
 	// ProjectID owns every row this loop writes. The detached runner is given it
 	// explicitly, because it resolves no project of its own.
 	ProjectID string
-	GH        ghub.Client
+	// ProjectName is the project's human name, for the project tag on
+	// metrics and for nothing else. It may be empty -- a Deps built by hand,
+	// or a runner whose project has since been forgotten -- and the tag is
+	// then left off. Nothing may key a row or a decision by it: names can
+	// change, which is why ProjectID exists.
+	ProjectName string
+	GH          ghub.Client
 	// Epic reads sub-issues and issue dependencies for the epic sweep. It is
 	// narrow on purpose -- see ghub.EpicReader -- so a test of any OTHER pass
 	// does not have to grow three methods it never calls.
@@ -244,6 +251,7 @@ type Summary struct {
 // the daemon runs TickIssue for the fast path. Both may run at once -- the
 // per-loop lock in RunTick and TickIssue makes an overlapping pass harmless.
 func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
+	defer timeTick(cfg, deps, passSweep, time.Now())
 	var sum Summary
 	now := deps.Now()
 
@@ -303,6 +311,11 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	}
 	sum.Live = len(live)
 	sum.Forced = deps.Force
+	// Emitted from the full sweep only. The sweep reads every running row
+	// this loop owns, so its count is the loop's true concurrency; an issue
+	// tick reads one issue's rows, and a gauge from it would report 0 or 1
+	// for a loop running five agents.
+	metrics.Default().Gauge(mDispatchConcurrent, float64(len(live)), loopTags(cfg, deps)...)
 
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
 		return sum, err
@@ -324,6 +337,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	clearUnreachableDeadlines(cfg, deps, snap, states)
 
 	if plan.BreakerTripped {
+		metrics.Default().Count(mBreakerTripped, 1, loopTags(cfg, deps)...)
 		if err := deps.Store.SetCooldown(cfg.Name, plan.CooldownUntil); err != nil {
 			return sum, err
 		}
@@ -458,6 +472,14 @@ func reapDead(
 		}); err != nil {
 			return nil, fmt.Errorf("retire dead dispatch %d: %w", d.ID, err)
 		}
+		// The dead runner cannot report its own outcome, so the reap reports
+		// it for it -- otherwise dispatch.started and dispatch.finished drift
+		// apart by one for every runner that dies. No duration: how long the
+		// agent actually ran before it died is not known, only when a tick
+		// noticed.
+		reaped := d
+		reaped.Status, reaped.ExitCode, reaped.APIError = store.StatusFailed, -1, "runner process died"
+		emitFinished(cfg, deps, reaped, 0)
 		if d.Kind != store.KindTend {
 			if err := deps.Store.MarkNeedsRetry(
 				cfg.Name, cfg.Repo, d.Number, now, runner.RetryBackoff(cfg)); err != nil {
@@ -627,6 +649,11 @@ func act(
 	case engine.KindParkRetryExhausted:
 		return count(&sum.Parked, parkRetryExhausted(ctx, cfg, deps, d))
 	case engine.KindTend:
+		// Per tend DECISION, before git or an agent is tried, so the
+		// distribution describes how far behind pull requests are when they
+		// come up for tending -- including the ones the conflict backoff then
+		// declines. A review-only tend contributes its zero honestly.
+		metrics.Default().Distribution(mPRBehindBy, float64(d.BehindBy), loopTags(cfg, deps)...)
 		// git first, the agent second. A rebase that replays cleanly needs no
 		// conversation, and this is the common case: the agent exists for the
 		// conflicts. gitRebase reports whether it settled the decision --
@@ -646,6 +673,7 @@ func act(
 			// unanswered: the rebase settled the staleness half of the
 			// decision, not the review half.
 			sum.Rebased++
+			metrics.Default().Count(mRebaseAgentFree, 1, loopTags(cfg, deps)...)
 			if !d.ReviewPending {
 				return nil
 			}
@@ -676,6 +704,17 @@ func act(
 		err := dispatch(ctx, cfg, deps, d, now, store.KindTend)
 		if err == nil {
 			recordConflictDispatch(cfg, deps, d, pendingConflict)
+			tags := append(runTags(cfg, deps, store.KindTend, d.Overrides),
+				metrics.Tag("trigger", tendTrigger(d)))
+			metrics.Default().Count(mTendDispatch, 1, tags...)
+			// The agent was sent at a branch that is still behind: git did
+			// not settle the staleness half, whether it conflicted, failed,
+			// or found the worktree dirty. A branch git already rebased this
+			// pass is not counted here, because what the agent is answering
+			// then is review activity, not the rebase.
+			if d.BehindBy > 0 && outcome != doneRebased {
+				metrics.Default().Count(mRebaseAgent, 1, loopTags(cfg, deps)...)
+			}
 		}
 		return count(&sum.Tended, err)
 	case engine.KindResume:
@@ -793,6 +832,7 @@ func dispatch(
 			workDir, wtErr = deps.WT.EnsureIssue(d.Issue)
 		}
 		if wtErr != nil {
+			metrics.Default().Count(mWorktreeFailed, 1, runTags(cfg, deps, kind, d.Overrides)...)
 			// Record the failed dispatch, but do NOT set the retry flag. No agent
 			// ran, so the issue carries no in-flight label, and a retry flag on an
 			// issue that is not in flight can never be acted on. The trigger label
@@ -816,6 +856,7 @@ func dispatch(
 	runnerLog := runner.RunnerLogPath(cfg.StateDir, cfg.Name, dispatchID)
 	pid, err := deps.Spawn(deps.SelfPath, dispatchID, deps.ProjectID, deps.ConfigPath, runnerLog)
 	if err != nil {
+		metrics.Default().Count(mDispatchSpawnFailed, 1, runTags(cfg, deps, kind, d.Overrides)...)
 		// As above: no agent ran, so no retry flag. Setting one here would strand
 		// the issue, because nothing can act on a retry flag without in-flight.
 		_ = deps.Store.FinishDispatch(dispatchID, store.DispatchResult{
@@ -825,6 +866,16 @@ func dispatch(
 	}
 	if err := deps.Store.SetDispatchProcess(dispatchID, pid, now); err != nil {
 		return err
+	}
+
+	// Started means a runner process exists. A dispatch that failed on its
+	// worktree or its spawn never had one, is counted by its own metric
+	// above, and is not counted here: dispatch.started and dispatch.finished
+	// pair up only because both describe runners.
+	tags := runTags(cfg, deps, kind, d.Overrides)
+	metrics.Default().Count(mDispatchStarted, 1, tags...)
+	if isRetry {
+		metrics.Default().Count(mDispatchRetry, 1, tags...)
 	}
 
 	slog.Info("dispatched", "loop", cfg.Name, "kind", kind, "issue", d.Issue,
@@ -956,6 +1007,13 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 	if err := deps.Store.PutIssueState(state); err != nil {
 		return err
 	}
+	// Counted once the durable park is written, before the GitHub calls. The
+	// Parked check above makes this run once per park however many ticks it
+	// takes the comment and the label edit to land, and a park whose GitHub
+	// half failed has still stopped the issue.
+	tags := loopTags(cfg, deps)
+	metrics.Default().Count(mRetryCapReached, 1, tags...)
+	metrics.Default().Count(mPark, 1, append(tags, metrics.Tag("reason", "retry_cap"))...)
 
 	// Best-effort. The park is the point of this function, so a read that fails
 	// must not stop the comment or the label edits: the cause is omitted and
@@ -1004,6 +1062,21 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 	if err := deps.Store.SetDispatchProcess(dispatchID, os.Getpid(), time.Now()); err != nil {
 		return err
 	}
+
+	// Every return below records an outcome through runner.Finish, so this
+	// one deferred read covers all of them: a template that will not render,
+	// an identity that cannot be prepared, and whatever Supervise records.
+	// Reading the row back, rather than threading the result out of the
+	// runner, is what lets one emit serve every path -- and it reports what
+	// was STORED, so the metric and `sessions describe` cannot disagree.
+	began := time.Now()
+	defer func() {
+		row, err := deps.Store.GetDispatch(dispatchID)
+		if err != nil || row.Status == store.StatusRunning {
+			return
+		}
+		emitFinished(cfg, deps, row, time.Since(began))
+	}()
 
 	// Two prompts, and a tend uses NEITHER branch: the tend dispatcher's
 	// configuration carries the project's tend.prompt in cfg.Prompt, because it
@@ -1163,9 +1236,18 @@ func Reset(cfg *config.Config, s *store.Store, wt *worktree.Manager, number int,
 				number, d.PID)
 		}
 		// The runner is gone. Retire the row so the next tick is coherent.
-		if err := s.FinishDispatch(d.ID, store.DispatchResult{
+		res := store.DispatchResult{
 			Status: store.StatusFailed, ExitCode: -1, APIError: "reset by operator",
-		}); err != nil && !errors.Is(err, store.ErrDispatchNotRunning) {
+		}
+		err := s.FinishDispatch(d.ID, res)
+		switch {
+		case err == nil:
+			// A dead runner nobody reaped yet, retired here instead of by the
+			// next tick, so it is reported here instead -- see emitFinished.
+			retired := d
+			retired.Status, retired.ExitCode, retired.APIError = res.Status, res.ExitCode, res.APIError
+			emitFinished(cfg, Deps{}, retired, 0)
+		case !errors.Is(err, store.ErrDispatchNotRunning):
 			return err
 		}
 	}

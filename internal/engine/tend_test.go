@@ -56,6 +56,11 @@ func TestTendsStalePullRequest(t *testing.T) {
 	if p.Decisions[0].PR != 20 || p.Decisions[0].Issue != 1 {
 		t.Errorf("decision = %+v, want issue 1 / PR 20", p.Decisions[0])
 	}
+	// The count travels on the decision for the caller's metrics: the
+	// tend.dispatch trigger and pr.behind_by are both read from it.
+	if p.Decisions[0].BehindBy != 3 {
+		t.Errorf("BehindBy = %d, want 3", p.Decisions[0].BehindBy)
+	}
 }
 
 func TestDoesNotTendCurrentPullRequest(t *testing.T) {

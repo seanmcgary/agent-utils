@@ -9,6 +9,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -83,6 +84,13 @@ func tendState(
 	}
 	live = append(live, liveMine...)
 	sum.Live = len(live)
+	// The dispatcher's OWN live agents, not sum.Live. sum.Live counts every
+	// loop's live rows in the repository, because that is what the guard
+	// needs; a gauge of it tagged loop:tend would count each loop's agents a
+	// second time under the dispatcher's name. mine is every running row the
+	// dispatcher holds for this repository on every path that reaches here,
+	// so the gauge is true from a delivery as well as from a sweep.
+	metrics.Default().Gauge(mDispatchConcurrent, float64(len(liveMine)), loopTags(cfg, deps)...)
 
 	liveIssues, liveTendPRs := engine.TendLiveness(live)
 

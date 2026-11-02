@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -56,6 +57,14 @@ func (w *Worker) pollPass(ctx context.Context) {
 	if len(byRepo) == 0 {
 		return
 	}
+	// Timed from here, once there is something to poll: a pass over an empty
+	// machine costs nothing and would only drag the distribution toward zero.
+	// It covers every repository, so it is the number to watch against
+	// PollInterval -- a pass that takes longer than the interval means the
+	// ticker is dropping beats.
+	defer func(began time.Time) {
+		metrics.Default().Distribution(mPollPassDuration, float64(time.Since(began).Milliseconds()))
+	}(time.Now())
 
 	var src PollSource
 	if w.App != nil {

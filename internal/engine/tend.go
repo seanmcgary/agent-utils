@@ -205,6 +205,7 @@ func DecideTend(cfg *config.Config, snap Snapshot, st TendState) TendPlan {
 			Reason:        strings.Join(reasons, "; "),
 			Overrides:     ov,
 			ReviewPending: reviewPending,
+			BehindBy:      snap.BehindBy[pr.Number],
 		})
 	}
 	return plan

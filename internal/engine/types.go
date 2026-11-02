@@ -144,6 +144,16 @@ type Decision struct {
 	// -- never on pr_links, see loopcmd.dispatch -- because the runner never
 	// sees this Decision or the tick's Snapshot.
 	ReviewPending bool
+	// BehindBy is how many commits the linked pull request lacks from its
+	// base, as the snapshot this KindTend decision was made from counted
+	// them. Zero on every other kind, and on a tend that fired for review
+	// activity alone.
+	//
+	// It is carried for the caller's metrics, not for any decision: the
+	// trigger tag on tend.dispatch and the pr.behind_by distribution both
+	// need the number, and re-deriving it from Reason's prose would tie a
+	// dashboard to a sentence.
+	BehindBy int
 }
 
 // Plan is the full output of one decision pass.
