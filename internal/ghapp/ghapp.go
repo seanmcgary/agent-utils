@@ -3,10 +3,12 @@
 // An installation token expires an hour after it is minted and cannot be
 // refreshed; a new one is minted by signing a JWT with the app's private key.
 // A dispatch can run for a day, and the agent's gh and git each run as fresh
-// processes, so tokens are cached ON DISK, per app and repository, and every
+// processes, so tokens are cached ON DISK, per app and installation, and every
 // process that needs one -- the daemon, a tick, the gh shim, the git
 // credential helper -- reads the same file and mints only when it is close to
 // expiry.
+//
+// A token covers the whole installation, not one repository; see App.Token.
 package ghapp
 
 import (
@@ -66,6 +68,11 @@ type App struct {
 	HTTP    *http.Client
 	Now     func() time.Time
 
+	// RepoScoped restricts each token to the one repository it was asked
+	// for, the behaviour up to v0.27.0. Off, a token covers the whole
+	// installation. Set from github_app.token_scope.
+	RepoScoped bool
+
 	key     *rsa.PrivateKey
 	keyPath string
 	dir     string
@@ -81,8 +88,8 @@ func New(id int64, keyPath, cacheDir string) (*App, error) {
 		return nil, err
 	}
 	return &App{
-		// A mint runs under the repository's token-cache lock, and every gh
-		// shim and credential helper call for that repository queues on it.
+		// A mint runs under the installation's token-cache lock, and every gh
+		// shim and credential helper call for that installation queues on it.
 		// http.DefaultClient never times out, so one hung GitHub response
 		// would stall all of them for good.
 		ID: id, BaseURL: "https://api.github.com", HTTP: &http.Client{Timeout: httpTimeout}, Now: time.Now,
@@ -102,11 +109,20 @@ func FromSettings(s *settings.Settings) (*App, error) {
 	if s.GitHubApp.PrivateKeyPath == "" {
 		return nil, fmt.Errorf("github_app.app_id is set but github_app.private_key_path is not")
 	}
+	if !settings.ValidTokenScope(s.GitHubApp.TokenScope) {
+		return nil, fmt.Errorf("github_app.token_scope is %q; want %q or %q",
+			s.GitHubApp.TokenScope, settings.TokenScopeInstallation, settings.TokenScopeRepo)
+	}
 	dir, err := home.Dir()
 	if err != nil {
 		return nil, err
 	}
-	return New(s.GitHubApp.AppID, s.GitHubApp.PrivateKeyPath, dir)
+	a, err := New(s.GitHubApp.AppID, s.GitHubApp.PrivateKeyPath, dir)
+	if err != nil {
+		return nil, err
+	}
+	a.RepoScoped = s.GitHubApp.TokenScope == settings.TokenScopeRepo
+	return a, nil
 }
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
@@ -151,29 +167,110 @@ type cachedToken struct {
 	ExpiresAt      time.Time `json:"expires_at"`
 }
 
-// tokenPath is keyed by app id as well as repository: after the operator
-// switches apps, a token the old app minted must not be handed out as the
-// new app's for the rest of its hour.
-func (a *App) tokenPath(owner, name string) string {
-	return filepath.Join(a.dir, "tokens", strconv.FormatInt(a.ID, 10), owner, name+".json")
+// installationEntry records which installation covers a repository, and when
+// GitHub last said so.
+type installationEntry struct {
+	InstallationID int64     `json:"installation_id"`
+	CheckedAt      time.Time `json:"checked_at"`
+}
+
+// InstallationRecheck is how long a recorded repository-to-installation answer
+// is trusted. An installation-wide token does not prove the installation still
+// covers a given repository, so without a recheck a repository removed from
+// the installation would read as 404s on every call instead of as
+// ErrNotInstalled. One JWT call per repository per hour is the price.
+const InstallationRecheck = time.Hour
+
+// installationPath is keyed by app id: after the operator switches apps, the
+// old app's answers must not be read as the new app's.
+func (a *App) installationPath(owner, name string) string {
+	return filepath.Join(a.dir, "tokens", strconv.FormatInt(a.ID, 10), "repos", owner, name+".json")
+}
+
+// tokenPath is one file per installation, or under RepoScoped one per
+// installation and repository. The owner is not part of the key: an
+// installation belongs to exactly one account.
+func (a *App) tokenPath(inst int64, name string) string {
+	base := filepath.Join(a.dir, "tokens", strconv.FormatInt(a.ID, 10), "installations")
+	if a.RepoScoped {
+		return filepath.Join(base, strconv.FormatInt(inst, 10), name+".json")
+	}
+	return filepath.Join(base, strconv.FormatInt(inst, 10)+".json")
 }
 
 func (a *App) fresh(c cachedToken) bool {
 	return c.Token != "" && c.ExpiresAt.Sub(a.Now()) > RefreshBefore
 }
 
-// Token returns an installation token scoped to repo alone.
+// Token returns an installation token for the installation that covers repo.
 //
-// The fast path reads the cache file without the lock. A stale or missing
-// entry takes the lock and READS AGAIN before minting: every process that
-// found the same stale entry queues on the lock, and only the first one
-// through should pay for a mint.
+// The token covers every repository that installation covers, not repo alone:
+// the waiting pass reads blockers in other repositories of the same
+// installation, and GitHub hides a dependency whose repository the token
+// cannot see. repo only selects the installation. Under RepoScoped the token
+// is restricted to repo, as up to v0.27.0.
+//
+// Tokens are cached per installation, so two repositories in one installation
+// share one token and one mint an hour.
 func (a *App) Token(ctx context.Context, repo string) (string, error) {
 	owner, name, err := splitRepo(repo)
 	if err != nil {
 		return "", err
 	}
-	path := a.tokenPath(owner, name)
+	inst, cached, err := a.installationFor(ctx, owner, name, false)
+	if err != nil {
+		return "", err
+	}
+	tok, err := a.tokenFor(ctx, inst, name)
+	if errors.Is(err, ErrNotInstalled) && cached {
+		// The recorded installation id is stale: the app was uninstalled and
+		// reinstalled. Look it up once more before giving up.
+		if inst, _, err = a.installationFor(ctx, owner, name, true); err != nil {
+			return "", err
+		}
+		tok, err = a.tokenFor(ctx, inst, name)
+	}
+	return tok, err
+}
+
+// installationFor returns the installation covering owner/name, and whether
+// the answer came from the cache. force skips the cache.
+func (a *App) installationFor(ctx context.Context, owner, name string, force bool) (int64, bool, error) {
+	path := a.installationPath(owner, name)
+	prev, havePrev := readJSON[installationEntry](path)
+	havePrev = havePrev && prev.InstallationID != 0
+	if !force && havePrev && a.Now().Sub(prev.CheckedAt) < InstallationRecheck {
+		return prev.InstallationID, true, nil
+	}
+	inst, err := a.installation(ctx, owner, name)
+	if err != nil {
+		// A recheck that could not reach GitHub keeps the previous answer:
+		// the recheck exists to notice a removal, and a network blip is not
+		// one. Only GitHub saying "not installed" overrides it.
+		if !force && havePrev && !errors.Is(err, ErrNotInstalled) {
+			return prev.InstallationID, true, nil
+		}
+		return 0, false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return 0, false, fmt.Errorf("create token cache: %w", err)
+	}
+	// Unlocked: concurrent lookups write the same answer, and the write is
+	// atomic.
+	if err := writeJSON(path, installationEntry{InstallationID: inst, CheckedAt: a.Now()}); err != nil {
+		return 0, false, err
+	}
+	return inst, false, nil
+}
+
+// tokenFor returns a cached or newly minted token for inst.
+//
+// The fast path reads the cache file without the lock. A stale or missing
+// entry takes the lock and READS AGAIN before minting: every process that
+// found the same stale entry queues on the lock, and only the first one
+// through should pay for a mint.
+func (a *App) tokenFor(ctx context.Context, inst int64, name string) (string, error) {
+	path := a.tokenPath(inst, name)
 	if c, ok := readJSON[cachedToken](path); ok && a.fresh(c) {
 		return c.Token, nil
 	}
@@ -186,25 +283,10 @@ func (a *App) Token(ctx context.Context, repo string) (string, error) {
 	}
 	defer l.Release()
 
-	c, ok := readJSON[cachedToken](path)
-	if ok && a.fresh(c) {
+	if c, ok := readJSON[cachedToken](path); ok && a.fresh(c) {
 		return c.Token, nil
 	}
-	inst := c.InstallationID
-	if inst == 0 {
-		if inst, err = a.installation(ctx, owner, name); err != nil {
-			return "", err
-		}
-	}
 	tok, exp, err := a.mint(ctx, inst, name)
-	if errors.Is(err, ErrNotInstalled) && c.InstallationID != 0 {
-		// The cached installation id is stale: the app was uninstalled and
-		// reinstalled. Look it up once more before giving up.
-		if inst, err = a.installation(ctx, owner, name); err != nil {
-			return "", err
-		}
-		tok, exp, err = a.mint(ctx, inst, name)
-	}
 	if err != nil {
 		return "", err
 	}
@@ -228,12 +310,18 @@ func (a *App) installation(ctx context.Context, owner, name string) (int64, erro
 	return out.ID, nil
 }
 
+// mint asks GitHub for an installation token. The request names no
+// repository unless RepoScoped is set, so the token covers whatever the
+// installation's repository selection covers.
 func (a *App) mint(ctx context.Context, inst int64, name string) (string, time.Time, error) {
 	var out struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`
 	}
-	body := map[string][]string{"repositories": {name}}
+	var body any
+	if a.RepoScoped {
+		body = map[string][]string{"repositories": {name}}
+	}
 	status, err := a.jwtCall(ctx, "POST", fmt.Sprintf("/app/installations/%d/access_tokens", inst), body, &out)
 	if status == http.StatusNotFound || status == http.StatusUnprocessableEntity {
 		return "", time.Time{}, fmt.Errorf("installation %d does not cover %s: %w", inst, name, ErrNotInstalled)

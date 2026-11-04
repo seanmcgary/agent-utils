@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seanmcgary/agent-utils/internal/home"
 	"github.com/seanmcgary/agent-utils/internal/settings"
 )
 
@@ -51,6 +52,24 @@ func TestFromSettings(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "private_key_path") {
 		t.Errorf("missing key path: err = %v", err)
 	}
+
+	dir := t.TempDir()
+	t.Setenv(home.EnvVar, dir)
+	keyPath, _ := writeKey(t, dir)
+	for scope, wantRepo := range map[string]bool{"": false, "installation": false, "repo": true} {
+		a, err := FromSettings(&settings.Settings{GitHubApp: settings.GitHubApp{
+			AppID: 7, PrivateKeyPath: keyPath, TokenScope: scope,
+		}})
+		if err != nil || a.RepoScoped != wantRepo {
+			t.Errorf("token_scope %q: RepoScoped = %v, err %v; want %v", scope, a != nil && a.RepoScoped, err, wantRepo)
+		}
+	}
+	_, err = FromSettings(&settings.Settings{GitHubApp: settings.GitHubApp{
+		AppID: 7, PrivateKeyPath: keyPath, TokenScope: "org",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "token_scope") {
+		t.Errorf("bad token_scope: err = %v", err)
+	}
 }
 
 func TestJWTClaims(t *testing.T) {
@@ -72,7 +91,7 @@ func TestJWTClaims(t *testing.T) {
 	}
 }
 
-func TestTokenIsCachedAndRepoScoped(t *testing.T) {
+func TestTokenIsCachedAndInstallationWide(t *testing.T) {
 	a, f := newTestApp(t)
 	ctx := context.Background()
 	t1, err := a.Token(ctx, "acme/widgets")
@@ -86,8 +105,10 @@ func TestTokenIsCachedAndRepoScoped(t *testing.T) {
 	if t1 != t2 || f.mints.Load() != 1 || f.lookups.Load() != 1 {
 		t.Errorf("tokens %q %q, mints %d, lookups %d; want one of each", t1, t2, f.mints.Load(), f.lookups.Load())
 	}
-	if got := f.scopes[0]; len(got) != 1 || got[0] != "widgets" {
-		t.Errorf("mint scoped to %v, want [widgets]", got)
+	// No repositories and no repository_ids: the token covers whatever the
+	// installation covers, so a dependency in a sibling repository is visible.
+	if got := f.bodies[0]; strings.Contains(got, "repositories") || strings.Contains(got, "repository_ids") {
+		t.Errorf("mint body = %q, want no repository restriction", got)
 	}
 	// A second process reads the file, not memory.
 	b, _ := New(7, a.keyPath, a.dir)
@@ -95,9 +116,111 @@ func TestTokenIsCachedAndRepoScoped(t *testing.T) {
 	if t3, _ := b.Token(ctx, "acme/widgets"); t3 != t1 || f.mints.Load() != 1 {
 		t.Errorf("second App re-minted: %q, mints %d", t3, f.mints.Load())
 	}
-	info, err := os.Stat(filepath.Join(a.dir, "tokens", "7", "acme", "widgets.json"))
+	info, err := os.Stat(filepath.Join(a.dir, "tokens", "7", "installations", "42.json"))
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Errorf("cache file: %v, mode %v", err, info.Mode().Perm())
+	}
+}
+
+// Two repositories in one installation share one token and one mint; a
+// repository in another installation gets its own.
+func TestTokenIsSharedAcrossAnInstallation(t *testing.T) {
+	a, f := newTestApp(t)
+	ctx := context.Background()
+	w, err := a.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := a.Token(ctx, "acme/gadgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w != g || f.mints.Load() != 1 {
+		t.Errorf("acme/widgets %q, acme/gadgets %q, %d mints; want one shared token", w, g, f.mints.Load())
+	}
+	if f.lookups.Load() != 2 {
+		t.Errorf("%d installation lookups, want one per repository", f.lookups.Load())
+	}
+	o, err := a.Token(ctx, "other/thing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o == w || f.mints.Load() != 2 {
+		t.Errorf("other/thing %q, %d mints; want its own token from installation 43", o, f.mints.Load())
+	}
+}
+
+// github_app.token_scope: repo keeps the old behaviour: one token per
+// repository, restricted to it.
+func TestTokenRepoScoped(t *testing.T) {
+	a, f := newTestApp(t)
+	a.RepoScoped = true
+	ctx := context.Background()
+	w, err := a.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := a.Token(ctx, "acme/gadgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w == g || f.mints.Load() != 2 {
+		t.Errorf("widgets %q, gadgets %q, %d mints; want a token per repository", w, g, f.mints.Load())
+	}
+	if len(f.scopes) != 2 || len(f.scopes[0]) != 1 || f.scopes[0][0] != "widgets" ||
+		len(f.scopes[1]) != 1 || f.scopes[1][0] != "gadgets" {
+		t.Errorf("mint scopes = %v, want [[widgets] [gadgets]]", f.scopes)
+	}
+	if again, _ := a.Token(ctx, "acme/widgets"); again != w || f.mints.Load() != 2 {
+		t.Errorf("repo-scoped token was not cached: %q, %d mints", again, f.mints.Load())
+	}
+}
+
+// A recheck that cannot reach GitHub keeps the previous answer, and the
+// cached token with it.
+func TestTokenSurvivesAFailedRecheck(t *testing.T) {
+	a, f := newTestApp(t)
+	// Outlives the recheck window, so the token is still fresh when it is due.
+	f.expiry = 3 * time.Hour
+	ctx := context.Background()
+	start := time.Now()
+	a.Now = func() time.Time { return start }
+	tok, err := a.Token(ctx, "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusBadGateway)
+	}))
+	defer down.Close()
+	a.BaseURL = down.URL
+	a.Now = func() time.Time { return start.Add(InstallationRecheck + time.Minute) }
+	if got, err := a.Token(ctx, "acme/widgets"); err != nil || got != tok || f.mints.Load() != 1 {
+		t.Errorf("Token during an outage = %q, %v (mints %d); want the cached %q", got, err, f.mints.Load(), tok)
+	}
+}
+
+// The repository-to-installation answer is rechecked hourly, so a repository
+// removed from the installation reports ErrNotInstalled instead of being
+// handed a token that cannot see it.
+func TestTokenRechecksTheInstallationHourly(t *testing.T) {
+	a, f := newTestApp(t)
+	ctx := context.Background()
+	start := time.Now()
+	a.Now = func() time.Time { return start }
+	if _, err := a.Token(ctx, "acme/gadgets"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	delete(f.installed, "acme/gadgets")
+	f.mu.Unlock()
+	a.Now = func() time.Time { return start.Add(InstallationRecheck - time.Minute) }
+	if _, err := a.Token(ctx, "acme/gadgets"); err != nil || f.lookups.Load() != 1 {
+		t.Fatalf("inside the recheck window: err %v, lookups %d; want the cached answer", err, f.lookups.Load())
+	}
+	a.Now = func() time.Time { return start.Add(InstallationRecheck + time.Minute) }
+	if _, err := a.Token(ctx, "acme/gadgets"); !errors.Is(err, ErrNotInstalled) {
+		t.Errorf("after the recheck window: err = %v, want ErrNotInstalled", err)
 	}
 }
 

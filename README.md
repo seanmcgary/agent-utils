@@ -562,8 +562,12 @@ engine reduces the blast radius in three ways, none of which is a substitute for
 - The agent process gets a filtered environment, at both hops (the detached runner and the
   agent itself). With `GITHUB_TOKEN`, the variable is removed from it. When a [GitHub App](docs/configuration.md#running-as-a-github-app)
   is configured, the agent's environment never holds an installation token either; `gh` and
-  git fetch one through `agent-utils internal gh-token` and `agent-utils internal git-credential`,
-  scoped to the dispatch's repository.
+  git fetch one through `agent-utils internal gh-token` and `agent-utils internal git-credential`.
+  That token covers **every repository the app's installation covers**, not only the
+  dispatch's repository, and the agent runs with `bypassPermissions`. The installation's
+  repository selection is the only boundary on what an agent can read and push to. See
+  [token mechanics](docs/configuration.md#running-as-a-github-app), and
+  `github_app.token_scope: repo` for per-repository tokens.
 
   **This does not make the agent unprivileged.** It keeps `HOME` and `SSH_AUTH_SOCK`, because
   it has to push branches and use `gh`. Anything readable by your user is readable by the
@@ -571,11 +575,11 @@ engine reduces the blast radius in three ways, none of which is a substitute for
   file this README tells you to create, and `~/.agent-utils/config.yaml`, which holds the
   webhook HMAC secret. Treat the environment filter as
   defence in depth, not as a boundary. If you need a real boundary, run the loop as a separate
-  user with its own `HOME` and a narrowly scoped token. In app mode the agent can run those
-  helpers to mint a token for its repository, and because the app's private key is readable by
-  the same user, it can mint one for any repository the app is installed on. Install the app
-  on the loop repositories only, and run the daemon as a dedicated user if you need a real
-  boundary.
+  user with its own `HOME` and a narrowly scoped token. In app mode the agent's token
+  already reaches every repository in the installation, and because the app's private key is
+  readable by the same user, it can mint one for any installation of the app. Install the app
+  on the loop repositories (and the repositories their blockers live in) only, and run the
+  daemon as a dedicated user if you need a real boundary.
 - Only a pull request opened by an OWNER, MEMBER, or COLLABORATOR, whose head branch lives in
   the target repository, is ever linked to an issue or tended. As a GitHub App, two more
   authors pass: the app's own bot (by login or user id, so dependabot and other bots do not),

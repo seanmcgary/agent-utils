@@ -144,9 +144,11 @@ Apps), with these repository permissions and no user permissions:
 | Metadata | Read |
 | Webhooks | Read and write, only if `project init` registers repository webhooks with this app |
 
-Generate a private key (a `.pem` file) and install the app on the loop repositories only. The
-app can mint a token for every repository it is installed on, so a narrow installation is the
-limit on what a leaked key can reach.
+Generate a private key (a `.pem` file) and install the app on the loop repositories, plus any
+repository that holds a blocker a waiting issue depends on, and nothing else. Each installation
+token covers every repository the installation covers (see **Token mechanics** below), so the
+installation's repository selection is the only limit on what the daemon, and every agent it
+dispatches, can read and write. It is also the limit on what a leaked key can reach.
 
 **Point agent-utils at it:**
 
@@ -214,14 +216,39 @@ whatever the author's permission) and both refs must be safe branch names. Revie
 still filtered on `author_association` alone, so in app mode a review from an org member whose
 membership is private does not trigger a tend. Making the membership public fixes both.
 
-**Token mechanics.** Installation tokens are minted for a single repository and kept in
-`~/.agent-utils/tokens/<app_id>/` (directory `0700`, files `0600`). A token is refreshed when fewer
-than 10 minutes of its lifetime remain. The agent's environment never holds a token: `gh` and
+**Token mechanics.** Installation tokens cover the whole installation: they are minted without a
+repository restriction, so one token reaches every repository the installation's repository
+selection covers ("all repositories" or the selected list). The repository a call acts on is
+used only to find the installation. One token is cached per installation in
+`~/.agent-utils/tokens/<app_id>/installations/` (directory `0700`, files `0600`), so two
+repositories in one installation share it, and it is refreshed when fewer than 10 minutes of its
+lifetime remain. Which installation covers a repository is cached beside it and rechecked
+hourly, so a repository removed from the installation fails with "not installed" within the
+hour.
+
+Installation-wide tokens are what make a cross-repository blocker visible to the
+[waiting pass](#labelswaiting--optional): GitHub hides a dependency from a token that cannot
+read the blocker's repository. They also mean an agent, which runs with
+`bypassPermissions`, can read and push to every repository in the installation, not only the
+one it was dispatched for. Keep the installation's repository selection narrow. The agent's environment never holds a token: `gh` and
 git reach it through the `agent-utils internal gh-token` and `agent-utils internal
 git-credential` helpers, which are configured per dispatch through environment variables and
 write nothing to the repository's `.git/config` or `.git/hooks`. The agent can still call
 those helpers, and the key is readable by the same user, so it can mint a token for any
 repository the app is installed on. For a real boundary, run the daemon as a dedicated user.
+
+#### `github_app.token_scope` — optional, default `installation`
+
+```bash
+agent-utils config set github_app.token_scope repo
+```
+
+`installation` (the default) mints tokens that cover the whole installation, as described
+above. `repo` restricts each token to the one repository it was minted for, which was the
+behaviour up to v0.27.0. With `repo`, a waiting issue whose blocker lives in another repository
+is never released: the token cannot see the blocker, and the pass logs that it is hidden. Any
+other value is rejected by `config set`, and a hand-edited bad value stops the daemon at startup.
+Restart the listener daemon after changing it.
 
 #### `commit.co_author_issue_author` — optional, default `false`
 
@@ -684,6 +711,13 @@ makes, alongside the retry-cap park and the epic sweep. In detail:
 - **An issue with no blocker at all keeps waiting.** That is the moment between a job applying
   the label and recording the dependency, and releasing it then would start the work early. To
   start it without a blocker, apply `trigger` and remove `waiting` yourself.
+- **A blocker the token cannot see keeps the issue waiting.** GitHub leaves a blocker out of
+  `blocked_by` when the token cannot read its repository, but still counts it in the issue's
+  dependency summary. When the count is higher than the blockers returned, the pass logs a WARN
+  (`waiting issue has a blocker this token cannot see`) with both numbers, and does not release
+  the issue. As a GitHub App, that means the blocker's repository is outside the installation's
+  repository selection, or `github_app.token_scope` is `repo`. If the count itself cannot be
+  read, the pass decides from the blockers it can see.
 - **A blocker may live in another repository**, unlike the epic sweep's. The blocker's
   repository is only ever *read*; both writes go to the waiting issue, addressed to the
   repository of the loop that declares the label. So a closure in another repository chooses

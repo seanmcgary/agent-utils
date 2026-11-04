@@ -83,6 +83,24 @@ const MinTendInterval = time.Minute
 type GitHubApp struct {
 	AppID          int64  `yaml:"app_id,omitempty"`
 	PrivateKeyPath string `yaml:"private_key_path,omitempty"`
+	// TokenScope is TokenScopeInstallation (the default, also when empty) or
+	// TokenScopeRepo.
+	TokenScope string `yaml:"token_scope,omitempty"`
+}
+
+// The values of github_app.token_scope. An installation-scoped token covers
+// every repository the app's installation covers; a repository-scoped one
+// covers only the repository it was minted for, which hides any issue
+// dependency that crosses repositories.
+const (
+	TokenScopeInstallation = "installation"
+	TokenScopeRepo         = "repo"
+)
+
+// ValidTokenScope reports whether v is a github_app.token_scope value. Empty
+// is valid and means TokenScopeInstallation.
+func ValidTokenScope(v string) bool {
+	return v == "" || v == TokenScopeInstallation || v == TokenScopeRepo
 }
 
 // Commit holds configuration for how agent-utils attributes its commits.
@@ -578,6 +596,18 @@ func Fields() []Field {
 				return nil
 			},
 			Unset: func(s *Settings) { s.GitHubApp.PrivateKeyPath = "" },
+		},
+		{
+			Key: "github_app.token_scope",
+			Get: func(s *Settings) string { return s.GitHubApp.TokenScope },
+			Set: func(s *Settings, v string) error {
+				if v == "" || !ValidTokenScope(v) {
+					return fmt.Errorf("github_app.token_scope must be %q or %q", TokenScopeInstallation, TokenScopeRepo)
+				}
+				s.GitHubApp.TokenScope = v
+				return nil
+			},
+			Unset: func(s *Settings) { s.GitHubApp.TokenScope = "" },
 		},
 		{
 			Key: "commit.co_author_issue_author",

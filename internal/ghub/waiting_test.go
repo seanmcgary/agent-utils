@@ -150,3 +150,29 @@ func TestWorkflowRunsSendsTheQuery(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 }
+
+// GitHub counts a blocker that blocked_by hides from the token; the count is
+// what lets the waiting pass tell a hidden blocker from a missing one.
+func TestBlockedByTotalReadsTheDependencySummary(t *testing.T) {
+	var req map[string]any
+	srv := graphQLServer(t, "/graphql",
+		`{"data":{"repository":{"issue":{"issueDependenciesSummary":{"totalBlockedBy":1}}}}}`, &req)
+	defer srv.Close()
+	n, err := newTestClient(t, srv).BlockedByTotal(context.Background(), "o", "r", 1014)
+	if err != nil || n != 1 {
+		t.Fatalf("BlockedByTotal = %d, %v; want 1", n, err)
+	}
+	vars, _ := req["variables"].(map[string]any)
+	if vars["owner"] != "o" || vars["name"] != "r" || vars["number"] != float64(1014) {
+		t.Errorf("variables = %v", vars)
+	}
+}
+
+func TestBlockedByTotalRefusesAGraphQLError(t *testing.T) {
+	srv := graphQLServer(t, "/graphql", `{"data":null,"errors":[{"message":"no such field"}]}`, nil)
+	defer srv.Close()
+	if _, err := newTestClient(t, srv).BlockedByTotal(context.Background(), "o", "r", 1014); err == nil ||
+		!strings.Contains(err.Error(), "no such field") {
+		t.Fatalf("err = %v, want the GraphQL error", err)
+	}
+}
