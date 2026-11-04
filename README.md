@@ -577,7 +577,12 @@ engine reduces the blast radius in three ways, none of which is a substitute for
   on the loop repositories only, and run the daemon as a dedicated user if you need a real
   boundary.
 - Only a pull request opened by an OWNER, MEMBER, or COLLABORATOR, whose head branch lives in
-  the target repository, is ever linked to an issue or tended.
+  the target repository, is ever linked to an issue or tended. As a GitHub App, two more
+  authors pass: the app's own bot (by login or user id, so dependabot and other bots do not),
+  and a CONTRIBUTOR or NONE author whom the collaborator permission endpoint reports as
+  `admin`, `maintain` or `write`. That second rule exists because an org member whose
+  membership is private reads as CONTRIBUTOR to an app. A fork is never trusted, whatever its
+  author's permission. See [Running as a GitHub App](docs/configuration.md#running-as-a-github-app).
 - `bypassPermissions` requires `i_understand_bypass_permissions: true` in the loop config.
 
 A loop with `agent.harness: pi` keeps the same posture. `pi -p` is non-interactive and runs
@@ -680,7 +685,8 @@ Two are on a `pull_request` delivery. A pull request that **closes**, merged or 
 `pr-<N>` worktree removed, along with the `issue-<M>` worktree of the issue it closes, once
 neither has a live dispatch. That deletes files: the live-dispatch guard protects work in
 progress, not uncommitted or unpushed work sitting in an idle worktree, and only a trusted
-pull request's `Closes #M` is honoured. And a pull request **merged** into `default_branch`
+pull request's `Closes #M` is honoured (see [Security](#security) for what is trusted, which
+differs when running as a GitHub App). And a pull request **merged** into `default_branch`
 arms a tend sweep, which acts on pull requests the delivery never names.
 
 The third is a `push` delivery, which names no issue at all: its subject is a branch, and the

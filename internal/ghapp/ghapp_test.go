@@ -171,7 +171,7 @@ func TestBotIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Identity{Login: "acme-agent[bot]", Name: "acme-agent[bot]", Email: "9001+acme-agent[bot]@users.noreply.github.com"}
+	want := Identity{Login: "acme-agent[bot]", Name: "acme-agent[bot]", Email: "9001+acme-agent[bot]@users.noreply.github.com", ID: 9001}
 	if id != want {
 		t.Errorf("Bot = %+v, want %+v", id, want)
 	}

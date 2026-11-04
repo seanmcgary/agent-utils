@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"sync"
@@ -59,6 +60,26 @@ type GitHubClient struct {
 	// installation token cannot call /user (403), so an app-mode client is
 	// given the bot login here.
 	self func(context.Context) (string, error)
+
+	// bot, set only in app mode, returns the app's own bot identity as seen
+	// from a repository. Its presence is also what turns on the app-mode
+	// trust rules in trustedAuthor; a token-mode client leaves it nil.
+	bot func(ctx context.Context, repo string) (ghapp.Identity, error)
+
+	// permMu and perms cache trustedAuthor's permission lookups, keyed by
+	// repository and login. A client is built per delivery and per poll pass
+	// (listener.Worker.access, listener.Worker.poll), so this lives exactly
+	// that long, and a listing with many pull requests by one author costs
+	// one lookup.
+	permMu sync.Mutex
+	perms  map[string]permAnswer
+}
+
+// permAnswer is one cached permission lookup: whether it grants trust, and
+// if not, why, for the log line each untrusted pull request gets.
+type permAnswer struct {
+	ok     bool
+	reason string
 }
 
 // New returns a client authenticated with token.
@@ -83,7 +104,7 @@ func NewApp(app *ghapp.App) *GitHubClient {
 			return "", err
 		}
 		return slug + "[bot]", nil
-	}}
+	}, bot: app.Bot}
 }
 
 // ConvertIssues maps go-github issues onto the engine type. It drops pull
@@ -143,9 +164,14 @@ func issueRepo(gi *github.Issue) string {
 // its trust.
 //
 // Trust is decided here, once, at the boundary. A pull request is trusted only
-// when its head branch lives in this repository and its author is a repository
-// insider. Tending checks the head branch out and runs an agent in it, so an
-// untrusted head is code execution.
+// when its head branch lives in this repository, both refs pass SafeRef, and
+// its author is a repository insider (see trustedAuthor). Tending checks the
+// head branch out and runs an agent in it, so an untrusted head is code
+// execution.
+//
+// The branch checks run first and short-circuit, so a fork's pull request
+// never costs the API calls trustedAuthor may make, and no permission an
+// author holds can make a fork's head trusted.
 //
 // EqualFold: full_name comes back in GitHub's canonical casing while
 // owner/repo come from config unchecked. A casing mismatch would fail closed
@@ -155,15 +181,15 @@ func issueRepo(gi *github.Issue) string {
 // computing trust for itself. Two copies could drift, and a single-fetch path
 // that drifted toward "trusted" would let one webhook delivery about a fork's
 // pull request run an agent inside that fork's branch.
-func convertPR(owner, repo string, pr *github.PullRequest) PullRequest {
+func (g *GitHubClient) convertPR(ctx context.Context, owner, repo string, pr *github.PullRequest) PullRequest {
 	head := pr.GetHead().GetRef()
 	base := pr.GetBase().GetRef()
 	assoc := pr.GetAuthorAssociation()
 	headRepo := pr.GetHead().GetRepo().GetFullName()
 
 	trusted := strings.EqualFold(headRepo, owner+"/"+repo) &&
-		(assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR") &&
-		SafeRef(head) && SafeRef(base)
+		SafeRef(head) && SafeRef(base) &&
+		g.trustedAuthor(ctx, owner, repo, pr)
 
 	return PullRequest{
 		Number:            pr.GetNumber(),
@@ -176,6 +202,101 @@ func convertPR(owner, repo string, pr *github.PullRequest) PullRequest {
 		Trusted:           trusted,
 		Merged:            pr.GetMerged(),
 	}
+}
+
+// insiderAssociation reports whether GitHub's author_association alone makes
+// an author a repository insider.
+func insiderAssociation(assoc string) bool {
+	return assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR"
+}
+
+// trustedAuthor decides whether a pull request's author is a repository
+// insider. convertPR is its only caller.
+//
+// In token mode this is author_association alone, exactly as it always was.
+//
+// In app mode the association is not enough. GitHub computes it from what
+// the installation token can see, so an org member whose membership is
+// private reads as CONTRIBUTOR, and the app's own bot reads as NONE. Two
+// rules apply there, after the association check:
+//
+//  1. The app's own bot is trusted, matched on its login or its user id.
+//     Never on a "[bot]" suffix: dependabot[bot] and every other bot stay
+//     untrusted.
+//  2. A CONTRIBUTOR or NONE author is trusted when the collaborator
+//     permission endpoint grants admin, maintain or write. Anything else,
+//     including a 404 or an error, is untrusted and logged.
+func (g *GitHubClient) trustedAuthor(ctx context.Context, owner, repo string, pr *github.PullRequest) bool {
+	assoc := pr.GetAuthorAssociation()
+	if insiderAssociation(assoc) {
+		return true
+	}
+	if g.bot == nil {
+		return false
+	}
+
+	user := pr.GetUser()
+	login := user.GetLogin()
+	bot, err := g.bot(ctx, owner+"/"+repo)
+	if err != nil {
+		// Not fatal to the decision: the author may still be a human the
+		// permission lookup below trusts. A bot that is not recognised here
+		// stays untrusted, because GitHub reports no permission for it.
+		slog.Warn("cannot resolve the GitHub App's bot; its pull requests are untrusted this pass",
+			"repo", owner+"/"+repo, "pr", pr.GetNumber(), "err", err)
+	} else if (bot.Login != "" && strings.EqualFold(login, bot.Login)) ||
+		(bot.ID != 0 && user.GetID() == bot.ID) {
+		return true
+	}
+
+	if assoc != "CONTRIBUTOR" && assoc != "NONE" {
+		return false
+	}
+	ans := g.permission(ctx, owner, repo, login)
+	if !ans.ok {
+		slog.Info("pull request untrusted: author has no write access",
+			"repo", owner+"/"+repo, "pr", pr.GetNumber(), "author", login,
+			"association", assoc, "reason", ans.reason)
+	}
+	return ans.ok
+}
+
+// permission asks GitHub for login's permission on owner/repo, caching the
+// answer for the life of this client. It fails closed: any error is an
+// answer of "untrusted", with the error as its reason.
+//
+// The mutex is held across the request so concurrent callers for the same
+// login make one lookup, not several.
+func (g *GitHubClient) permission(ctx context.Context, owner, repo, login string) permAnswer {
+	if login == "" {
+		return permAnswer{reason: "the pull request has no author login"}
+	}
+	key := strings.ToLower(owner+"/"+repo) + "\x00" + strings.ToLower(login)
+
+	g.permMu.Lock()
+	defer g.permMu.Unlock()
+	if ans, ok := g.perms[key]; ok {
+		return ans
+	}
+
+	var ans permAnswer
+	// PathEscape: go-github interpolates the login into the path unescaped,
+	// and a bot's login carries brackets.
+	level, _, err := g.c.Repositories.GetPermissionLevel(ctx, owner, repo, url.PathEscape(login))
+	switch p := level.GetPermission(); {
+	case err != nil:
+		ans.reason = fmt.Sprintf("permission lookup failed: %v", err)
+	case p == "admin" || p == "maintain" || p == "write":
+		ans.ok = true
+	default:
+		ans.reason = fmt.Sprintf("permission is %q", p)
+	}
+
+	if g.perms == nil {
+		g.perms = make(map[string]permAnswer)
+	}
+	g.perms[key] = ans
+	return ans
 }
 
 // ErrNotAnIssue reports that a number names a pull request rather than an
@@ -226,7 +347,7 @@ func (g *GitHubClient) PullRequest(ctx context.Context, owner, repo string, numb
 	if pr == nil {
 		return PullRequest{}, fmt.Errorf("get pull request %s/%s#%d: empty response", owner, repo, number)
 	}
-	return convertPR(owner, repo, pr), nil
+	return g.convertPR(ctx, owner, repo, pr), nil
 }
 
 // ListOpenIssues returns every open issue in the repository.
@@ -269,7 +390,7 @@ func (g *GitHubClient) ListOpenPullRequests(ctx context.Context, owner, repo str
 			return nil, fmt.Errorf("list pull requests %s/%s: %w", owner, repo, err)
 		}
 		for _, pr := range page {
-			all = append(all, convertPR(owner, repo, pr))
+			all = append(all, g.convertPR(ctx, owner, repo, pr))
 		}
 		if resp.NextPage == 0 {
 			return all, nil
@@ -440,8 +561,10 @@ const maxReviewPages = 10
 //     comment written during the dispatch is older than it whoever wrote it.
 //
 //  2. An author whose AuthorAssociation is not OWNER, MEMBER, or COLLABORATOR
-//     is skipped -- the same three values convertPR requires before it will
-//     trust a pull request (see convertPR). A review comment can be written by
+//     is skipped -- the same three values convertPR accepts without a
+//     lookup (see insiderAssociation). Unlike convertPR, this filter has no
+//     app-mode permission fallback, so in app mode a reviewer whose org
+//     membership is private does not count. A review comment can be written by
 //     anyone with read access to the repository. Without this filter a
 //     stranger can spend the loop's budget at will, and can put chosen text
 //     in front of an agent that holds push rights on the branch.
@@ -525,7 +648,7 @@ func countsAsReviewActivity(self, author, assoc string) bool {
 	if strings.EqualFold(author, self) {
 		return false
 	}
-	return assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR"
+	return insiderAssociation(assoc)
 }
 
 // PostComment adds a comment to an issue. Task 10 is its only caller.

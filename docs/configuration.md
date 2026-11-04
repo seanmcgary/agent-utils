@@ -183,6 +183,36 @@ longer falls back to defaults.
   `<bot_user_id>+<slug>[bot]@users.noreply.github.com`.
 - `GITHUB_TOKEN` is not required. When both an app and `GITHUB_TOKEN` are configured, the app
   is used and `GITHUB_TOKEN` is ignored.
+- Which pull requests are trusted changes. See below.
+
+**Which pull requests are trusted in app mode.** Tending, and removing worktrees when a pull
+request closes, act only on a trusted pull request. With a personal token, that means its head
+branch lives in this repository and its author's `author_association` is `OWNER`, `MEMBER` or
+`COLLABORATOR`. GitHub computes `author_association` from what the token can see, so an
+installation token reads differently:
+
+| Pull request author | With a personal token | With the app's installation token |
+|---|---|---|
+| Org member whose membership is private | `MEMBER` | `CONTRIBUTOR` |
+| The app's own bot, `<slug>[bot]` | | `NONE` |
+| Another bot, such as `dependabot[bot]` | | `NONE` |
+
+So in app mode the author check also passes in two other cases:
+
+- The author is this app's own bot, matched on its login or its user id. Other bots, including
+  dependabot, stay untrusted. A pull request the agent opened as the app is therefore tended
+  and cleaned up.
+- The association is `CONTRIBUTOR` or `NONE` and
+  `GET /repos/{owner}/{repo}/collaborators/{login}/permission` reports `admin`, `maintain` or
+  `write`. A private org member with write access is trusted this way. Any other answer,
+  including a 404 or an error, leaves the pull request untrusted, and agent-utils logs the
+  pull request number and the reason. The answer is cached per author for one delivery or
+  one poll pass.
+
+The other conditions do not change: the head branch must live in this repository (no forks,
+whatever the author's permission) and both refs must be safe branch names. Review activity is
+still filtered on `author_association` alone, so in app mode a review from an org member whose
+membership is private does not trigger a tend. Making the membership public fixes both.
 
 **Token mechanics.** Installation tokens are minted for a single repository and kept in
 `~/.agent-utils/tokens/<app_id>/` (directory `0700`, files `0600`). A token is refreshed when fewer
@@ -1031,7 +1061,9 @@ should not have to rebuild to get there.
 Two limits apply, and neither is configurable:
 
 - The `Closes #M` link is honoured only for a **trusted** pull request — one whose head is in
-  this repository and whose author is an `OWNER`, `MEMBER`, or `COLLABORATOR`. An outside
+  this repository and whose author is an `OWNER`, `MEMBER`, or `COLLABORATOR` (in app mode, also
+  the app's own bot or an author with write access; see
+  [Running as a GitHub App](#running-as-a-github-app)). An outside
   contributor cannot name someone else's issue and have its work deleted. The `pr-<N>` worktree
   is removed either way, because that number comes from the delivery rather than from body text.
 - The live-dispatch guard protects work **in progress**, not uncommitted or unpushed work in an
@@ -1277,7 +1309,9 @@ Silence is the correct output.
 Three safeguards apply:
 
 - **Only a trusted pull request is ever linked.** Its head branch must live in the target
-  repository and its author must be an `OWNER`, `MEMBER`, or `COLLABORATOR`. A fork pull
+  repository and its author must be an `OWNER`, `MEMBER`, or `COLLABORATOR` (in app mode, also
+  the app's own bot or an author with write access; see
+  [Running as a GitHub App](#running-as-a-github-app)). A fork pull
   request claiming `Closes #7` cannot hijack the link, because tending checks the head branch
   out and rebases or runs an agent inside it.
 - **An issue with a live agent ANYWHERE IN THE PROJECT is never tended**, so a rebase cannot
@@ -1383,8 +1417,10 @@ crashed tend agent on its own, only the next qualifying trigger does.
 
 **Only a trusted reviewer's activity counts, and the loop's own comments never do.** A review or
 review comment counts only when its author's association with the repository is `OWNER`,
-`MEMBER`, or `COLLABORATOR` — the same bar a pull request itself must clear before tending
-trusts it at all. Activity written by this program's own GitHub account is excluded outright,
+`MEMBER`, or `COLLABORATOR` — the bar a pull request's author must clear in token mode. In app
+mode a pull request can also be trusted through the app's bot or a permission lookup, but review
+activity cannot: a reviewer whose org membership is private reads as `CONTRIBUTOR` to the app
+and does not count. Activity written by this program's own GitHub account is excluded outright,
 regardless of association: without that exclusion, a `tend.prompt` that has the agent post a
 reply would make its own comment newer than the dispatch that produced it, and every later pass
 would see pending review activity and dispatch again — an unattended loop billing itself to
