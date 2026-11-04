@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -432,6 +433,75 @@ func TestSpawnReturnsTheRealPidNotTheReleasedHandle(t *testing.T) {
 	}
 	if pid <= 0 {
 		t.Fatalf("Spawn returned pid %d; a spawned process always has a positive pid", pid)
+	}
+}
+
+// spawnEnv spawns a script that prints its environment in place of the
+// runner, and returns what it printed: the exact environment a real runner
+// would start with.
+//
+// A script rather than /usr/bin/env itself: env would read the runner's
+// "internal run-agent ..." arguments as a command to execute.
+func spawnEnv(t *testing.T) string {
+	t.Helper()
+	log := filepath.Join(t.TempDir(), "runner-9.log")
+	script := filepath.Join(t.TempDir(), "printenv.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nenv\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Spawn(script, 9, testProject, "/tmp/loop.yaml", log); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		b, _ := os.ReadFile(log)
+		if strings.Contains(string(b), "PATH=") {
+			return string(b)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the spawned runner printed no environment; log holds %q", b)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestSpawnCarriesTheActiveMetricsConfiguration is the propagation trap the
+// metrics feature has to get right: the runner is the process that records a
+// dispatch's outcome, and Spawn builds its environment from an allowlist. A
+// configuration that did not make the hop would lose every dispatch.finished
+// silently.
+func TestSpawnCarriesTheActiveMetricsConfiguration(t *testing.T) {
+	t.Cleanup(metrics.Shutdown)
+	if err := metrics.Configure(metrics.Config{
+		Addr: "127.0.0.1:8125", Prefix: "agent_utils", Tags: []string{"env:test"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GITHUB_TOKEN", "ghp_must_not_leak")
+
+	env := spawnEnv(t)
+	for _, want := range []string{
+		metrics.EnvAddr + "=127.0.0.1:8125",
+		metrics.EnvPrefix + "=agent_utils",
+		metrics.EnvTags + "=env:test",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("runner environment lacks %q:\n%s", want, env)
+		}
+	}
+	if strings.Contains(env, "ghp_must_not_leak") {
+		t.Error("the runner inherited GITHUB_TOKEN alongside the metrics configuration")
+	}
+}
+
+// TestSpawnCarriesNoMetricsConfigurationWhenDisabled is the other half: a
+// tick that was not configured must not start a runner that is, even when
+// the variable happens to sit in its environment unread.
+func TestSpawnCarriesNoMetricsConfigurationWhenDisabled(t *testing.T) {
+	metrics.Shutdown()
+	t.Setenv(metrics.EnvAddr, "127.0.0.1:8125")
+	if env := spawnEnv(t); strings.Contains(env, metrics.EnvAddr) {
+		t.Errorf("an unconfigured tick passed metrics configuration to its runner:\n%s", env)
 	}
 }
 

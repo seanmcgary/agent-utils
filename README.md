@@ -179,6 +179,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils listener run [--listen-addr <a>] [--listen-port <p>]` | Run the webhook listener in this terminal until Ctrl-C |
 | `agent-utils listener poll [interval]` | Run the loops from a GitHub poll instead of webhook deliveries, for a repository you cannot add a hook to |
 | `agent-utils listener install [--listen-addr <a>] [--listen-port <p>] \| uninstall \| status` | Register the listener as an OS service, remove that registration, or inspect it |
+| `agent-utils --statsd-addr <host:port> [--statsd-prefix <p>] [--statsd-tags <k:v,...>] <command>` | Global flags, accepted by every command: send DogStatsD metrics. Off unless an address is set. See [docs/configuration.md](docs/configuration.md#metrics) |
 
 ### Project
 
@@ -516,6 +517,13 @@ active — no configuration field enables them. See
 [Agent overrides from labels](docs/configuration.md#agent-overrides-from-labels) for the syntax,
 the rejection rules, and why an invalid label stops the issue instead of falling back to the
 configured value.
+
+**Metrics are optional and off by default.** Set `--statsd-addr` (or `AGENT_UTILS_STATSD_ADDR`) to
+a DogStatsD agent such as `127.0.0.1:8125` and agent-utils sends dispatch outcomes, cost, duration,
+retries, parks, tend and rebase counts, webhook counts and the GitHub rate-limit gauge over UDP.
+`--statsd-prefix` and `--statsd-tags` adjust the names and add global tags. `listener install`
+writes the configuration it runs with into the service definition. See
+[Metrics](docs/configuration.md#metrics) for the full list of metrics and tags.
 
 ## Migration
 

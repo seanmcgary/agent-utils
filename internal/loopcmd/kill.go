@@ -827,7 +827,22 @@ func productionKiller(cfg *config.Config, st *store.Store) killer {
 		// bias for a poll deciding whether to keep waiting.
 		waitGone: newWaitGone(proc.IsAlive),
 		reread:   st.GetDispatch,
-		finish:   st.FinishDispatch,
+		// The third place a dispatch leaves the running state, after the
+		// runner and the reap: a runner that did not survive to record its
+		// own outcome. It reports dispatch.finished for the same reason
+		// reapDead does -- started and finished must pair up -- but only if
+		// the operator's shell has metrics configured, since this runs in
+		// their `sessions kill`, not in the tick. No ProjectName: Kill
+		// resolves targets by id, and the tag is dropped rather than guessed.
+		finish: func(dispatchID int64, res store.DispatchResult) error {
+			if err := st.FinishDispatch(dispatchID, res); err != nil {
+				return err
+			}
+			if row, err := st.GetDispatch(dispatchID); err == nil {
+				emitFinished(cfg, Deps{}, row, 0)
+			}
+			return nil
+		},
 		killAgent: func(pid int) error {
 			return proc.SignalGroup(pid, syscall.SIGKILL)
 		},

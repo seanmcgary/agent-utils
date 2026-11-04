@@ -17,6 +17,7 @@ import (
 	"github.com/google/go-github/v77/github"
 	"github.com/seanmcgary/agent-utils/internal/epic"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 )
 
 // maxBodyBytes bounds a webhook delivery. GitHub's own limit is 25 MB;
@@ -273,6 +274,11 @@ func (l *throttledLog) forget(key string) {
 // The RESPONSE is never rate-limited, only the log line: a caller always gets
 // its status code, so nothing about a legitimate delivery changes.
 func (s *Server) rejected(w http.ResponseWriter, deliveryID, stage string, status int) {
+	// Counted on every rejection, unlike the log line below, which is
+	// throttled. The stage is a fixed label from this file, never request
+	// data, so it is safe as a tag; a spike in "signature verification
+	// failed" is the shape of a stale secret or of someone probing.
+	metrics.Default().Count(mWebhookRejected, 1, metrics.Tag("stage", stage))
 	if ok, suppressed := s.rejects.allow(stage); ok {
 		slog.Warn("rejected webhook delivery", "delivery", safeDeliveryID(deliveryID),
 			"stage", stage, "status", status, "suppressed_since_last", suppressed)
@@ -426,6 +432,13 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		// declared once in internal/ghub so register-webhook's subscription
 		// list and this check can never drift apart.
 		event := github.WebHookType(r)
+		// Counted here, after the HMAC and before anything else can drop the
+		// delivery, so every delivery GitHub actually signed is counted once
+		// -- including the events this daemon ignores and the workflow_run
+		// actions it answers without work. The event name is safe as a tag
+		// only because the payload has been authenticated; GitHub's own
+		// vocabulary is small and fixed.
+		metrics.Default().Count(mWebhookReceived, 1, metrics.Tag("event", event))
 		if !ghub.IsHookEvent(event) {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -674,6 +687,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 		if deliveryID == "" {
 			slog.Warn("delivery has no id, skipping dedup", "repo", repo)
 		} else if s.seen.has(deliveryID) {
+			metrics.Default().Count(mWebhookDeduped, 1, metrics.Tag("repo", repo))
 			slog.Info("duplicate delivery, skipping tick", "delivery", safeDeliveryID(deliveryID), "repo", repo)
 			w.WriteHeader(http.StatusOK)
 			return
@@ -699,6 +713,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			// answers 200, the same as any other duplicate.
 			if deliveryID != "" && s.seen.claim(deliveryID) {
 				<-s.sem
+				metrics.Default().Count(mWebhookDeduped, 1, metrics.Tag("repo", repo))
 				slog.Info("duplicate delivery, skipping tick",
 					"delivery", safeDeliveryID(deliveryID), "repo", repo)
 				w.WriteHeader(http.StatusOK)
@@ -805,6 +820,7 @@ func (s *Server) handleWebhook(ctx context.Context) http.HandlerFunc {
 			if closedPR {
 				dropped = append(dropped, "closed_pr", true)
 			}
+			metrics.Default().Count(mWebhookDropped, 1, metrics.Tag("repo", repo))
 			slog.Warn("dropping delivery: worker pool full", dropped...)
 		}
 		w.WriteHeader(http.StatusAccepted)

@@ -12,6 +12,7 @@ import (
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
 	"github.com/seanmcgary/agent-utils/internal/loopcmd"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/proc"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
@@ -584,6 +585,7 @@ func (w *Worker) Deliver(ctx context.Context, d Delivery) {
 		return
 	}
 	if len(targets) == 0 {
+		metrics.Default().Count(mWebhookUnrouted, 1, metrics.Tag("repo", d.Repo))
 		slog.Info("no loop watches this repository", "repo", d.Repo)
 		return
 	}

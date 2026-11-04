@@ -271,6 +271,7 @@ absolute path** — it depends on no working directory and can never prompt.
 - [Prompts](#prompts)
 - [Template variables](#template-variables)
 - [Validation rules](#validation-rules)
+- [Metrics](#metrics)
 
 ## Quick reference
 
@@ -1684,3 +1685,120 @@ is reported as `INVALID` with its error rather than being skipped.
 repository's open issues, so it needs `GITHUB_TOKEN` (see [The machine-wide
 directory](#the-machine-wide-directory), or `agent-utils config token`) or a GitHub App (see [Running as a GitHub App](#running-as-a-github-app)) and network access. A config error names
 the offending field, so it is easy to tell from an authentication error.
+
+## Metrics
+
+agent-utils can send DogStatsD metrics over UDP to a local agent (the Datadog agent, or anything
+that speaks the DogStatsD line format). **Metrics are off unless you configure an address.** With
+no address nothing is sent and nothing is opened.
+
+These are machine-level settings, not loop settings: they are global command-line flags, each with
+an environment variable that sets it, and no loop file or `config.yaml` key carries them.
+
+| Flag | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `--statsd-addr` | `AGENT_UTILS_STATSD_ADDR` | empty (off) | `host:port` of the DogStatsD agent, e.g. `127.0.0.1:8125` |
+| `--statsd-prefix` | `AGENT_UTILS_STATSD_PREFIX` | `agent_utils` | prepended to every metric name with a dot |
+| `--statsd-tags` | `AGENT_UTILS_STATSD_TAGS` | none | comma-separated tags added to every metric, e.g. `env:prod,host:mini` |
+
+The flags go anywhere on the command line: `agent-utils --statsd-addr 127.0.0.1:8125 listener run`
+and `agent-utils listener run --statsd-addr 127.0.0.1:8125` are the same. A flag wins over its
+environment variable. A prefix or tag may hold only letters, digits and `_ . : / -`; anything else,
+or an address without a port, fails the command rather than silently sending nothing. An address
+whose host does not resolve is logged as a warning and the process runs with metrics off.
+
+Sending never blocks and never fails a command. Each metric is one UDP datagram, written once; a
+write error (usually "nothing is listening") is logged at debug level and dropped.
+
+### Where the configuration has to reach
+
+- **Cron.** Export `AGENT_UTILS_STATSD_ADDR` (and any tags) in the crontab line or the env file the
+  line sources, or pass `--statsd-addr` on the `project loop tick` command.
+- **The detached runner.** Every dispatch runs in a runner process the tick starts, and that runner
+  is what records the outcome, cost and duration. Its environment is built from an allowlist, so the
+  tick writes its own active metrics configuration into the runner's environment explicitly. You do
+  not need to do anything; this is noted so a missing `dispatch.finished` is not blamed on it.
+- **The installed listener.** `agent-utils listener install` writes whatever metrics configuration
+  the install command itself is running with into the service definition, as `--statsd-*`
+  arguments after `listener run` — the same way it records `--listen-addr` and `--listen-port`. So:
+
+  ```bash
+  AGENT_UTILS_STATSD_ADDR=127.0.0.1:8125 AGENT_UTILS_STATSD_TAGS=host:mini agent-utils listener install
+  ```
+
+  A service started at login inherits none of your shell, so a variable you export later does not
+  reach an already-installed listener. To change or remove the settings, run `listener install`
+  again with the configuration you want (or with none, to turn metrics off). Editing the launchd
+  plist or systemd unit by hand also works — add the flags to `ProgramArguments` or `ExecStart` —
+  but the next `listener install` rewrites the file.
+
+### Tags
+
+Most metrics carry some of these:
+
+| Tag | Value |
+|---|---|
+| `project` | the project's registered name (omitted when it cannot be resolved) |
+| `repo` | `owner/name` |
+| `loop` | the loop's name, or `tend` for the tend dispatcher |
+| `kind` | `fresh`, `resume` or `tend` |
+| `harness` | `claude` or `pi`, after any `harness:` label |
+| `model` | the model the agent ran, after any `model:` label; omitted when none is configured |
+| `effort` | the effort level, after any `effort:` label; omitted when none is set |
+
+No metric is tagged with an issue or pull request number. Each would be a new time series for as
+long as the agent keeps it; the JSON logs carry the numbers.
+
+### Metric list
+
+Names are shown without the prefix. Types: `count`, `gauge`, `distribution`.
+
+**Dispatch**
+
+| Metric | Type | Extra tags | Emitted when |
+|---|---|---|---|
+| `dispatch.started` | count | run tags | the tick spawned a runner for a dispatch |
+| `dispatch.finished` | count | run tags, `status` (`succeeded`/`failed`), `exit_code` (`zero`/`nonzero`/`none`) | a dispatch left the running state: recorded by its runner, by a later tick that found the runner dead, or by `sessions kill` or `loop reset` retiring a runner that could not record its own. Every `started` gets exactly one `finished`, as long as the process that retires it (for `sessions kill` and `loop reset`, your shell) has metrics configured |
+| `dispatch.cost_usd` | distribution | run tags | with every `finished`; the cost the harness reported (0 when it reported none) |
+| `dispatch.duration_ms` | distribution | run tags | with a `finished` the runner recorded: the runner's wall-clock time. Not sent for a runner found dead |
+| `dispatch.api_error` | count | run tags, `error_class` | a failed dispatch recorded an error. Classes: `runner_died`, `operator` (killed or reset by an operator), `session_in_use`, `session_missing`, `background_abandoned`, `harness_start`, `rate_limit`, `billing`, `auth`, `overloaded`, `timeout`, `server`, `other` |
+| `dispatch.concurrent` | gauge | `project`, `repo`, `loop` | each full sweep of a loop, and each tend pass: how many of that loop's (or the tend dispatcher's) runners are alive |
+| `dispatch.spawn_failed` | count | run tags | the runner process could not be started; no `started` is sent |
+
+**Reliability**
+
+| Metric | Type | Extra tags | Emitted when |
+|---|---|---|---|
+| `dispatch.retry` | count | run tags | a retry was dispatched (also counted in `dispatch.started`) |
+| `retry_cap.reached` | count | `project`, `repo`, `loop` | an issue exhausted `retry.max` and was parked; once per park |
+| `park` | count | `project`, `repo`, `loop`, `reason` | the program itself parked an issue. The only reason today is `retry_cap` |
+| `breaker.tripped` | count | `project`, `repo`, `loop` | the circuit breaker tripped and the pass dispatched nothing |
+| `resume.failed` | count | run tags, `error_class` | a resume dispatch finished failed (the same events as `dispatch.finished{kind:resume,status:failed}`, named for alerting) |
+| `worktree.setup_failed` | count | run tags | the worktree for a dispatch could not be created; no `started` is sent |
+| `rebase.conflict` | count | `project`, `repo`, `loop` | the automatic rebase did not replay cleanly, before the conflict backoff decides anything |
+
+**Tend**
+
+| Metric | Type | Extra tags | Emitted when |
+|---|---|---|---|
+| `tend.dispatch` | count | run tags, `trigger` (`behind`/`review`/`behind_review`) | a tend agent was dispatched |
+| `rebase.agent_free` | count | `project`, `repo`, `loop` | git rebased and pushed a pull request with no agent |
+| `rebase.agent` | count | `project`, `repo`, `loop` | a tend agent was sent at a branch that was still behind its base |
+| `pr.behind_by` | distribution | `project`, `repo`, `loop` | per tend decision: commits the pull request lacked from its base (0 for a review-only tend) |
+
+**Listener and infrastructure**
+
+| Metric | Type | Extra tags | Emitted when |
+|---|---|---|---|
+| `webhook.received` | count | `event` | a delivery passed signature verification, whether or not it leads to work |
+| `webhook.rejected` | count | `stage` | a delivery was refused (bad method, signature, content type, payload) |
+| `webhook.deduped` | count | `repo` | a redelivery of an id already handled was answered without work |
+| `webhook.dropped` | count | `repo` | the worker pool was full and the delivery was dropped |
+| `webhook.unrouted` | count | `repo` | a delivery (from a webhook or a poll) named a repository no loop watches |
+| `poll.pass.duration_ms` | distribution | none | one `listener poll` pass over every routed repository |
+| `tick.duration_ms` | distribution | `project`, `repo`, `loop`, `pass` (`sweep`/`issue`/`tend_sweep`/`tend_issue`/`tend_base`) | one decision pass |
+| `github.rate_limit.remaining` | gauge | `resource` (`core`, `search`, `graphql`, …) | every GitHub API response that carries rate-limit headers |
+
+There is no `dispatch.queue_wait_ms`. The time from a trigger label being applied to the agent
+starting would need the label event's timestamp, which this program does not read; the time from
+the dispatch row to the runner starting is a process spawn and says nothing useful.

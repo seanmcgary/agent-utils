@@ -6,11 +6,13 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	"github.com/seanmcgary/agent-utils/internal/config"
 	"github.com/seanmcgary/agent-utils/internal/engine"
 	"github.com/seanmcgary/agent-utils/internal/ghub"
 	"github.com/seanmcgary/agent-utils/internal/lock"
+	"github.com/seanmcgary/agent-utils/internal/metrics"
 	"github.com/seanmcgary/agent-utils/internal/store"
 )
 
@@ -47,6 +49,7 @@ func TickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 }
 
 func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (Summary, error) {
+	defer timeTick(cfg, deps, passIssue, time.Now())
 	var sum Summary
 	now := deps.Now()
 
@@ -149,6 +152,7 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	// still runs it under cron.
 
 	if plan.BreakerTripped {
+		metrics.Default().Count(mBreakerTripped, 1, loopTags(cfg, deps)...)
 		if err := deps.Store.SetCooldown(cfg.Name, plan.CooldownUntil); err != nil {
 			return sum, err
 		}
