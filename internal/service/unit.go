@@ -175,6 +175,13 @@ func renderUnit(u systemdUnit) ([]byte, error) {
 	// limit trips and stops restarting it altogether.
 	b.WriteString("Restart=always\n")
 	b.WriteString("RestartSec=" + strconv.Itoa(u.RestartSec) + "\n")
+	// KillMode=process: stopping or restarting the unit signals only the
+	// listener itself. The default, control-group, signals every process in
+	// the service's cgroup, and the runners and agents the listener
+	// dispatches stay in that cgroup even though each agent has its own
+	// process group. Under the default, `systemctl restart` SIGTERMs every
+	// running agent. launchd leaves them alone, and so must this unit.
+	b.WriteString("KillMode=process\n")
 	// No StandardOutput and no StandardError: the default sink is journald,
 	// which is where `journalctl -u agent-utils-listener` reads from. The
 	// launchd plist writes two files under ~/.agent-utils instead, because

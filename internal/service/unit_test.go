@@ -40,6 +40,7 @@ func TestRenderUnitProducesEveryRequiredDirective(t *testing.T) {
 		`Environment="HOME=/home/sean"`,
 		"Restart=always",
 		"RestartSec=5",
+		"KillMode=process",
 		"[Install]",
 		"WantedBy=multi-user.target",
 	}
@@ -62,6 +63,22 @@ func TestRenderUnitOmitsAnyLogSinkDirective(t *testing.T) {
 		if strings.Contains(string(doc), bad) {
 			t.Errorf("unit sets %s, but the design sends output to journald:\n%s", bad, doc)
 		}
+	}
+}
+
+// TestRenderUnitKillsOnlyTheListener pins KillMode=process. Without it
+// systemd defaults to control-group, and a `systemctl restart` of the
+// listener SIGTERMs every agent it dispatched, since they share its cgroup.
+func TestRenderUnitKillsOnlyTheListener(t *testing.T) {
+	doc, err := renderUnit(sampleUnit())
+	if err != nil {
+		t.Fatalf("renderUnit: %v", err)
+	}
+	if n := strings.Count(string(doc), "KillMode="); n != 1 {
+		t.Fatalf("unit has %d KillMode lines, want exactly 1:\n%s", n, doc)
+	}
+	if !strings.Contains(string(doc), "\nKillMode=process\n") {
+		t.Errorf("unit does not set KillMode=process:\n%s", doc)
 	}
 }
 
