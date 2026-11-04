@@ -976,7 +976,9 @@ Two details worth knowing:
   commit are left for the retrying agent to resolve.
 
 An agent still running when the listener stops is **not** an orphan: agents are detached, so a
-graceful stop leaves them working and the sweep correctly ignores them.
+graceful stop leaves them working and the sweep correctly ignores them. That holds for both
+service managers. The systemd unit sets `KillMode=process`, so `systemctl stop` or `systemctl
+restart` signals only the listener and not the agents it dispatched, which share its cgroup.
 
 `agent-utils listener install` registers the listener as an OS service — a launchd agent on
 macOS, a systemd unit on Linux — instead of running it in your terminal. Both are configured to
@@ -1009,6 +1011,10 @@ journalctl -u agent-utils-listener -f     # follow it
 systemctl status agent-utils-listener     # is it running
 agent-utils listener uninstall            # stop it and remove the unit -- this also sudo-prompts
 ```
+
+`listener uninstall` stops the listener but leaves running agents alone: they finish their
+current run and record their outcome as usual. Nothing dispatches new work until a listener runs
+again.
 
 `journalctl` needs no root of its own, but it does need your account in the `systemd-journal` or
 `adm` group; if it is in neither, that command silently prints nothing rather than failing loudly,
@@ -1250,6 +1256,12 @@ label, and follows blockers across repositories. The full rules are under
 [`wait_for_checks`](docs/configuration.md#wait_for_checks).
 
 ## Upgrading
+
+**On Linux, re-run `agent-utils listener install` to stop restarts from killing agents.** Units
+written by earlier releases had no `KillMode`, so systemd's default `control-group` applied and
+every `systemctl restart agent-utils-listener` SIGTERMed the running agents (they exited 143).
+The unit now sets `KillMode=process`. A unit already in `/etc/systemd/system` keeps the old
+behaviour until `listener install` rewrites it.
 
 **`retry.backoff_ticks` was renamed to `retry.backoff`, and its values are now durations, not
 tick counts.** A tick was a fixed interval only under cron; the webhook listener can tick a
