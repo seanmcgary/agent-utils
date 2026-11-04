@@ -49,11 +49,14 @@ const httpTimeout = 30 * time.Second
 // repository.
 var ErrNotInstalled = errors.New("the GitHub App is not installed on this repository")
 
-// Identity is a git author identity, and for the bot, its GitHub login.
+// Identity is a git author identity, and for the bot, its GitHub login and
+// user id. ID is zero when only the slug was fetched (Slug, or Bot with no
+// repository).
 type Identity struct {
 	Login string
 	Name  string
 	Email string
+	ID    int64
 }
 
 // App is one GitHub App's credentials and token cache.
@@ -336,6 +339,7 @@ func (a *App) botCache(ctx context.Context, repo string) (Identity, error) {
 		Login: login,
 		Name:  login,
 		Email: fmt.Sprintf("%d+%s@users.noreply.github.com", b.UserID, login),
+		ID:    b.UserID,
 	}, nil
 }
 
