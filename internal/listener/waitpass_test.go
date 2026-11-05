@@ -42,6 +42,9 @@ func (f *waitGH) askedRepos() []string {
 func (*waitGH) BlockedBy(context.Context, string, string, int) ([]ghub.Issue, error) {
 	return nil, nil
 }
+func (*waitGH) BlockedByTotal(context.Context, string, string, int) (int, error) {
+	return 0, nil
+}
 func (*waitGH) ListOpenIssuesLabeled(context.Context, string, string, string) ([]ghub.Issue, error) {
 	return nil, nil
 }

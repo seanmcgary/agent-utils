@@ -45,6 +45,11 @@ type fakeWait struct {
 	issues map[string]ghub.Issue
 	// blockedBy maps a waiting issue (in o/r) to its blockers.
 	blockedBy map[int][]ghub.Issue
+	// hidden maps a waiting issue to how many MORE blockers GitHub counts
+	// than blocked_by returns: blockers in a repository the token cannot see.
+	hidden map[int]int
+	// totalErr, when set, fails every BlockedByTotal.
+	totalErr error
 	// blocking maps "owner/name#n" to the issues it blocks.
 	blocking map[string][]ghub.Issue
 	// closing maps "owner/name#n" to its closing pull requests.
@@ -74,6 +79,7 @@ func newFakeWait() *fakeWait {
 	return &fakeWait{
 		issues:    map[string]ghub.Issue{},
 		blockedBy: map[int][]ghub.Issue{},
+		hidden:    map[int]int{},
 		blocking:  map[string][]ghub.Issue{},
 		closing:   map[string][]ghub.ClosingPR{},
 		compare:   map[string]string{},
@@ -98,6 +104,16 @@ func (f *fakeWait) BlockedBy(_ context.Context, owner, repo string, n int) ([]gh
 		return nil, fmt.Errorf("blocked_by asked of %s/%s; the pass reads blockers of its own issues only", owner, repo)
 	}
 	return f.blockedBy[n], nil
+}
+
+func (f *fakeWait) BlockedByTotal(_ context.Context, owner, repo string, n int) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads++
+	if f.totalErr != nil {
+		return 0, f.totalErr
+	}
+	return len(f.blockedBy[n]) + f.hidden[n], nil
 }
 
 func (f *fakeWait) Issue(_ context.Context, owner, repo string, n int) (ghub.Issue, error) {
@@ -362,6 +378,59 @@ func TestWaitHoldsAnIssueWithNoBlocker(t *testing.T) {
 	}
 	if len(f.writes) != 0 {
 		t.Fatalf("writes = %+v, want none for an issue with no blocker", f.writes)
+	}
+}
+
+// exchange-infra#1014: the blocker lives in a repository the token cannot see,
+// so blocked_by returns nothing while GitHub still counts one blocker. The
+// issue stays waiting, and the log says the blocker is hidden rather than
+// that the issue declares none.
+func TestWaitHoldsAndWarnsWhenABlockerIsHiddenFromTheToken(t *testing.T) {
+	logs := captureTickLogs(t)
+	cfg, deps, f := waitFixture(t, "mirror.yml")
+	f.hidden[945] = 1
+	if _, err := WaitSweep(context.Background(), cfg, deps, []int{945}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.writes) != 0 {
+		t.Fatalf("writes = %+v, want none while a blocker is hidden", f.writes)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "blocker this token cannot see") ||
+		!strings.Contains(out, "total_blocked_by=1") || !strings.Contains(out, "visible_blockers=0") {
+		t.Errorf("logs = %s, want a WARN naming the hidden blocker", out)
+	}
+	if strings.Contains(out, "declares no blocker") {
+		t.Errorf("logs = %s; a hidden blocker must not be reported as no blocker", out)
+	}
+}
+
+// One visible blocker done, one hidden: releasing on the visible one alone
+// would start work the hidden one may still be holding back.
+func TestWaitHoldsWhenOnlySomeBlockersAreVisible(t *testing.T) {
+	cfg, deps, f := waitFixture(t)
+	f.blockedBy[945] = []ghub.Issue{closedCompleted(blockerRepo, 697)}
+	f.hidden[945] = 1
+	if _, err := WaitSweep(context.Background(), cfg, deps, []int{945}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.writes) != 0 {
+		t.Fatalf("writes = %+v, want none while a blocker is hidden", f.writes)
+	}
+}
+
+// The count is a cross-check. When it cannot be read the pass decides from
+// the visible blockers, as it did before the count existed.
+func TestWaitReleasesWhenTheBlockerCountIsUnreadable(t *testing.T) {
+	cfg, deps, f := waitFixture(t)
+	f.blockedBy[945] = []ghub.Issue{closedCompleted(blockerRepo, 697)}
+	f.totalErr = errors.New("graphql: field issueDependenciesSummary not found")
+	sum, err := WaitSweep(context.Background(), cfg, deps, []int{945})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Released != 1 || !f.released(cfg, 945) {
+		t.Fatalf("released = %d, writes = %+v; want #945 released", sum.Released, f.writes)
 	}
 }
 

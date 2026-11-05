@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,6 +32,7 @@ type fakeGitHub struct {
 	expiry    time.Duration
 	mu        sync.Mutex
 	scopes    [][]string // repositories requested per mint
+	bodies    []string   // raw body of each mint request
 	redirect  string     // target of GET /repos/{owner}/{name}/redirect
 	noUserID  bool       // GET /users/{login} answers {}
 }
@@ -74,7 +76,7 @@ func (f *fakeGitHub) verifyJWT(r *http.Request) (map[string]any, bool) {
 }
 
 func newFakeGitHub(t *testing.T, pub *rsa.PublicKey) *fakeGitHub {
-	f := &fakeGitHub{pub: pub, installed: map[string]int64{"acme/widgets": 42}, expiry: time.Hour}
+	f := &fakeGitHub{pub: pub, installed: map[string]int64{"acme/widgets": 42, "acme/gadgets": 42, "other/thing": 43}, expiry: time.Hour}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{name}/installation", func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := f.verifyJWT(r); !ok {
@@ -82,6 +84,8 @@ func newFakeGitHub(t *testing.T, pub *rsa.PublicKey) *fakeGitHub {
 			return
 		}
 		f.lookups.Add(1)
+		f.mu.Lock()
+		defer f.mu.Unlock()
 		id, ok := f.installed[r.PathValue("owner")+"/"+r.PathValue("name")]
 		if !ok {
 			http.Error(w, `{"message":"Not Found"}`, 404)
@@ -94,10 +98,12 @@ func newFakeGitHub(t *testing.T, pub *rsa.PublicKey) *fakeGitHub {
 			http.Error(w, "bad jwt", http.StatusUnauthorized)
 			return
 		}
+		raw, _ := io.ReadAll(r.Body)
 		var body struct{ Repositories []string }
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.Unmarshal(raw, &body)
 		f.mu.Lock()
 		f.scopes = append(f.scopes, body.Repositories)
+		f.bodies = append(f.bodies, string(raw))
 		f.mu.Unlock()
 		n := f.mints.Add(1)
 		// A real mint takes a round trip; widen the race window the lock closes.

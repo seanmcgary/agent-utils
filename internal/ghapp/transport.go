@@ -27,8 +27,9 @@ type transport struct {
 	api  *url.URL // BaseURL, parsed once; nil if it did not parse
 }
 
-// RoundTrip authenticates req with an installation token for the repository
-// it addresses. A request that addresses none and carries no WithRepo hint is
+// RoundTrip authenticates req with the token of the installation covering the
+// repository it addresses. The token is installation-wide, but the repository
+// is still needed to find the installation. A request that addresses none and carries no WithRepo hint is
 // refused rather than sent unauthenticated: an anonymous call would succeed
 // against public data and fail confusingly, at a 60-an-hour rate limit, on
 // anything else.
@@ -61,7 +62,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // Client returns an HTTP client that authenticates every request as the app's
-// installation on the repository the request addresses.
+// installation covering the repository the request addresses.
 func (a *App) Client() *http.Client {
 	base := http.DefaultTransport
 	if a.HTTP != nil && a.HTTP.Transport != nil {

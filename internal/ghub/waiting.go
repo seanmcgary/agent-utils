@@ -2,6 +2,7 @@ package ghub
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -34,6 +35,10 @@ type WaitReader interface {
 	// reverse of BlockedBy. The answer may cross repositories.
 	Blocking(ctx context.Context, owner, repo string, number int) ([]Issue, error)
 	BlockedBy(ctx context.Context, owner, repo string, number int) ([]Issue, error)
+	// BlockedByTotal returns how many blockers GitHub counts for number,
+	// including ones in repositories the token cannot see, which BlockedBy
+	// leaves out.
+	BlockedByTotal(ctx context.Context, owner, repo string, number int) (int, error)
 	Issue(ctx context.Context, owner, repo string, number int) (Issue, error)
 	// ListOpenIssuesLabeled returns every open issue carrying label.
 	ListOpenIssuesLabeled(ctx context.Context, owner, repo, label string) ([]Issue, error)
@@ -256,70 +261,42 @@ const closingPRsQuery = `query($owner: String!, $name: String!, $number: Int!, $
 
 // ClosingPullRequests returns the pull requests that close number.
 //
-// This is the one GraphQL call in the program: REST has no endpoint that names
-// the pull request that closed an issue. It is built by hand on the REST
-// client's transport so it carries the same authentication -- including a
-// GitHub App's per-repository installation token, which needs the repository
-// named on the context because a GraphQL path names none (ghapp.WithRepo).
+// It is GraphQL because REST has no endpoint that names the pull request that
+// closed an issue; see graphQL for how it is authenticated.
 func (g *GitHubClient) ClosingPullRequests(ctx context.Context, owner, repo string, number int) ([]ClosingPR, error) {
 	what := fmt.Sprintf("closing pull requests of %s/%s#%d", owner, repo, number)
-	body := map[string]any{
-		"query": closingPRsQuery,
-		"variables": map[string]any{
-			"owner": owner, "name": repo, "number": number, "first": maxClosingPRs,
-		},
+	var data struct {
+		Repository *struct {
+			Issue *struct {
+				Refs struct {
+					PageInfo struct {
+						HasNextPage bool `json:"hasNextPage"`
+					} `json:"pageInfo"`
+					Nodes []struct {
+						Number      int  `json:"number"`
+						Merged      bool `json:"merged"`
+						MergeCommit *struct {
+							OID string `json:"oid"`
+						} `json:"mergeCommit"`
+						Repository struct {
+							NameWithOwner string `json:"nameWithOwner"`
+						} `json:"repository"`
+					} `json:"nodes"`
+				} `json:"closedByPullRequestsReferences"`
+			} `json:"issue"`
+		} `json:"repository"`
 	}
-	req, err := g.c.NewRequest("POST", graphQLURL(g.c.BaseURL), body)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", what, err)
+	// A failed query is an error, never "no closing pull requests": that would
+	// read as "a human closed it" and promote without waiting for any check.
+	if err := g.graphQL(ctx, owner, repo, what, closingPRsQuery, map[string]any{
+		"owner": owner, "name": repo, "number": number, "first": maxClosingPRs,
+	}, &data); err != nil {
+		return nil, err
 	}
-	// On the context passed to Do, not on req: Do replaces the request's
-	// context with the one it is given, so a value set on req alone is lost.
-	ctx = ghapp.WithRepo(ctx, owner+"/"+repo)
-
-	var out struct {
-		Data struct {
-			Repository *struct {
-				Issue *struct {
-					Refs struct {
-						PageInfo struct {
-							HasNextPage bool `json:"hasNextPage"`
-						} `json:"pageInfo"`
-						Nodes []struct {
-							Number      int  `json:"number"`
-							Merged      bool `json:"merged"`
-							MergeCommit *struct {
-								OID string `json:"oid"`
-							} `json:"mergeCommit"`
-							Repository struct {
-								NameWithOwner string `json:"nameWithOwner"`
-							} `json:"repository"`
-						} `json:"nodes"`
-					} `json:"closedByPullRequestsReferences"`
-				} `json:"issue"`
-			} `json:"repository"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if _, err := g.c.Do(ctx, req, &out); err != nil {
-		return nil, fmt.Errorf("%s: %w", what, err)
-	}
-	// GraphQL answers 200 with an errors array for a failed query. Treating
-	// that as "no closing pull requests" would read as "a human closed it" and
-	// promote without waiting for any check, so it is an error.
-	if len(out.Errors) > 0 {
-		msgs := make([]string, 0, len(out.Errors))
-		for _, e := range out.Errors {
-			msgs = append(msgs, e.Message)
-		}
-		return nil, fmt.Errorf("%s: %s", what, strings.Join(msgs, "; "))
-	}
-	if out.Data.Repository == nil || out.Data.Repository.Issue == nil {
+	if data.Repository == nil || data.Repository.Issue == nil {
 		return nil, fmt.Errorf("%s: the response named no such issue", what)
 	}
-	refs := out.Data.Repository.Issue.Refs
+	refs := data.Repository.Issue.Refs
 	if refs.PageInfo.HasNextPage {
 		// A partial list could omit the merged pull request and read as "no
 		// merged pull request", which promotes without checks. Refuse it.
@@ -334,6 +311,84 @@ func (g *GitHubClient) ClosingPullRequests(ctx context.Context, owner, repo stri
 		prs = append(prs, pr)
 	}
 	return prs, nil
+}
+
+// blockedByTotalQuery reads how many blockers GitHub counts for an issue. The
+// count includes blockers the token cannot see, which blocked_by omits.
+const blockedByTotalQuery = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      issueDependenciesSummary { totalBlockedBy }
+    }
+  }
+}`
+
+// BlockedByTotal returns how many blockers GitHub records for number,
+// including any in a repository this token cannot read. BlockedBy returns only
+// the visible ones, so a larger total here means a blocker is hidden from the
+// token rather than missing.
+func (g *GitHubClient) BlockedByTotal(ctx context.Context, owner, repo string, number int) (int, error) {
+	what := fmt.Sprintf("blocker count of %s/%s#%d", owner, repo, number)
+	var data struct {
+		Repository *struct {
+			Issue *struct {
+				Summary struct {
+					TotalBlockedBy int `json:"totalBlockedBy"`
+				} `json:"issueDependenciesSummary"`
+			} `json:"issue"`
+		} `json:"repository"`
+	}
+	if err := g.graphQL(ctx, owner, repo, what, blockedByTotalQuery, map[string]any{
+		"owner": owner, "name": repo, "number": number,
+	}, &data); err != nil {
+		return 0, err
+	}
+	if data.Repository == nil || data.Repository.Issue == nil {
+		return 0, fmt.Errorf("%s: the response named no such issue", what)
+	}
+	return data.Repository.Issue.Summary.TotalBlockedBy, nil
+}
+
+// graphQL runs one query against owner/repo and decodes its data into out.
+//
+// It is built by hand on the REST client's transport so it carries the same
+// authentication. A GitHub App's transport finds its installation from the
+// repository, and a GraphQL path names none, so the repository goes on the
+// context (ghapp.WithRepo). GraphQL answers 200 with an errors array for a
+// failed query; that is returned as an error.
+func (g *GitHubClient) graphQL(ctx context.Context, owner, repo, what, query string, vars map[string]any, out any) error {
+	req, err := g.c.NewRequest("POST", graphQLURL(g.c.BaseURL), map[string]any{
+		"query": query, "variables": vars,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	// On the context passed to Do, not on req: Do replaces the request's
+	// context with the one it is given, so a value set on req alone is lost.
+	ctx = ghapp.WithRepo(ctx, owner+"/"+repo)
+	var resp struct {
+		Data   json.RawMessage `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if _, err := g.c.Do(ctx, req, &resp); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if len(resp.Errors) > 0 {
+		msgs := make([]string, 0, len(resp.Errors))
+		for _, e := range resp.Errors {
+			msgs = append(msgs, e.Message)
+		}
+		return fmt.Errorf("%s: %s", what, strings.Join(msgs, "; "))
+	}
+	if len(resp.Data) == 0 || string(resp.Data) == "null" {
+		return fmt.Errorf("%s: the response carried no data", what)
+	}
+	if err := json.Unmarshal(resp.Data, out); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return nil
 }
 
 // graphQLURL returns the GraphQL endpoint for a REST base URL.

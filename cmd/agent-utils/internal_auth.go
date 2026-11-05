@@ -15,11 +15,11 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
-// dispatchRepo is the repository the helpers serve. It comes from the
-// dispatch's environment and never from a flag, so the shim and the
-// credential helper cannot be pointed at another repository the app is
-// installed on by an argument the agent writes. This is a speed bump, not a
-// boundary: see the Security section of the README.
+// dispatchRepo is the repository whose installation the helpers serve. It
+// comes from the dispatch's environment and never from a flag. It selects the
+// installation only: the token covers every repository that installation
+// covers, so the installation's repository selection is the boundary on what
+// the agent can reach. See the Security section of the README.
 func dispatchRepo() (string, error) {
 	r := strings.TrimSpace(os.Getenv(identity.RepoEnv))
 	if r == "" {
@@ -50,7 +50,7 @@ func appToken(ctx context.Context) (string, error) {
 func ghTokenCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "gh-token",
-		Usage: "print an installation token for the dispatch's repository",
+		Usage: "print an installation token for the installation covering the dispatch's repository",
 		Action: func(ctx context.Context, c *cli.Command) error {
 			tok, err := appToken(ctx)
 			if err != nil {

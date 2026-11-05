@@ -24,7 +24,7 @@ const maxReleasePerPass = 25
 // maxBlockerReadsPerSweep does for the epic sweep, and for its reason: the
 // steady state -- every waiting issue still waiting -- spends no write budget,
 // so only a read budget bounds it. A waiting issue costs roughly one
-// blocked_by read, plus, under wait_for_checks, a closing-pull-request read
+// blocked_by read and one blocker-count read, plus, under wait_for_checks, a closing-pull-request read
 // and two or three run reads per blocker; 300 covers dozens of waiting issues
 // and stays far inside the 5000/hour token every loop on the machine shares.
 const maxWaitReadsPerPass = 300
@@ -286,6 +286,34 @@ func (p *waitPass) consider(ctx context.Context, iss ghub.Issue, blockerRepo str
 		// reading releases an issue whose blockers may be open.
 		slog.Warn("waiting pass cannot read blockers; holding this issue",
 			"loop", cfg.Name, "repo", cfg.Repo, "issue", iss.Number, "err", err)
+		return
+	}
+	// blocked_by lists only the blockers this token can read; GitHub's count
+	// includes the rest. A hidden blocker is NOT a missing one, and an issue
+	// with one must not be released on its visible blockers alone, nor
+	// reported as declaring none: that would make a token-scope problem look
+	// like a missing dependency link. Checked before the blockerRepo filter,
+	// so the delivery that should have released the issue is the one that
+	// says why it cannot.
+	if err := p.spend(); err != nil {
+		slog.Warn("waiting pass hit its read cap; holding this issue",
+			"loop", cfg.Name, "repo", cfg.Repo, "issue", iss.Number)
+		return
+	}
+	total, err := p.r.BlockedByTotal(ctx, owner, repo, iss.Number)
+	switch {
+	case err != nil:
+		// Not held: the count is a cross-check on blocked_by, and an
+		// unreadable count must not stop every release. The pass decides from
+		// the visible blockers, as it did before the count existed.
+		slog.Warn("waiting pass cannot read the blocker count; deciding from the visible blockers",
+			"loop", cfg.Name, "repo", cfg.Repo, "issue", iss.Number, "err", err)
+	case total > len(blockers):
+		slog.Warn("waiting issue has a blocker this token cannot see; leaving it waiting. "+
+			"The blocker's repository is likely outside the GitHub App installation's repository "+
+			"selection, or github_app.token_scope is \"repo\"",
+			"loop", cfg.Name, "repo", cfg.Repo, "issue", iss.Number,
+			"total_blocked_by", total, "visible_blockers", len(blockers))
 		return
 	}
 	if blockerRepo != "" && !anyInRepo(blockers, blockerRepo) {
