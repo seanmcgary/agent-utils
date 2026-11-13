@@ -96,6 +96,9 @@ prompt: |
 
   YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
   {{.Labels.InFlight}}.
+  Never put {{.Labels.Trigger}} back on the issue yourself, not even so a later
+  dispatch can re-check something. The loop parks any issue whose run ends with
+  {{.Labels.Trigger}} still on it. When you cannot proceed, PARK.
   Every status label in this prompt lives on ISSUE #{{.Issue.Number}}, never on
   its pull request. Change labels only with `gh issue edit {{.Issue.Number}}`;
   never run `gh pr edit --add-label` or `--remove-label`.
@@ -159,7 +162,9 @@ prompt: |
   push, post a comment stating exactly what you need, remove
   {{.Labels.InFlight}}, add {{.Labels.Blocked}}, and stop. End the comment with:
   "To proceed: comment your decision and re-add the {{.Labels.Trigger}} label."
-  Never guess on a genuine blocker.
+  Never guess on a genuine blocker. A dependency that has not merged yet, an
+  issue or pull request this one needs, is a blocker: PARK and name it. Do not
+  wait for it by leaving or re-adding {{.Labels.Trigger}}.
 
   ON COMPLETION, IN THIS ORDER. The order is the whole safety property of the
   handoff, because {{.Labels.Terminal}} is the REVIEW loop's trigger. Applying it
@@ -195,6 +200,7 @@ resume_prompt: |
   Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
   in the SAME session you used before, so you already know what you built and why.
   Remove {{.Labels.Trigger}} and add {{.Labels.InFlight}} as your first action.
+  Never put {{.Labels.Trigger}} back yourself; when you cannot proceed, PARK.
 
   Read the comments added since your last message. They answer the blocker you
   parked on, or they ask for more work on a pull request you already opened.

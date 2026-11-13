@@ -126,6 +126,14 @@ type Agent struct {
 	MaxBudgetUSD   float64  `yaml:"max_budget_usd"`
 	Timeout        Duration `yaml:"timeout"`
 
+	// MaxSessionCostUSD is the most one session may cost across all its runs
+	// before the loop stops resuming it and parks the issue for a human. It
+	// is the backstop max_budget_usd cannot be: that bounds one run, and a
+	// session that goes wrong usually does it in many cheap runs. A pointer
+	// so an absent field takes DefaultMaxSessionCostUSD; 0 means no ceiling.
+	// An issue's budget: label replaces it for that issue.
+	MaxSessionCostUSD *float64 `yaml:"max_session_cost_usd"`
+
 	// BackgroundTasks re-enables claude's background tasks, which this
 	// program disables by default. Claude backgrounds a subagent unless told
 	// otherwise, and "claude -p" waits only a bounded time for background
@@ -139,6 +147,18 @@ type Agent struct {
 	// bool cannot distinguish an absent field from an explicit false.
 	// claude-only: pi has no equivalent.
 	BackgroundTasks *bool `yaml:"background_tasks"`
+}
+
+// DefaultMaxSessionCostUSD is agent.max_session_cost_usd when it is omitted.
+const DefaultMaxSessionCostUSD = 250.0
+
+// SessionCostLimit returns agent.max_session_cost_usd, or its default when
+// the field is absent. Zero means no ceiling.
+func (a Agent) SessionCostLimit() float64 {
+	if a.MaxSessionCostUSD == nil {
+		return DefaultMaxSessionCostUSD
+	}
+	return *a.MaxSessionCostUSD
 }
 
 // BackgroundTasksEnabled reports whether the claude child may background its
@@ -429,6 +449,11 @@ func (c *Config) validate() error {
 			c.Agent.Timeout.Std(), DefaultAgentTimeout))
 	}
 
+	if c.Agent.MaxSessionCostUSD != nil && *c.Agent.MaxSessionCostUSD < 0 {
+		errs = append(errs, fmt.Errorf(
+			"agent.max_session_cost_usd must not be negative, got %v; use 0 for no limit",
+			*c.Agent.MaxSessionCostUSD))
+	}
 	if c.Retry.Max < 0 {
 		errs = append(errs, errors.New("retry.max must not be negative"))
 	}

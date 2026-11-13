@@ -47,6 +47,21 @@ func TestParseOverrides(t *testing.T) {
 			labels: []string{"effort:HIGH"},
 			want:   Overrides{Effort: "high"},
 		},
+		{
+			name:   "budget in dollars",
+			labels: []string{"budget:500"},
+			want:   Overrides{Budget: 500, BudgetSet: true},
+		},
+		{
+			name:   "fractional budget",
+			labels: []string{"Budget:12.5"},
+			want:   Overrides{Budget: 12.5, BudgetSet: true},
+		},
+		{
+			name:   "budget none is set with no ceiling",
+			labels: []string{"budget:NONE"},
+			want:   Overrides{Budget: 0, BudgetSet: true},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -73,6 +88,11 @@ func TestParseOverridesRejectsBadValues(t *testing.T) {
 		{"duplicate prefix", []string{"model:a", "model:b"}},
 		{"bad harness", []string{"harness:gpt"}},
 		{"bad effort", []string{"effort:bogus"}},
+		{"zero budget", []string{"budget:0"}},
+		{"word budget", []string{"budget:lots"}},
+		{"infinite budget", []string{"budget:Inf"}},
+		{"nan budget", []string{"budget:NaN"}},
+		{"duplicate budget", []string{"budget:100", "budget:200"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -105,6 +105,9 @@ prompt: |
 
   YOU OWN THE LABELS. As your first action, remove {{.Labels.Trigger}} and add
   {{.Labels.InFlight}}.
+  Never put {{.Labels.Trigger}} back on the issue yourself, not even so a later
+  dispatch can re-check something. The loop parks any issue whose run ends with
+  {{.Labels.Trigger}} still on it. When you cannot proceed, PARK.
   Every status label in this prompt lives on ISSUE #{{.Issue.Number}}, never on
   its pull request. Change labels only with `gh issue edit {{.Issue.Number}}`;
   never run `gh pr edit --add-label` or `--remove-label`.
@@ -245,7 +248,9 @@ prompt: |
 resume_prompt: |
   Issue #{{.Issue.Number}} in {{.Repo}} carries {{.Labels.Trigger}} again. You are
   in the SAME session you used before, so you already know which pull request you
-  were reviewing and what you had found. As your first action remove
+  were reviewing and what you had found.
+  Never put {{.Labels.Trigger}} back yourself; when you cannot proceed, PARK.
+  As your first action remove
   {{.Labels.Trigger}}, remove {{.Labels.Terminal}} IF IT IS STILL PRESENT, and
   add {{.Labels.InFlight}}. The terminal removal matters: an issue carrying both
   {{.Labels.Trigger}} and {{.Labels.Terminal}} is vetoed by this loop AND by the

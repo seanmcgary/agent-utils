@@ -30,6 +30,14 @@ const (
 	// because the issue is not in flight. Without it such an issue is stranded
 	// permanently and no human action recovers it.
 	KindClearRetry Kind = "clear_retry"
+	// KindParkNoProgress parks an issue whose last run on this loop left the
+	// loop's own trigger label on it. Such a run exits zero, so the retry cap
+	// never sees it. Like KindParkRetryExhausted it writes to GitHub: a
+	// comment, the blocked label, the trigger and in-flight labels removed.
+	KindParkNoProgress Kind = "park_no_progress"
+	// KindParkSessionCost parks an issue whose session has cost at least its
+	// ceiling, instead of resuming it. It writes to GitHub the same way.
+	KindParkSessionCost Kind = "park_session_cost"
 	// KindStop refuses to dispatch an issue: an operator stopped it, or an
 	// issue label's override is invalid. It is a refusal, not a dispatch, so
 	// it must survive a tripped circuit breaker, which drops every entry of
@@ -89,6 +97,22 @@ type State struct {
 	// change. Callers that can never retire a cap -- the tend sweep, which
 	// makes no retry decision -- leave it nil.
 	Providers map[int]string
+	// SelfRetriggered marks an issue whose trigger label was last applied no
+	// later than the end of its most recent dispatch on this loop, and that
+	// dispatch succeeded. Nothing outside the run asked for another dispatch:
+	// the agent re-applied the trigger itself, or never removed it. The
+	// CALLER works it out, because it needs the issue's label history from
+	// GitHub.
+	//
+	// A missing entry means "not known to be self-retriggered", which
+	// dispatches as before. That is the fail-open direction: a failed read
+	// costs one more run, never a park the evidence did not support. The
+	// session cost ceiling is what bounds a run of such failures.
+	SelfRetriggered map[int]bool
+	// SessionCost maps an issue number to the total recorded cost of every
+	// run in its stored session. The caller sums it from the store. A missing
+	// entry reads as zero.
+	SessionCost map[int]float64
 	// CooldownUntil is the time before which the loop must not dispatch.
 	CooldownUntil time.Time
 	// Force is the operator override behind `loop tick --force`. It is the one
@@ -154,6 +178,10 @@ type Decision struct {
 	// need the number, and re-deriving it from Reason's prose would tie a
 	// dashboard to a sentence.
 	BehindBy int
+	// SessionCost and SessionLimit are set on a KindParkSessionCost decision,
+	// for the comment the park posts.
+	SessionCost  float64
+	SessionLimit float64
 }
 
 // Plan is the full output of one decision pass.
