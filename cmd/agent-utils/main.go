@@ -48,6 +48,7 @@ func main() {
 			logsCommand(),
 			forgetCommand(),
 			migrateCommand(),
+			recostCommand(),
 			versionCommand(),
 			configCommand(),
 			listenerCommand(),
@@ -916,6 +917,42 @@ func migrateCommand() *cli.Command {
 			// Err names every failure already. Rebuilding that message here would
 			// let the two drift apart, and the write path prints the same one.
 			return report.Err()
+		},
+	}
+}
+
+// recostCommand settles recorded dispatch costs from the run logs, for the
+// whole machine, and prints what changed.
+//
+// Like migrate, nothing waits on it: every command that opens the state
+// database settles costs first. It exists for the report, and for --dry-run.
+func recostCommand() *cli.Command {
+	return &cli.Command{
+		Name: "recost",
+		Usage: "recompute recorded dispatch costs from the run logs; not required, " +
+			"every command does it on open",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "dry-run",
+				Usage: "report what would change and write nothing"},
+		},
+		Action: func(_ context.Context, c *cli.Command) error {
+			if _, err := home.EnsureDir(); err != nil {
+				return err
+			}
+			dbPath, err := home.StateDBPath()
+			if err != nil {
+				return err
+			}
+			db, err := store.Open(dbPath)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+
+			dryRun := c.Bool("dry-run")
+			report, err := loopcmd.SettleCosts(db, dryRun)
+			fmt.Print(loopcmd.RenderSettleReport(report, dryRun))
+			return err
 		},
 	}
 }

@@ -250,10 +250,13 @@ type streamLine struct {
 	PermissionMode string  `json:"permissionMode"`
 	Result         string  `json:"result"`
 	TotalCostUSD   float64 `json:"total_cost_usd"`
-	DurationMS     int64   `json:"duration_ms"`
-	NumTurns       int     `json:"num_turns"`
-	IsError        bool    `json:"is_error"`
-	APIError       *string `json:"api_error_status"`
+	// SinceLast is the usage since the session's previous result line. Where
+	// claude writes it, total_cost_usd is the session's running total.
+	SinceLast  map[string]runner.ModelUsage `json:"model_usage_since_last_result"`
+	DurationMS int64                        `json:"duration_ms"`
+	NumTurns   int                          `json:"num_turns"`
+	IsError    bool                         `json:"is_error"`
+	APIError   *string                      `json:"api_error_status"`
 	// Errors carries what the harness said went wrong when the failure was not
 	// an API status. A refused resume reports api_error_status null and one
 	// error here, so a renderer that reads only APIError shows the run failing
@@ -313,8 +316,16 @@ func (r *renderer) line(raw string) {
 			}
 		}
 	case "result":
-		r.printf("\n── result: %s  turns=%d  cost=$%.4f  duration=%s\n",
-			l.Subtype, l.NumTurns, l.TotalCostUSD,
+		cost := fmt.Sprintf("$%.4f", l.TotalCostUSD)
+		if l.SinceLast != nil {
+			var run float64
+			for _, mu := range l.SinceLast {
+				run += mu.CostUSD
+			}
+			cost = fmt.Sprintf("$%.4f (session $%.4f)", run, l.TotalCostUSD)
+		}
+		r.printf("\n── result: %s  turns=%d  cost=%s  duration=%s\n",
+			l.Subtype, l.NumTurns, cost,
 			(time.Duration(l.DurationMS) * time.Millisecond).Round(time.Second))
 		if l.APIError != nil && *l.APIError != "" {
 			r.printf("   api error: %s\n", *l.APIError)

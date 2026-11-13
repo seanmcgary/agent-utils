@@ -11,12 +11,44 @@ import (
 
 // Result is the outcome of one claude run.
 type Result struct {
-	SessionID  string
+	SessionID string
+	// CostUSD is what THIS run spent, and CostSource says how it was read.
 	CostUSD    float64
+	CostSource string
 	DurationMS int64
 	IsError    bool
 	APIError   string
 	Text       string
+}
+
+// Cost sources, as stored in dispatches.cost_source.
+//
+// claude's total_cost_usd has meant two things. Through at least 2.1.274 it
+// was the run's own cost. By 2.1.323 it is the SESSION's running total, so on
+// a resume it re-counts every earlier run; those versions also write
+// model_usage_since_last_result, whose costUSD is the run's own. Which field a
+// result line carries is therefore what says how to read it.
+const (
+	// CostSourceRun is the sum of model_usage_since_last_result's costUSD.
+	CostSourceRun = "run"
+	// CostSourceTotal is total_cost_usd from a result line without
+	// model_usage_since_last_result, which reported per run.
+	CostSourceTotal = "total"
+	// CostSourcePi is pi's per-message costs, summed. pi has always reported
+	// per run.
+	CostSourcePi = "pi"
+	// CostSourceNone marks a run with no result line, so no cost. A claude
+	// that reports per-run usage counts its spend in the next run's result.
+	CostSourceNone = "none"
+	// CostSourceUnverified marks a row the cost reconcile pass could not
+	// check, because its log is missing. Its recorded cost is left as it was.
+	CostSourceUnverified = "unverified"
+)
+
+// ModelUsage is one model's entry in a result line's usage maps. Only the
+// cost is read.
+type ModelUsage struct {
+	CostUSD float64 `json:"costUSD"`
 }
 
 // ErrNoResult reports that the stream held no result line.
@@ -34,6 +66,9 @@ type resultLine struct {
 	// was not an API status: a refused resume reports api_error_status null
 	// and errors ["No conversation found with session ID: ..."].
 	Errors []string `json:"errors"`
+	// SinceLast is the usage since the session's previous result line: this
+	// run's own. See the cost sources above.
+	SinceLast map[string]ModelUsage `json:"model_usage_since_last_result"`
 }
 
 // ParseStream reads a claude stream-json stream and returns the final result.
@@ -59,6 +94,11 @@ func ParseStream(r io.Reader) (Result, error) {
 	// the loop permanently -- every later tick failed the same way, at no cost,
 	// so the retry budget never ran down and the issue never parked.
 	var sessionID string
+	// A run can write more than one result line, and each one's
+	// model_usage_since_last_result covers only the stretch since the one
+	// before, so the run's cost is their sum.
+	var sinceCost float64
+	sawSince := false
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 || line[0] != '{' {
@@ -73,6 +113,12 @@ func ParseStream(r io.Reader) (Result, error) {
 		}
 		if rl.Type != "result" {
 			continue
+		}
+		if rl.SinceLast != nil {
+			sawSince = true
+			for _, mu := range rl.SinceLast {
+				sinceCost += mu.CostUSD
+			}
 		}
 		copied := rl
 		last = &copied
@@ -89,9 +135,15 @@ func ParseStream(r io.Reader) (Result, error) {
 	out := Result{
 		SessionID:  last.SessionID,
 		CostUSD:    last.TotalCostUSD,
+		CostSource: CostSourceTotal,
 		DurationMS: last.DurationMS,
 		IsError:    last.IsError,
 		Text:       last.ResultText,
+	}
+	// total_cost_usd is the session's running total in the claude versions
+	// that carry this field, so it is never the run's cost there.
+	if sawSince {
+		out.CostUSD, out.CostSource = sinceCost, CostSourceRun
 	}
 	if out.SessionID == "" {
 		out.SessionID = sessionID
@@ -203,6 +255,7 @@ func ParsePiStream(r io.Reader) (Result, error) {
 	out := Result{
 		SessionID:  sessionID,
 		CostUSD:    costTotal,
+		CostSource: CostSourcePi,
 		DurationMS: 0, // pi carries no wall-clock duration; Supervise measures it.
 		IsError:    last.StopReason != "stop",
 		Text:       piText(last.Content),

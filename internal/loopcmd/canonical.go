@@ -41,6 +41,8 @@ func openCanonical() (*store.DB, error) {
 		fmt.Fprintf(os.Stderr, "warning: state in %s (loop %s) was not imported: %s\n",
 			res.Source.Path, res.Source.Loop, res.Reason)
 	}
+	// Every report this opener serves sums dispatch costs.
+	settleCostsOnOpen(db)
 	return db, nil
 }
 
