@@ -2,17 +2,25 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
-// The three label prefixes that override an agent setting for one issue.
-// They are fixed and not configurable: the feature is always active, so
-// there is no config field an operator could use to turn it off by mistake.
+// The label prefixes that override an agent setting for one issue. They are
+// fixed and not configurable: the feature is always active, so there is no
+// config field an operator could use to turn it off by mistake.
 const (
 	OverrideModelPrefix   = "model:"
 	OverrideHarnessPrefix = "harness:"
 	OverrideEffortPrefix  = "effort:"
+	// OverrideBudgetPrefix sets the issue's session cost ceiling in US
+	// dollars, replacing agent.max_session_cost_usd: budget:500 raises it to
+	// $500, budget:none removes it.
+	OverrideBudgetPrefix = "budget:"
+	// BudgetNone is the budget: value that removes the ceiling.
+	BudgetNone = "none"
 )
 
 // Overrides holds the per-issue agent settings read from labels. A zero
@@ -22,6 +30,12 @@ type Overrides struct {
 	Model   string
 	Harness string
 	Effort  string
+	// Budget is the session cost ceiling from a budget: label, and BudgetSet
+	// says one was present. A set Budget of 0 is budget:none, no ceiling;
+	// it is not "no override". Budget never reaches the runner: the engine
+	// checks it between runs.
+	Budget    float64
+	BudgetSet bool
 }
 
 // overrideValue is an ALLOWLIST, not a denylist. The value becomes one
@@ -53,6 +67,7 @@ func ParseOverrides(labels []string) (Overrides, error) {
 	var (
 		out                              Overrides
 		modelLabel, harnessLabel, effLbl string
+		budgetLabel                      string
 	)
 
 	for _, label := range labels {
@@ -118,9 +133,45 @@ func ParseOverrides(labels []string) (Overrides, error) {
 			out.Effort = lowered
 			continue
 		}
+
+		prefix, value, ok = cutPrefixFold(label, OverrideBudgetPrefix)
+		if ok {
+			if err := validateOverrideValue(prefix, value); err != nil {
+				return Overrides{}, err
+			}
+			budget, err := parseBudget(value)
+			if err != nil {
+				return Overrides{}, fmt.Errorf("invalid budget override %q: %w", label, err)
+			}
+			if budgetLabel != "" {
+				return Overrides{}, fmt.Errorf(
+					"duplicate budget override: %q and %q", budgetLabel, label)
+			}
+			budgetLabel = label
+			out.Budget, out.BudgetSet = budget, true
+			continue
+		}
 	}
 
 	return out, nil
+}
+
+// parseBudget reads a budget: value: "none" for no ceiling, or a positive
+// number of US dollars. Zero is refused rather than read as "none": a label
+// that says budget:0 more likely means "spend nothing" than "spend without
+// limit", and guessing either way is worse than asking for the explicit word.
+func parseBudget(value string) (float64, error) {
+	if strings.EqualFold(value, BudgetNone) {
+		return 0, nil
+	}
+	v, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("must be %q or a number of US dollars", BudgetNone)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("must be greater than zero; use %q for no ceiling", BudgetNone)
+	}
+	return v, nil
 }
 
 // cutPrefixFold reports whether label starts with prefix, ignoring case —

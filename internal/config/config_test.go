@@ -756,3 +756,32 @@ func TestListReportsALoopThatTakesTheReservedName(t *testing.T) {
 		t.Errorf("error must name the reason, got: %v", entries[0].Err)
 	}
 }
+
+func TestSessionCostCeilingDefaultsWhenOmitted(t *testing.T) {
+	cfg, err := Load(writeTemp(t, validYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Agent.SessionCostLimit(); got != DefaultMaxSessionCostUSD {
+		t.Errorf("SessionCostLimit = %v, want %v", got, DefaultMaxSessionCostUSD)
+	}
+}
+
+func TestSessionCostCeilingZeroMeansNoCeiling(t *testing.T) {
+	body := replaceOnce(validYAML, "  max_budget_usd: 25\n", "  max_budget_usd: 25\n  max_session_cost_usd: 0\n")
+	cfg, err := Load(writeTemp(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Agent.SessionCostLimit(); got != 0 {
+		t.Errorf("SessionCostLimit = %v, want 0", got)
+	}
+}
+
+func TestLoadRejectsNegativeSessionCostCeiling(t *testing.T) {
+	body := replaceOnce(validYAML, "  max_budget_usd: 25\n", "  max_budget_usd: 25\n  max_session_cost_usd: -1\n")
+	_, err := Load(writeTemp(t, body))
+	if err == nil || !strings.Contains(err.Error(), "max_session_cost_usd") {
+		t.Fatalf("err = %v, want one naming max_session_cost_usd", err)
+	}
+}

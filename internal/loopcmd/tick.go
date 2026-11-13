@@ -138,6 +138,89 @@ type Deps struct {
 	// resolves the issue author through Authors when CoAuthor is set.
 	Authors  ghub.AuthorReader
 	CoAuthor bool
+	// Labels reads an issue's label history, which is how the tick tells a
+	// trigger label a human applied from one the agent's own run put back. Nil
+	// switches the no-progress check off: every trigger is taken at face value.
+	Labels ghub.LabelHistory
+}
+
+// retriggerSlack widens the end of a run when comparing it to a label event.
+// FinishedAt is this machine's clock and the event time is GitHub's, so a label
+// the agent applied in its last second can read as a few seconds later. A human
+// re-applying the label within this long of the run ending is not plausible.
+const retriggerSlack = 30 * time.Second
+
+// sessionCosts returns the recorded cost of each issue's stored session, for
+// the issues the engine might resume: those carrying the trigger label or a
+// pending retry. A read that fails leaves the issue out, which reads as zero.
+func sessionCosts(cfg *config.Config, deps Deps, issues []ghub.Issue, states map[int]store.IssueState) map[int]float64 {
+	out := map[int]float64{}
+	for _, iss := range issues {
+		state := states[iss.Number]
+		if state.SessionID == "" || (!state.NeedsRetry && !iss.HasLabel(cfg.Labels.Trigger)) {
+			continue
+		}
+		runs, err := deps.Store.DispatchesBySession(state.SessionID)
+		if err != nil {
+			slog.Warn("read a session's cost; resuming without the ceiling check",
+				"loop", cfg.Name, "issue", iss.Number, "err", err)
+			continue
+		}
+		var total float64
+		for _, r := range runs {
+			total += r.CostUSD
+		}
+		out[iss.Number] = total
+	}
+	return out
+}
+
+// selfRetriggered returns the issues whose trigger label nothing outside their
+// last run applied: that run succeeded, and the label's most recent "labeled"
+// event is no later than the run's end. Those are the issues the loop would
+// otherwise re-dispatch with nothing changed. See engine.State.SelfRetriggered.
+//
+// It costs a GitHub read only for an issue that is about to be dispatched on
+// the trigger path and whose last run of this loop succeeded, which is the
+// unusual case: an agent that finishes its work moves the label on.
+//
+// Every failure leaves the issue out of the map, which dispatches as before.
+func selfRetriggered(ctx context.Context, cfg *config.Config, deps Deps,
+	issues []ghub.Issue, states map[int]store.IssueState, live []store.Dispatch) map[int]bool {
+	out := map[int]bool{}
+	if deps.Labels == nil || cfg.Labels.Trigger == "" {
+		return out
+	}
+	busy := make(map[int]bool, len(live))
+	for _, d := range live {
+		busy[d.Number] = true
+	}
+	owner, repo := cfg.RepoOwner(), cfg.RepoName()
+	for _, iss := range issues {
+		if !iss.HasLabel(cfg.Labels.Trigger) || busy[iss.Number] ||
+			iss.HasAnyLabel(cfg.Labels.Vetoes()) || states[iss.Number].NeedsRetry {
+			continue
+		}
+		runs, err := deps.Store.RecentDispatches(cfg.Name, cfg.Repo, iss.Number, 1)
+		if err != nil || len(runs) == 0 {
+			continue
+		}
+		last := runs[0]
+		if last.Status != store.StatusSucceeded || last.FinishedAt.IsZero() ||
+			(last.Kind != store.KindStart && last.Kind != store.KindResume) {
+			continue
+		}
+		at, found, err := deps.Labels.LastLabeledAt(ctx, owner, repo, iss.Number, cfg.Labels.Trigger)
+		if err != nil {
+			slog.Warn("read the trigger label's history; dispatching as a fresh trigger",
+				"loop", cfg.Name, "issue", iss.Number, "err", err)
+			continue
+		}
+		if found && !at.After(last.FinishedAt.Add(retriggerSlack)) {
+			out[iss.Number] = true
+		}
+	}
+	return out
 }
 
 // resolveCoAuthor returns the co-author for issue number's commits, or "".
@@ -307,7 +390,9 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Summary, error) {
 	st := engine.State{
 		Issues: states, Running: live, Tended: tended,
 		CooldownUntil: time.Time{}, Force: deps.Force,
-		Providers: resolveProviders(ctx, cfg, snap.Issues),
+		Providers:       resolveProviders(ctx, cfg, snap.Issues),
+		SelfRetriggered: selfRetriggered(ctx, cfg, deps, snap.Issues, states, live),
+		SessionCost:     sessionCosts(cfg, deps, snap.Issues, states),
 	}
 	sum.Live = len(live)
 	sum.Forced = deps.Force
@@ -633,8 +718,7 @@ func act(
 ) error {
 	switch d.Kind {
 	case engine.KindStop:
-		// Not a dispatch, and not a GitHub write: parkRetryExhausted stays
-		// the only one this program performs. The write is LOCAL only --
+		// Not a dispatch, and not a GitHub write. The write is LOCAL only --
 		// MarkStopped -- so an operator kill or an invalid label is visible
 		// in `loop status` and `sessions list` without ever touching the
 		// issue on GitHub.
@@ -648,6 +732,13 @@ func act(
 		return deps.Store.ClearNeedsRetry(cfg.Name, cfg.Repo, d.Issue)
 	case engine.KindParkRetryExhausted:
 		return count(&sum.Parked, parkRetryExhausted(ctx, cfg, deps, d))
+	case engine.KindParkNoProgress:
+		body := fmt.Sprintf(noProgressComment, cfg.Labels.Trigger, cfg.Labels.Blocked, cfg.Labels.Trigger)
+		return count(&sum.Parked, parkForHuman(ctx, cfg, deps, d, "no_progress", body))
+	case engine.KindParkSessionCost:
+		body := fmt.Sprintf(sessionCostComment, d.SessionCost, d.SessionLimit,
+			config.OverrideBudgetPrefix, config.OverrideBudgetPrefix, config.BudgetNone, cfg.Labels.Trigger)
+		return count(&sum.Parked, parkForHuman(ctx, cfg, deps, d, "session_cost", body))
 	case engine.KindTend:
 		// Per tend DECISION, before git or an agent is tried, so the
 		// distribution describes how far behind pull requests are when they
@@ -978,8 +1069,9 @@ func redactForComment(s string) string {
 	return s
 }
 
-// parkRetryExhausted is the ONE GitHub write this program performs. Every other
-// comment and label change belongs to the dispatched agent. The exception
+// parkRetryExhausted is one of the few GitHub writes this program performs
+// itself (parkForHuman is another). Every other comment and label change on a
+// loop's issue belongs to the dispatched agent. The exception
 // exists because the failing action is the dispatch itself, so an agent sent to
 // report the failure would fail the same way.
 func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision) error {
@@ -1043,6 +1135,58 @@ func parkRetryExhausted(ctx context.Context, cfg *config.Config, deps Deps, d en
 	}
 
 	slog.Warn("parked at retry cap", "loop", cfg.Name, "issue", d.Issue)
+	return nil
+}
+
+const noProgressComment = `⏸️ **Paused: waiting for input.** The last run on this loop ended with the ` + "`%s`" + ` label still on this issue, so dispatching again would only repeat that run. An agent never re-dispatches itself on its own loop; it hands the issue to a human, or moves it on to another loop's label. The loop has applied ` + "`%s`" + ` instead.
+
+To proceed: resolve what the agent was waiting on, then re-add the ` + "`%s`" + ` label.`
+
+const sessionCostComment = `💸 **Paused: session cost ceiling reached.** This issue's agent session has cost $%.2f across its runs, at or above its $%.2f ceiling, so the loop has stopped resuming it.
+
+To proceed: check the session (` + "`agent-utils sessions list`" + `). To let it continue, add a ` + "`%s<usd>`" + ` label with a higher ceiling (for example ` + "`%s500`" + `, or ` + "`budget:%s`" + ` for no ceiling), then re-add the ` + "`%s`" + ` label.`
+
+// parkForHuman hands an issue to a human instead of dispatching it: it posts
+// body, applies the blocked label, and removes the trigger and in-flight
+// labels. It is the same exception to "every GitHub write belongs to the agent"
+// that parkRetryExhausted makes, for the same reason: the dispatch is the thing
+// that must not happen, so no agent can be sent to report it.
+//
+// The durable park is written first and the comment is posted once per park,
+// so a GitHub failure cannot become one comment per tick. The label edit runs
+// every time: the decision repeats only while the trigger is still on the
+// issue, so a park whose label edit failed must retry it, or it stops nothing.
+// The edit is idempotent.
+func parkForHuman(ctx context.Context, cfg *config.Config, deps Deps, d engine.Decision, reason, body string) error {
+	owner, repo := cfg.RepoOwner(), cfg.RepoName()
+
+	state, err := deps.Store.IssueState(cfg.Name, cfg.Repo, d.Issue)
+	if err != nil {
+		return err
+	}
+	if !state.Parked {
+		state.Parked = true
+		// A session-cost park can come from the retry path. The failure goes
+		// with the park, as it does at the retry cap, or the next tick would
+		// see a failed issue with no labels and clear it anyway.
+		state.NeedsRetry = false
+		state.RetryAfter = time.Time{}
+		state.UpdatedAt = deps.Now()
+		if err := deps.Store.PutIssueState(state); err != nil {
+			return err
+		}
+		metrics.Default().Count(mPark, 1, append(loopTags(cfg, deps), metrics.Tag("reason", reason))...)
+		if err := deps.GH.PostComment(ctx, owner, repo, d.Issue, body); err != nil {
+			return err
+		}
+	}
+	if err := deps.GH.EditLabels(ctx, owner, repo, d.Issue,
+		[]string{cfg.Labels.Blocked},
+		[]string{cfg.Labels.InFlight, cfg.Labels.Trigger}); err != nil {
+		return err
+	}
+
+	slog.Warn("parked for a human", "loop", cfg.Name, "issue", d.Issue, "reason", d.Reason)
 	return nil
 }
 

@@ -179,12 +179,23 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 				})
 				continue
 			}
+			// A retry that resumes the session spends from the same session
+			// budget as a trigger-path resume, and a failing session is the
+			// likelier one to have run up its cost. Checked after the stop
+			// above, because the ceiling may come from the issue's own
+			// budget: label, and an invalid one has already stopped it.
+			if d != nil && d.Kind == KindRetryResume {
+				if park := sessionCostPark(cfg, iss.Number, ov, st.SessionCost[iss.Number]); park != nil {
+					d = park
+					eligible = false
+				}
+			}
 			if eligible {
 				eligibleRetries++
 			}
 			if d != nil {
 				decided[iss.Number] = true
-				if d.Kind == KindParkRetryExhausted {
+				if d.Kind == KindParkRetryExhausted || d.Kind == KindParkSessionCost {
 					parks = append(parks, *d)
 				} else {
 					d.Overrides = ov
@@ -219,7 +230,35 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 			})
 			continue
 		}
+
+		// NO-PROGRESS PATH. The previous run on this loop succeeded and the
+		// trigger label is on the issue only because that run put it back, or
+		// never took it off. Nothing outside the run asked for another
+		// dispatch, so dispatching again would repeat the same run. Such runs
+		// exit zero, which the retry cap and the orphan breaker never count,
+		// and a resume carries the whole growing transcript: unchecked, the
+		// loop resumes the session on every tick, each run costing more than
+		// the last.
+		//
+		// An agent never re-dispatches itself on its own loop. It hands the
+		// issue to a human (this loop's blocked label) or moves it to another
+		// loop's trigger. Parked at once, and kept out of decisions for the
+		// reason parks are: the breaker drops every dispatch, and a park is
+		// not one.
+		if st.SelfRetriggered[iss.Number] {
+			parks = append(parks, Decision{
+				Kind:   KindParkNoProgress,
+				Issue:  iss.Number,
+				Reason: "the previous run on this loop left its own trigger label on the issue",
+			})
+			continue
+		}
+
 		if resumable(cfg, state, ov) {
+			if park := sessionCostPark(cfg, iss.Number, ov, st.SessionCost[iss.Number]); park != nil {
+				parks = append(parks, *park)
+				continue
+			}
 			decisions = append(decisions, Decision{
 				Kind:      KindResume,
 				Issue:     iss.Number,
@@ -292,6 +331,31 @@ func Decide(cfg *config.Config, snap Snapshot, st State, now time.Time) Plan {
 	// dispatcher, and DecideTend is what makes its decisions, from
 	// project-wide state this per-loop pass does not hold.
 	return finish(Plan{Decisions: decisions, Skips: skips})
+}
+
+// sessionCostPark returns a park when the session about to be resumed has
+// already cost at least its ceiling, and nil otherwise. The ceiling is the
+// issue's budget: label when it has one, else agent.max_session_cost_usd. Zero
+// means no ceiling.
+//
+// Only a resume is checked. A new session has spent nothing, and the check is
+// made between runs: a run already going is not stopped by it.
+func sessionCostPark(cfg *config.Config, number int, ov config.Overrides, spent float64) *Decision {
+	limit, source := cfg.Agent.SessionCostLimit(), "agent.max_session_cost_usd"
+	if ov.BudgetSet {
+		limit, source = ov.Budget, "the issue's budget: label"
+	}
+	if limit <= 0 || spent < limit {
+		return nil
+	}
+	return &Decision{
+		Kind:  KindParkSessionCost,
+		Issue: number,
+		Reason: fmt.Sprintf("the session has cost $%.2f, at or above its $%.2f ceiling (%s)",
+			spent, limit, source),
+		SessionCost:  spent,
+		SessionLimit: limit,
+	}
 }
 
 // finish drops the skip reason of every issue that ended up with a decision.

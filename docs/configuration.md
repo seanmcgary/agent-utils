@@ -352,6 +352,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.permission_mode` | enum | no | claude's own default |
 | `agent.worktree` | enum | yes | — |
 | `agent.max_budget_usd` | number | no | `0`, meaning no limit |
+| `agent.max_session_cost_usd` | number | no | `250`; `0` means no limit |
 | `agent.background_tasks` | bool | no | `false` |
 | `agent.timeout` | duration | no | `24h` |
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
@@ -593,6 +594,21 @@ knows what it planned and why.
 
 Re-applying it is also the only way to recover a parked issue.
 
+**An agent must never re-apply its own loop's trigger.** A run that cannot proceed hands the issue
+to a human with `blocked`, or moves it on to another loop's trigger. If a run ends with this
+label still on the issue, whether the agent put it back or never took it off, the loop does not
+dispatch again. It parks the issue: it posts a comment, applies `labels.blocked`, and removes the
+trigger and in-flight labels. A run that exits zero is otherwise invisible to the retry cap
+and the orphan breaker, and the loop would resume the same session on every tick.
+
+The loop tells the two apart from the issue's label history: when the trigger's most recent
+`labeled` event is no later than the end of the last succeeded run on this loop (allowing 30
+seconds for clock skew), nothing outside the run applied it. A trigger you re-apply after
+the run has ended dispatches normally. If the history cannot be read, the issue dispatches as
+before and [`agent.max_session_cost_usd`](#agentmax_session_cost_usd--optional) is the backstop.
+A trigger applied while a run is still going counts as the run's own, so wait for the run to
+end before re-applying it.
+
 ```yaml
 trigger: status:ready-for-spec
 ```
@@ -614,7 +630,9 @@ in_flight: status:speccing
 ### `labels.blocked` — required
 
 The agent parked and needs a human answer. The **agent** applies it, and so does the loop
-when it parks an issue at the retry cap.
+when it parks an issue: at the retry cap, when a run left the loop's own trigger label on the
+issue (see [`labels.trigger`](#labelstrigger--required)), or at the session cost ceiling (see
+[`agent.max_session_cost_usd`](#agentmax_session_cost_usd--optional)).
 
 To un-park, answer in a comment and re-apply `trigger`.
 
@@ -754,7 +772,7 @@ label, not a `*` prefix rule. Matching ignores case.
 
 ## Agent overrides from labels
 
-Three label prefixes let a label on the issue override one setting from `agent`, for that
+Four label prefixes let a label on the issue override one setting from `agent`, for that
 issue's dispatch only. They are always active. No configuration field turns them on, and none
 turns them off.
 
@@ -763,6 +781,7 @@ turns them off.
 | `model:` | `agent.model` | `model:claude-opus-5` |
 | `harness:` | `agent.harness` | `harness:pi` |
 | `effort:` | `agent.effort` | `effort:high` |
+| `budget:` | `agent.max_session_cost_usd` | `budget:500`, `budget:none` |
 
 See [`agent.model`](#agentmodel--required), [`agent.harness`](#agentharness--optional), and
 [`agent.effort`](#agenteffort--optional) for what each setting does.
@@ -794,6 +813,7 @@ invalid:
 - Two labels on the same issue carry the same prefix. Two `model:` labels is an error, not a
   choice between them — nothing decides which one wins.
 - `harness:` names anything other than `claude` or `pi`.
+- `budget:` is neither `none` nor a number greater than zero.
 - `effort:` names anything other than `low`, `medium`, `high`, `xhigh`, or `max`.
 
 A `harness:` label naming the loop's OWN configured harness is a no-op: it is accepted, but
@@ -965,6 +985,36 @@ because pi exposes no cost-ceiling flag.
 
 ```yaml
 max_budget_usd: 0   # no cost ceiling; the recommended value
+```
+
+### `agent.max_session_cost_usd` — optional
+
+The most one agent session may cost, in US dollars, summed over every run recorded under it.
+Before the loop resumes a session (a trigger-path resume or a retry), it adds up the session's
+recorded cost. At or above this ceiling it does not dispatch. It parks the issue instead: it
+posts a comment, applies `labels.blocked`, and removes the trigger and in-flight labels.
+
+**Omitted, the ceiling is `$250`.** `0` turns it off. A negative value is rejected at load.
+
+This is a backstop, not a budget. `agent.max_budget_usd` bounds one run, and a session that goes
+wrong usually does it in many cheap runs, each resuming a longer transcript than the last. The
+ceiling is checked between runs only, so it never stops a run part way through; a run that starts
+under the ceiling may finish above it, and the next resume is what it refuses.
+
+A new session starts at `$0`. A session is new when the issue has none yet, or when the previous
+one was created by a different harness.
+
+To let a parked session continue, add a `budget:` label and re-apply the trigger.
+`budget:500` sets that issue's ceiling to `$500`; `budget:none` removes it. The label replaces
+this field for that issue, in either direction. Re-applying the trigger without raising the ceiling parks
+the issue again, without a second comment. `budget:0` is rejected, because it is ambiguous;
+write `budget:none`. An invalid `budget:` label stops the issue like any other invalid override
+label (see [What an invalid label does](#what-an-invalid-label-does)).
+
+Applies to both harnesses: the loop sums cost from its own records, which pi runs also write.
+
+```yaml
+max_session_cost_usd: 250
 ```
 
 ### `agent.background_tasks` — optional
@@ -1695,6 +1745,7 @@ Beyond the required fields in the quick reference:
 | `agent.permission_mode` is a real claude mode or empty | `… is not a valid claude permission mode` |
 | `bypassPermissions` needs the acknowledgement | `set i_understand_bypass_permissions: true` |
 | `agent.max_budget_usd` ≥ 0 (`0` means no cap) | `agent.max_budget_usd must not be negative` |
+| `agent.max_session_cost_usd` ≥ 0 (`0` means no cap) | `agent.max_session_cost_usd must not be negative` |
 | `agent.timeout` not negative (omitted or `0` takes the `24h` default) | `agent.timeout must not be negative` |
 | `retry.max` ≥ 0 | `retry.max must not be negative` |
 | `len(retry.backoff)` ≥ `retry.max` | `it needs one entry per retry` |

@@ -389,7 +389,7 @@ Both states show up where you already look:
 - `agent-utils project loop status` shows `stopped` in its state column, and lists every
   stopped issue with its reason underneath the table.
 
-An invalid `model:`/`harness:`/`effort:` label (see
+An invalid `model:`/`harness:`/`effort:`/`budget:` label (see
 [Configuration](#configuration)) sets the same flag, with the label's error as the reason.
 `sessions resume` clears that too, once the label is fixed.
 
@@ -596,11 +596,11 @@ agent environment. For the worktree, trust of `AGENTS.md`/`CLAUDE.md` follows pi
 `defaultProjectTrust`; keep an open trust default off for a loop whose worktree is fed with
 untrusted issue text. See [docs/configuration.md](docs/configuration.md#agent-harness-optional).
 
-The `model:`, `harness:`, and `effort:` override labels (see
+The `model:`, `harness:`, `effort:`, and `budget:` override labels (see
 [Configuration](#configuration)) are always active and grant no new code execution: GitHub
 already restricts the label permission to a collaborator with triage access or above, and that
 collaborator's issues already run an agent with a repository-write token. What the labels add is
-the choice of which binary runs and which model is billed. An invalid label stops the issue
+the choice of which binary runs, which model is billed, and how much one session may cost before the loop parks it. An invalid label stops the issue
 rather than falling back to a default, and clearing that flag needs `sessions resume` run on the
 loop's own machine — so a label applied from GitHub can halt an issue that only a local operator
 can restart. See [Stopping a session](#stopping-a-session).

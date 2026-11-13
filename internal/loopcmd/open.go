@@ -305,6 +305,11 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		Authors:  authors,
 		CoAuthor: s.Commit.CoAuthorIssueAuthor,
 	}
+	// The concrete client and the daemon's DeliveryCache both read label
+	// history; a test's fake may not, and nil switches the check off.
+	if lh, ok := gh.(ghub.LabelHistory); ok {
+		deps.Labels = lh
+	}
 	return cfg, deps, func() { db.Close() }, nil
 }
 

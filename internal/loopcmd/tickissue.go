@@ -133,7 +133,9 @@ func tickIssue(ctx context.Context, cfg *config.Config, deps Deps, number int) (
 	// one `pi --list-models` rather than one per issue in the loop.
 	st := engine.State{
 		Issues: states, Running: live, Tended: tended,
-		Providers: resolveProviders(ctx, cfg, snap.Issues),
+		Providers:       resolveProviders(ctx, cfg, snap.Issues),
+		SelfRetriggered: selfRetriggered(ctx, cfg, deps, snap.Issues, states, live),
+		SessionCost:     sessionCosts(cfg, deps, snap.Issues, states),
 	}
 	if st.CooldownUntil, err = deps.Store.CooldownUntil(cfg.Name); err != nil {
 		return sum, err
