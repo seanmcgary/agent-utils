@@ -80,6 +80,9 @@ prompt: |
 
   YOU OWN THE LABELS. Nothing else moves them. As your first action, remove
   {{.Labels.Trigger}} and add {{.Labels.InFlight}}.
+  Never put {{.Labels.Trigger}} back on the issue yourself, not even so a later
+  dispatch can re-check something. The loop parks any issue whose run ends with
+  {{.Labels.Trigger}} still on it. When you cannot proceed, PARK.
   Every status label in this prompt lives on ISSUE #{{.Issue.Number}}, never on
   its pull request. Change labels only with `gh issue edit {{.Issue.Number}}`;
   never run `gh pr edit --add-label` or `--remove-label`.
@@ -180,6 +183,7 @@ resume_prompt: |
   in the SAME session you used before, so you already know what you planned and
   why. Re-add {{.Labels.InFlight}} and remove {{.Labels.Trigger}} as your first
   action.
+  Never put {{.Labels.Trigger}} back yourself; when you cannot proceed, PARK.
 
   Read the comments added since your last message. They are either answers to
   your questions or a change request on the plan.
