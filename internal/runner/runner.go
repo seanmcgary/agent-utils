@@ -270,6 +270,7 @@ func Supervise(
 	res := store.DispatchResult{
 		Status:     store.StatusSucceeded,
 		CostUSD:    result.CostUSD,
+		CostSource: result.CostSource,
 		DurationMS: result.DurationMS,
 		APIError:   result.APIError,
 		// A session identifier in the stream proves the agent created the session,
@@ -277,6 +278,11 @@ func Supervise(
 		// already in use, which is the only evidence left when the run that
 		// created it was killed before it wrote anything this program parses.
 		SessionStarted: result.SessionID != "" || (waitErr != nil && inUse.Seen()),
+	}
+	// No result line, no cost. A claude that reports per-run usage counts this
+	// run's spend in the session's next result line instead.
+	if errors.Is(parseErr, ErrNoResult) {
+		res.CostSource = CostSourceNone
 	}
 	// pi reports no wall-clock duration in its stream; the runner measures it.
 	if effective.Harness == config.HarnessPi {

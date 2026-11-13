@@ -127,7 +127,12 @@ CREATE TABLE IF NOT EXISTS dispatches (
   review_pending INTEGER NOT NULL DEFAULT 0,
   -- co_author is the "Name <email>" the runner's commit hook credits, resolved
   -- by the tick from the issue's author. See store.Dispatch.CoAuthor.
-  co_author TEXT NOT NULL DEFAULT ''
+  co_author TEXT NOT NULL DEFAULT '',
+  -- cost_source says how cost_usd was derived; see runner.CostSource*. Empty
+  -- means a row written before this column existed, whose cost may be a
+  -- session's running total. The cost reconcile pass settles every finished
+  -- row left empty, from its run log.
+  cost_source TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS pr_links (
@@ -291,6 +296,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS dispatches_legacy
   WHERE legacy_source <> '';
 
 CREATE INDEX IF NOT EXISTS ticks_loop ON ticks (project_id, loop);
+
+-- The cost reconcile pass runs on every open; once it has settled the
+-- history, this keeps its query an empty index probe.
+CREATE INDEX IF NOT EXISTS dispatches_cost_unsettled
+  ON dispatches (id) WHERE cost_source = '';
 `
 
 // DB is the canonical state database. One file holds every project.
@@ -472,6 +482,7 @@ var addedColumns = []struct{ table, column, def string }{
 	{"dispatches", "provider", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "review_pending", "INTEGER NOT NULL DEFAULT 0"},
 	{"dispatches", "co_author", "TEXT NOT NULL DEFAULT ''"},
+	{"dispatches", "cost_source", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // backfillSessionHarness fills issues.session_harness for rows whose session was
@@ -1180,9 +1191,9 @@ func (s *Store) FinishDispatch(id int64, r DispatchResult) error {
 	res, err := s.db.Exec(`
 		UPDATE dispatches
 		SET status = ?, exit_code = ?, cost_usd = ?, duration_ms = ?,
-		    api_error = ?, finished_at = ?
+		    api_error = ?, finished_at = ?, cost_source = ?
 		WHERE id = ? AND project_id = ? AND status = ?`,
-		r.Status, r.ExitCode, r.CostUSD, r.DurationMS, r.APIError, time.Now().UTC(),
+		r.Status, r.ExitCode, r.CostUSD, r.DurationMS, r.APIError, time.Now().UTC(), r.CostSource,
 		id, s.projectID, StatusRunning)
 	if err != nil {
 		return fmt.Errorf("finish dispatch: %w", err)
@@ -1197,6 +1208,31 @@ func (s *Store) FinishDispatch(id int64, r DispatchResult) error {
 	return nil
 }
 
+// UnsettledCosts returns every finished agent dispatch, in every project,
+// whose cost_source is still empty, oldest first.
+func (d *DB) UnsettledCosts() ([]Dispatch, error) {
+	rows, err := d.db.Query(`SELECT ` + dispatchColumns + ` FROM dispatches
+		WHERE cost_source = '' AND status <> 'running'
+		  AND kind IN ('start', 'resume', 'tend')
+		ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("query unsettled costs: %w", err)
+	}
+	return scanDispatches(rows)
+}
+
+// SettleCost records a dispatch's reconciled cost. It applies only while
+// cost_source is still empty, so two processes settling the same row at once
+// cannot both write, and a settled row is never revisited.
+func (d *DB) SettleCost(id int64, cost float64, source string) error {
+	_, err := d.db.Exec(`UPDATE dispatches SET cost_usd = ?, cost_source = ?
+		WHERE id = ? AND cost_source = ''`, cost, source, id)
+	if err != nil {
+		return fmt.Errorf("settle cost of dispatch %d: %w", id, err)
+	}
+	return nil
+}
+
 // ErrDispatchNotRunning reports that a dispatch was already finished, so this
 // caller lost the race and must not write any further state for it.
 var ErrDispatchNotRunning = errors.New("dispatch is no longer running")
@@ -1204,7 +1240,8 @@ var ErrDispatchNotRunning = errors.New("dispatch is no longer running")
 const dispatchColumns = `id, project_id, loop, repo, number, kind, session_id, pid,
 	pid_start_at, status, started_at, finished_at, exit_code, cost_usd, duration_ms,
 	api_error, log_path, pr_number, title, legacy_source, legacy_id,
-	agent_pid, model, harness, effort, provider, review_pending, co_author`
+	agent_pid, model, harness, effort, provider, review_pending, co_author,
+	cost_source`
 
 func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 	var d Dispatch
@@ -1213,7 +1250,8 @@ func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 		&d.SessionID, &d.PID, &pidStart, &d.Status, &d.StartedAt, &finished,
 		&d.ExitCode, &d.CostUSD, &d.DurationMS, &d.APIError, &d.LogPath,
 		&d.PRNumber, &d.Title, &d.LegacySource, &d.LegacyID,
-		&d.AgentPID, &d.Model, &d.Harness, &d.Effort, &d.Provider, &d.ReviewPending, &d.CoAuthor)
+		&d.AgentPID, &d.Model, &d.Harness, &d.Effort, &d.Provider, &d.ReviewPending, &d.CoAuthor,
+		&d.CostSource)
 	if err != nil {
 		return Dispatch{}, err
 	}

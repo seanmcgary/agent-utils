@@ -251,6 +251,9 @@ func Open(ref ProjectRef, configPath string, opts Options) (*config.Config, Deps
 		}
 		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	}
+	// After the import, so imported rows are settled in the same pass, and
+	// before anything reads a cost: the session cost ceiling decides from them.
+	settleCostsOnOpen(db)
 
 	self, err := os.Executable()
 	if err != nil {

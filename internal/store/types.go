@@ -173,6 +173,9 @@ type Dispatch struct {
 	// client, so this row is how the value reaches it. Empty means none: the
 	// setting is off, the author is a bot, or the lookup failed.
 	CoAuthor string
+	// CostSource says how CostUSD was derived; see runner.CostSource*. Empty
+	// means not yet settled.
+	CostSource string
 }
 
 // RunnerID is the dispatch identifier the runner process actually carries.
@@ -192,9 +195,11 @@ func (d Dispatch) RunnerID() int64 {
 
 // DispatchResult is the outcome recorded when a dispatch ends.
 type DispatchResult struct {
-	Status     string
-	ExitCode   int
-	CostUSD    float64
+	Status   string
+	ExitCode int
+	CostUSD  float64
+	// CostSource is how CostUSD was derived; see runner.CostSource*.
+	CostSource string
 	DurationMS int64
 	APIError   string
 	// SessionStarted reports that the run produced a session identifier, so the

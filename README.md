@@ -173,6 +173,7 @@ Commands split by scope. **Top level spans the machine; `project` acts on one pr
 | `agent-utils logs [--name <loop>] [--session <id>]` | The log of a dispatched agent, for the project in the current directory |
 | `agent-utils forget <name\|id\|path>` | Drop a project from the registry, touching none of its files |
 | `agent-utils migrate [--dry-run]` | Import state left by the old per-loop databases, and print a report. Not required |
+| `agent-utils recost [--dry-run]` | Recompute recorded dispatch costs from the run logs, and print what changed. Not required |
 | `agent-utils version` | Version and commit |
 | `agent-utils config show [--reveal] \| get <key> \| set <key> <value> \| unset <key> \| webhook ...` | Read and write the machine-wide `~/.agent-utils/config.yaml`: the webhook daemon's URL, bind address and secret |
 | `agent-utils config github-app --app-id <n> --private-key <path> \| --unset` | Act as a GitHub App instead of with `GITHUB_TOKEN`, after checking that GitHub accepts the key. See [docs/configuration.md](docs/configuration.md#running-as-a-github-app) |
@@ -420,8 +421,9 @@ identifier may also be given as a bare argument, which is the shape `logs -f <se
 takes; giving both spellings different values is refused rather than resolved by precedence.
 
 The transcript is rendered rather than dumped — session start, the agent's text, each tool
-call and its result, and a closing line with turns, cost and duration. Thinking blocks and
-token counters are hidden.
+call and its result, and a closing line with turns, cost and duration. Where claude reports
+the session's running total, the closing line shows the run's own cost with the session total
+beside it. Thinking blocks and token counters are hidden.
 
 | Flag | Effect |
 |---|---|
@@ -548,6 +550,31 @@ that part cannot be avoided.
 
 Nothing left to import. Every registered project's state is already
 in the canonical database.
+```
+
+### Dispatch costs
+
+A run's cost is what that run alone spent, read from claude's result line. Recent claude
+versions report `total_cost_usd` as the session's running total and add
+`model_usage_since_last_result`, whose cost is the run's own; when that field is present, it is
+what agent-utils records. Older versions, which lack it, reported `total_cost_usd` per run, and
+that is recorded as is. pi reports per-message costs, which are summed.
+
+Releases before v0.29.0 recorded `total_cost_usd` whatever it meant, so every resume of a session
+re-counted the runs before it. The first time any command opens the state database after an
+upgrade, it re-reads the log of every run recorded before the fix and stores the run's own cost.
+There is nothing to run. A run whose log is missing keeps its recorded cost and is marked
+unverified. `agent-utils recost` prints what that pass changed or would change; `--dry-run` writes
+nothing:
+
+```
+$ agent-utils recost --dry-run
+Dry run: no cost was written.
+
+SESSION    LOOP             ISSUE  RUNS        BEFORE        AFTER
+74a6fe4…   execution        1063   250      $2457.13      $160.09
+
+Would settle 251 dispatches: 250 changed, $2457.45 recorded before, $160.41 after.
 ```
 
 ## Security
