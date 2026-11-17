@@ -264,7 +264,7 @@ prompt: |
   the Defer rows' issue links; and the full suite's result. Copy the artifact's
   "Decisions needed" and "Pre-merge checks" rows into the pull request body. Do not restate the review's Reject and Defer
   reasoning -- the findings comment already carries it and the human has read
-  it. Link to that comment instead. @-mention @seanmcgary. Then remove
+  it. Link to that comment instead.{{if .Contact}} @-mention @{{.Contact}}.{{end}} Then remove
   {{.Labels.InFlight}} and add {{.Labels.Terminal}} as your LAST action. That
   label is the human's merge queue: nothing follows it, and no loop triggers on
   it.

@@ -785,3 +785,52 @@ func TestLoadRejectsNegativeSessionCostCeiling(t *testing.T) {
 		t.Fatalf("err = %v, want one naming max_session_cost_usd", err)
 	}
 }
+
+func TestLoadFallbackContact(t *testing.T) {
+	cases := []struct {
+		value   string
+		wantErr string
+	}{
+		{"octocat", ""},
+		{"Octo-Cat-9", ""},
+		{"acme/maintainers", ""},
+		{"acme-inc/release_team", ""},
+		{"@octocat", "must not start with @"},
+		{"@acme/maintainers", "must not start with @"},
+		{"-octocat", "must be a GitHub login"},
+		{"octocat-", "must be a GitHub login"},
+		{"octo cat", "must be a GitHub login"},
+		{"acme/", "must be a GitHub login"},
+		{"/maintainers", "must be a GitHub login"},
+		{"acme/team/extra", "must be a GitHub login"},
+		{"acme/-team", "must be a GitHub login"},
+		{"averyveryveryveryveryveryverylongloginname", "must be a GitHub login"},
+	}
+	for _, c := range cases {
+		t.Run(c.value, func(t *testing.T) {
+			cfg, err := Load(writeTemp(t, validYAML+"\nfallback_contact: \""+c.value+"\"\n"))
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				if cfg.FallbackContact != c.value {
+					t.Errorf("FallbackContact = %q, want %q", cfg.FallbackContact, c.value)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("Load error = %v, want one containing %q", err, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsMissingFallbackContact(t *testing.T) {
+	cfg, err := Load(writeTemp(t, validYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FallbackContact != "" {
+		t.Errorf("FallbackContact = %q, want empty", cfg.FallbackContact)
+	}
+}

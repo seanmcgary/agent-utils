@@ -296,3 +296,85 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// The example prompts @-mention and assign the issue's author, fall back to
+// fallback_contact when the author is a bot or unknown, and name no one when
+// neither is available. A hardcoded handle used to sit here, and under a
+// GitHub App it pinged the same person on every issue.
+func TestExamplePromptsAddressTheIssueAuthor(t *testing.T) {
+	cases := []struct {
+		name, author, fallback string
+		// want maps each example to substrings its rendered prompt must
+		// contain; absent lists substrings it must not.
+		want   map[string][]string
+		absent []string
+	}{
+		{
+			name: "human author", author: "alice", fallback: "acme/maintainers",
+			want: map[string][]string{
+				"planning.yaml":                {"ONE numbered comment, @-mention @alice, then park."},
+				"pr-review.yaml":               {"4. @-mention @alice."},
+				"exec-pr-review-findings.yaml": {"Link to that comment instead. @-mention @alice. Then remove"},
+				"execution.yaml":               {"in the body. Assign @alice.\n"},
+			},
+			absent: []string{"acme/maintainers"},
+		},
+		{
+			name: "bot author with a team fallback", author: "", fallback: "acme/maintainers",
+			want: map[string][]string{
+				"planning.yaml":                {"ONE numbered comment, @-mention @acme/maintainers, then park."},
+				"pr-review.yaml":               {"4. @-mention @acme/maintainers."},
+				"exec-pr-review-findings.yaml": {"@-mention @acme/maintainers. Then remove"},
+				"execution.yaml": {
+					"in the body. Request review from acme/maintainers:\n",
+					"`gh pr edit <n> --add-reviewer acme/maintainers`.\n",
+				},
+			},
+			absent: []string{"Assign @"},
+		},
+		{
+			name: "bot author without a fallback", author: "", fallback: "",
+			want: map[string][]string{
+				"planning.yaml":                {"ONE numbered comment, then park."},
+				"pr-review.yaml":               {"4. Skip: there is no one to @-mention."},
+				"exec-pr-review-findings.yaml": {"Link to that comment instead. Then remove"},
+				"execution.yaml":               {"in the body.\n"},
+			},
+			absent: []string{"@-mention @", "Assign @", "--add-reviewer", "@seanmcgary"},
+		},
+	}
+	for _, c := range cases {
+		for name, want := range c.want {
+			t.Run(c.name+"/"+name, func(t *testing.T) {
+				cfg, err := config.Load(filepath.Join("..", "..", "examples", name))
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				got, err := runner.RenderPrompt(cfg.Prompt, runner.PromptData{
+					Repo:  cfg.Repo,
+					Loop:  cfg.Name,
+					Issue: runner.PromptIssue{Number: 12, Title: "a title", Author: c.author},
+					Labels: runner.PromptLabels{
+						Trigger: cfg.Labels.Trigger, InFlight: cfg.Labels.InFlight,
+						Blocked: cfg.Labels.Blocked, Terminal: cfg.Labels.Terminal,
+					},
+					Contact:         runner.ContactFor(c.author, c.fallback),
+					FallbackContact: c.fallback,
+				})
+				if err != nil {
+					t.Fatalf("render: %v", err)
+				}
+				for _, w := range want {
+					if !strings.Contains(got, w) {
+						t.Errorf("rendered prompt lacks %q", w)
+					}
+				}
+				for _, a := range c.absent {
+					if strings.Contains(got, a) {
+						t.Errorf("rendered prompt contains %q", a)
+					}
+				}
+			})
+		}
+	}
+}

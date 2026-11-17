@@ -734,8 +734,9 @@ type access struct {
 	// to collapse, so they bypass it rather than teaching it three more methods
 	// it would only ever pass through.
 	epic ghub.EpicReader
-	// authors is the same client again, for crediting the issue author. Nil
-	// where the client cannot answer, and loopcmd treats nil as "no credit".
+	// authors is the same client again, for naming and crediting the issue
+	// author. Nil where the client cannot answer, and loopcmd treats nil as
+	// "author unknown".
 	authors ghub.AuthorReader
 	// wait is the same client again, for the waiting pass, which bypasses the
 	// cache for epic's reason. Nil where the client cannot answer, and the

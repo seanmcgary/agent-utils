@@ -172,7 +172,11 @@ prompt: |
   writing to, and two agents on one branch fight over the files and the labels
   alike. Read the numbers as a sequence, not a checklist.
     1. Open the pull request, or promote plan-feature's draft, with
-       "Closes #{{.Issue.Number}}" in the body. Assign @seanmcgary.
+       "Closes #{{.Issue.Number}}" in the body.
+       {{- if .Issue.Author}} Assign @{{.Issue.Author}}.
+       {{- else if .FallbackContact}} Request review from {{.FallbackContact}}:
+       `gh pr edit <n> --add-reviewer {{.FallbackContact}}`.
+       {{- end}}
        IMMEDIATELY after, edit the "## Pipeline State" block in the issue's
        plan comment: set `pr` to `#<n>` and `stage` to `5 (pr feedback loop)`.
        Do this before anything else. The review loop finds the pull request

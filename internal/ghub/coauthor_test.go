@@ -72,6 +72,26 @@ func TestCoAuthor(t *testing.T) {
 	}
 }
 
+func TestIssueAuthor(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name, user string
+		want       Author
+	}{
+		{"human", `{"login":"alice","id":7,"type":"User"}`, Author{Login: "alice", ID: 7}},
+		{"bot by type", `{"login":"acme-agent","id":9,"type":"Bot"}`, Author{Login: "acme-agent", ID: 9, Bot: true}},
+		{"bot by suffix", `{"login":"renovate[bot]","id":10,"type":"User"}`, Author{Login: "renovate[bot]", ID: 10, Bot: true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := fakeAPI(t, c.user, "").IssueAuthor(ctx, "acme", "widgets", 5)
+			if err != nil || got != c.want {
+				t.Errorf("IssueAuthor = %+v, %v; want %+v", got, err, c.want)
+			}
+		})
+	}
+}
+
 func TestAuthenticatedLoginUsesSelfOverride(t *testing.T) {
 	g := &GitHubClient{c: github.NewClient(nil), self: func(context.Context) (string, error) { return "acme-agent[bot]", nil }}
 	got, err := g.AuthenticatedLogin(context.Background())
