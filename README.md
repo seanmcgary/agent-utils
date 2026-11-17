@@ -82,6 +82,14 @@ to its derived default. There is no prompt anywhere in this path, including the 
 the wizard puts in front of `bypassPermissions` — the warning above is what is left of it, so
 read the files before the first tick.
 
+The prompts @-mention the issue's author through `{{.Contact}}`, and the execution loop assigns
+its pull request to `{{.Issue.Author}}`. When the author is a bot, as the execution loop's own
+pull requests are under a GitHub App, they address the loop's
+[`fallback_contact`](docs/configuration.md#fallback_contact) instead, which neither the wizard
+nor `--all-loops` sets. Add it to each loop file to name a user or an `org/team-slug`; without
+it those prompts mention no one. See [Template variables](docs/configuration.md#template-variables)
+for every field a prompt can read.
+
 Because it asks nothing, `--all-loops` works where the wizard cannot: a provisioning script, a
 cron job, a fresh checkout over ssh. It needs an origin remote, since there is no way to ask
 for the repository, and it refuses to run alongside `--no-loop`. On a project that already has

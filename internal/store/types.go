@@ -173,6 +173,12 @@ type Dispatch struct {
 	// client, so this row is how the value reaches it. Empty means none: the
 	// setting is off, the author is a bot, or the lookup failed.
 	CoAuthor string
+	// IssueAuthor is the login of the human who opened the issue (or pull
+	// request), for the prompt's @-mentions and assignment. It travels here
+	// for CoAuthor's reason: the detached runner holds no GitHub client.
+	// Empty means the author is a bot or the lookup failed, and the prompt
+	// then falls back to the loop's fallback_contact.
+	IssueAuthor string
 	// CostSource says how CostUSD was derived; see runner.CostSource*. Empty
 	// means not yet settled.
 	CostSource string

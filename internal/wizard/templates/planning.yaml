@@ -103,7 +103,7 @@ prompt: |
   human interaction is issue comments plus label transitions. Read the issue body
   and every comment as your input and as the record of what has already been
   asked. Never re-ask a question the thread answers. Collect every outstanding
-  question into ONE numbered comment, @-mention @seanmcgary, then park.
+  question into ONE numbered comment,{{if .Contact}} @-mention @{{.Contact}},{{end}} then park.
 
   QUESTION DISCIPLINE. A question earns a place in your batch ONLY if it is
   genuinely unresolvable without the human: you cannot write the plan without an

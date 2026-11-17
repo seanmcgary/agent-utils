@@ -226,6 +226,11 @@ func PiBuildArgs(cfg *config.Config, inv Invocation) []string {
 type PromptIssue struct {
 	Number int
 	Title  string
+	// Author is the login of the human who opened the issue, or the pull
+	// request in a loop whose items are pull requests. It is empty when the
+	// author is a bot or could not be read, so a template can test it with
+	// {{if .Issue.Author}} before mentioning or assigning anyone.
+	Author string
 }
 
 // PromptPR is the pull request view a prompt template can read.
@@ -281,6 +286,23 @@ type PromptData struct {
 	PR        PromptPR
 	Labels    PromptLabels
 	Tend      PromptTend
+	// Contact is who the agent should @-mention: Issue.Author when there is
+	// one, else FallbackContact, else empty. See ContactFor.
+	Contact string
+	// FallbackContact is the loop's fallback_contact, a login or an
+	// org/team-slug. It is exposed apart from Contact because a pull request
+	// can be ASSIGNED only to a user: a prompt assigns Issue.Author and
+	// requests review from FallbackContact, which accepts a team.
+	FallbackContact string
+}
+
+// ContactFor returns who a prompt should @-mention: the issue's author when
+// there is a human one, else the loop's fallback, else "" for no one.
+func ContactFor(author, fallback string) string {
+	if author != "" {
+		return author
+	}
+	return fallback
 }
 
 // RenderPrompt renders a prompt template. An unknown field is an error, so a

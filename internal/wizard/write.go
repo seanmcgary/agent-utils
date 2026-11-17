@@ -33,6 +33,7 @@ type yamlDoc struct {
 	Agent                        yamlAgent  `yaml:"agent"`
 	Retry                        yamlRetry  `yaml:"retry"`
 	AcknowledgeBypassPermissions bool       `yaml:"i_understand_bypass_permissions,omitempty"`
+	FallbackContact              string     `yaml:"fallback_contact,omitempty"`
 	Prompt                       string     `yaml:"prompt"`
 	ResumePrompt                 string     `yaml:"resume_prompt"`
 }
@@ -103,6 +104,7 @@ func toYAMLDoc(cfg *config.Config) yamlDoc {
 			},
 		},
 		AcknowledgeBypassPermissions: cfg.AcknowledgeBypassPermissions,
+		FallbackContact:              cfg.FallbackContact,
 		Prompt:                       cfg.Prompt,
 		ResumePrompt:                 cfg.ResumePrompt,
 	}

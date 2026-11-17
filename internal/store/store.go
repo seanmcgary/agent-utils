@@ -132,7 +132,11 @@ CREATE TABLE IF NOT EXISTS dispatches (
   -- means a row written before this column existed, whose cost may be a
   -- session's running total. The cost reconcile pass settles every finished
   -- row left empty, from its run log.
-  cost_source TEXT NOT NULL DEFAULT ''
+  cost_source TEXT NOT NULL DEFAULT '',
+  -- issue_author is the login of the issue's human author, for the prompt.
+  -- Empty when the author is a bot or the lookup failed. See
+  -- store.Dispatch.IssueAuthor.
+  issue_author TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS pr_links (
@@ -483,6 +487,7 @@ var addedColumns = []struct{ table, column, def string }{
 	{"dispatches", "review_pending", "INTEGER NOT NULL DEFAULT 0"},
 	{"dispatches", "co_author", "TEXT NOT NULL DEFAULT ''"},
 	{"dispatches", "cost_source", "TEXT NOT NULL DEFAULT ''"},
+	{"dispatches", "issue_author", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // backfillSessionHarness fills issues.session_harness for rows whose session was
@@ -1098,8 +1103,9 @@ func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
 	res, err := s.db.Exec(`
 		INSERT INTO dispatches (project_id, loop, repo, number, kind, session_id,
 		                        status, started_at, log_path, pr_number, title,
-		                        model, harness, effort, provider, review_pending, co_author)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		                        model, harness, effort, provider, review_pending, co_author,
+		                        issue_author)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE NOT EXISTS (
 		  SELECT 1 FROM dispatches
 		  WHERE project_id = ? AND repo = ? AND number = ? AND status = ?
@@ -1108,6 +1114,7 @@ func (s *Store) CreateDispatch(d Dispatch) (int64, error) {
 		s.projectID, d.Loop, d.Repo, d.Number, d.Kind, d.SessionID,
 		StatusRunning, time.Now().UTC(), d.LogPath, d.PRNumber, d.Title,
 		d.Model, d.Harness, d.Effort, d.Provider, d.ReviewPending, d.CoAuthor,
+		d.IssueAuthor,
 		s.projectID, d.Repo, d.Number, StatusRunning, KindTend, tend)
 	if err != nil {
 		return 0, fmt.Errorf("create dispatch: %w", err)
@@ -1241,7 +1248,7 @@ const dispatchColumns = `id, project_id, loop, repo, number, kind, session_id, p
 	pid_start_at, status, started_at, finished_at, exit_code, cost_usd, duration_ms,
 	api_error, log_path, pr_number, title, legacy_source, legacy_id,
 	agent_pid, model, harness, effort, provider, review_pending, co_author,
-	cost_source`
+	cost_source, issue_author`
 
 func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 	var d Dispatch
@@ -1251,7 +1258,7 @@ func scanDispatch(sc interface{ Scan(...any) error }) (Dispatch, error) {
 		&d.ExitCode, &d.CostUSD, &d.DurationMS, &d.APIError, &d.LogPath,
 		&d.PRNumber, &d.Title, &d.LegacySource, &d.LegacyID,
 		&d.AgentPID, &d.Model, &d.Harness, &d.Effort, &d.Provider, &d.ReviewPending, &d.CoAuthor,
-		&d.CostSource)
+		&d.CostSource, &d.IssueAuthor)
 	if err != nil {
 		return Dispatch{}, err
 	}

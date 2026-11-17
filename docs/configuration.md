@@ -322,6 +322,7 @@ absolute path** — it depends on no working directory and can never prompt.
 - [`labels`](#labels)
 - [Agent overrides from labels](#agent-overrides-from-labels)
 - [`agent`](#agent)
+- [`fallback_contact`](#fallback_contact)
 - [`wait_for_checks`](#wait_for_checks)
 - [Project settings: `tend` and `epic`](#project-settings-tend-and-epic)
 - [`retry`](#retry)
@@ -357,6 +358,7 @@ absolute path** — it depends on no working directory and can never prompt.
 | `agent.timeout` | duration | no | `24h` |
 | `i_understand_bypass_permissions` | bool | only with `bypassPermissions` | `false` |
 | `cleanup_closed_pr` | bool | no | `true` |
+| `fallback_contact` | GitHub login or `org/team-slug` | no | empty |
 | `wait_for_checks` | list of workflow file names | no | empty |
 | `retry.max` | int | no | `0`, meaning never retry |
 | `retry.backoff` | list of duration | yes if `retry.max > 0` | empty |
@@ -1158,6 +1160,38 @@ Two limits apply, and neither is configurable:
 cleanup_closed_pr: false   # keep the worktrees
 ```
 
+## `fallback_contact`
+
+Who a prompt addresses when the issue's author cannot be addressed. Optional. It is a GitHub
+login (`octocat`) or a team (`acme/maintainers`), written without the leading `@`.
+
+Before each dispatch the tick reads the author of the issue, or of the pull request in a loop
+whose items are pull requests, and passes it to the prompt as `{{.Issue.Author}}`. When the
+author is a bot (`type: Bot`, or a login ending in `[bot]`), or the lookup fails, that field
+is empty and `{{.Contact}}` falls back to this value. A failed lookup is logged and never
+fails the dispatch. Under a GitHub App the pull requests the execution loop opens are authored
+by the app's bot, so the review loops that follow it address this contact.
+
+The example prompts use it like this:
+
+- Mentions are written `@{{.Contact}}` inside `{{if .Contact}}`, so they mention the author,
+  else this contact, else no one.
+- The execution loop assigns the pull request to `{{.Issue.Author}}` when there is one.
+  GitHub cannot assign a pull request to a team, so when the author is a bot it requests
+  review from this contact instead (`gh pr edit <n> --add-reviewer <contact>`, which accepts a
+  user or `org/team`). With neither, it does neither.
+
+```yaml
+fallback_contact: acme/maintainers
+```
+
+The tend dispatcher has no loop file, so it has no fallback: in a tend prompt `{{.Contact}}` is
+the issue's human author or empty.
+
+Loop files written before this field existed keep whatever handle their prompts hardcode. To
+address issue authors, edit those prompts by hand to use `{{.Contact}}` and `{{.Issue.Author}}`,
+following the files in `examples/`.
+
 ## `wait_for_checks`
 
 GitHub Actions workflows, by **file name**, that must have succeeded on a blocker's merge commit
@@ -1718,6 +1752,9 @@ Available to all three prompts.
 | `{{.Worktree}}` | string | Absolute path the agent runs in |
 | `{{.Issue.Number}}` | int | |
 | `{{.Issue.Title}}` | string | As of dispatch time |
+| `{{.Issue.Author}}` | string | Login of the issue's author (the pull request's, in a loop over pull requests); empty when the author is a bot or the lookup failed |
+| `{{.Contact}}` | string | `{{.Issue.Author}}` if set, else [`fallback_contact`](#fallback_contact), else empty. For @-mentions |
+| `{{.FallbackContact}}` | string | [`fallback_contact`](#fallback_contact) as written; empty in a tend prompt. A login or `org/team-slug`, so it can be a reviewer but not an assignee |
 | `{{.PR.Number}}` | int | Tend dispatches only; `0` otherwise |
 | `{{.PR.HeadRef}}` | string | Tend dispatches only |
 | `{{.PR.BaseRef}}` | string | Tend dispatches only |
@@ -1754,6 +1791,7 @@ Beyond the required fields in the quick reference:
 | `retry.breaker.cooldown` > 0 | `must be greater than zero` |
 | `labels.waiting` differs from `trigger`, `in_flight`, `blocked`, `terminal` | `labels.waiting must differ from …` |
 | `labels.waiting` is not a `*` prefix rule | `… it must be one literal label` |
+| `fallback_contact` is a login or `org/team-slug`, without `@` | `fallback_contact … must be a GitHub login (octocat) or a team as org/team-slug` |
 | `wait_for_checks` needs `labels.waiting` | `wait_for_checks is set but labels.waiting is not` |
 | `wait_for_checks` entries are workflow file names, each once | `… is not a workflow file name` / `… lists … twice` |
 | `checkout_base_dir`/`worktree_dir` relative needs a project root | `… so there is no project root to resolve it against` |

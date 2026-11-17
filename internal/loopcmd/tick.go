@@ -134,8 +134,10 @@ type Deps struct {
 	Force bool
 	// App is the GitHub App this machine acts as, or nil in token mode.
 	App *ghapp.App
-	// Authors and CoAuthor drive commit.co_author_issue_author: the tick
-	// resolves the issue author through Authors when CoAuthor is set.
+	// Authors reads each dispatched issue's author, for the prompt's
+	// @-mentions and assignment. CoAuthor drives commit.co_author_issue_author:
+	// when it is set the tick also resolves the author's co-author trailer.
+	// A nil Authors leaves both empty.
 	Authors  ghub.AuthorReader
 	CoAuthor bool
 	// Labels reads an issue's label history, which is how the tick tells a
@@ -223,26 +225,37 @@ func selfRetriggered(ctx context.Context, cfg *config.Config, deps Deps,
 	return out
 }
 
-// resolveCoAuthor returns the co-author for issue number's commits, or "".
+// resolveAuthor returns the login of issue number's human author and the
+// co-author its commits should credit. Either is "" when there is none: the
+// author is a bot, the lookup failed, or (for the co-author) the setting is off.
 //
-// It runs in the tick because the detached runner has no GitHub client; the
-// value reaches the runner on the dispatch row. A lookup failure is a
-// warning, never a failed dispatch: the commit is still correct without the
-// trailer, and a flaky profile read must not stall an issue.
-func resolveCoAuthor(ctx context.Context, cfg *config.Config, deps Deps, number int) string {
-	if !deps.CoAuthor || deps.Authors == nil {
-		return ""
+// One issue read serves both, so a dispatch costs at most one Issues.Get for
+// its author. It runs in the tick because the detached runner has no GitHub
+// client; both values reach the runner on the dispatch row. A lookup failure
+// is a warning, never a failed dispatch: the commit is still correct without
+// the trailer, the prompt falls back to the loop's fallback_contact, and a
+// flaky read must not stall an issue.
+func resolveAuthor(ctx context.Context, cfg *config.Config, deps Deps, number int) (login, coAuthor string) {
+	if deps.Authors == nil {
+		return "", ""
 	}
 	owner, repo, ok := strings.Cut(cfg.Repo, "/")
 	if !ok {
-		return ""
+		return "", ""
 	}
-	v, err := deps.Authors.CoAuthor(ctx, owner, repo, number)
+	a, err := deps.Authors.IssueAuthor(ctx, owner, repo, number)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: %s#%d: no co-author: %v\n", cfg.Repo, number, err)
-		return ""
+		slog.Warn("read the issue author; mentioning the fallback contact and crediting no co-author",
+			"loop", cfg.Name, "repo", cfg.Repo, "issue", number, "err", err)
+		return "", ""
 	}
-	return v
+	if a.Bot || a.Login == "" {
+		return "", ""
+	}
+	if deps.CoAuthor {
+		coAuthor = deps.Authors.CoAuthorFor(ctx, owner, repo, a)
+	}
+	return a.Login, coAuthor
 }
 
 // count increments n only when the action succeeded, so the recorded summary
@@ -862,6 +875,11 @@ func dispatch(
 	// costs a rebuild and buys nothing.
 	isRetry := d.Kind == engine.KindRetryStart || d.Kind == engine.KindRetryResume
 
+	// The issue's author for the commit hook and for the prompt. A tend's
+	// Number is its issue too, so a fix pushed during a tend credits the same
+	// person. It is read before the claim, like every value on the row.
+	author, coAuthor := resolveAuthor(ctx, cfg, deps, d.Issue)
+
 	// The dispatch row comes FIRST, before the worktree and before the issue
 	// state, because it is the CLAIM on this issue -- see store.CreateDispatch.
 	// Nothing this function does may be visible before the claim is won: the
@@ -890,9 +908,8 @@ func dispatch(
 		// ReviewPending travels here, not on pr_links: see
 		// store.Dispatch.ReviewPending for why.
 		ReviewPending: d.ReviewPending,
-		// The issue's author for the commit hook. A tend's Number is its
-		// issue too, so a fix pushed during a tend credits the same person.
-		CoAuthor: resolveCoAuthor(ctx, cfg, deps, d.Issue),
+		CoAuthor:      coAuthor,
+		IssueAuthor:   author,
 	})
 	if err != nil {
 		return err
@@ -1249,12 +1266,54 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		}
 	}
 
-	prompt, err := runner.RenderPrompt(tmpl, runner.PromptData{
+	prompt, err := runner.RenderPrompt(tmpl, promptData(cfg, d, pr, workDir))
+	if err != nil {
+		// Route this through the same accounting as any other failed dispatch.
+		// Calling FinishDispatch alone would skip MarkNeedsRetry, and the issue
+		// would keep its trigger label and redispatch every tick with no cap:
+		// one detached process per tick, forever, on a single template typo.
+		_ = runner.Finish(cfg, deps.Store, d, store.DispatchResult{
+			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
+		}, deps.Now())
+		return err
+	}
+
+	idEnv, idDir, err := prepareIdentity(ctx, cfg, deps, d, workDir)
+	if err != nil {
+		_ = runner.Finish(cfg, deps.Store, d, store.DispatchResult{
+			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
+		}, deps.Now())
+		return err
+	}
+	if idDir != "" {
+		defer func() { _ = os.RemoveAll(idDir) }()
+	}
+
+	// Overrides come from THE ROW, not from a snapshot the tick took: this
+	// detached process never saw the tick's decision, and the labels it was
+	// parsed from may since have changed on GitHub.
+	return runner.Supervise(ctx, cfg, deps.Store, d,
+		runner.Invocation{
+			SessionID: d.SessionID, Prompt: prompt, Resume: resume,
+			Overrides: config.Overrides{Model: d.Model, Harness: d.Harness, Effort: d.Effort},
+			Env:       idEnv,
+		},
+		workDir, d.LogPath)
+}
+
+// promptData builds the template context for dispatch d.
+func promptData(cfg *config.Config, d store.Dispatch, pr store.PRLink, workDir string) runner.PromptData {
+	return runner.PromptData{
 		Repo:      cfg.Repo,
 		Loop:      cfg.Name,
 		SessionID: d.SessionID,
 		Worktree:  workDir,
-		Issue:     runner.PromptIssue{Number: d.Number, Title: d.Title},
+		Issue: runner.PromptIssue{
+			Number: d.Number, Title: d.Title,
+			// From the dispatch row, for CoAuthor's reason: this detached
+			// process holds no GitHub client. See resolveAuthor.
+			Author: d.IssueAuthor,
+		},
 		PR: runner.PromptPR{
 			Number:  d.PRNumber,
 			HeadRef: pr.HeadRef,
@@ -1289,39 +1348,12 @@ func RunAgent(ctx context.Context, cfg *config.Config, deps Deps, dispatchID int
 		// The eligibility label, and only for a tend. A loop's prompt has its
 		// own four labels and no business reading a project-level one.
 		Tend: runner.PromptTend{Label: cfg.Tend.Label},
-	})
-	if err != nil {
-		// Route this through the same accounting as any other failed dispatch.
-		// Calling FinishDispatch alone would skip MarkNeedsRetry, and the issue
-		// would keep its trigger label and redispatch every tick with no cap:
-		// one detached process per tick, forever, on a single template typo.
-		_ = runner.Finish(cfg, deps.Store, d, store.DispatchResult{
-			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
-		}, deps.Now())
-		return err
+		// The issue's author when there is a human one, else the loop's
+		// fallback. A tend's configuration carries no fallback_contact, so a
+		// tend whose issue has a bot author gets an empty Contact.
+		Contact:         runner.ContactFor(d.IssueAuthor, cfg.FallbackContact),
+		FallbackContact: cfg.FallbackContact,
 	}
-
-	idEnv, idDir, err := prepareIdentity(ctx, cfg, deps, d, workDir)
-	if err != nil {
-		_ = runner.Finish(cfg, deps.Store, d, store.DispatchResult{
-			Status: store.StatusFailed, ExitCode: -1, APIError: err.Error(),
-		}, deps.Now())
-		return err
-	}
-	if idDir != "" {
-		defer func() { _ = os.RemoveAll(idDir) }()
-	}
-
-	// Overrides come from THE ROW, not from a snapshot the tick took: this
-	// detached process never saw the tick's decision, and the labels it was
-	// parsed from may since have changed on GitHub.
-	return runner.Supervise(ctx, cfg, deps.Store, d,
-		runner.Invocation{
-			SessionID: d.SessionID, Prompt: prompt, Resume: resume,
-			Overrides: config.Overrides{Model: d.Model, Harness: d.Harness, Effort: d.Effort},
-			Env:       idEnv,
-		},
-		workDir, d.LogPath)
 }
 
 // prepareIdentity builds the dispatch's identity directory and environment.

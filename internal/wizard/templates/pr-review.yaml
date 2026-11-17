@@ -226,7 +226,7 @@ prompt: |
        never a part's. The next loop reads the manifest to learn the parts, so a
        part ID there loses every group the manifest would have named. The next loop fetches exactly that one comment by ID and never
        searches, so an unwritten or stale ID strands the round.
-    4. @-mention @seanmcgary.
+    4. {{if .Contact}}@-mention @{{.Contact}}.{{else}}Skip: there is no one to @-mention.{{end}}
     5. Remove {{.Labels.InFlight}}.
     6. Add {{.Labels.Terminal}}. THIS IS YOUR LAST ACTION. Nothing follows it.
   {{.Labels.Terminal}} is the ONLY label you add at the end. In particular do not

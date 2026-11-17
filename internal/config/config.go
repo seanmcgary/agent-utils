@@ -71,6 +71,18 @@ type Config struct {
 	// bypassPermissions agent permission mode. See validate.
 	AcknowledgeBypassPermissions bool `yaml:"i_understand_bypass_permissions"`
 
+	// FallbackContact is who the prompt names when the issue's author cannot
+	// be: the author is a bot, or the lookup failed. It is a GitHub login or
+	// an org/team-slug, written without the leading @, and optional; empty
+	// means the prompt mentions and assigns no one in that case.
+	//
+	// It exists because a prompt cannot hardcode a person. Under a GitHub App
+	// the agent posts as the app's bot, so a hardcoded handle pings that one
+	// person on every issue, whoever opened it; and an issue the execution
+	// loop's agent opened, or a pull request it pushed, has a bot author that
+	// no mention reaches.
+	FallbackContact string `yaml:"fallback_contact"`
+
 	// Prompt and ResumePrompt are the only prompts a loop file carries. There
 	// used to be a third, tend_prompt, and it moved to the project descriptor
 	// with the rest of the tend policy: a loop that does not tend -- which is
@@ -368,6 +380,10 @@ func (c *Config) validate() error {
 
 	errs = append(errs, c.validateWaiting()...)
 
+	if err := validateContact(c.FallbackContact); err != nil {
+		errs = append(errs, err)
+	}
+
 	switch c.Agent.Harness {
 	case "", HarnessClaude, HarnessPi:
 	default:
@@ -495,6 +511,38 @@ func (c *Config) validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// githubLogin matches a GitHub user or organization login: alphanumerics and
+// single interior hyphens, at most 39 characters. Consecutive hyphens are
+// accepted because some older accounts have them.
+var githubLogin = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
+
+// teamSlug matches the slug half of an org/team-slug. GitHub derives slugs
+// from team names as lowercase alphanumerics, hyphens and underscores, and
+// matches them case-insensitively, so case is not checked.
+var teamSlug = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+
+// validateContact checks fallback_contact. The value is rendered into a
+// prompt after an @ and passed to `gh pr edit --add-reviewer`, so anything
+// that is neither a login nor an org/team-slug is refused here rather than
+// becoming a mention of nobody, or an argument gh rejects at the end of a run.
+func validateContact(v string) error {
+	if v == "" {
+		return nil
+	}
+	if strings.HasPrefix(v, "@") {
+		return fmt.Errorf("fallback_contact %q must not start with @; write %q", v, strings.TrimPrefix(v, "@"))
+	}
+	org, team, isTeam := strings.Cut(v, "/")
+	if !isTeam {
+		if githubLogin.MatchString(v) {
+			return nil
+		}
+	} else if githubLogin.MatchString(org) && teamSlug.MatchString(team) {
+		return nil
+	}
+	return fmt.Errorf("fallback_contact %q must be a GitHub login (octocat) or a team as org/team-slug (acme/maintainers)", v)
 }
 
 // workflowFile matches a workflow file's base name. It is the same shape the

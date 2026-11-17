@@ -513,7 +513,7 @@ func TestTickCarriesAModelOverrideToTheDispatchRow(t *testing.T) {
 	// The co-author rides the same row to the runner, so it is pinned here
 	// beside the overrides.
 	deps.CoAuthor = true
-	deps.Authors = &fakeAuthors{v: "X <x@y.z>"}
+	deps.Authors = &fakeAuthors{a: ghub.Author{Login: "xavier", ID: 3}, v: "X <x@y.z>"}
 
 	sum, err := Tick(context.Background(), cfg, deps)
 	if err != nil {
@@ -546,6 +546,9 @@ func TestTickCarriesAModelOverrideToTheDispatchRow(t *testing.T) {
 	}
 	if got.CoAuthor != "X <x@y.z>" {
 		t.Errorf("CoAuthor = %q, want %q", got.CoAuthor, "X <x@y.z>")
+	}
+	if got.IssueAuthor != "xavier" {
+		t.Errorf("IssueAuthor = %q, want %q", got.IssueAuthor, "xavier")
 	}
 }
 

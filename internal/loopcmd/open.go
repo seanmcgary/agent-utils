@@ -91,7 +91,7 @@ type Options struct {
 	// implements it, exactly as Epic does, and for the same reason the daemon
 	// passes it explicitly: its GH is a DeliveryCache.
 	Wait ghub.WaitReader
-	// Authors resolves co-authors. Nil falls back to GH when GH implements
+	// Authors resolves issue authors and co-authors. Nil falls back to GH when GH implements
 	// it; the daemon passes it explicitly, as it does Epic, because the
 	// DeliveryCache wrapper does not.
 	Authors ghub.AuthorReader
